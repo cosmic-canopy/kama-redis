@@ -1,0 +1,341 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error };
+export { RedisUrl, UrlTransport, UrlError };
+
+// Connection URLs, read as Redis's own tools read them:
+//
+//   redis://[[user]:password@][host][:port][/db][?key=value&…]      also valkey://
+//   rediss://…                                                       TLS; also valkeys://
+//   unix://[[user]:password@]/path/to/socket[?db=N&key=value&…]
+//
+// redis:// and rediss:// mean what they mean to redis-cli 8.10 (`-u`), and valkey:// and valkeys:// what they mean
+// to valkey-cli: tests/unit/src/url_vectors.kama is redis-cli and valkey-cli asked live, URL by URL
+// (tools/gen-url-vectors.sh). So `secret@host` is a password, `:secret@` is a password with no user, the database
+// is the path, and an IPv6 address goes in brackets. A user and a password are percent-decoded; the host is not.
+//
+// Redis defines no unix:// URL (redis-cli takes a socket with -s), so this one is decided here: the form redis-py
+// and go-redis both document. The socket path is percent-decoded, and the database comes only from `?db=`.
+//
+// Where redis-cli would read a URL into something other than what it says (`atoi` turning a port of `6379x` into
+// 6379 and a database of `x` into 0, the first `@` ending the password even past the host, `user:@` silently
+// dropping the user), this reader refuses it and says how to write it. A URL it accepts is never read two ways.
+//
+// The query is read and kept, in order, but not interpreted: `Config` decides which keys it honours. A key given
+// twice is refused here, as is `password` (the password goes before the host) and, on a TCP URL, `db` (the
+// database goes in the path).
+
+// How a URL reaches the server.
+type enum UrlTransport implements Sendable { Tcp, Tls, Unix; }
+
+// Why a URL was refused, in words that say how to write it.
+type enum UrlError implements Error, Sendable {
+    Invalid(string detail);
+
+    public const fn string message() {
+        return match (this) { case Invalid(detail: d): copy d; };
+    }
+}
+
+type resource RedisUrl implements Sendable {
+    UrlTransport kind;
+    Optional<string> hostName;
+    Optional<int32> portNumber;
+    string socket;
+    Optional<string> userName;
+    Optional<string> secret;
+    Optional<int64> database;
+    DynamicArray<string> keys;
+    DynamicArray<string> values;
+
+    ctor empty() {
+        this.kind = UrlTransport::Tcp;
+        this.hostName = Optional::None;
+        this.portNumber = Optional::None;
+        this.socket = "";
+        this.userName = Optional::None;
+        this.secret = Optional::None;
+        this.database = Optional::None;
+        this.keys = DynamicArray.empty();
+        this.values = DynamicArray.empty();
+    }
+
+    // Read `text` as a URL, or say why it is not one this package accepts.
+    public ctor Result<RedisUrl, UrlError> parse(const ref string text) {
+        RedisUrl u = RedisUrl.empty();
+        Optional<UrlError> bad = u.read(b: text.bytes());
+        string why = match (bad) { case Some(value: e): e.message(); case None: ""; };
+        if (why.length() > 0) { return Result::Err(error: UrlError::Invalid(detail: give why)); }
+        return Result::Ok(value: give u);
+    }
+
+    // TCP, TLS over TCP, or a Unix-domain socket.
+    public const fn UrlTransport transport() { return this.kind; }
+    // The host, without brackets; None when the URL names none (the default is 127.0.0.1). None for unix://.
+    public const fn Optional<string> host() { return copied(o: this.hostName); }
+    // The port; None when the URL names none (the default is 6379).
+    public const fn Optional<int32> port() { return this.portNumber; }
+    // The socket's path, for unix://; empty otherwise.
+    public const fn string socketPath() { return copy this.socket; }
+    public const fn Optional<string> user() { return copied(o: this.userName); }
+    public const fn Optional<string> password() { return copied(o: this.secret); }
+    // The database to SELECT; None when the URL names none (the server's default is 0).
+    public const fn Optional<int64> db() { return this.database; }
+    // The query's keys and values, in the order given, percent-decoded.
+    public const fn isize queryLength() { return this.keys.length(); }
+    public const fn string queryKey(isize index) { return copy this.keys[index]; }
+    public const fn string queryValue(isize index) { return copy this.values[index]; }
+    // The value of `key` in the query, if it is there.
+    public const fn Optional<string> query(const ref string key) {
+        isize i = 0;
+        while (i < this.keys.length()) {
+            if (this.keys[i] == key) { return Optional::Some(value: copy this.values[i]); }
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+
+    fn Optional<UrlError> read(ConstView<uint8> b) {
+        isize n = b.length();
+        isize sep = find(b: b, from: 0, upTo: n, c: 58ui8);
+        if (sep < 0 || sep + 2 >= n || b[sep + 1] != 47ui8 || b[sep + 2] != 47ui8) {
+            return invalid(m: "not a URL: it should begin redis://, rediss://, valkey://, valkeys:// or unix://");
+        }
+        string scheme = lowerAscii(b: b.slice(from: 0, count: sep));
+        if (scheme == "redis" || scheme == "valkey") { this.kind = UrlTransport::Tcp; }
+        else if (scheme == "rediss" || scheme == "valkeys") { this.kind = UrlTransport::Tls; }
+        else if (scheme == "unix") { this.kind = UrlTransport::Unix; }
+        else { return invalid(m: "unknown scheme \"".concat(other: scheme).concat(other: "\": use redis://, rediss://, valkey://, valkeys:// or unix://")); }
+        isize start = sep + 3;
+        // The authority runs to the first `/` or `?`; the query starts at the first `?`.
+        isize question = find(b: b, from: start, upTo: n, c: 63ui8);
+        isize queryAt = question;
+        if (queryAt < 0) { queryAt = n; }
+        isize slash = find(b: b, from: start, upTo: queryAt, c: 47ui8);
+        isize authEnd = slash;
+        if (authEnd < 0) { authEnd = queryAt; }
+        // redis-cli takes the first `@` anywhere as the end of the password, so a second `@`, or one past the host,
+        // would be read as part of the password there and of the host or path here.
+        isize at = find(b: b, from: start, upTo: authEnd, c: 64ui8);
+        isize laterFrom = authEnd;
+        if (at >= 0) { laterFrom = at + 1; }
+        if (find(b: b, from: laterFrom, upTo: n, c: 64ui8) >= 0) {
+            return invalid(m: "an '@' after the one before the host: percent-encode an '@' in a user or password as %40");
+        }
+        isize hostStart = start;
+        if (at >= 0) {
+            Optional<UrlError> e = this.readUserInfo(b: b.slice(from: start, count: at - start));
+            match (give e) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+            hostStart = at + 1;
+        }
+        if (this.kind == UrlTransport::Unix) {
+            if (hostStart != authEnd) {
+                return invalid(m: "a unix:// URL names no host: write unix:///path/to/socket, or unix://user:password@/path/to/socket");
+            }
+            if (slash < 0 || queryAt - slash < 2) { return invalid(m: "a unix:// URL needs the socket's path: unix:///path/to/socket"); }
+            Result<string, UrlError> path = percentDecoded(b: b.slice(from: slash, count: queryAt - slash), what: "the socket path");
+            match (give path) { case Ok(value: p): { this.socket = give p; } case Err(error: x): { return Optional::Some(value: give x); } };
+        } else {
+            Optional<UrlError> e = this.readHostPort(b: b.slice(from: hostStart, count: authEnd - hostStart));
+            match (give e) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+            if (slash >= 0) {
+                Optional<UrlError> d = this.readDatabase(b: b.slice(from: slash + 1, count: queryAt - slash - 1));
+                match (give d) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+            }
+        }
+        if (question >= 0) {
+            Optional<UrlError> q = this.readQuery(b: b.slice(from: question + 1, count: n - question - 1));
+            match (give q) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+        }
+        return Optional::None;
+    }
+
+    // `user:password`, `:password`, or `password` alone, as redis-cli reads them.
+    fn Optional<UrlError> readUserInfo(ConstView<uint8> b) {
+        isize colon = find(b: b, from: 0, upTo: b.length(), c: 58ui8);
+        isize passFrom = 0;
+        if (colon >= 0) {
+            if (colon > 0) {
+                Result<string, UrlError> u = percentDecoded(b: b.slice(from: 0, count: colon), what: "the user");
+                match (give u) { case Ok(value: v): { this.userName = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
+            }
+            passFrom = colon + 1;
+        }
+        if (passFrom == b.length()) {
+            if (colon > 0) {
+                return invalid(m: "a user with an empty password, which redis-cli would drop with the user: give the password, or leave out the user");
+            }
+            return Optional::None;
+        }
+        Result<string, UrlError> p = percentDecoded(b: b.slice(from: passFrom, count: b.length() - passFrom), what: "the password");
+        return match (give p) {
+            case Ok(value: v): { this.secret = Optional::Some(value: give v); := Optional::None; }
+            case Err(error: x): Optional::Some(value: give x);
+        };
+    }
+
+    fn Optional<UrlError> readHostPort(ConstView<uint8> b) {
+        isize n = b.length();
+        if (n == 0) { return Optional::None; }
+        isize portFrom = -1;
+        if (b[0] == 91ui8) {
+            isize close = find(b: b, from: 1, upTo: n, c: 93ui8);
+            if (close < 0) { return invalid(m: "an IPv6 address with no closing ']': write [::1]:6379"); }
+            if (close == 1) { return invalid(m: "an empty IPv6 address: write [::1]:6379"); }
+            Result<string, UrlError> h = textOf(b: b.slice(from: 1, count: close - 1), what: "the host");
+            match (give h) { case Ok(value: v): { this.hostName = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
+            if (close + 1 < n) {
+                if (b[close + 1] != 58ui8) { return invalid(m: "something after an IPv6 address's ']' that is not a port: write [::1]:6379"); }
+                portFrom = close + 2;
+            }
+        } else {
+            isize colon = find(b: b, from: 0, upTo: n, c: 58ui8);
+            isize hostEnd = colon;
+            if (hostEnd < 0) { hostEnd = n; }
+            if (hostEnd == 0) { return invalid(m: "a port with no host before it: write redis://localhost:6379"); }
+            Result<string, UrlError> h = textOf(b: b.slice(from: 0, count: hostEnd), what: "the host");
+            match (give h) { case Ok(value: v): { this.hostName = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
+            if (colon >= 0) { portFrom = colon + 1; }
+        }
+        if (portFrom >= 0) {
+            Optional<int64> p = digits(b: b.slice(from: portFrom, count: n - portFrom));
+            int64 port = match (p) { case Some(value: v): v; case None: -1i64; };
+            if (port < 1i64 || port > 65535i64) { return invalid(m: "the port is a number from 1 to 65535: redis://host:6379"); }
+            this.portNumber = Optional::Some(value: cast<int32>(port));
+        }
+        return Optional::None;
+    }
+
+    fn Optional<UrlError> readDatabase(ConstView<uint8> b) {
+        if (b.length() == 0) { return Optional::None; }
+        Optional<int64> d = digits(b: b);
+        return match (d) {
+            case Some(value: v): { this.database = Optional::Some(value: v); := Optional::None; }
+            case None: invalid(m: "the database is a number after the host: redis://host:6379/2");
+        };
+    }
+
+    fn Optional<UrlError> readQuery(ConstView<uint8> b) {
+        isize from = 0;
+        while (from <= b.length()) {
+            isize amp = find(b: b, from: from, upTo: b.length(), c: 38ui8);
+            if (amp < 0) { amp = b.length(); }
+            Optional<UrlError> e = this.readPair(b: b.slice(from: from, count: amp - from));
+            match (give e) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+            from = amp + 1;
+        }
+        return Optional::None;
+    }
+
+    fn Optional<UrlError> readPair(ConstView<uint8> b) {
+        isize eq = find(b: b, from: 0, upTo: b.length(), c: 61ui8);
+        if (eq <= 0) { return invalid(m: "a query item that is not key=value: write ?key=value&key=value"); }
+        Result<string, UrlError> k = percentDecoded(b: b.slice(from: 0, count: eq), what: "a query key");
+        string key = match (give k) { case Ok(value: v): give v; case Err(error: x): { return Optional::Some(value: give x); } };
+        Result<string, UrlError> v = percentDecoded(b: b.slice(from: eq + 1, count: b.length() - eq - 1), what: "a query value");
+        string value = match (give v) { case Ok(value: t): give t; case Err(error: x): { return Optional::Some(value: give x); } };
+        if (key == "password" || key == "user" || key == "username") {
+            return invalid(m: "the user and password go before the host, not in the query: redis://user:password@host");
+        }
+        if (key == "db") {
+            if (this.kind != UrlTransport::Unix) { return invalid(m: "the database goes in the path, not the query: redis://host:6379/2"); }
+            Optional<int64> d = digits(b: value.bytes());
+            match (d) {
+                case Some(value: n): { this.database = Optional::Some(value: n); }
+                case None: { return invalid(m: "the database is a number: unix:///path/to/socket?db=2"); }
+            };
+        }
+        isize i = 0;
+        while (i < this.keys.length()) {
+            if (this.keys[i] == key) { return invalid(m: "the query names \"".concat(other: key).concat(other: "\" twice")); }
+            i = i + 1;
+        }
+        this.keys.add(item: give key);
+        this.values.add(item: give value);
+        return Optional::None;
+    }
+}
+
+// KRD-4: `copy` does not reach through an Optional.
+fn Optional<string> copied(const ref Optional<string> o) {
+    return match (o) { case Some(value: v): Optional::Some(value: copy v); case None: Optional::None; };
+}
+
+fn Optional<UrlError> invalid(const ref string m) { return Optional::Some(value: UrlError::Invalid(detail: copy m)); }
+
+// The first `c` in b[from, upTo), or -1.
+fn isize find(ConstView<uint8> b, isize from, isize upTo, uint8 c) {
+    isize i = from;
+    if (i < 0) { i = 0; }
+    while (i < upTo) {
+        if (b[i] == c) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn string lowerAscii(ConstView<uint8> b) {
+    DynamicArray<uint8> low = DynamicArray.withCapacity(capacity: b.length());
+    isize i = 0;
+    while (i < b.length()) {
+        uint8 c = b[i];
+        if (c >= 65ui8 && c <= 90ui8) { c = c + 32ui8; }
+        low.add(item: c);
+        i = i + 1;
+    }
+    Result<string, Utf8Error> s = decode(bytes: low.view());
+    return match (give s) { case Ok(value: t): give t; case Err(error: e): "?"; };
+}
+
+// One or more ASCII digits, as an int64 that fits; None otherwise.
+fn Optional<int64> digits(ConstView<uint8> b) {
+    if (b.length() == 0) { return Optional::None; }
+    int64 v = 0i64;
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] < 48ui8 || b[i] > 57ui8) { return Optional::None; }
+        int64 d = cast<int64>(b[i] - 48ui8);
+        if (v > (9223372036854775807i64 - d) / 10i64) { return Optional::None; }
+        v = v * 10i64 + d;
+        i = i + 1;
+    }
+    return Optional::Some(value: v);
+}
+
+fn int32 hexValue(uint8 c) {
+    if (c >= 48ui8 && c <= 57ui8) { return cast<int32>(c - 48ui8); }
+    if (c >= 97ui8 && c <= 102ui8) { return cast<int32>(c - 87ui8); }
+    if (c >= 65ui8 && c <= 70ui8) { return cast<int32>(c - 55ui8); }
+    return -1;
+}
+
+// `%XX` as the byte it encodes, every other byte as itself; the result must be UTF-8.
+fn Result<string, UrlError> percentDecoded(ConstView<uint8> b, const ref string what) {
+    DynamicArray<uint8> acc = DynamicArray.withCapacity(capacity: b.length());
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] == 37ui8) {
+            if (i + 2 >= b.length()) {
+                return Result::Err(error: UrlError::Invalid(detail: "an incomplete percent-encoding in ".concat(other: what).concat(other: ": a '%' is followed by two hex digits, and '%' itself is %25")));
+            }
+            int32 hi = hexValue(c: b[i + 1]);
+            int32 lo = hexValue(c: b[i + 2]);
+            if (hi < 0 || lo < 0) {
+                return Result::Err(error: UrlError::Invalid(detail: "a bad percent-encoding in ".concat(other: what).concat(other: ": a '%' is followed by two hex digits, and '%' itself is %25")));
+            }
+            acc.add(item: cast<uint8>(hi * 16 + lo));
+            i = i + 3;
+        } else {
+            acc.add(item: b[i]);
+            i = i + 1;
+        }
+    }
+    return textOf(b: acc.view(), what: what);
+}
+
+fn Result<string, UrlError> textOf(ConstView<uint8> b, const ref string what) {
+    Result<string, Utf8Error> s = decode(bytes: b);
+    return match (give s) {
+        case Ok(value: t): Result::Ok(value: give t);
+        case Err(error: e): Result::Err(error: UrlError::Invalid(detail: what.concat(other: " is not UTF-8 once percent-decoded")));
+    };
+}

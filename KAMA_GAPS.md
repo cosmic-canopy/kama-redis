@@ -11,7 +11,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-1 (MED), KRD-2 (MED), KRD-3 (MED). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-1 (MED), KRD-2 (MED), KRD-3 (MED), KRD-4 (LOW). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Priorities:**
@@ -22,6 +22,42 @@ filed is cited by its KPG number rather than filed again.
 ---
 
 ## OPEN
+
+### KRD-4 · LOW · `copy` does not reach through an `Optional`
+
+**Found** writing phase 1's URL type, on `kama 0.9.523+gfc170153`: an accessor that hands back a copy of an optional
+string field.
+
+```kama
+import { core::println, std::collections::DynamicArray };
+
+type resource Named {
+    Optional<string> label;
+    public ctor make() { this.label = Optional::Some(value: "a label"); }
+    // A string copies; an Optional of one does not.
+    public const fn Optional<string> get() { return copy this.label; }
+}
+
+fn int32 main() {
+    Named n = Named.make();
+    Optional<string> a = n.get();
+    Optional<string> b = copy a;
+    DynamicArray<string> xs = DynamicArray.empty();
+    xs.add(item: "x");
+    DynamicArray<string> ys = copy xs;
+    println(s: "ok");
+    return 0;
+}
+```
+
+`kama build` refuses lines 7 and 13: `` `Optional<string>` has no `copy` method — add `implements Copyable(bare: …)`, or
+use `give` to move it ``. Line 16, the same `copy` of a `DynamicArray<string>`, is accepted: a collection copies when
+its element does, and `Optional` is the one generic wrapper that does not. A package cannot add `Copyable` to
+`Optional` (it is the language's).
+
+**What would close it:** `Optional<T>` copyable when `T` is, as `DynamicArray<T>` is.
+
+**Workaround** (src/url.kama, `copied`): a borrowing `match` that copies the payload into a new `Optional`.
 
 ### KRD-3 · MED · no bulk append to a `DynamicArray`, and no `capacity()`
 
