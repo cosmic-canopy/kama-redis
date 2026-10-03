@@ -6,7 +6,7 @@ import { core::println, std::collections::DynamicArray, std::collections::ConstV
          std::encoding::hex::encode as hexEncode, std::encoding::hex::decode as hexDecode,
          std::encoding::hex::DecodeError, std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::fmt::i64Str, std::concurrent::Isolate,
          redis::resp::Reader, redis::resp::Writer, redis::resp::Value, redis::resp::Read, redis::resp::Limits,
-         redis_unit_tests::check };
+         redis_unit_tests::check, respNames, respSources, respInputs, respMaxElements, respWant, respNotes };
 export { respTests, describe, readAll, readChunked, unhex };
 
 // ---- helpers shared with the vector tests ----
@@ -427,6 +427,7 @@ fn int32 bulkTests() {
     f = f + check(ok: isError(got: readWhole(input: "$?\r\n;-1\r\n"), message: "Bulk string length out of range"), what: "resp bulk: a negative chunk");
     f = f + check(ok: isError(got: readWhole(input: "=?\r\n"), message: "Bad bulk string length"), what: "resp bulk: no streamed verbatim");
     f = f + check(ok: isError(got: readWhole(input: "!?\r\n"), message: "Bad bulk string length"), what: "resp bulk: no streamed blob error");
+    f = f + check(ok: isError(got: readWhole(input: "!\r\n"), message: "Bad bulk string length"), what: "resp bulk: a blob error with no length");
     return f;
 }
 
@@ -920,8 +921,47 @@ fn int32 isolateTests() {
     return f;
 }
 
+// Every vector in resp_vectors.kama, read whole and a byte at a time by a reader with hiredis's limits: no bound
+// on a string or a reply, its maxelements (0 is none), and its depth of 1024.
+fn int32 respVectorTests() {
+    int32 f = 0;
+    DynamicArray<string> names = respNames();
+    DynamicArray<string> inputs = respInputs();
+    DynamicArray<int64> maxes = respMaxElements();
+    DynamicArray<string> wants = respWant();
+    isize i = 0;
+    while (i < names.length()) {
+        Limits l = Limits.defaults();
+        l.maxBulk = 9223372036854775807i64;
+        l.maxReplyBytes = 9223372036854775807i64;
+        l.maxDepth = 1024;
+        l.maxElements = maxes[i];
+        if (maxes[i] == 0i64) { l.maxElements = 9223372036854775807i64; }
+        DynamicArray<uint8> bytes = unhex(text: inputs[i]);
+        string whole = readAll(input: bytes.view(), chunk: 1 << 30, limits: l);
+        string bytewise = readAll(input: bytes.view(), chunk: 1, limits: l);
+        if (whole != wants[i] || bytewise != wants[i]) {
+            string name = copy names[i];
+            string want = clip(s: wants[i]);
+            string got = clip(s: whole);
+            string gotBytewise = clip(s: bytewise);
+            println(s: "  FAIL resp vector: ${name}\n      want ${want}\n      got  ${got}\n      byte at a time ${gotBytewise}");
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    f = f + check(ok: names.length() > 500, what: "resp vectors: more than 500 cases");
+    return f;
+}
+
+fn string clip(const ref string s) {
+    if (s.length() <= 300) { return copy s; }
+    return s.substring(start: 0, end: 300).concat(other: "…");
+}
+
 fn int32 respTests() {
     int32 f = 0;
+    f = f + respVectorTests();
     f = f + splitTests();
     f = f + prefixTests();
     f = f + pipelineTests();

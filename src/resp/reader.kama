@@ -650,7 +650,7 @@ fn Optional<int64> string2ll(ConstView<uint8> b) {
 
 // hiredis's double: `inf`, `-inf`, `nan` and `-nan` in any case, else a finite number in fast_float's grammar
 // with no leading `+` (an optional `-`, digits with an optional `.` fraction, at least one digit, an optional
-// exponent), read whole.
+// exponent), read whole. Like fast_float, a number too small to be anything but zero is out of range, not zero.
 fn Optional<float64> readDouble(ConstView<uint8> b) {
     isize n = b.length();
     if (n == 3 && caseIs(b: b, from: 0, word: "inf")) { return parseFloat(text: "inf"); }
@@ -660,10 +660,11 @@ fn Optional<float64> readDouble(ConstView<uint8> b) {
     isize i = 0;
     if (i < n && b[i] == MINUS) { i = i + 1; }
     isize digits = 0;
-    while (i < n && isDigit(c: b[i])) { i = i + 1; digits = digits + 1; }
+    bool nonzero = false;
+    while (i < n && isDigit(c: b[i])) { if (b[i] != 48ui8) { nonzero = true; } i = i + 1; digits = digits + 1; }
     if (i < n && b[i] == DOT) {
         i = i + 1;
-        while (i < n && isDigit(c: b[i])) { i = i + 1; digits = digits + 1; }
+        while (i < n && isDigit(c: b[i])) { if (b[i] != 48ui8) { nonzero = true; } i = i + 1; digits = digits + 1; }
     }
     if (digits == 0) { return Optional::None; }
     if (i < n && (b[i] == 101ui8 || b[i] == 69ui8)) {
@@ -679,6 +680,7 @@ fn Optional<float64> readDouble(ConstView<uint8> b) {
     Optional<float64> d = parseFloat(text: text);
     float64 v = match (d) { case Some(value: x): x; case None: { return Optional::None; } };
     if (v - v != v - v) { return Optional::None; }
+    if (v == 0.0 && nonzero) { return Optional::None; }
     return Optional::Some(value: v);
 }
 
