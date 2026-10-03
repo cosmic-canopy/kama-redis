@@ -11,7 +11,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-1 (MED), KRD-2 (MED). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-1 (MED), KRD-2 (MED), KRD-3 (MED). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Priorities:**
@@ -22,6 +22,68 @@ filed is cited by its KPG number rather than filed again.
 ---
 
 ## OPEN
+
+### KRD-3 · MED · no bulk append to a `DynamicArray`, and no `capacity()`
+
+**Found** writing phase 1's reader, on `kama 0.9.523+gfc170153`. A bulk string's payload moves from the receive
+buffer into the `DynamicArray<uint8>` a `Value::Bulk` holds; a string may be 512 MiB.
+
+```kama
+import { core::println, std::collections::DynamicArray, std::collections::FixedArray, std::collections::ConstView,
+         std::collections::View, std::time::monotonicNow, std::time::Instant, std::time::Duration };
+
+// There is no bulk copy: a ConstView goes into a DynamicArray or a View one element at a time.
+fn void appendBytes(ref DynamicArray<uint8> to, ConstView<uint8> from) {
+    isize i = 0;
+    while (i < from.length()) { to.add(item: from[i]); i = i + 1; }
+}
+
+fn isize copyBytes(View<uint8> to, ConstView<uint8> from) {
+    isize i = 0;
+    while (i < from.length()) { to[i] = from[i]; i = i + 1; }
+    return from.length();
+}
+
+fn int32 main() {
+    isize size = 268435456;   // 256 MiB
+    FixedArray<uint8> src = FixedArray.make(size: size);
+    isize k = 0;
+    while (k < size) { src[k] = truncate<uint8>(k * 7); k = k + 4096; }
+    FixedArray<uint8> dst = FixedArray.make(size: size);
+    Instant a = monotonicNow();
+    isize n = copyBytes(to: dst.viewMut(), from: src.view());
+    Instant b = monotonicNow();
+    DynamicArray<uint8> grown = DynamicArray.empty();
+    grown.reserve(n: size);
+    appendBytes(to: grown, from: src.view());
+    Instant c = monotonicNow();
+    Duration d1 = b - a;
+    Duration d2 = c - b;
+    int64 viewMs = d1.asNanos() / 1000000i64;
+    int64 addMs = d2.asNanos() / 1000000i64;
+    uint8 x = dst[size - 4096];
+    uint8 y = grown[size - 4096];
+    println(s: "256 MiB: View to View ${viewMs} ms, DynamicArray.add ${addMs} ms (check ${x} ${y})");
+    return 0;
+}
+```
+
+On macOS arm64, `--release` prints `View to View 18 ms, DynamicArray.add 155 ms`, and `--debug` prints 1276 ms and
+1502 ms. The view loop is fast in release only because the C compiler recognizes it as a memcpy. `add` keeps its
+length, capacity and modification count in memory across a `uint8` store that may alias them, so it costs about
+0.6 ns a byte: 0.3 s for one 512 MiB string, and 3 s in a debug build.
+
+Nothing in `std::collections` copies a run of elements: `DynamicArray` has `add`, `insertAt` and `reserve`, `View`
+has indexing, `swap` and `reverse` (`lib/std/collections/dynamic_array.kama`, `view.kama`). There is also no
+`capacity()`, and `reserve(n)` grows to exactly `n` (`dynamic_array.kama:183`), so a caller growing an array as
+data arrives must keep its own count of the capacity, or call `reserve` with the running total and copy the whole
+array each time.
+
+**What would close it:** `DynamicArray.addAll(items: ConstView<T>)` for a copyable `T` (one `reserve`, one
+`memcpy`), `View.copyFrom(source: ConstView<T>)`, and `capacity()`.
+
+**Workaround** (src/resp/reader.kama, `copyBytes`, and the string loop in `Reader.stepBody`; src/resp/writer.kama,
+`putBytes`): byte loops, with the reader keeping its own capacity count (`textCap`) and growing it geometrically.
 
 ### KRD-2 · MED · an isolate's stack is the OS default, so a depth that works on the main thread crashes in one
 

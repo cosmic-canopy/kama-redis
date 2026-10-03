@@ -1,0 +1,113 @@
+import { std::collections::DynamicArray, std::collections::ConstView };
+export { Value };
+
+// redis::resp — the Redis serialization protocol as data: every RESP2 and RESP3 type, a reader that turns bytes
+// into values as they arrive, and a writer that turns values into bytes. No I/O happens here. A connection moves
+// the bytes; this module only says what they mean. It is public because a proxy, a fake server or a test harness
+// wants exactly this layer.
+//
+// The rules this module holds:
+//   - Nothing from the server is trusted. Every length, count and nesting depth is bounded before it is used, and
+//     memory grows only with bytes that actually arrived. Bytes that break the protocol are a `ProtocolError`,
+//     never a panic.
+//   - The reference is hiredis v1.4.1, the reader redis-cli and the server's own tests use: this reader accepts
+//     what hiredis accepts and refuses what it refuses, with hiredis's own messages. Where it goes further (RESP3's
+//     blob errors, streamed strings and aggregates, attributes; bounds hiredis does not keep), the difference is
+//     written where it is made and listed in tools/gen-resp-vectors.sh.
+//   - Payloads are bytes. A RESP string is binary, and a kama `string` must be UTF-8, so text is decoded by
+//     whoever knows it is text.
+
+// One RESP value. Strings are bytes; aggregates hold values; a map's entries are flat, key then value.
+//
+// `Attributed` is a value with RESP3 attributes attached: its parts are the attribute map's entries, key then
+// value, and the value they describe last. A reader builds one only with at least one attribute pair, and never
+// around another `Attributed`.
+type enum Value implements Sendable {
+    // `+` — a simple string: a status such as OK, never containing CR or LF.
+    Simple(DynamicArray<uint8> bytes),
+    // `-` or `!` — an error the server returned, whole: its code, a space, then the message.
+    Error(DynamicArray<uint8> bytes),
+    // `:`
+    Integer(int64 value),
+    // `,`
+    Double(float64 value),
+    // `#`
+    Boolean(bool value),
+    // `_`, and RESP2's `$-1` and `*-1`. hiredis reads every length or count of -1 as this.
+    Null,
+    // `(` — the server's decimal digits, with a leading `-` when negative.
+    BigNumber(DynamicArray<uint8> digits),
+    // `$`
+    Bulk(DynamicArray<uint8> bytes),
+    // `=` — a format of exactly three bytes (`txt`, `mkd`) and the text.
+    Verbatim(DynamicArray<uint8> format, DynamicArray<uint8> bytes),
+    // `*`
+    Array(DynamicArray<Value> items),
+    // `%` — key, value, key, value.
+    Map(DynamicArray<Value> entries),
+    // `~`
+    Set(DynamicArray<Value> items),
+    // `>` — an out-of-band message: pub/sub, a client-side caching invalidation.
+    Push(DynamicArray<Value> items),
+    // `|` and what it describes — key, value, …, then the value.
+    Attributed(DynamicArray<Value> parts);
+
+    // Equality of what was said, not how. A `Double` compares by its bits, so -0 and 0 differ and a NaN equals
+    // a NaN: two values that write the same bytes are equal. An `Error` is equal whether it came as `-` or `!`.
+    public const fn bool equals(const ref Value other) {
+        return match (this) {
+            case Simple(bytes: a): match (other) { case Simple(bytes: b): sameBytes(a: a.view(), b: b.view()); case _: false; };
+            case Error(bytes: a): match (other) { case Error(bytes: b): sameBytes(a: a.view(), b: b.view()); case _: false; };
+            case Integer(value: a): match (other) { case Integer(value: b): a == b; case _: false; };
+            case Double(value: a): match (other) { case Double(value: b): sameDouble(a: a, b: b); case _: false; };
+            case Boolean(value: a): match (other) { case Boolean(value: b): a == b; case _: false; };
+            case Null: match (other) { case Null: true; case _: false; };
+            case BigNumber(digits: a): match (other) { case BigNumber(digits: b): sameBytes(a: a.view(), b: b.view()); case _: false; };
+            case Bulk(bytes: a): match (other) { case Bulk(bytes: b): sameBytes(a: a.view(), b: b.view()); case _: false; };
+            case Verbatim(format: f, bytes: a): match (other) {
+                case Verbatim(format: g, bytes: b): sameBytes(a: f.view(), b: g.view()) && sameBytes(a: a.view(), b: b.view());
+                case _: false;
+            };
+            case Array(items: a): match (other) { case Array(items: b): sameValues(a: a, b: b); case _: false; };
+            case Map(entries: a): match (other) { case Map(entries: b): sameValues(a: a, b: b); case _: false; };
+            case Set(items: a): match (other) { case Set(items: b): sameValues(a: a, b: b); case _: false; };
+            case Push(items: a): match (other) { case Push(items: b): sameValues(a: a, b: b); case _: false; };
+            case Attributed(parts: a): match (other) { case Attributed(parts: b): sameValues(a: a, b: b); case _: false; };
+        };
+    }
+
+    // Whether this is `Null`.
+    public const fn bool isNull() {
+        return match (this) { case Null: true; case _: false; };
+    }
+
+    // Whether this is an `Error`.
+    public const fn bool isError() {
+        return match (this) { case Error(bytes: b): true; case _: false; };
+    }
+}
+
+fn bool sameBytes(ConstView<uint8> a, ConstView<uint8> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool sameDouble(float64 a, float64 b) {
+    if (a != a) { return b != b; }
+    return bitcast<uint64>(a) == bitcast<uint64>(b);
+}
+
+fn bool sameValues(const ref DynamicArray<Value> a, const ref DynamicArray<Value> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (!a[i].equals(other: b[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}

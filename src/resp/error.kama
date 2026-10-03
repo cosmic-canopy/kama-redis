@@ -1,0 +1,104 @@
+import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error };
+export { ProtocolError };
+
+// What can be wrong with bytes that claim to be RESP. Every variant's payload is a scalar, so a reader that has
+// failed can hand the same error back on every later call.
+//
+// `message()` is hiredis's own errstr wherever hiredis has one (read.c, v1.4.1), so a log line reads the same
+// whichever client wrote it. The variants hiredis has no word for are marked "ours".
+type enum ProtocolError implements Error, Sendable {
+    // A byte that starts no RESP type here: an unknown byte, a `.` outside a streamed aggregate, a `;` outside a
+    // streamed string, or anything but `;` inside one.
+    TypeByte(uint8 byte),
+    // A `:` line that is not a 64-bit integer, spelled as hiredis's string2ll reads one: no `+`, no leading zero,
+    // no `-0`.
+    BadInteger,
+    // A `,` line of 326 bytes or more.
+    DoubleTooLarge,
+    // A `,` line that is not a finite number, `inf`, `-inf`, `nan` or `-nan`.
+    BadDouble,
+    // A `_` line with anything on it.
+    BadNil,
+    // A `#` line other than `t`, `T`, `f` or `F`.
+    BadBool,
+    // A `(` line with a byte other than a digit, or a `-` anywhere but first.
+    BadBignum,
+    // A `+` or `-` line with a CR or LF inside it.
+    BadSimple,
+    // A `$`, `=`, `!` or `;` length that is not an integer.
+    BadBulkLength,
+    // A string length below -1, or over the reader's `maxBulk`.
+    BulkRange,
+    // A verbatim string shorter than its 4-byte format and colon, or without the colon.
+    BadVerbatim,
+    // An aggregate count that is not an integer.
+    BadAggregateLength,
+    // An aggregate count below -1, or over the reader's `maxElements`.
+    AggregateRange,
+    // An aggregate nested deeper than the reader's `maxDepth`.
+    TooDeep,
+    // Ours: a string payload not followed by CR LF. hiredis skips two bytes without looking at them.
+    BulkTerminator,
+    // Ours: a `.` line with anything on it.
+    BadEnd,
+    // Ours: a streamed map ended between a key and its value.
+    OddMap,
+    // Ours: an attribute with no value after it, at the end of an aggregate.
+    DanglingAttribute,
+    // Ours: one reply bigger than the reader's `maxReplyBytes`.
+    ReplyTooLarge;
+
+    public const fn string message() {
+        return match (this) {
+            case TypeByte(byte: b): typeByteMessage(b: b);
+            case BadInteger: "Bad integer value";
+            case DoubleTooLarge: "Double value is too large";
+            case BadDouble: "Bad double value";
+            case BadNil: "Bad nil value";
+            case BadBool: "Bad bool value";
+            case BadBignum: "Bad bignum value";
+            case BadSimple: "Bad simple string value";
+            case BadBulkLength: "Bad bulk string length";
+            case BulkRange: "Bulk string length out of range";
+            case BadVerbatim: "Verbatim string 4 bytes of content type are missing or incorrectly encoded.";
+            case BadAggregateLength: "Bad multi-bulk length";
+            case AggregateRange: "Multi-bulk length out of range";
+            case TooDeep: "Max nesting depth exceeded";
+            case BulkTerminator: "Bulk string not terminated by CRLF";
+            case BadEnd: "Bad streamed aggregate end";
+            case OddMap: "Streamed map ended between a key and its value";
+            case DanglingAttribute: "Attribute not followed by a value";
+            case ReplyTooLarge: "Reply larger than the reader allows";
+        };
+    }
+}
+
+// hiredis's __redisReaderSetErrorProtocolByte, with its chrtos quoting: a printable byte in double quotes, the
+// C escapes for \\ \" \n \r \t \a \b, and \xNN for the rest.
+fn string typeByteMessage(uint8 b) {
+    string quoted = quoteByte(b: b);
+    return "Protocol error, got ".concat(other: quoted).concat(other: " as reply type byte");
+}
+
+fn string quoteByte(uint8 b) {
+    if (b == 92ui8) { return "\"\\\\\""; }
+    if (b == 34ui8) { return "\"\\\"\""; }
+    if (b == 10ui8) { return "\"\\n\""; }
+    if (b == 13ui8) { return "\"\\r\""; }
+    if (b == 9ui8) { return "\"\\t\""; }
+    if (b == 7ui8) { return "\"\\a\""; }
+    if (b == 8ui8) { return "\"\\b\""; }
+    if (b >= 32ui8 && b <= 126ui8) { return "\"".concat(other: asciiOf(b: b)).concat(other: "\""); }
+    string hex = "0123456789abcdef";
+    isize hi = cast<isize>(b >> 4);
+    isize lo = cast<isize>(b & 15ui8);
+    return "\"\\x".concat(other: hex.substring(start: hi, end: hi + 1)).concat(other: hex.substring(start: lo, end: lo + 1)).concat(other: "\"");
+}
+
+// One printable ASCII byte as a string.
+fn string asciiOf(uint8 b) {
+    DynamicArray<uint8> one = DynamicArray.empty();
+    one.add(item: b);
+    Result<string, Utf8Error> s = decode(bytes: one.view());
+    return match (give s) { case Ok(value: t): give t; case Err(error: e): "?"; };
+}

@@ -1,0 +1,731 @@
+import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::ConstView,
+         std::collections::View, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         std::fmt::parse, std::fmt::ParseError, ProtocolError, Value };
+export { Reader, Limits, Read };
+
+// Turns bytes into RESP values as they arrive. Feed it what the socket gave, ask it for the next value: the answer
+// is a value, "not yet", or what was wrong. A reply may arrive in any number of pieces, split anywhere, and
+// several replies may arrive in one piece; the values come out the same.
+//
+// How it holds a reply in progress, so that no piece is ever read twice and memory follows the bytes that came:
+//   - The input buffer has a start and an end, as kama-postgres's wire does. `spare`/`commit` let a connection read
+//     the socket straight into it; `feed` copies.
+//   - A line (a type byte up to CR LF) is searched once: `scanned` remembers how far the search got. Each type has a
+//     longest legal line, and a line past it fails without waiting for its CR LF.
+//   - A string's payload moves out of the buffer as it arrives, into the string being built. Its capacity grows
+//     geometrically up to its declared length, never ahead of the bytes received, so a declared 512 MiB with
+//     nothing behind it costs nothing.
+//   - Every open aggregate is a `Frame` (a plain value), and their elements live on one stack, `vals`, in wire
+//     order. Closing a frame takes its elements off the top. Nothing is ever allocated from a declared count.
+//   - An attribute's entries stay on the stack, waiting at their level for the value they describe, which takes
+//     them along when it arrives (`Value::Attributed`). An attribute is not an element: the aggregate around it
+//     counts the value, not the attribute.
+//   - The first error is final: the reader keeps it, drops everything it holds, and answers it again on every
+//     call. A protocol error leaves no way to find where the next reply starts.
+
+// When to give up on what a server sends.
+type value Limits implements Sendable {
+    // The longest string: the server's own proto-max-bulk-len default. hiredis has no bound on a 64-bit host.
+    public int64 maxBulk = 536870912i64;
+    // The most elements in one aggregate, as hiredis's REDIS_READER_MAX_ARRAY_ELEMENTS. A map counts pairs.
+    public int64 maxElements = 4294967295i64;
+    // The deepest nesting. hiredis allows 1024; this default is lower because a reply is walked recursively
+    // (dropped, compared, written, deserialized), and an isolate's stack is the OS default thread stack: 512 KiB
+    // on macOS, 128 KiB with musl (KRD-2). 128 is 18 times what redis-cli lived with until hiredis 1.0.
+    public isize maxDepth = 128;
+    // The most one reply may cost: its bytes on the wire plus `sizeof(Value)` for each value, so a flood of
+    // tiny elements is bounded by the memory it really takes.
+    public int64 maxReplyBytes = 1073741824i64;
+
+    public ctor defaults() { }
+}
+
+// What `Reader.next` found.
+type enum Read {
+    // Not a whole value yet: feed more bytes.
+    Incomplete,
+    Complete(Value value),
+    // The bytes broke the protocol. The reader answers this from now on.
+    Invalid(ProtocolError error);
+}
+
+// The receive buffer starts at hiredis's REDIS_READER_MAX_BUF; once drained, a buffer grown past RETAIN_BYTES is
+// given back.
+comptime isize INITIAL_BYTES = 16384;
+comptime isize RETAIN_BYTES = 1048576;
+// The longest legal line of a count, a length or an integer: "-9223372036854775808".
+comptime int64 NUMBER_LINE = 20i64;
+// hiredis's buffer for a double is 326 bytes, NUL included.
+comptime int64 DOUBLE_LINE = 325i64;
+
+comptime uint8 CR = 13ui8;
+comptime uint8 LF = 10ui8;
+comptime uint8 BANG = 33ui8;        // !
+comptime uint8 HASH = 35ui8;        // #
+comptime uint8 DOLLAR = 36ui8;      // $
+comptime uint8 PERCENT = 37ui8;     // %
+comptime uint8 LPAREN = 40ui8;      // (
+comptime uint8 STAR = 42ui8;        // *
+comptime uint8 PLUS = 43ui8;        // +
+comptime uint8 COMMA = 44ui8;       // ,
+comptime uint8 MINUS = 45ui8;       // -
+comptime uint8 DOT = 46ui8;         // .
+comptime uint8 COLON = 58ui8;       // :
+comptime uint8 SEMI = 59ui8;        // ;
+comptime uint8 EQUALS = 61ui8;      // =
+comptime uint8 GREATER = 62ui8;     // >
+comptime uint8 QUESTION = 63ui8;    // ?
+comptime uint8 UNDERSCORE = 95ui8;  // _
+comptime uint8 BAR = 124ui8;        // |
+comptime uint8 TILDE = 126ui8;      // ~
+
+// An open aggregate.
+type value Frame implements Sendable {
+    // Its type byte; 0 for the root, which is never closed.
+    public uint8 kind = 0ui8;
+    // How many elements it holds when complete (2N for a map or an attribute); -1 for a streamed one.
+    public int64 want = 0i64;
+    public int64 got = 0i64;
+    // Where its first element is on `vals`.
+    public isize first = 0;
+    // Attribute entries on top of `vals`, waiting at this level for the value they describe.
+    public int64 attrs = 0i64;
+
+    public ctor of(uint8 kind, int64 want, isize first) {
+        this.kind = kind;
+        this.want = want;
+        this.first = first;
+    }
+}
+
+// One step of the reader.
+type enum Step {
+    More,
+    Again,
+    Done(Value value),
+    Bad(ProtocolError error);
+}
+
+// What a line says, before the reader acts on it.
+type enum Head {
+    // A whole value.
+    Ready(Value value),
+    // Nothing: an attribute of no pairs.
+    Skip,
+    Bad(ProtocolError error),
+    // A string whose `length` bytes follow: `$`, `=`, `!`, or a `;` chunk.
+    Body(uint8 kind, int64 length),
+    // `$?`
+    Stream,
+    // An aggregate of `want` elements; -1 for a streamed one.
+    Open(uint8 kind, int64 want),
+    // `.`
+    End;
+}
+
+type resource Reader implements Sendable {
+    FixedArray<uint8> buf;
+    isize start = 0;
+    isize end = 0;
+    // How many bytes of the line at `start`, after its type byte, are known to hold no CR LF.
+    isize scanned = 0;
+    // Open aggregates; [0] is the root.
+    DynamicArray<Frame> frames;
+    // The elements of every open aggregate, in wire order.
+    DynamicArray<Value> vals;
+    // The string being built: none or one.
+    DynamicArray<DynamicArray<uint8>> text;
+    // A verbatim string's format and colon.
+    DynamicArray<uint8> head;
+    // The type byte of the string whose payload is arriving; 0 when none is.
+    uint8 body = 0ui8;
+    int64 bodyLeft = 0i64;
+    // The most the string being built may hold: its declared length, or `maxBulk` for a streamed one.
+    int64 bodyMost = 0i64;
+    int64 textCap = 0i64;
+    // Inside a `$?` string, between its `;` chunks.
+    bool streaming = false;
+    int64 streamTotal = 0i64;
+    // Open aggregates, plus one for each level holding attributes.
+    isize depth = 0;
+    int64 replyBytes = 0i64;
+    Limits limits;
+    Optional<ProtocolError> failed;
+
+    public ctor make() {
+        this.limits = Limits.defaults();
+        this.buf = FixedArray.make(size: INITIAL_BYTES);
+        this.frames = DynamicArray.empty();
+        this.frames.add(item: Frame.of(kind: 0ui8, want: 0i64, first: 0));
+        this.vals = DynamicArray.empty();
+        this.text = DynamicArray.empty();
+        this.head = DynamicArray.empty();
+        this.failed = Optional::None;
+    }
+
+    public ctor withLimits(Limits limits) {
+        this.limits = limits;
+        this.buf = FixedArray.make(size: INITIAL_BYTES);
+        this.frames = DynamicArray.empty();
+        this.frames.add(item: Frame.of(kind: 0ui8, want: 0i64, first: 0));
+        this.vals = DynamicArray.empty();
+        this.text = DynamicArray.empty();
+        this.head = DynamicArray.empty();
+        this.failed = Optional::None;
+    }
+
+    // Room for at least `minimum` more bytes, to read into; `commit` says how many were. The unread bytes move to
+    // the front when they fill at most half the buffer, and the buffer doubles otherwise, so each byte moves a
+    // bounded number of times.
+    public fn View<uint8> spare(isize minimum) {
+        isize need = minimum;
+        if (need < 1) { need = 1; }
+        if (this.buf.length() - this.end < need) {
+            isize unread = this.end - this.start;
+            isize size = this.buf.length();
+            if (unread + need <= size && unread * 2 <= size) {
+                isize i = 0;
+                while (i < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }
+            } else {
+                while (size < unread + need) { size = size * 2; }
+                FixedArray<uint8> grown = FixedArray.make(size: size);
+                isize i = 0;
+                while (i < unread) { grown[i] = this.buf[this.start + i]; i = i + 1; }
+                this.buf = give grown;
+            }
+            this.start = 0;
+            this.end = unread;
+        }
+        return this.buf.sliceMut(from: this.end, count: this.buf.length() - this.end);
+    }
+
+    // `count` bytes were written into what `spare` returned. After an error they are dropped.
+    public fn void commit(isize count) {
+        if (count < 0 || this.end + count > this.buf.length()) { panic(msg: "resp::Reader.commit: more bytes than spare() offered"); }
+        if (this.hasFailed()) { return; }
+        this.end = this.end + count;
+    }
+
+    // Copy `bytes` in. After an error they are dropped.
+    public fn void feed(ConstView<uint8> bytes) {
+        if (this.hasFailed()) { return; }
+        isize done = 0;
+        while (done < bytes.length()) {
+            isize n = copyBytes(to: this.spare(minimum: bytes.length() - done), from: bytes.slice(from: done, count: bytes.length() - done));
+            this.commit(count: n);
+            done = done + n;
+        }
+    }
+
+    // The next value, if its bytes have all arrived.
+    public fn Read next() {
+        match (this.failed) { case Some(value: e): { return Read::Invalid(error: e); } case None: { } };
+        while (true) {
+            Step s = this.step();
+            match (give s) {
+                case More: { return Read::Incomplete; }
+                case Again: { }
+                case Done(value: v): { this.settle(); return Read::Complete(value: give v); }
+                case Bad(error: e): { this.fail(error: e); return Read::Invalid(error: e); }
+            };
+        }
+        return Read::Incomplete;
+    }
+
+    // Bytes received and not yet read.
+    public const fn isize buffered() { return this.end - this.start; }
+
+    // Whether no reply is in progress: nothing buffered, nothing half read. A failed reader is not idle.
+    public const fn bool isIdle() {
+        if (this.hasFailed()) { return false; }
+        return this.frames.length() == 1 && this.frames[0].attrs == 0i64 && this.body == 0ui8 && !this.streaming
+            && this.start == this.end && this.vals.length() == 0;
+    }
+
+    // What the reader holds for a reply in progress: its buffer and the string being built. Values already built
+    // are not counted.
+    public const fn int64 retainedBytes() { return cast<int64>(this.buf.length()) + this.textCap; }
+
+    // The limits this reader keeps.
+    public const fn Limits currentLimits() { return this.limits; }
+
+    const fn bool hasFailed() {
+        return match (this.failed) { case Some(value: e): true; case None: false; };
+    }
+
+    fn Step step() {
+        if (this.body != 0ui8) { return this.stepBody(); }
+        if (this.end == this.start) { return Step::More; }
+        uint8 t = this.buf[this.start];
+        if (this.streaming) {
+            if (t != SEMI) { return Step::Bad(error: ProtocolError::TypeByte(byte: t)); }
+        } else if (!isType(t: t)) {
+            return Step::Bad(error: ProtocolError::TypeByte(byte: t));
+        } else if (t == DOT && !this.inStreamedAggregate()) {
+            return Step::Bad(error: ProtocolError::TypeByte(byte: t));
+        }
+        int64 limit = this.lineLimit(t: t);
+        isize i = this.start + 1 + this.scanned;
+        isize found = -1;
+        while (i + 1 < this.end) {
+            if (this.buf[i] == CR && this.buf[i + 1] == LF) { found = i; break; }
+            i = i + 1;
+        }
+        if (found < 0) {
+            this.scanned = i - this.start - 1;
+            isize least = this.end - this.start - 1;
+            if (this.buf[this.end - 1] == CR) { least = least - 1; }
+            if (cast<int64>(least) > limit) { return Step::Bad(error: lineError(t: t)); }
+            return Step::More;
+        }
+        isize n = found - this.start - 1;
+        if (cast<int64>(n) > limit) { return Step::Bad(error: lineError(t: t)); }
+        Head h = readHead(t: t, line: this.buf.slice(from: this.start + 1, count: n), limits: this.limits);
+        this.consume(count: n + 3);
+        if (this.replyBytes > this.limits.maxReplyBytes) { return Step::Bad(error: ProtocolError::ReplyTooLarge); }
+        return match (give h) {
+            case Ready(value: v): this.deliver(v: give v);
+            case Skip: Step::Again;
+            case Bad(error: e): Step::Bad(error: e);
+            case Body(kind: k, length: len): this.openBody(kind: k, length: len);
+            case Stream: this.openStream();
+            case Open(kind: k, want: w): this.open(kind: k, want: w);
+            case End: this.closeStreamed();
+        };
+    }
+
+    // A string's payload, then the CR LF after it.
+    fn Step stepBody() {
+        if (this.bodyLeft > 0i64) {
+            isize take = this.end - this.start;
+            if (take == 0) { return Step::More; }
+            if (cast<int64>(take) > this.bodyLeft) { take = cast<isize>(this.bodyLeft); }
+            isize skip = 0;
+            if (this.body == EQUALS) {
+                while (this.head.length() < 4 && skip < take) { this.head.add(item: this.buf[this.start + skip]); skip = skip + 1; }
+            }
+            if (take > skip) {
+                this.growText(need: take - skip);
+                isize k = this.start + skip;
+                while (k < this.start + take) { this.text[0].add(item: this.buf[k]); k = k + 1; }
+            }
+            this.consume(count: take);
+            this.bodyLeft = this.bodyLeft - cast<int64>(take);
+            if (this.replyBytes > this.limits.maxReplyBytes) { return Step::Bad(error: ProtocolError::ReplyTooLarge); }
+            if (this.bodyLeft > 0i64) { return Step::More; }
+        }
+        if (this.end - this.start < 2) { return Step::More; }
+        if (this.buf[this.start] != CR || this.buf[this.start + 1] != LF) { return Step::Bad(error: ProtocolError::BulkTerminator); }
+        this.consume(count: 2);
+        uint8 k = this.body;
+        this.body = 0ui8;
+        if (k == SEMI) { return Step::Again; }
+        return this.finishString(kind: k);
+    }
+
+    fn Step openBody(uint8 kind, int64 length) {
+        if (kind == SEMI) {
+            if (length == 0i64) {
+                this.streaming = false;
+                return this.finishString(kind: DOLLAR);
+            }
+            if (this.streamTotal + length > this.limits.maxBulk) { return Step::Bad(error: ProtocolError::BulkRange); }
+            this.streamTotal = this.streamTotal + length;
+            this.body = SEMI;
+            this.bodyLeft = length;
+            return Step::Again;
+        }
+        this.body = kind;
+        this.bodyLeft = length;
+        this.bodyMost = length;
+        if (kind == EQUALS) {
+            this.bodyMost = length - 4i64;
+            if (this.bodyMost < 0i64) { this.bodyMost = 0i64; }
+        }
+        this.textCap = 0i64;
+        this.text.add(item: DynamicArray.empty());
+        this.head.clear();
+        return Step::Again;
+    }
+
+    fn Step openStream() {
+        this.streaming = true;
+        this.streamTotal = 0i64;
+        this.bodyMost = this.limits.maxBulk;
+        this.textCap = 0i64;
+        this.text.add(item: DynamicArray.empty());
+        return Step::Again;
+    }
+
+    // Room in the string being built for `need` more bytes: double what it has, up to what it may hold.
+    fn void growText(isize need) {
+        int64 want = cast<int64>(this.text[0].length()) + cast<int64>(need);
+        if (want <= this.textCap) { return; }
+        int64 cap = this.textCap * 2i64;
+        if (cap < 64i64) { cap = 64i64; }
+        if (cap > this.bodyMost) { cap = this.bodyMost; }
+        if (cap < want) { cap = want; }
+        this.text[0].reserve(n: cast<isize>(cap));
+        this.textCap = cap;
+    }
+
+    fn Step finishString(uint8 kind) {
+        Optional<DynamicArray<uint8>> s = this.text.pop();
+        DynamicArray<uint8> bytes = match (give s) { case Some(value: b): give b; case None: DynamicArray.empty(); };
+        this.textCap = 0i64;
+        if (kind == DOLLAR) { return this.deliver(v: Value::Bulk(bytes: give bytes)); }
+        if (kind == BANG) { return this.deliver(v: Value::Error(bytes: give bytes)); }
+        if (this.head.length() < 4 || this.head[3] != COLON) { return Step::Bad(error: ProtocolError::BadVerbatim); }
+        DynamicArray<uint8> format = DynamicArray.withCapacity(capacity: 3);
+        format.add(item: this.head[0]);
+        format.add(item: this.head[1]);
+        format.add(item: this.head[2]);
+        this.head.clear();
+        return this.deliver(v: Value::Verbatim(format: give format, bytes: give bytes));
+    }
+
+    fn Step open(uint8 kind, int64 want) {
+        if (this.depth >= this.limits.maxDepth) { return Step::Bad(error: ProtocolError::TooDeep); }
+        this.depth = this.depth + 1;
+        this.frames.add(item: Frame.of(kind: kind, want: want, first: this.vals.length()));
+        return Step::Again;
+    }
+
+    // A finished value goes to the top frame. Attributes waiting there take it along; a frame it completes closes,
+    // and the aggregate goes up in turn. The value rides on `vals`, so nothing is moved across iterations.
+    fn Step deliver(Value v) {
+        this.vals.add(item: give v);
+        this.replyBytes = this.replyBytes + cast<int64>(sizeof(Value));
+        if (this.replyBytes > this.limits.maxReplyBytes) { return Step::Bad(error: ProtocolError::ReplyTooLarge); }
+        while (true) {
+            isize t = this.frames.length() - 1;
+            if (this.frames[t].attrs > 0i64) {
+                DynamicArray<Value> parts = this.takeTop(count: cast<isize>(this.frames[t].attrs) + 1);
+                this.frames[t].attrs = 0i64;
+                this.depth = this.depth - 1;
+                this.vals.add(item: Value::Attributed(parts: give parts));
+            }
+            if (t == 0) {
+                Optional<Value> r = this.vals.pop();
+                return match (give r) { case Some(value: x): Step::Done(value: give x); case None: Step::More; };
+            }
+            this.frames[t].got = this.frames[t].got + 1i64;
+            if (this.frames[t].want < 0i64) {
+                int64 count = this.frames[t].got;
+                if (this.frames[t].kind == PERCENT) { count = count / 2i64; }
+                if (count > this.limits.maxElements) { return Step::Bad(error: ProtocolError::AggregateRange); }
+                return Step::Again;
+            }
+            if (this.frames[t].got < this.frames[t].want) { return Step::Again; }
+            if (this.frames[t].kind == BAR) { return this.park(); }
+            Value done = this.closeTop();
+            this.vals.add(item: give done);
+        }
+        return Step::More;
+    }
+
+    // An attribute is complete: its entries stay on `vals` for the next value at the level below.
+    fn Step park() {
+        isize t = this.frames.length() - 1;
+        int64 entries = this.frames[t].got;
+        Optional<Frame> gone = this.frames.pop();
+        this.depth = this.depth - 1;
+        isize p = t - 1;
+        if (this.frames[p].attrs == 0i64) {
+            if (this.depth >= this.limits.maxDepth) { return Step::Bad(error: ProtocolError::TooDeep); }
+            this.depth = this.depth + 1;
+        }
+        this.frames[p].attrs = this.frames[p].attrs + entries;
+        if (this.frames[p].attrs / 2i64 > this.limits.maxElements) { return Step::Bad(error: ProtocolError::AggregateRange); }
+        return Step::Again;
+    }
+
+    // `.`: the streamed aggregate on top is complete.
+    fn Step closeStreamed() {
+        isize t = this.frames.length() - 1;
+        if (this.frames[t].attrs > 0i64) { return Step::Bad(error: ProtocolError::DanglingAttribute); }
+        if (this.frames[t].kind == PERCENT && this.frames[t].got % 2i64 == 1i64) { return Step::Bad(error: ProtocolError::OddMap); }
+        Value done = this.closeTop();
+        return this.deliver(v: give done);
+    }
+
+    fn Value closeTop() {
+        isize t = this.frames.length() - 1;
+        uint8 kind = this.frames[t].kind;
+        DynamicArray<Value> items = this.takeTop(count: this.vals.length() - this.frames[t].first);
+        Optional<Frame> gone = this.frames.pop();
+        this.depth = this.depth - 1;
+        if (kind == PERCENT) { return Value::Map(entries: give items); }
+        if (kind == TILDE) { return Value::Set(items: give items); }
+        if (kind == GREATER) { return Value::Push(items: give items); }
+        return Value::Array(items: give items);
+    }
+
+    // The top `count` values of `vals`, in wire order.
+    fn DynamicArray<Value> takeTop(isize count) {
+        DynamicArray<Value> taken = DynamicArray.withCapacity(capacity: count);
+        isize i = 0;
+        while (i < count) {
+            Optional<Value> v = this.vals.pop();
+            match (give v) { case Some(value: x): { taken.add(item: give x); } case None: { } };
+            i = i + 1;
+        }
+        reverseValues(v: taken.viewMut());
+        return taken;
+    }
+
+    const fn bool inStreamedAggregate() {
+        isize t = this.frames.length() - 1;
+        return t > 0 && this.frames[t].want < 0i64;
+    }
+
+    // The longest line type `t` may have, after its type byte.
+    const fn int64 lineLimit(uint8 t) {
+        if (t == PLUS || t == MINUS || t == LPAREN) { return this.limits.maxBulk; }
+        if (t == COMMA) { return DOUBLE_LINE; }
+        if (t == UNDERSCORE || t == DOT) { return 0i64; }
+        if (t == HASH) { return 1i64; }
+        return NUMBER_LINE;
+    }
+
+    fn void consume(isize count) {
+        this.start = this.start + count;
+        this.scanned = 0;
+        this.replyBytes = this.replyBytes + cast<int64>(count);
+        if (this.start == this.end) {
+            this.start = 0;
+            this.end = 0;
+        }
+    }
+
+    // A reply was returned.
+    fn void settle() {
+        this.replyBytes = 0i64;
+        if (this.start == this.end && this.buf.length() > RETAIN_BYTES) { this.buf = FixedArray.make(size: INITIAL_BYTES); }
+    }
+
+    fn void fail(ProtocolError error) {
+        this.failed = Optional::Some(value: error);
+        this.start = 0;
+        this.end = 0;
+        this.scanned = 0;
+        while (this.frames.length() > 1) { Optional<Frame> gone = this.frames.pop(); }
+        this.frames[0].attrs = 0i64;
+        this.vals.clear();
+        this.text.clear();
+        this.head.clear();
+        this.body = 0ui8;
+        this.bodyLeft = 0i64;
+        this.textCap = 0i64;
+        this.streaming = false;
+        this.depth = 0;
+        this.replyBytes = 0i64;
+        if (this.buf.length() > RETAIN_BYTES) { this.buf = FixedArray.make(size: INITIAL_BYTES); }
+    }
+}
+
+fn bool isType(uint8 t) {
+    return t == PLUS || t == MINUS || t == COLON || t == COMMA || t == UNDERSCORE || t == DOLLAR || t == STAR
+        || t == PERCENT || t == BAR || t == TILDE || t == HASH || t == EQUALS || t == GREATER || t == LPAREN
+        || t == BANG || t == DOT;
+}
+
+// The error a line of type `t` gets when it is longer than any legal one: the error hiredis gives that line once
+// its CR LF arrives.
+fn ProtocolError lineError(uint8 t) {
+    if (t == COLON) { return ProtocolError::BadInteger; }
+    if (t == DOLLAR || t == EQUALS || t == BANG || t == SEMI) { return ProtocolError::BadBulkLength; }
+    if (t == COMMA) { return ProtocolError::DoubleTooLarge; }
+    if (t == UNDERSCORE) { return ProtocolError::BadNil; }
+    if (t == HASH) { return ProtocolError::BadBool; }
+    if (t == DOT) { return ProtocolError::BadEnd; }
+    if (t == PLUS || t == MINUS || t == LPAREN) { return ProtocolError::BulkRange; }
+    return ProtocolError::BadAggregateLength;
+}
+
+// What a complete line of type `t` says.
+fn Head readHead(uint8 t, ConstView<uint8> line, Limits limits) {
+    if (t == PLUS || t == MINUS) {
+        if (hasLineBreak(b: line)) { return Head::Bad(error: ProtocolError::BadSimple); }
+        DynamicArray<uint8> b = copyOf(b: line);
+        if (t == PLUS) { return Head::Ready(value: Value::Simple(bytes: give b)); }
+        return Head::Ready(value: Value::Error(bytes: give b));
+    }
+    if (t == COLON) {
+        Optional<int64> n = string2ll(b: line);
+        return match (n) { case Some(value: v): Head::Ready(value: Value::Integer(value: v)); case None: Head::Bad(error: ProtocolError::BadInteger); };
+    }
+    if (t == COMMA) {
+        Optional<float64> d = readDouble(b: line);
+        return match (d) { case Some(value: v): Head::Ready(value: Value::Double(value: v)); case None: Head::Bad(error: ProtocolError::BadDouble); };
+    }
+    if (t == UNDERSCORE) {
+        if (line.length() != 0) { return Head::Bad(error: ProtocolError::BadNil); }
+        return Head::Ready(value: Value::Null);
+    }
+    if (t == HASH) {
+        if (line.length() != 1) { return Head::Bad(error: ProtocolError::BadBool); }
+        uint8 c = line[0];
+        if (c == 116ui8 || c == 84ui8) { return Head::Ready(value: Value::Boolean(value: true)); }
+        if (c == 102ui8 || c == 70ui8) { return Head::Ready(value: Value::Boolean(value: false)); }
+        return Head::Bad(error: ProtocolError::BadBool);
+    }
+    if (t == LPAREN) {
+        isize i = 0;
+        while (i < line.length()) {
+            bool digit = line[i] >= 48ui8 && line[i] <= 57ui8;
+            if (!digit && !(i == 0 && line[i] == MINUS)) { return Head::Bad(error: ProtocolError::BadBignum); }
+            i = i + 1;
+        }
+        DynamicArray<uint8> b = copyOf(b: line);
+        return Head::Ready(value: Value::BigNumber(digits: give b));
+    }
+    if (t == DOT) { return Head::End; }
+    bool question = line.length() == 1 && line[0] == QUESTION;
+    if (t == DOLLAR || t == EQUALS || t == BANG || t == SEMI) {
+        if (question && t == DOLLAR) { return Head::Stream; }
+        Optional<int64> n = string2ll(b: line);
+        int64 len = match (n) { case Some(value: v): v; case None: { return Head::Bad(error: ProtocolError::BadBulkLength); } };
+        if (t == SEMI) {
+            if (len < 0i64) { return Head::Bad(error: ProtocolError::BulkRange); }
+            return Head::Body(kind: t, length: len);
+        }
+        if (len < -1i64) { return Head::Bad(error: ProtocolError::BulkRange); }
+        if (len == -1i64) { return Head::Ready(value: Value::Null); }
+        if (len > limits.maxBulk) { return Head::Bad(error: ProtocolError::BulkRange); }
+        return Head::Body(kind: t, length: len);
+    }
+    // * % ~ > |
+    if (question && (t == STAR || t == PERCENT || t == TILDE)) { return Head::Open(kind: t, want: -1i64); }
+    Optional<int64> n = string2ll(b: line);
+    int64 count = match (n) { case Some(value: v): v; case None: { return Head::Bad(error: ProtocolError::BadAggregateLength); } };
+    if (count < -1i64) { return Head::Bad(error: ProtocolError::AggregateRange); }
+    if (count == -1i64) { return Head::Ready(value: Value::Null); }
+    bool paired = t == PERCENT || t == BAR;
+    if (count > limits.maxElements || (paired && count > 4611686018427387903i64)) { return Head::Bad(error: ProtocolError::AggregateRange); }
+    if (count == 0i64) {
+        if (t == BAR) { return Head::Skip; }
+        if (t == PERCENT) { return Head::Ready(value: Value::Map(entries: DynamicArray.empty())); }
+        if (t == TILDE) { return Head::Ready(value: Value::Set(items: DynamicArray.empty())); }
+        if (t == GREATER) { return Head::Ready(value: Value::Push(items: DynamicArray.empty())); }
+        return Head::Ready(value: Value::Array(items: DynamicArray.empty()));
+    }
+    if (paired) { return Head::Open(kind: t, want: count * 2i64); }
+    return Head::Open(kind: t, want: count);
+}
+
+// hiredis's string2ll: an optional `-`, then `0` alone or a digit 1-9 and more digits, fitting an int64. No `+`,
+// no leading zero, no `-0`, no space.
+fn Optional<int64> string2ll(ConstView<uint8> b) {
+    isize n = b.length();
+    if (n == 0) { return Optional::None; }
+    if (n == 1 && b[0] == 48ui8) { return Optional::Some(value: 0i64); }
+    isize i = 0;
+    bool negative = false;
+    if (b[0] == MINUS) {
+        negative = true;
+        i = 1;
+        if (i == n) { return Optional::None; }
+    }
+    if (b[i] < 49ui8 || b[i] > 57ui8) { return Optional::None; }
+    uint64 v = cast<uint64>(b[i] - 48ui8);
+    i = i + 1;
+    while (i < n && b[i] >= 48ui8 && b[i] <= 57ui8) {
+        uint64 d = cast<uint64>(b[i] - 48ui8);
+        if (v > 1844674407370955161ui64) { return Optional::None; }
+        v = v * 10ui64;
+        if (v > 18446744073709551615ui64 - d) { return Optional::None; }
+        v = v + d;
+        i = i + 1;
+    }
+    if (i < n) { return Optional::None; }
+    if (negative) {
+        if (v > 9223372036854775808ui64) { return Optional::None; }
+        if (v == 9223372036854775808ui64) { return Optional::Some(value: -9223372036854775807i64 - 1i64); }
+        return Optional::Some(value: -cast<int64>(v));
+    }
+    if (v > 9223372036854775807ui64) { return Optional::None; }
+    return Optional::Some(value: cast<int64>(v));
+}
+
+// hiredis's double: `inf`, `-inf`, `nan` and `-nan` in any case, else a finite number in fast_float's grammar
+// with no leading `+` (an optional `-`, digits with an optional `.` fraction, at least one digit, an optional
+// exponent), read whole.
+fn Optional<float64> readDouble(ConstView<uint8> b) {
+    isize n = b.length();
+    if (n == 3 && caseIs(b: b, from: 0, word: "inf")) { return parseFloat(text: "inf"); }
+    if (n == 4 && b[0] == MINUS && caseIs(b: b, from: 1, word: "inf")) { return parseFloat(text: "-inf"); }
+    if (n == 3 && caseIs(b: b, from: 0, word: "nan")) { return parseFloat(text: "nan"); }
+    if (n == 4 && b[0] == MINUS && caseIs(b: b, from: 1, word: "nan")) { return parseFloat(text: "nan"); }
+    isize i = 0;
+    if (i < n && b[i] == MINUS) { i = i + 1; }
+    isize digits = 0;
+    while (i < n && isDigit(c: b[i])) { i = i + 1; digits = digits + 1; }
+    if (i < n && b[i] == DOT) {
+        i = i + 1;
+        while (i < n && isDigit(c: b[i])) { i = i + 1; digits = digits + 1; }
+    }
+    if (digits == 0) { return Optional::None; }
+    if (i < n && (b[i] == 101ui8 || b[i] == 69ui8)) {
+        i = i + 1;
+        if (i < n && (b[i] == PLUS || b[i] == MINUS)) { i = i + 1; }
+        isize exp = 0;
+        while (i < n && isDigit(c: b[i])) { i = i + 1; exp = exp + 1; }
+        if (exp == 0) { return Optional::None; }
+    }
+    if (i != n) { return Optional::None; }
+    Result<string, Utf8Error> s = decode(bytes: b);
+    string text = match (give s) { case Ok(value: t): give t; case Err(error: e): { return Optional::None; } };
+    Optional<float64> d = parseFloat(text: text);
+    float64 v = match (d) { case Some(value: x): x; case None: { return Optional::None; } };
+    if (v - v != v - v) { return Optional::None; }
+    return Optional::Some(value: v);
+}
+
+fn Optional<float64> parseFloat(const ref string text) {
+    Result<float64, ParseError> r = parse::<float64>(s: text);
+    return match (r) { case Ok(value: v): Optional::Some(value: v); case Err(error: e): Optional::None; };
+}
+
+// Whether `b[from..]` spells `word` (ASCII lowercase) ignoring case.
+fn bool caseIs(ConstView<uint8> b, isize from, const ref string word) { return caseIsBytes(b: b, from: from, w: word.bytes()); }
+
+fn bool caseIsBytes(ConstView<uint8> b, isize from, ConstView<uint8> w) {
+    isize i = 0;
+    while (i < w.length()) {
+        uint8 c = b[from + i];
+        if (c >= 65ui8 && c <= 90ui8) { c = c + 32ui8; }
+        if (c != w[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool isDigit(uint8 c) { return c >= 48ui8 && c <= 57ui8; }
+
+fn bool hasLineBreak(ConstView<uint8> b) {
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] == CR || b[i] == LF) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn DynamicArray<uint8> copyOf(ConstView<uint8> b) {
+    DynamicArray<uint8> copied = DynamicArray.withCapacity(capacity: b.length());
+    isize i = 0;
+    while (i < b.length()) { copied.add(item: b[i]); i = i + 1; }
+    return copied;
+}
+
+// KRD-3: std has no copy between views, so it goes byte by byte. Copies what fits; answers how much.
+fn isize copyBytes(View<uint8> to, ConstView<uint8> from) {
+    isize n = from.length();
+    if (to.length() < n) { n = to.length(); }
+    isize i = 0;
+    while (i < n) { to[i] = from[i]; i = i + 1; }
+    return n;
+}
+
+fn void reverseValues(View<Value> v) { v.reverse(); }

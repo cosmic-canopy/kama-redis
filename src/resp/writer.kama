@@ -1,0 +1,212 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, std::fmt::f64Str, Value };
+export { Writer };
+
+// Builds RESP into one growable buffer. A client sends one shape (an array of bulk strings per command); a server,
+// a proxy or a test sends every shape, so every wire form has a primitive here, the RESP2 nulls and RESP3's
+// streamed forms included. Several values may be queued before the buffer is sent (a pipeline is exactly that).
+//
+// A primitive whose content could be wrong answers false and writes nothing: a CR or LF in a simple string, a
+// verbatim format that is not three bytes, a big number that is not digits. A count below zero is a caller's
+// bug and panics, as an index out of range does.
+type resource Writer implements Sendable {
+    DynamicArray<uint8> buf;
+
+    public ctor make() { this.buf = DynamicArray.empty(); }
+
+    // Everything queued so far.
+    public const fn ConstView<uint8> view() { return this.buf.view(); }
+    public const fn isize length() { return this.buf.length(); }
+    public const fn bool isEmpty() { return this.buf.length() == 0; }
+    // Forget everything queued (after it was sent).
+    public fn void clear() { this.buf.clear(); }
+
+    // `+text`. False if `text` holds a CR or LF, which a simple string cannot carry.
+    public fn bool simple(ConstView<uint8> text) {
+        if (hasLineBreak(b: text)) { return false; }
+        this.put(b: 43ui8);
+        this.putBytes(b: text);
+        this.crlf();
+        return true;
+    }
+
+    // An error: `-text`, or `!len` when `text` holds a CR or LF, so any error can be written.
+    public fn void error(ConstView<uint8> text) {
+        if (hasLineBreak(b: text)) { this.bulkError(text: text); return; }
+        this.put(b: 45ui8);
+        this.putBytes(b: text);
+        this.crlf();
+    }
+
+    // `!len` — RESP3's blob error, whatever it holds.
+    public fn void bulkError(ConstView<uint8> text) { this.lengthHeader(tag: 33ui8, n: text.length()); this.putBytes(b: text); this.crlf(); }
+
+    // `:n`
+    public fn void integer(int64 value) {
+        this.put(b: 58ui8);
+        string s = i64Str(v: value);
+        this.putBytes(b: s.bytes());
+        this.crlf();
+    }
+
+    // `,x` — RESP3's double, in its shortest round-trip decimal; `inf`, `-inf` and `nan` as RESP3 spells them.
+    public fn void real(float64 value) {
+        this.put(b: 44ui8);
+        if (value != value) {
+            this.putText(s: "nan");
+        } else if (value - value != value - value) {
+            if (value > 0.0) { this.putText(s: "inf"); } else { this.putText(s: "-inf"); }
+        } else {
+            string s = f64Str(v: value);
+            this.putBytes(b: s.bytes());
+        }
+        this.crlf();
+    }
+
+    // `#t` or `#f`
+    public fn void boolean(bool value) {
+        this.put(b: 35ui8);
+        if (value) { this.put(b: 116ui8); } else { this.put(b: 102ui8); }
+        this.crlf();
+    }
+
+    // `_` — RESP3's null.
+    public fn void nil() { this.put(b: 95ui8); this.crlf(); }
+    // `$-1` — RESP2's null bulk string.
+    public fn void nullBulk() { this.putText(s: "$-1"); this.crlf(); }
+    // `*-1` — RESP2's null array.
+    public fn void nullArray() { this.putText(s: "*-1"); this.crlf(); }
+
+    // `(digits` — an optional `-` and at least one digit. False otherwise.
+    public fn bool bigNumber(ConstView<uint8> digits) {
+        isize i = 0;
+        if (digits.length() > 0 && digits[0] == 45ui8) { i = 1; }
+        if (i == digits.length()) { return false; }
+        while (i < digits.length()) {
+            if (digits[i] < 48ui8 || digits[i] > 57ui8) { return false; }
+            i = i + 1;
+        }
+        this.put(b: 40ui8);
+        this.putBytes(b: digits);
+        this.crlf();
+        return true;
+    }
+
+    // `$len` and the bytes.
+    public fn void bulk(ConstView<uint8> bytes) { this.lengthHeader(tag: 36ui8, n: bytes.length()); this.putBytes(b: bytes); this.crlf(); }
+
+    // `=len`, then `fmt:` and the text. False unless `format` is exactly three bytes, none of them a colon.
+    public fn bool verbatim(ConstView<uint8> format, ConstView<uint8> text) {
+        if (format.length() != 3 || format[0] == 58ui8 || format[1] == 58ui8 || format[2] == 58ui8) { return false; }
+        this.lengthHeader(tag: 61ui8, n: text.length() + 4);
+        this.putBytes(b: format);
+        this.put(b: 58ui8);
+        this.putBytes(b: text);
+        this.crlf();
+        return true;
+    }
+
+    // Aggregate headers: the count of what follows. A map and an attribute count pairs.
+    public fn void arrayHeader(isize count) { this.countHeader(tag: 42ui8, n: count); }
+    public fn void mapHeader(isize pairs) { this.countHeader(tag: 37ui8, n: pairs); }
+    public fn void setHeader(isize count) { this.countHeader(tag: 126ui8, n: count); }
+    public fn void pushHeader(isize count) { this.countHeader(tag: 62ui8, n: count); }
+    public fn void attributeHeader(isize pairs) { this.countHeader(tag: 124ui8, n: pairs); }
+
+    // RESP3's streamed string: `$?`, then non-empty chunks, then `;0`.
+    public fn void streamedString() { this.putText(s: "$?"); this.crlf(); }
+    // `;len` and the bytes. False for an empty chunk, which would end the string.
+    public fn bool chunk(ConstView<uint8> bytes) {
+        if (bytes.length() == 0) { return false; }
+        this.lengthHeader(tag: 59ui8, n: bytes.length());
+        this.putBytes(b: bytes);
+        this.crlf();
+        return true;
+    }
+    public fn void streamedStringEnd() { this.putText(s: ";0"); this.crlf(); }
+
+    // RESP3's streamed aggregates: the header, the elements, then `.`.
+    public fn void streamedArray() { this.putText(s: "*?"); this.crlf(); }
+    public fn void streamedMap() { this.putText(s: "%?"); this.crlf(); }
+    public fn void streamedSet() { this.putText(s: "~?"); this.crlf(); }
+    public fn void streamedEnd() { this.put(b: 46ui8); this.crlf(); }
+
+    // A whole value, in RESP3's forms. False, with nothing written, if any part cannot be written: a simple
+    // string with a line break, a map with an odd number of entries, an `Attributed` with no attribute pair or
+    // around another `Attributed`.
+    public fn bool value(const ref Value v) {
+        isize mark = this.buf.length();
+        if (this.write(v: v)) { return true; }
+        while (this.buf.length() > mark) { Optional<uint8> dropped = this.buf.pop(); }
+        return false;
+    }
+
+    fn bool write(const ref Value v) {
+        return match (v) {
+            case Simple(bytes: b): this.simple(text: b.view());
+            case Error(bytes: b): { this.error(text: b.view()); := true; }
+            case Integer(value: n): { this.integer(value: n); := true; }
+            case Double(value: d): { this.real(value: d); := true; }
+            case Boolean(value: t): { this.boolean(value: t); := true; }
+            case Null: { this.nil(); := true; }
+            case BigNumber(digits: d): this.bigNumber(digits: d.view());
+            case Bulk(bytes: b): { this.bulk(bytes: b.view()); := true; }
+            case Verbatim(format: f, bytes: b): this.verbatim(format: f.view(), text: b.view());
+            case Array(items: xs): { this.arrayHeader(count: xs.length()); := this.writeAll(xs: xs, count: xs.length()); }
+            case Map(entries: xs): {
+                if (xs.length() % 2 != 0) { return false; }
+                this.mapHeader(pairs: xs.length() / 2);
+                := this.writeAll(xs: xs, count: xs.length());
+            }
+            case Set(items: xs): { this.setHeader(count: xs.length()); := this.writeAll(xs: xs, count: xs.length()); }
+            case Push(items: xs): { this.pushHeader(count: xs.length()); := this.writeAll(xs: xs, count: xs.length()); }
+            case Attributed(parts: xs): {
+                isize n = xs.length();
+                if (n < 3 || n % 2 == 0) { return false; }
+                bool nested = match (xs[n - 1]) { case Attributed(parts: inner): true; case _: false; };
+                if (nested) { return false; }
+                this.attributeHeader(pairs: (n - 1) / 2);
+                if (!this.writeAll(xs: xs, count: n - 1)) { return false; }
+                := this.write(v: xs[n - 1]);
+            }
+        };
+    }
+
+    fn bool writeAll(const ref DynamicArray<Value> xs, isize count) {
+        isize i = 0;
+        while (i < count) {
+            if (!this.write(v: xs[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn void countHeader(uint8 tag, isize n) {
+        if (n < 0) { panic(msg: "resp::Writer: a negative count"); }
+        this.lengthHeader(tag: tag, n: n);
+    }
+
+    fn void lengthHeader(uint8 tag, isize n) {
+        this.put(b: tag);
+        string s = i64Str(v: cast<int64>(n));
+        this.putBytes(b: s.bytes());
+        this.crlf();
+    }
+
+    fn void put(uint8 b) { this.buf.add(item: b); }
+    fn void crlf() { this.buf.add(item: 13ui8); this.buf.add(item: 10ui8); }
+    fn void putText(string s) { this.putBytes(b: s.bytes()); }
+    // KRD-3: byte by byte, as std has no bulk append.
+    fn void putBytes(ConstView<uint8> b) {
+        isize i = 0;
+        while (i < b.length()) { this.buf.add(item: b[i]); i = i + 1; }
+    }
+}
+
+fn bool hasLineBreak(ConstView<uint8> b) {
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] == 13ui8 || b[i] == 10ui8) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
