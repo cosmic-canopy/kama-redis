@@ -1,0 +1,52 @@
+import { std::collections::ConstView };
+export { keySlot, crc16, SLOT_COUNT };
+
+// redis::cluster — Redis Cluster's key space, as the cluster specification defines it: which of the 16384 hash
+// slots a key belongs to. The slot map and redirections build on this.
+//
+// A key's slot is CRC16 of the key, modulo 16384, unless the key has a hash tag: the bytes between its first `{`
+// and the first `}` after it, when there is at least one byte between them. Then only the tag is hashed, which is
+// how keys that must be on one node (for a multi-key command or a transaction) are named.
+
+// How many hash slots a cluster has.
+comptime isize SLOT_COUNT = 16384;
+
+// CRC16 as the cluster specification names it: XMODEM, polynomial 0x1021, initial value 0, no reflection, no
+// final XOR. The table is built at compile time.
+comptime fn InlineArray<uint16>#(256) crc16Table() {
+    InlineArray<uint16>#(256) t = [0ui16; 256];
+    for (int32 i = 0; i < 256; i = i + 1) {
+        uint32 crc = cast<uint32>(i) << 8;
+        for (int32 k = 0; k < 8; k = k + 1) {
+            if ((crc & 32768ui32) != 0ui32) { crc = ((crc << 1) ^ 4129ui32) & 65535ui32; }
+            else { crc = (crc << 1) & 65535ui32; }
+        }
+        t[i] = truncate<uint16>(crc);
+    }
+    return t;
+}
+comptime InlineArray<uint16>#(256) CRC16 = crc16Table();
+
+// The cluster specification's CRC16 of `bytes`.
+fn uint16 crc16(ConstView<uint8> bytes) {
+    uint32 crc = 0ui32;
+    isize i = 0;
+    while (i < bytes.length()) {
+        uint32 index = ((crc >> 8) ^ cast<uint32>(bytes[i])) & 255ui32;
+        crc = ((crc << 8) & 65535ui32) ^ cast<uint32>(CRC16[cast<isize>(index)]);
+        i = i + 1;
+    }
+    return truncate<uint16>(crc);
+}
+
+// The hash slot of `key`, 0 to 16383: the server's keyHashSlot.
+fn isize keySlot(ConstView<uint8> key) {
+    isize n = key.length();
+    isize s = 0;
+    while (s < n && key[s] != 123ui8) { s = s + 1; }
+    if (s == n) { return cast<isize>(crc16(bytes: key)) % SLOT_COUNT; }
+    isize e = s + 1;
+    while (e < n && key[e] != 125ui8) { e = e + 1; }
+    if (e == n || e == s + 1) { return cast<isize>(crc16(bytes: key)) % SLOT_COUNT; }
+    return cast<isize>(crc16(bytes: key.slice(from: s + 1, count: e - s - 1))) % SLOT_COUNT;
+}

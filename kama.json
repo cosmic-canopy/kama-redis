@@ -15,6 +15,7 @@
   },
   "modules": {
     ".": { "visibility": "public" },
-    "resp": { "visibility": "public" }
+    "resp": { "visibility": "public" },
+    "cluster": { "visibility": "public" }
   }
 }
