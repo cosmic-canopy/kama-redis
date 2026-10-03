@@ -1,14 +1,15 @@
-// The library surface. This file sits at the top of `source`, so it is in the project's ROOT module —
-// the one `kama.json`'s `name` names — and `export` is what importers can see:
-// `import { redis::answer };`
+// @kama/redis — the Redis and Valkey client for kama. It speaks RESP2 and RESP3 directly, in kama, over
+// std::net; there is no hiredis and nothing to install. TLS will come from @kama/tls.
 //
-// To add a module, make a folder under `source` and list it in `modules`. A folder with no entry is not
-// a module: its files belong to the nearest listed folder above them, so nothing joins your API by
-// accident.
-
-export { answer };
-
-fn int32 answer()
-{
-    return 42;
-}
+// The shape of the package, as it fills in (docs/ROADMAP.md):
+//   redis            Connection, Config, Command and the `cmd"…"` tag, Reply and `reply::<T>`, RedisError
+//   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
+//   redis::cluster   the slot map and redirections
+//   redis::pool      a connection pool shared by isolates
+//
+// The rules every module holds:
+//   - Nothing from the server is trusted: every length is bounded before it is used, and a malformed reply
+//     is `RedisError::Protocol`, never a panic.
+//   - A data error is a `Result`; a contract violation (an index out of range) panics, exactly like an index
+//     out of range on a collection.
+//   - Non-blocking I/O with deadlines. A connection belongs to one isolate at a time and moves between them.

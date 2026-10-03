@@ -72,3 +72,9 @@ Tracked files that belong to the repository but not the package (`.github/`, `to
 Before the first publish: `--license mit-or-apache` (or `mit`, `apache-2.0`) at seed time (or `"license"` in
 the manifest and the license file), a README that says what is vendored and why, and the `tests/` gate green on every target the
 package claims.
+
+## This project
+
+`AGENTS.redis.md` — what is true in @kama/redis and nowhere else. (Pointer added by hand; `kama agents
+install --force` drops it. `CLAUDE.md` loads all three files directly, so the chain survives a re-install
+either way.)

@@ -4,6 +4,12 @@
   "license": "MIT OR Apache-2.0",
   "kind": "library",
   "kama": ">=0.9.520",
+  "publish": {
+    "exclude": [
+      ".claude/", ".github/", "tools/", "docs/",
+      "AGENTS.md", "AGENTS.package.md", "AGENTS.redis.md", "CLAUDE.md", "KAMA_GAPS.md"
+    ]
+  },
   "modules": {
     ".": { "visibility": "public" }
   }
