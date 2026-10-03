@@ -5,7 +5,7 @@ over `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and n
 from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
 > **Status: scaffold, not yet published.** The package builds and its test servers run. The protocol comes next;
-> see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.520**.
+> see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.523**.
 
 ## What it will cover
 

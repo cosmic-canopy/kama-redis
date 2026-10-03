@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "license": "MIT OR Apache-2.0",
   "kind": "library",
-  "kama": ">=0.9.520",
+  "kama": ">=0.9.523",
+  "description": "Redis and Valkey client in pure kama: RESP2 and RESP3, TLS, pipelining, pub/sub, cluster and sentinel",
+  "repository": "https://github.com/cosmic-canopy/kama-redis",
+  "keywords": ["redis", "valkey", "resp", "database", "cache"],
   "publish": {
     "exclude": [
       ".claude/", ".github/", "tools/", "docs/",

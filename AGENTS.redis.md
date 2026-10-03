@@ -17,7 +17,8 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.520**, declared as `"kama"` in every manifest here.
+**The package needs kama ≥ 0.9.523**, declared as `"kama"` in every manifest here. 0.9.523 is the first compiler
+that takes the registry keys `description`, `repository` and `keywords` in `kama.json`.
 
 ## What is true here and nowhere else
 
@@ -71,8 +72,6 @@ the matching part of its code before designing something here. Copy what fits; d
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
   - No shadowing: a parameter cannot have the name of a function in scope, nor a match binding the name of a local.
   - A `ConstView` local must be rooted: pass the view as a by-value parameter to a helper instead.
-  - A `break` in a `match` arm leaves the match, not the loop (KPG-32 in `../kama-postgres/KAMA_GAPS.md`): end
-    such a loop on a flag.
   - A static function is called with `::`; `.` on a type calls a constructor.
   - A method cannot take type parameters (a cstar decision), so typed access is a free generic function.
   - Never put a `Shared` in anything that must be `Sendable`; its count is not atomic.
