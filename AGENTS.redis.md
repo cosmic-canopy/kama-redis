@@ -32,9 +32,25 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
     release. From phase 2 it holds a scripted fake server for every hostile path: a reply a byte at a time,
     silence, hangups, oversized lengths.
   - `tests/integration` (from phase 2) needs a live server and runs on every server in the matrix.
-  - Vectors come from upstream by script: the RESP specification, hiredis's reader tests, the cluster
-    specification's CRC16 vectors, and the container's own redis-cli and server asked live. A generator pins
-    each upstream file by SHA256.
+  - Vectors come from upstream by script. Each generator pins every upstream file by SHA256 and dies on a
+    mismatch. Run it, and `git diff` must be empty unless a server image moved.
+  - `tools/gen-resp-vectors.sh` writes `resp_vectors.kama`, with hiredis v1.4.1's reading of every input:
+    - its inputs are hiredis's own reader tests, every example in RESP3.md and protocol-spec.md, what all eight
+      servers send for 29 commands under RESP2 and RESP3, and a hostile list;
+    - `tools/resp-dump.c` (generator-only C, never shipped) compiles hiredis's `test.c` with `redisReaderFeed`
+      wrapped to capture those inputs, then replays any input through hiredis;
+    - an input in what hiredis lacks reads as hiredis reads its equivalent (`canon` in the script);
+    - a deliberate difference from hiredis goes in `%DEVIATIONS` with its reason, and is never silent;
+    - a case that is malformed in a RESP3 form hiredis lacks has no upstream reading, so the script refuses it.
+      Test such a case in `resp_test.kama`.
+  - `tools/gen-slot-vectors.sh` writes `slot_vectors.kama` from the cluster specification's check value, its
+    crc16tab and its tag examples, plus `CLUSTER KEYSLOT` on all eight servers, which must agree.
+  - `tools/gen-url-vectors.sh` writes `url_vectors.kama` from redis-cli 8.10 and valkey-cli 9.1, given each URL
+    beside a recorder. Its `misread` rules are the URLs this package refuses although the CLI accepts them.
+  - The live parts run in throwaway `--network none` containers of the matrix's images. They never touch the
+    `tools/redis.sh` servers.
+  - The unit program's run-time tests check properties instead: every split of an input reads the same, every
+    prefix of a reply is incomplete, and what the writer writes reads back.
 
 - **`tools/redis.sh` is the server.**
   - It runs the official images under podman or docker: `redis:6.2`, `7.2`, `7.4`, `8.2` and `8.10`, and
@@ -56,6 +72,14 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
   - The test PKI is generated into `out/test-certs` by `tools/gen-test-certs.sh` and is never tracked. `kama
     publish` refuses a tracked `*.key`, and so does the registry.
 
+- **`redis::resp`'s reader is built so that nothing is read twice and memory follows the bytes that came.** Keep it
+  that way when changing it. The rules are in `src/resp/reader.kama`'s header:
+  - Lines are searched once (`scanned`).
+  - Payloads leave the buffer as they arrive, into a string whose capacity the reader counts itself (KRD-3).
+  - Open aggregates are plain `Frame` values over one `vals` stack. Nothing is allocated from a declared count.
+  - The first error is final, and `ProtocolError` has scalar payloads so it can be handed back on every call.
+  - `spare`/`commit` let a connection read straight into the buffer.
+
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.
   - A malformed reply is `RedisError::Protocol`, never a panic. The unit tests feed truncated and oversized
@@ -76,8 +100,14 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
   - A method cannot take type parameters (a cstar decision), so typed access is a free generic function.
   - Never put a `Shared` in anything that must be `Sendable`; its count is not atomic.
   - An `IoError` is a value: branch on `e.kind()`.
-  - Reserved words bite as names: every C keyword (`out`, `float`, `register`, …) and kama's own (`base`, `addr`,
-    `ref`, `in`, `const`, `final`).
+  - Reserved words bite as names: every C keyword (`out`, `float`, `double`, `register`, …) and kama's own (`base`,
+    `addr`, `ref`, `in`, `const`, `final`).
+  - A local that was given away cannot be assigned again, even in straight-line code (KRD-1). To rebuild a value
+    in a loop, keep it in a `DynamicArray` of zero or one, and use `pop()` and `add`.
+  - `copy` does not reach through an `Optional` (KRD-4). Copy the payload in a borrowing `match`.
+  - A view local must be rooted. Open a window (`borrow s.bytes() as b { … }`), or pass the view as a by-value
+    parameter to a helper.
+  - A value-producing `match` is not an assignment's right side. Bind it to a local, or move it into a helper.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates
