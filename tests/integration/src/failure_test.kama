@@ -1,0 +1,100 @@
+// Failures and sizes, live: a connection the server kills, errors by their codes, an error inside EXEC's reply, and
+// replies large in bytes and in elements.
+import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
+         redis::resp::Value, redis_integration_tests::check, mainUrl, open, ask, codeOf };
+export { failureTests };
+
+unsafe fn Connection connected(const ref string what) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: ""));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "failure_test: ${what}: ${m}"); return connected(what: what); }
+    };
+    return give c;
+}
+
+unsafe fn int32 failureTests() {
+    int32 f = 0;
+
+    // A connection the server kills: the next call fails on I/O, and every one after is Closed.
+    Connection victim = connected(what: "victim");
+    int64 id = match (victim.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    Connection killer = connected(what: "killer");
+    string killed = ask(c: killer, text: "CLIENT KILL ID ${id}");
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> after = victim.call(command: ping);
+    bool io = match (after) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
+    string next = ask(c: victim, text: "PING");
+    f = f + check(ok: killed == "1" && io && victim.isClosed() && next == "(failed) the connection is closed",
+                  what: "failure: CLIENT KILL: ${killed}, then an I/O error, then: ${next}");
+
+    // Errors by their codes; the connection goes on after each.
+    Connection c = connected(what: "codes");
+    string setS = ask(c: c, text: "SET kr:string v");
+    f = f + check(ok: codeOf(c: c, text: "LPUSH kr:string x") == "WRONGTYPE", what: "failure: WRONGTYPE");
+    f = f + check(ok: codeOf(c: c, text: "NOSUCHCOMMAND") == "ERR", what: "failure: ERR for an unknown command");
+    f = f + check(ok: codeOf(c: c, text: "EVALSHA ffffffffffffffffffffffffffffffffffffffff 0") == "NOSCRIPT", what: "failure: NOSCRIPT");
+    string multi = ask(c: c, text: "MULTI");
+    string queuedBad = codeOf(c: c, text: "NOSUCHCOMMAND");
+    f = f + check(ok: codeOf(c: c, text: "EXEC") == "EXECABORT", what: "failure: EXECABORT");
+    string created = ask(c: c, text: "XGROUP CREATE kr:stream g $ MKSTREAM");
+    f = f + check(ok: codeOf(c: c, text: "XGROUP CREATE kr:stream g $ MKSTREAM") == "BUSYGROUP", what: "failure: BUSYGROUP");
+    f = f + check(ok: codeOf(c: c, text: "XREADGROUP GROUP nog c STREAMS kr:stream >") == "NOGROUP", what: "failure: NOGROUP");
+    string still = ask(c: c, text: "PING");
+    f = f + check(ok: still == "PONG" && !c.isClosed(), what: "failure: the connection goes on after error replies");
+
+    // An error inside EXEC's reply stays a value there.
+    string m2 = ask(c: c, text: "MULTI");
+    string q1 = ask(c: c, text: "SET kr:exec v");
+    string q2 = ask(c: c, text: "LPUSH kr:exec x");
+    string exec = ask(c: c, text: "EXEC");
+    f = f + check(ok: exec.startsWith(prefix: "[OK, (error) WRONGTYPE "), what: "failure: EXEC's error stays inside its array: ${exec}");
+
+    // 10 MiB in one bulk string, both ways.
+    DynamicArray<uint8> big = DynamicArray.withCapacity(capacity: 10485760);
+    isize i = 0;
+    while (i < 10485760) { big.add(item: truncate<uint8>(i * 7 + i / 4096)); i = i + 1; }
+    Command set = Command.of(name: "SET");
+    set.arg(text: "kr:big");
+    set.argBytes(bytes: big.view());
+    Result<Value, RedisError> stored = c.call(command: set);
+    bool ok = match (stored) { case Ok(value: v): match (v) { case Simple(bytes: b): b.length() == 2; case _: false; }; case Err(error: e): false; };
+    Command get = Command.of(name: "GET");
+    get.arg(text: "kr:big");
+    Result<Value, RedisError> fetched = c.call(command: get);
+    bool same = match (fetched) {
+        case Ok(value: v): match (v) { case Bulk(bytes: b): sameBytes(a: b, b2: big); case _: false; };
+        case Err(error: e): false;
+    };
+    f = f + check(ok: ok && same, what: "failure: a 10 MiB value round trip");
+
+    // 100,000 elements in one reply.
+    string cleared = ask(c: c, text: "DEL kr:list");
+    int32 batch = 0;
+    while (batch < 100) {
+        Command push = Command.of(name: "RPUSH");
+        push.arg(text: "kr:list");
+        int32 k = 0;
+        while (k < 1000) { push.argInt(value: cast<int64>(batch * 1000 + k)); k = k + 1; }
+        Result<Value, RedisError> pushed = c.call(command: push);
+        batch = batch + 1;
+    }
+    Command range = Command.of(name: "LRANGE");
+    range.arg(text: "kr:list");
+    range.argInt(value: 0i64);
+    range.argInt(value: -1i64);
+    Result<Value, RedisError> all = c.call(command: range);
+    isize count = match (all) { case Ok(value: v): match (v) { case Array(items: xs): xs.length(); case _: -1; }; case Err(error: e): -1; };
+    f = f + check(ok: count == 100000, what: "failure: an LRANGE of 100,000 elements: ${count}");
+    return f;
+}
+
+fn bool sameBytes(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b2) {
+    if (a.length() != b2.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (a[i] != b2[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}

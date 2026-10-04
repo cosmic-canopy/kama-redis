@@ -1,0 +1,67 @@
+// Deadlines and unreachable servers, live: a refused port, a server that never answers, a name that does not
+// resolve, and a call that outlasts command_timeout.
+import { std::io::IoError, std::net::TcpListener, std::time::monotonicNow, std::time::Instant, std::time::Duration,
+         redis::Connection, redis::Command, redis::RedisError, redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask };
+export { timeoutTests };
+
+unsafe fn int32 timeoutTests() {
+    int32 f = 0;
+    // A closed port, in redis-cli's words.
+    string refused = attempt(url: "redis://127.0.0.1:1");
+    f = f + check(ok: refused == "Could not connect to 127.0.0.1:1: Connection refused", what: "timeout: a closed port: ${refused}");
+
+    // A name that does not resolve: the one attempt, named by host and port.
+    string unresolved = attempt(url: "redis://nohost.invalid:6390");
+    f = f + check(ok: unresolved.startsWith(prefix: "Could not connect to nohost.invalid:6390: "), what: "timeout: a name that does not resolve: ${unresolved}");
+
+    // A listener that never answers: the TCP handshake completes in the kernel, HELLO gets no reply, and
+    // connect_timeout ends the connect.
+    Result<TcpListener, IoError> bound = TcpListener.bind(host: "127.0.0.1", port: 0ui16);
+    match (give bound) {
+        case Ok(value: listener): {
+            uint16 port = match (listener.localAddr()) { case Ok(value: a): a.port; case Err(error: e): 0ui16; };
+            Instant started = monotonicNow();
+            Result<Connection, RedisError> silent = open(url: "redis://127.0.0.1:${port}?connect_timeout=0.5");
+            int64 ms = (monotonicNow() - started).asMillis();
+            bool timedOut = match (silent) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: c): false; };
+            f = f + check(ok: timedOut && ms >= 450i64 && ms < 2000i64, what: "timeout: connect_timeout=0.5 against a silent server, after ${ms} ms");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "timeout: bind a listener"); }
+    };
+
+    // A call that outlasts command_timeout ends in Timeout, and closes the connection.
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: "?command_timeout=0.3"));
+    match (give r) {
+        case Ok(value: v): {
+            Connection c = give v;
+            Instant started = monotonicNow();
+            Command blpop = Command.of(name: "BLPOP");
+            blpop.arg(text: "kr:never");
+            blpop.argInt(value: 2i64);
+            Result<Value, RedisError> late = c.call(command: blpop);
+            int64 ms = (monotonicNow() - started).asMillis();
+            bool timedOut = match (late) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: x): false; };
+            string after = ask(c: c, text: "PING");
+            f = f + check(ok: timedOut && ms >= 280i64 && ms < 1500i64 && c.isClosed() && after == "(failed) the connection is closed",
+                          what: "timeout: BLPOP 2 against command_timeout=0.3, after ${ms} ms, then: ${after}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "timeout: connect with command_timeout=0.3: ${m}"); }
+    };
+
+    // command_timeout=0 is no limit: a blocking call returns when the server answers.
+    Result<Connection, RedisError> r0 = open(url: mainUrl(userinfo: "", tail: "?command_timeout=0"));
+    match (give r0) {
+        case Ok(value: v): {
+            Connection c = give v;
+            string waited = ask(c: c, text: "BLPOP kr:never 1");
+            f = f + check(ok: waited == "(nil)" && !c.isClosed(), what: "timeout: command_timeout=0 waits for BLPOP 1: ${waited}");
+            // And a connection's own timeout replaces the config's.
+            Result<Unit, RedisError> set = c.setCommandTimeout(timeout: Duration.fromMillis(ms: 200i64));
+            string cut = ask(c: c, text: "BLPOP kr:never 2");
+            f = f + check(ok: cut == "(failed) timed out" && c.isClosed(), what: "timeout: setCommandTimeout takes effect: ${cut}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "timeout: connect with command_timeout=0: ${m}"); }
+    };
+    return f;
+}

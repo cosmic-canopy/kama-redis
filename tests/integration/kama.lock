@@ -1,0 +1,6 @@
+{
+  "lockVersion": 1,
+  "packages": {
+    "@kama/redis": { "source": "path", "path": "../..", "dependencies": [] }
+  }
+}

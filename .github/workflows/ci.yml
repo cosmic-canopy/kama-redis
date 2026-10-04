@@ -3,9 +3,9 @@
 # Two jobs:
 #   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64.
 #   - integration: a real server per matrix entry via tools/redis.sh (docker on the Linux runner; macOS
-#     runners have no container runtime). Until the kama integration suite exists, this job proves the
-#     server configuration with `tools/redis.sh smoke`: one check per authentication case and transport,
-#     using the server's own redis-cli.
+#     runners have no container runtime). `tools/redis.sh smoke` first proves the server's configuration
+#     with its own redis-cli, one check per authentication case and transport; then
+#     tools/test-integration.sh runs the live suite (tests/integration), debug and release.
 # Windows is not in the matrix; the package has never been built there.
 
 name: ci
@@ -60,11 +60,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install kama
+        env:
+          KAMA_VERSION: v0.9.530
+        run: |
+          curl -fsSL https://kama-lang.org/install.sh | sh
+          echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
+
       - name: Start ${{ matrix.server }}
         run: tools/redis.sh up --server ${{ matrix.server }}
 
       - name: Server smoke (one check per authentication case and transport)
         run: tools/redis.sh smoke --server ${{ matrix.server }}
+
+      - name: Integration tests (debug and release)
+        run: tools/test-integration.sh --server ${{ matrix.server }}
 
       - name: Server log on failure
         if: failure()

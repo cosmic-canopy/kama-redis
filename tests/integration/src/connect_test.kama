@@ -1,0 +1,101 @@
+// Connecting, live: the server identified by HELLO, the client by CLIENT SETINFO, RESP3 by default and RESP2 on
+// request, the client's name, the database, keepalive, and a name that resolves to several addresses.
+import { std::collections::DynamicArray, redis::Connection, redis::Config, redis::Command, redis::RedisError,
+         redis::Protocol, redis::ServerInfo, redis::libraryVersion, redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask, shown,
+         productWanted, versionPrefix };
+export { connectTests };
+
+unsafe fn Connection connected(const ref string url, const ref string what) {
+    Result<Connection, RedisError> r = open(url: url);
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "connect_test: ${what}: ${m}"); return connected(url: url, what: what); }
+    };
+    return give c;
+}
+
+unsafe fn int32 connectTests() {
+    int32 f = 0;
+    string server = setting(name: "REDISTEST_SERVER");
+
+    // The server, as it names itself in HELLO.
+    Connection c = connected(url: mainUrl(userinfo: "", tail: ""), what: "default");
+    Optional<ServerInfo> info = c.server();
+    string product = match (info) { case Some(value: v): copy v.product(); case None: "-"; };
+    string version = match (info) { case Some(value: v): copy v.version(); case None: "-"; };
+    int64 helloId = match (info) { case Some(value: v): v.id(); case None: -1i64; };
+    bool newer = match (info) { case Some(value: v): v.atLeast(major: 7i64, minor: 2i64); case None: false; };
+    string wantProduct = productWanted();
+    string wantVersion = versionPrefix();
+    f = f + check(ok: product == wantProduct && version.startsWith(prefix: wantVersion) && c.protocol() == Protocol::Resp3,
+                  what: "connect: ${server} names itself ${product} ${version} over RESP3 (want ${wantProduct} ${wantVersion}…)");
+    string id = ask(c: c, text: "CLIENT ID");
+    f = f + check(ok: id == "${helloId}", what: "connect: HELLO's id is CLIENT ID's: ${helloId} and ${id}");
+
+    // The client, as CLIENT SETINFO names it: 7.2 and later keep it; 6.2 refused it and the connect went on.
+    string clientInfo = ask(c: c, text: "CLIENT INFO");
+    string lib = libraryVersion();
+    string named = "lib-name=kama-redis lib-ver=".concat(other: lib);
+    if (newer) {
+        f = f + check(ok: clientInfo.contains(substring: named), what: "connect: CLIENT INFO names the library: ${clientInfo}");
+    } else {
+        f = f + check(ok: !clientInfo.contains(substring: "lib-name="), what: "connect: a server before 7.2 has no lib-name, and the connect went on");
+    }
+    Result<Config, RedisError> quietMade = Config.parse(url: mainUrl(userinfo: "", tail: ""));
+    match (give quietMade) {
+        case Ok(value: q): {
+            Config quiet = give q;
+            quiet.setIdentity(on: false);
+            Result<Connection, RedisError> rq = Connection.connect(config: quiet);
+            match (give rq) {
+                case Ok(value: qc): {
+                    Connection qconn = give qc;
+                    string qInfo = ask(c: qconn, text: "CLIENT INFO");
+                    f = f + check(ok: !qInfo.contains(substring: "lib-name=kama-redis"), what: "connect: identity off sends no CLIENT SETINFO: ${qInfo}");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "connect: identity off: ${m}"); }
+            };
+        }
+        case Err(error: e): { }
+    };
+
+    // RESP3's map, and RESP2's flat array, for the same hash.
+    string set = ask(c: c, text: "HSET kr:hash field value");
+    string asMap = ask(c: c, text: "HGETALL kr:hash");
+    f = f + check(ok: asMap == "{field, value}", what: "connect: HGETALL under RESP3 is a map: ${asMap}");
+    Connection two = connected(url: mainUrl(userinfo: "", tail: "?protocol=2"), what: "protocol=2");
+    string asArray = ask(c: two, text: "HGETALL kr:hash");
+    bool unnamed = match (two.server()) { case Some(value: v): false; case None: true; };
+    f = f + check(ok: asArray == "[field, value]" && two.protocol() == Protocol::Resp2 && unnamed,
+                  what: "connect: protocol=2: HGETALL is a flat array, and no HELLO was sent: ${asArray}");
+
+    // The client's name, set by HELLO on the default path and by CLIENT SETNAME on the RESP2 path.
+    Connection namedConn = connected(url: mainUrl(userinfo: "", tail: "?client_name=kama-it"), what: "client_name");
+    string name3 = ask(c: namedConn, text: "CLIENT GETNAME");
+    Connection named2 = connected(url: mainUrl(userinfo: "", tail: "?protocol=2&client_name=kama-it2"), what: "client_name, protocol=2");
+    string name2 = ask(c: named2, text: "CLIENT GETNAME");
+    f = f + check(ok: name3 == "kama-it" && name2 == "kama-it2", what: "connect: client_name on both paths: ${name3}, ${name2}");
+
+    // The database.
+    Connection db3 = connected(url: mainUrl(userinfo: "", tail: "/3"), what: "database 3");
+    string db3Info = ask(c: db3, text: "CLIENT INFO");
+    Connection db3two = connected(url: mainUrl(userinfo: "", tail: "/3?protocol=2"), what: "database 3, protocol=2");
+    string db3twoInfo = ask(c: db3two, text: "CLIENT INFO");
+    f = f + check(ok: db3Info.contains(substring: " db=3 ") && db3twoInfo.contains(substring: " db=3 "), what: "connect: /3 selects database 3 on both paths");
+    string beyond = attempt(url: mainUrl(userinfo: "", tail: "/99"));
+    f = f + check(ok: beyond.startsWith(prefix: "ERR "), what: "connect: a database past the last fails the connect: ${beyond}");
+
+    // Keepalive, on at one second and off.
+    Connection kept = connected(url: mainUrl(userinfo: "", tail: "?keepalive=1"), what: "keepalive=1");
+    string keptPing = ask(c: kept, text: "PING");
+    Connection unkept = connected(url: mainUrl(userinfo: "", tail: "?keepalive=0"), what: "keepalive=0");
+    string unkeptPing = ask(c: unkept, text: "PING");
+    f = f + check(ok: keptPing == "PONG" && unkeptPing == "PONG", what: "connect: keepalive=1 and keepalive=0");
+
+    // localhost: its addresses in turn (on macOS ::1 first, which the container's 127.0.0.1-only port refuses).
+    string port = setting(name: "REDISTEST_PORT");
+    string local = attempt(url: "redis://localhost:".concat(other: port));
+    f = f + check(ok: local == "ok", what: "connect: localhost, every address in turn: ${local}");
+    return f;
+}

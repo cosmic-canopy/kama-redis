@@ -1,0 +1,137 @@
+// What every live test shares: URLs for the test servers, connecting, sending a command written as words, and a
+// reply as text.
+import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, std::fmt::i64Str, std::fmt::f64Str,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::ServerCode, redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting };
+export { mainUrl, lockedUrl, open, attempt, commandOf, ask, shown, codeOf, flush, productWanted, versionPrefix };
+
+// redis://<userinfo>host:port<tail> for the main server: `userinfo` is "" or "user:password@", `tail` the path and
+// query ("/3?protocol=2").
+unsafe fn string mainUrl(const ref string userinfo, const ref string tail) {
+    string host = setting(name: "REDISTEST_HOST");
+    string port = setting(name: "REDISTEST_PORT");
+    return "redis://".concat(other: userinfo).concat(other: host).concat(other: ":").concat(other: port).concat(other: tail);
+}
+
+// The same, for the locked server, whose default user has a password.
+unsafe fn string lockedUrl(const ref string userinfo, const ref string tail) {
+    string host = setting(name: "REDISTEST_HOST");
+    string port = setting(name: "REDISTEST_LOCKED_PORT");
+    return "redis://".concat(other: userinfo).concat(other: host).concat(other: ":").concat(other: port).concat(other: tail);
+}
+
+unsafe fn Result<Connection, RedisError> open(const ref string url) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Connection.connect(config: config);
+}
+
+// "ok", or why the connect failed.
+unsafe fn string attempt(const ref string url) {
+    Result<Connection, RedisError> r = open(url: url);
+    return match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+}
+
+// A command written as words separated by single spaces.
+fn Command commandOf(const ref string text) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    isize start = 0;
+    isize i = 0;
+    while (i <= text.length()) {
+        if (i == text.length() || text.bytes()[i] == 32ui8) {
+            parts.add(item: text.substring(start: start, end: i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    Command c = Command.of(name: parts[0]);
+    isize k = 1;
+    while (k < parts.length()) { c.arg(text: parts[k]); k = k + 1; }
+    return give c;
+}
+
+// Send `text` and show the reply; an error is "(error) <the server's line>", a failure of the connection
+// "(failed) <message>".
+unsafe fn string ask(ref Connection c, const ref string text) {
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.message()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+// The server's code of a call's error, as text; "" when it succeeded or failed otherwise.
+unsafe fn string codeOf(ref Connection c, const ref string text) {
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: ""; };
+        case Ok(value: v): "";
+    };
+}
+
+// A reply as text: strings as they are, integers in decimal, aggregates in brackets ({…} for a map).
+fn string shown(const ref Value v) {
+    return match (v) {
+        case Simple(bytes: b): utf8(b: b.view());
+        case Bulk(bytes: b): utf8(b: b.view());
+        case Verbatim(format: f, bytes: b): utf8(b: b.view());
+        case Error(bytes: b): "(error) ".concat(other: utf8(b: b.view()));
+        case Integer(value: n): i64Str(v: n);
+        case Double(value: d): f64Str(v: d);
+        case Boolean(value: t): boolText(t: t);
+        case Null: "(nil)";
+        case BigNumber(digits: b): utf8(b: b.view());
+        case Array(items: xs): "[".concat(other: joined(xs: xs)).concat(other: "]");
+        case Set(items: xs): "~[".concat(other: joined(xs: xs)).concat(other: "]");
+        case Push(items: xs): ">[".concat(other: joined(xs: xs)).concat(other: "]");
+        case Map(entries: xs): "{".concat(other: joined(xs: xs)).concat(other: "}");
+        case Attributed(parts: xs): "|[".concat(other: joined(xs: xs)).concat(other: "]");
+    };
+}
+
+fn string boolText(bool t) { if (t) { return "true"; } return "false"; }
+
+fn string joined(const ref DynamicArray<Value> xs) {
+    string text = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        if (i > 0) { text = text.concat(other: ", "); }
+        text = text.concat(other: shown(v: xs[i]));
+        i = i + 1;
+    }
+    return text;
+}
+
+fn string utf8(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): "(not UTF-8)"; };
+}
+
+// Start from an empty server: the debug and the release run share it.
+unsafe fn int32 flush() {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: ""));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "flush: connect: ${m}"); }
+    };
+    string done = ask(c: c, text: "FLUSHALL");
+    return check(ok: done == "OK", what: "flush: FLUSHALL: ${done}");
+}
+
+// The product the server names itself as in HELLO: Valkey from 8.0, Redis otherwise (Valkey 7.2 is Redis 7.2's code).
+unsafe fn string productWanted() {
+    string server = setting(name: "REDISTEST_SERVER");
+    if (server.startsWith(prefix: "valkey-") && !server.startsWith(prefix: "valkey-7.")) { return "valkey"; }
+    return "redis";
+}
+
+// "8.10." for redis-8.10: what the server's version starts with.
+unsafe fn string versionPrefix() {
+    string server = setting(name: "REDISTEST_SERVER");
+    isize dash = 0;
+    while (dash < server.length() && server.bytes()[dash] != 45ui8) { dash = dash + 1; }
+    return server.substring(start: dash + 1, end: server.length()).concat(other: ".");
+}

@@ -1,0 +1,32 @@
+// The live tests: one program, run against each server in the matrix by tools/test-integration.sh, which starts the
+// server (tools/redis.sh) and exports its REDISTEST_* settings. A failing case prints its name. When cases fail, run
+// `tools/redis.sh smoke --server S` first: it tells a misconfigured server from a wrong client.
+import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests };
+export { check, setting };
+
+fn int32 check(bool ok, string what) {
+    if (!ok) { println(s: "  FAIL ${what}"); return 1; }
+    return 0;
+}
+
+// A REDISTEST_* setting the runner exports; the program cannot run without them.
+unsafe fn string setting(string name) {
+    Optional<string> v = env(name: copy name);
+    return match (give v) {
+        case Some(value: s): give s;
+        case None: { panic(msg: "REDISTEST settings are missing: run tools/test-integration.sh, or source out/redistest-<server>.env"); return ""; }
+    };
+}
+
+fn int32 main() {
+    int32 failed = flush();
+    failed = failed + connectTests();
+    failed = failed + authTests();
+    failed = failed + socketTests();
+    failed = failed + timeoutTests();
+    failed = failed + failureTests();
+    string server = setting(name: "REDISTEST_SERVER");
+    if (failed != 0) { println(s: "redis integration tests on ${server}: ${failed} failed"); return 1; }
+    println(s: "redis integration tests on ${server}: OK");
+    return 0;
+}

@@ -1,0 +1,69 @@
+// Authentication, live: one ACL user per case (tests/integration/server/redis.conf), and the locked server, whose
+// default user has a password (locked.conf).
+import { redis::Connection, redis::RedisError, redis::Protocol, redis_integration_tests::check,
+         redis_integration_tests::setting, mainUrl, lockedUrl, open, attempt, ask, codeOf };
+export { authTests };
+
+// The server's code a connect failed with; "ok" when it connected, "-" for a failure that is not the server's.
+unsafe fn string refusal(const ref string url) {
+    Result<Connection, RedisError> r = open(url: url);
+    return match (r) {
+        case Ok(value: c): "ok";
+        case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: "-"; };
+    };
+}
+
+// Who the connection authenticated as.
+unsafe fn string whoami(const ref string url) {
+    Result<Connection, RedisError> r = open(url: url);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    return ask(c: c, text: "ACL WHOAMI");
+}
+
+unsafe fn int32 authTests() {
+    int32 f = 0;
+    string aclPw = setting(name: "REDISTEST_ACL_PASSWORD");
+    string roPw = setting(name: "REDISTEST_RO_PASSWORD");
+    string offPw = setting(name: "REDISTEST_OFF_PASSWORD");
+    string defaultPw = setting(name: "REDISTEST_DEFAULT_PASSWORD");
+    string acl = "kr_acl:".concat(other: aclPw).concat(other: "@");
+
+    string plain = whoami(url: mainUrl(userinfo: "", tail: ""));
+    f = f + check(ok: plain == "default", what: "auth: no password is the default user: ${plain}");
+    string asAcl = whoami(url: mainUrl(userinfo: acl, tail: ""));
+    string asAcl2 = whoami(url: mainUrl(userinfo: acl, tail: "?protocol=2"));
+    f = f + check(ok: asAcl == "kr_acl" && asAcl2 == "kr_acl", what: "auth: an ACL user, by HELLO and by AUTH: ${asAcl}, ${asAcl2}");
+    string wrong = refusal(url: mainUrl(userinfo: "kr_acl:wrong@", tail: ""));
+    string wrong2 = refusal(url: mainUrl(userinfo: "kr_acl:wrong@", tail: "?protocol=2"));
+    f = f + check(ok: wrong == "WRONGPASS" && wrong2 == "WRONGPASS", what: "auth: a wrong password is WRONGPASS on both paths: ${wrong}, ${wrong2}");
+    string off = refusal(url: mainUrl(userinfo: "kr_off:".concat(other: offPw).concat(other: "@"), tail: ""));
+    f = f + check(ok: off == "WRONGPASS", what: "auth: a disabled user is WRONGPASS: ${off}");
+    string any = whoami(url: mainUrl(userinfo: "kr_nopass:anything@", tail: ""));
+    f = f + check(ok: any == "kr_nopass", what: "auth: a nopass user takes any password: ${any}");
+
+    // A read-only user: reads work, a write is NOPERM, and the connection goes on.
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "kr_ro:".concat(other: roPw).concat(other: "@"), tail: ""));
+    match (give r) {
+        case Ok(value: v): {
+            Connection ro = give v;
+            string read = ask(c: ro, text: "EXISTS kr:none");
+            string write = codeOf(c: ro, text: "SET kr:ro v");
+            string after = ask(c: ro, text: "PING");
+            f = f + check(ok: read == "0" && write == "NOPERM" && after == "PONG", what: "auth: a read-only user: ${read}, ${write}, then ${after}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "auth: the read-only user connects: ${m}"); }
+    };
+
+    // The locked server: NOAUTH without a password; the password alone, by HELLO as the default user and by the
+    // one-argument AUTH under protocol=2; a wrong one.
+    string none = refusal(url: lockedUrl(userinfo: "", tail: ""));
+    f = f + check(ok: none == "NOAUTH", what: "auth: the locked server without a password is NOAUTH: ${none}");
+    string pw = ":".concat(other: defaultPw).concat(other: "@");
+    string byHello = whoami(url: lockedUrl(userinfo: pw, tail: ""));
+    string byAuth = whoami(url: lockedUrl(userinfo: pw, tail: "?protocol=2"));
+    f = f + check(ok: byHello == "default" && byAuth == "default", what: "auth: the locked server's password, by HELLO and by AUTH <password>: ${byHello}, ${byAuth}");
+    string lockedWrong = refusal(url: lockedUrl(userinfo: ":wrong@", tail: ""));
+    string lockedWrong2 = refusal(url: lockedUrl(userinfo: ":wrong@", tail: "?protocol=2"));
+    f = f + check(ok: lockedWrong == "WRONGPASS" && lockedWrong2 == "WRONGPASS", what: "auth: the locked server, a wrong password: ${lockedWrong}, ${lockedWrong2}");
+    return f;
+}
