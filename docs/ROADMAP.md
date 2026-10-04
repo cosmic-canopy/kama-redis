@@ -184,13 +184,17 @@ What the peer clients do was read from their current source, not remembered: go-
     - A `SELECT` error fails the connect.
     - A `CLIENT SETINFO` error does not: the command's own documentation tells clients to ignore it, because a server
       before 7.2 does not have it.
-  - **`WRONGPASS`, `NOAUTH` or `NOPERM`** fails the connect with that error.
+  - **`WRONGPASS` or `NOPERM`** fails the connect with that error. So does **`NOAUTH`** to a `HELLO` that carried
+    no `AUTH`: the server wants a password and none was given.
+  - **`NOAUTH` to a `HELLO` that carried `AUTH`** means the peer did not read `HELLO`'s `AUTH`. A server never
+    answers that way. Envoy 1.32 and 1.37 to 1.39 do, when they require a password, because they check it before
+    they look at `HELLO`. With `protocol` unset, the connection takes the RESP2 path, which sends `AUTH` alone.
   - **Any other error reply, with `protocol` unset,** means `HELLO` is not supported. The connection takes the
     RESP2 path. That error is told by its code, never by its words:
     - Redis before 6 says `ERR unknown command`;
     - Envoy up to 1.32 says `unsupported command`;
     - Envoy 1.33 to 1.36 says `ERR unknown command`;
-    - Envoy 1.37 to 1.39 says `NOPROTO` to `HELLO 3`.
+    - Envoy 1.37 to 1.39 says `NOPROTO` to `HELLO 3`, and `ERR` to `HELLO` with `AUTH` or `SETNAME`.
 
     go-redis falls back on every error, which hides a wrong password and sends it twice. Lettuce looks for the word
     "unknown" in the message. redis-py and redis-rs do not fall back at all.
