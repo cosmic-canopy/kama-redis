@@ -6,7 +6,7 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.523**.
+Needs **kama ≥ 0.9.529**.
 
 ### Added
 - `redis::resp`: `Value` (every RESP2 and RESP3 type), `Reader` and `Writer`.

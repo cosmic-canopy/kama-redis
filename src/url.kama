@@ -71,13 +71,13 @@ type resource RedisUrl implements Sendable {
     // TCP, TLS over TCP, or a Unix-domain socket.
     public const fn UrlTransport transport() { return this.kind; }
     // The host, without brackets; None when the URL names none (the default is 127.0.0.1). None for unix://.
-    public const fn Optional<string> host() { return copied(o: this.hostName); }
+    public const fn Optional<string> host() { return copy this.hostName; }
     // The port; None when the URL names none (the default is 6379).
     public const fn Optional<int32> port() { return this.portNumber; }
     // The socket's path, for unix://; empty otherwise.
     public const fn string socketPath() { return copy this.socket; }
-    public const fn Optional<string> user() { return copied(o: this.userName); }
-    public const fn Optional<string> password() { return copied(o: this.secret); }
+    public const fn Optional<string> user() { return copy this.userName; }
+    public const fn Optional<string> password() { return copy this.secret; }
     // The database to SELECT; None when the URL names none (the server's default is 0).
     public const fn Optional<int64> db() { return this.database; }
     // The query's keys and values, in the order given, percent-decoded.
@@ -253,11 +253,6 @@ type resource RedisUrl implements Sendable {
         this.values.add(item: give value);
         return Optional::None;
     }
-}
-
-// KRD-4: `copy` does not reach through an Optional.
-fn Optional<string> copied(const ref Optional<string> o) {
-    return match (o) { case Some(value: v): Optional::Some(value: copy v); case None: Optional::None; };
 }
 
 fn Optional<UrlError> invalid(const ref string m) { return Optional::Some(value: UrlError::Invalid(detail: copy m)); }

@@ -195,11 +195,7 @@ type resource Writer implements Sendable {
     fn void put(uint8 b) { this.buf.add(item: b); }
     fn void crlf() { this.buf.add(item: 13ui8); this.buf.add(item: 10ui8); }
     fn void putText(string s) { this.putBytes(b: s.bytes()); }
-    // KRD-3: byte by byte, as std has no bulk append.
-    fn void putBytes(ConstView<uint8> b) {
-        isize i = 0;
-        while (i < b.length()) { this.buf.add(item: b[i]); i = i + 1; }
-    }
+    fn void putBytes(ConstView<uint8> b) { this.buf.addAll(items: b); }
 }
 
 fn bool hasLineBreak(ConstView<uint8> b) {

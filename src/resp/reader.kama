@@ -29,10 +29,10 @@ type value Limits implements Sendable {
     public int64 maxBulk = 536870912i64;
     // The most elements in one aggregate, as hiredis's REDIS_READER_MAX_ARRAY_ELEMENTS. A map counts pairs.
     public int64 maxElements = 4294967295i64;
-    // The deepest nesting. hiredis allows 1024; this default is lower because a reply is walked recursively
-    // (dropped, compared, written, deserialized), and an isolate's stack is the OS default thread stack: 512 KiB
-    // on macOS, 128 KiB with musl (KRD-2). 128 is 18 times what redis-cli lived with until hiredis 1.0.
-    public isize maxDepth = 128;
+    // The deepest nesting, as hiredis's REDIS_READER_MAX_REPLY_DEPTH. A reply is walked recursively (dropped,
+    // compared, written, deserialized); kama gives an isolate the main thread's stack (8 MiB on a 64-bit target,
+    // since 0.9.529), on which a walk this deep runs with room to spare.
+    public isize maxDepth = 1024;
     // The most one reply may cost: its bytes on the wire plus `sizeof(Value)` for each value, so a flood of
     // tiny elements is bounded by the memory it really takes.
     public int64 maxReplyBytes = 1073741824i64;
@@ -142,7 +142,6 @@ type resource Reader implements Sendable {
     int64 bodyLeft = 0i64;
     // The most the string being built may hold: its declared length, or `maxBulk` for a streamed one.
     int64 bodyMost = 0i64;
-    int64 textCap = 0i64;
     // Inside a `$?` string, between its `;` chunks.
     bool streaming = false;
     int64 streamTotal = 0i64;
@@ -183,14 +182,13 @@ type resource Reader implements Sendable {
         if (this.buf.length() - this.end < need) {
             isize unread = this.end - this.start;
             isize size = this.buf.length();
-            if (unread + need <= size && unread * 2 <= size) {
-                isize i = 0;
-                while (i < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }
+            // Slide only when the unread bytes and where they go do not overlap: each byte moved then frees one.
+            if (unread + need <= size && unread <= this.start) {
+                this.buf.sliceMut(from: 0, count: unread).copyFrom(source: this.buf.slice(from: this.start, count: unread));
             } else {
                 while (size < unread + need) { size = size * 2; }
                 FixedArray<uint8> grown = FixedArray.make(size: size);
-                isize i = 0;
-                while (i < unread) { grown[i] = this.buf[this.start + i]; i = i + 1; }
+                grown.sliceMut(from: 0, count: unread).copyFrom(source: this.buf.slice(from: this.start, count: unread));
                 this.buf = give grown;
             }
             this.start = 0;
@@ -244,7 +242,11 @@ type resource Reader implements Sendable {
 
     // What the reader holds for a reply in progress: its buffer and the string being built. Values already built
     // are not counted.
-    public const fn int64 retainedBytes() { return cast<int64>(this.buf.length()) + this.textCap; }
+    public const fn int64 retainedBytes() {
+        int64 n = cast<int64>(this.buf.length());
+        if (this.text.length() > 0) { n = n + cast<int64>(this.text[0].capacity()); }
+        return n;
+    }
 
     // The limits this reader keeps.
     public const fn Limits currentLimits() { return this.limits; }
@@ -306,8 +308,7 @@ type resource Reader implements Sendable {
             }
             if (take > skip) {
                 this.growText(need: take - skip);
-                isize k = this.start + skip;
-                while (k < this.start + take) { this.text[0].add(item: this.buf[k]); k = k + 1; }
+                this.text[0].addAll(items: this.buf.slice(from: this.start + skip, count: take - skip));
             }
             this.consume(count: take);
             this.bodyLeft = this.bodyLeft - cast<int64>(take);
@@ -342,7 +343,6 @@ type resource Reader implements Sendable {
             this.bodyMost = length - 4i64;
             if (this.bodyMost < 0i64) { this.bodyMost = 0i64; }
         }
-        this.textCap = 0i64;
         this.text.add(item: DynamicArray.empty());
         this.head.clear();
         return Step::Again;
@@ -352,27 +352,26 @@ type resource Reader implements Sendable {
         this.streaming = true;
         this.streamTotal = 0i64;
         this.bodyMost = this.limits.maxBulk;
-        this.textCap = 0i64;
         this.text.add(item: DynamicArray.empty());
         return Step::Again;
     }
 
-    // Room in the string being built for `need` more bytes: double what it has, up to what it may hold.
+    // Room in the string being built for `need` more bytes: double what it has, up to what it may hold, so it never
+    // grows past its declared length as `addAll`'s own doubling would.
     fn void growText(isize need) {
         int64 want = cast<int64>(this.text[0].length()) + cast<int64>(need);
-        if (want <= this.textCap) { return; }
-        int64 cap = this.textCap * 2i64;
+        int64 had = cast<int64>(this.text[0].capacity());
+        if (want <= had) { return; }
+        int64 cap = had * 2i64;
         if (cap < 64i64) { cap = 64i64; }
         if (cap > this.bodyMost) { cap = this.bodyMost; }
         if (cap < want) { cap = want; }
         this.text[0].reserve(n: cast<isize>(cap));
-        this.textCap = cap;
     }
 
     fn Step finishString(uint8 kind) {
         Optional<DynamicArray<uint8>> s = this.text.pop();
         DynamicArray<uint8> bytes = match (give s) { case Some(value: b): give b; case None: DynamicArray.empty(); };
-        this.textCap = 0i64;
         if (kind == DOLLAR) { return this.deliver(v: Value::Bulk(bytes: give bytes)); }
         if (kind == BANG) { return this.deliver(v: Value::Error(bytes: give bytes)); }
         if (this.head.length() < 4 || this.head[3] != COLON) { return Step::Bad(error: ProtocolError::BadVerbatim); }
@@ -516,7 +515,6 @@ type resource Reader implements Sendable {
         this.head.clear();
         this.body = 0ui8;
         this.bodyLeft = 0i64;
-        this.textCap = 0i64;
         this.streaming = false;
         this.depth = 0;
         this.replyBytes = 0i64;
@@ -716,17 +714,15 @@ fn bool hasLineBreak(ConstView<uint8> b) {
 
 fn DynamicArray<uint8> copyOf(ConstView<uint8> b) {
     DynamicArray<uint8> copied = DynamicArray.withCapacity(capacity: b.length());
-    isize i = 0;
-    while (i < b.length()) { copied.add(item: b[i]); i = i + 1; }
+    copied.addAll(items: b);
     return copied;
 }
 
-// KRD-3: std has no copy between views, so it goes byte by byte. Copies what fits; answers how much.
+// Copies what fits; answers how much.
 fn isize copyBytes(View<uint8> to, ConstView<uint8> from) {
     isize n = from.length();
     if (to.length() < n) { n = to.length(); }
-    isize i = 0;
-    while (i < n) { to[i] = from[i]; i = i + 1; }
+    to.slice(from: 0, count: n).copyFrom(source: from.slice(from: 0, count: n));
     return n;
 }
 

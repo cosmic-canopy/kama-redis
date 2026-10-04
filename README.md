@@ -5,7 +5,7 @@ over `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and n
 from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
 > **Status: the protocol layer, not yet published.** RESP2 and RESP3, connection URLs and cluster key slots are in
-> and tested. The connection itself comes next; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.523**.
+> and tested. The connection itself comes next; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.529**.
 
 ## What is here now
 
@@ -21,7 +21,7 @@ from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
     |---|---|
     | One string | 512 MiB |
     | One aggregate | 2³²−1 elements |
-    | Nesting | 128 deep |
+    | Nesting | 1024 deep |
     | One reply | 1 GiB |
 
     A malformed reply is an error, never a crash, and memory grows only with bytes that actually arrived.

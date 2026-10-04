@@ -17,8 +17,12 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.523**, declared as `"kama"` in every manifest here. 0.9.523 is the first compiler
-that takes the registry keys `description`, `repository` and `keywords` in `kama.json`.
+**The package needs kama ≥ 0.9.529**, declared as `"kama"` in every manifest here. That is the first compiler with
+everything this package relies on:
+- the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
+- `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
+- `DynamicArray.addAll`, `View.copyFrom` and `capacity()`, one `memcpy` each (0.9.528, KRD-3);
+- an isolate's stack stated as the main thread's, which `resp::Limits.maxDepth` = 1024 relies on (0.9.529, KRD-2).
 
 ## What is true here and nowhere else
 
@@ -75,7 +79,8 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
 - **`redis::resp`'s reader is built so that nothing is read twice and memory follows the bytes that came.** Keep it
   that way when changing it. The rules are in `src/resp/reader.kama`'s header:
   - Lines are searched once (`scanned`).
-  - Payloads leave the buffer as they arrive, into a string whose capacity the reader counts itself (KRD-3).
+  - Payloads leave the buffer as they arrive (`addAll`), into a string that doubles as it grows but never past its
+    declared length.
   - Open aggregates are plain `Frame` values over one `vals` stack. Nothing is allocated from a declared count.
   - The first error is final, and `ProtocolError` has scalar payloads so it can be handed back on every call.
   - `spare`/`commit` let a connection read straight into the buffer.
@@ -91,7 +96,8 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
   - `new` goes only in a local initializer: `Owned<H> h = new Impl.make(); this.h = give h;`.
   - A value-producing `match` may only initialize a local or be returned. A block arm that yields a value ends
     with `:= expr;`.
-  - A value declared outside a loop cannot be given inside it: set a flag, leave the loop, then give.
+  - A value declared outside a loop may be given inside it only if every path back to the loop's start assigns it
+    again (0.9.526). A local moved on only some paths cannot be assigned at all.
   - A field cannot be moved out (`give this.x`). Drain a `DynamicArray` with `pop()`.
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
   - No shadowing: a parameter cannot have the name of a function in scope, nor a match binding the name of a local.
@@ -102,9 +108,6 @@ that takes the registry keys `description`, `repository` and `keywords` in `kama
   - An `IoError` is a value: branch on `e.kind()`.
   - Reserved words bite as names: every C keyword (`out`, `float`, `double`, `register`, …) and kama's own (`base`,
     `addr`, `ref`, `in`, `const`, `final`).
-  - A local that was given away cannot be assigned again, even in straight-line code (KRD-1). To rebuild a value
-    in a loop, keep it in a `DynamicArray` of zero or one, and use `pop()` and `add`.
-  - `copy` does not reach through an `Optional` (KRD-4). Copy the payload in a borrowing `match`.
   - A view local must be rooted. Open a window (`borrow s.bytes() as b { … }`), or pass the view as a by-value
     parameter to a helper.
   - A value-producing `match` is not an assignment's right side. Bind it to a local, or move it into a helper.

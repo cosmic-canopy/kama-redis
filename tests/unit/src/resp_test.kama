@@ -872,8 +872,8 @@ fn isize copyInto(View<uint8> to, ConstView<uint8> from) {
     return i;
 }
 
-// A reply at the default maxDepth, walked (compared, written, dropped) inside an isolate, whose stack is the
-// OS's default thread stack (KRD-2).
+// A reply at the default maxDepth, walked (compared, written, dropped) inside an isolate, on the stack kama gives
+// every isolate (the main thread's, since 0.9.529).
 type resource DeepJob implements Sendable {
     int32 code = -1;
     public ctor make() { }

@@ -9,7 +9,8 @@ Where this is, 2026-10-03: phases 0 and 1 are done. Phase 2 is next.
     eight servers send.
   - `redis::cluster` key slots against the cluster specification and against `CLUSTER KEYSLOT` on all eight servers.
   - `RedisUrl` against redis-cli and valkey-cli, asked live.
-- `tools/test.sh` is green, debug and release, on kama 0.9.523.
+- `tools/test.sh` is green, debug and release, on kama 0.9.530. KRD-1 to KRD-4, the gaps phase 1 filed, are fixed,
+  and their workarounds are gone.
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -76,10 +77,10 @@ These are the scaffold's working assumptions. Each is cheap to change now and ex
   - `maxElements`: 2³²−1, as in hiredis.
   - `maxReplyBytes`: 1 GiB, counted as wire bytes plus `sizeof(Value)` per value, so a flood of tiny elements is
     bounded by what it costs.
-  - `maxDepth`: **128, not hiredis's 1024**. A reply is walked recursively (dropped, compared, written,
-    deserialized). An isolate gets the OS default thread stack, 512 KiB on macOS and 128 KiB with musl (KRD-2). A
-    recursive compare of a 1000-deep reply overflows a macOS isolate in a debug build. Drop alone survives 4000.
-    hiredis's own depth cases run at 1024 on the main thread.
+  - `maxDepth`: 1024, as in hiredis. A reply is walked recursively (dropped, compared, written, deserialized), so
+    the depth must fit the stack of whatever isolate walks it. It was 128 while an isolate had the OS's default
+    thread stack, on which a 1000-deep compare overflowed (KRD-2). Since kama 0.9.529 an isolate has the main
+    thread's 8 MiB, and resp_test.kama walks a 1024-deep reply inside one in a debug build.
 - **Payloads are bytes.** A RESP string is binary, and a kama `string` must be UTF-8. `Value::Error` holds both
   `-` and `!`, and the writer picks `!` when the text has a line break.
 - **The reader is incremental, and phase 2 reads the socket straight into it** (`spare`/`commit`).
