@@ -11,7 +11,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-5 (HIGH). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-5 (HIGH), KRD-6 (LOW). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Priorities:**
@@ -22,6 +22,60 @@ filed is cited by its KPG number rather than filed again.
 ---
 
 ## OPEN
+
+### KRD-6 · LOW · A branch whose every inner path moves a value and returns still counts as not moving it
+
+**Found:** 2026-10-04, writing `Connection.call`'s read loop (phase 2). **Version:** 0.9.530 (`e01de340`), and the
+same on 0.9.523, so it is not a regression.
+
+The move check refuses a function in which every path moves `v`, when one outer branch holds an inner `if` whose
+two arms both move `v` and `return`. A plain two-arm `if`/`else` that moves in both arms is accepted. So is the same
+logic written as early exits. It looks as if the point after the inner `if`, which no path reaches, is merged as a
+path on which `v` is still live.
+
+Repro (an `else if` chain is the same shape, and fails the same way):
+
+```kama
+import { core::println, std::collections::DynamicArray };
+
+type resource R {
+    int32 n = 0;
+    public ctor make(int32 n) { this.n = n; }
+    public const fn int32 value() { return this.n; }
+}
+
+fn int32 pick(DynamicArray<R> kept, int32 which) {
+    R v = R.make(n: which);
+    if (v.value() == 0) {
+        kept.add(item: give v);
+    } else {
+        if (v.value() == 1) {
+            R dropped = give v;
+            return 1;
+        } else {
+            R last = give v;
+            return last.value();
+        }
+    }
+    return -1;
+}
+
+fn int32 main() {
+    DynamicArray<R> kept = DynamicArray.empty();
+    int32 got = pick(kept: kept, which: 0);
+    println(s: "ok ${got}");
+    return 0;
+}
+```
+
+```
+repro.kama:22:0: error: `v` is moved on some paths but not others and is still live at scope exit — move it on all paths or none, or use Optional<T>
+```
+
+**Expected:** it builds and prints `ok -1`, since `v` is moved on every path that reaches the end of its scope.
+
+**Workaround here:** `Connection.call` (`src/connection.kama`) is written as early exits (`if (push) { …; continue; }`
+then `if (error) { …; return …; }`), which is as clear. Nothing needs undoing when this is fixed.
 
 ### KRD-5 · HIGH · A type that holds a collection of itself through a resource no longer compiles — since KRD-4's fix
 
