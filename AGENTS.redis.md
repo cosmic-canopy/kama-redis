@@ -33,9 +33,14 @@ everything this package relies on:
 
 - **Two test programs, and neither is typed from memory.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug and
-    release. From phase 2 it holds a scripted fake server for every hostile path: a reply a byte at a time,
-    silence, hangups, oversized lengths.
-  - `tests/integration` (from phase 2) needs a live server and runs on every server in the matrix.
+    release. Its scripted server (`fake_server.kama`) is an in-memory `Transport` that plays real servers' bytes from
+    the vectors, a byte at a time, written three bytes at a time, for every hostile path: silence, late replies,
+    hangups at every step, garbage, oversized lengths, a server that stops reading.
+  - `tests/integration` needs a live server. `tools/test-integration.sh` runs it on every server in the matrix,
+    debug and release (`--server S` for one), and CI runs it after `smoke`.
+    - Its Unix-socket test listens on a socket of its own and relays to the server's TCP port, because macOS cannot
+      reach the container's socket (as postgres's `socket_test` does).
+    - It starts with FLUSHALL, so the debug and release runs share the server cleanly.
   - Vectors come from upstream by script. Each generator pins every upstream file by SHA256 and dies on a
     mismatch. Run it, and `git diff` must be empty unless a server image moved.
   - `tools/gen-resp-vectors.sh` writes `resp_vectors.kama`, with hiredis v1.4.1's reading of every input:
@@ -51,6 +56,14 @@ everything this package relies on:
     crc16tab and its tag examples, plus `CLUSTER KEYSLOT` on all eight servers, which must agree.
   - `tools/gen-url-vectors.sh` writes `url_vectors.kama` from redis-cli 8.10 and valkey-cli 9.1, given each URL
     beside a recorder. Its `misread` rules are the URLs this package refuses although the CLI accepts them.
+  - `tools/gen-server-vectors.sh` writes `server_vectors.kama`, for the connection's tests to replay:
+    - the error codes each server can send, read out of its own binary in the image (each `-CODE message` literal,
+      and MOVED and ASK from cluster.c's format); `ServerCode` must name every one;
+    - each server's raw reply to every handshake step and to every error a standalone server can be made to send;
+    - Envoy's redis proxy's answers to HELLO at 1.32, 1.36 and 1.39, from its pinned source, in the order that
+      source checks them. The script verifies that order before it uses it.
+    A case that needs a server setting Redis lacks (Valkey's `extended-redis-compatibility`) is started by
+    product: Redis 8 passes a setting it does not know to its modules and fails only after daemonizing.
   - The live parts run in throwaway `--network none` containers of the matrix's images. They never touch the
     `tools/redis.sh` servers.
   - The unit program's run-time tests check properties instead: every split of an input reads the same, every
@@ -111,6 +124,14 @@ everything this package relies on:
   - A view local must be rooted. Open a window (`borrow s.bytes() as b { … }`), or pass the view as a by-value
     parameter to a helper.
   - A value-producing `match` is not an assignment's right side. Bind it to a local, or move it into a helper.
+  - A local moved on one branch must be moved on every branch, a failure branch included:
+    `case Err(error: e): { Connection failed = give c; return …; }`.
+  - An inner `if` whose arms all move a value and `return` still reads as not moving it (KRD-6). Write early exits:
+    `if (push) { …; continue; }`, then `if (error) { …; return …; }`.
+  - A `Result`'s error type must implement `Error`: `Result<T, string>` is refused. Return a `RedisError`.
+  - A constructor that delegates the whole job is a private ctor (`Connection.establish`), not a static returning
+    the type.
+  - A path dependency's path is relative to its manifest; an absolute one is not found.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates

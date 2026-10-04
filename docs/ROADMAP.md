@@ -1,7 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-04: phases 0 and 1 are done. Phase 2 is under way: its decisions are made ("Phase 2" in
-"Decided, and why"), and "Phase 2: where to start" says what to read first.
+Where this is, 2026-10-04: phases 0, 1 and 2 are done. Phase 3 is next: see "Phase 3: where to start" below.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -10,8 +9,14 @@ Where this is, 2026-10-04: phases 0 and 1 are done. Phase 2 is under way: its de
     eight servers send.
   - `redis::cluster` key slots against the cluster specification and against `CLUSTER KEYSLOT` on all eight servers.
   - `RedisUrl` against redis-cli and valkey-cli, asked live.
-- `tools/test.sh` is green, debug and release, on kama 0.9.530. KRD-1 to KRD-4, the gaps phase 1 filed, are fixed,
-  and their workarounds are gone.
+- The connection is in (phase 2): `Config`, `Connection`, `RedisError`, `Command`, `ServerInfo`, the `Transport` and
+  `Dialer` contracts.
+  - The unit suite's scripted server plays every server's real handshake replies and Envoy's refusals
+    (`tools/gen-server-vectors.sh`).
+  - `tools/test-integration.sh` is green on all eight servers, debug and release.
+- `tools/test.sh` is green, debug and release, on kama 0.9.530.
+- Open gaps: KRD-5 (HIGH), a type that holds a collection of itself through a resource no longer compiles, which
+  breaks @kama/postgres 0.2.0's build; KRD-6 (LOW). Neither needs a workaround here.
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -23,34 +28,46 @@ does its discipline:
 |---|---|---|
 | 0 | Scaffold: manifest, agent files, unit program (`tools/test.sh`); `tools/redis.sh` + server config + test PKI for Redis 6.2–8.10 and Valkey 7.2–9.1; smoke; CI | **done** |
 | 1 | Pure layers. `redis::resp`: a reader and a writer for every RESP2 and RESP3 type (attributes, push, streamed strings and aggregates, big numbers, verbatim strings), bounded and hostile-input safe, with vectors from the RESP specification and hiredis's reader tests, by script. The `redis://`, `rediss://` and `unix://` URL forms. CRC16 key slots and hash tags, with the cluster specification's vectors | **done** |
-| 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **in progress** |
-| 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | |
+| 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
+| 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | next |
 | 4 | Server push. Pub/sub on RESP3 push messages beside commands on the same connection, and on a dedicated connection under RESP2. Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations) | |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI | |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both | |
 | 7 | Pool (cross-isolate), reconnection, examples, hardening (server restart, failover, bounded memory), docs | |
 | — | Publish `@kama/redis` 0.1.0 — only on the maintainer's word | |
 
-## Phase 2: where to start
+## Phase 3: where to start
 
-The bar is the one `@kama/postgres` set: comprehensive and production-grade. Every setting is honoured or refused,
-every failure path is tested against a scripted server, and the whole matrix passes live, debug and release.
+The bar stays `@kama/postgres`'s: every form honoured or refused, every failure path against the scripted server, the
+whole matrix live, debug and release.
 
 - **Before writing anything**, read the matching parts of `@kama/postgres`:
-  - `src/transport.kama`: the `Transport` contract, and `TcpTransport` and `UnixTransport`, non-blocking, with
-    connect timeouts and TCP keepalive.
-  - `src/wire/wire.kama`: `Deadline`, and framing over a transport. Here, `Wire` reads into
-    `resp::Reader.spare`/`commit`.
-  - `src/config.kama` and `src/conninfo/`: settings resolved in one order, each honoured or refused.
-  - `src/connection.kama`: the connect procedure, step by step, and `busy`.
-  - `src/error.kama`: `PgError`.
-  - `tests/unit/src/fake_server.kama`: the scripted server.
-  - `tools/test-integration.sh`: the live suite on every server, debug and release.
-- **Decided** (2026-10-04, before any code): `RedisError`, `Config` and its URL keys, the handshake, identity and
-  the defaults. Each is under "Phase 2" in "Decided, and why" below, with what the peer clients do.
-- **The test servers** are ready: all eight passed `tools/redis.sh smoke` on 2026-10-04, at the versions above.
-  `tests/integration` does not exist yet; phase 2 creates it, as postgres's.
-- **The compiler** is cstar's own build (0.9.530). CI pins v0.9.530, which must be tagged before CI can install it.
+  - `src/query.kama` (`PgParam`) and `src/types/codec.kama`: arguments through a contract with `type adapter`s. Mind
+    KPG-38: two files that use the same adapter fail every release build, so keep each adapter's use in one file
+    and test release.
+  - `src/rows.kama` and `src/decode.kama`: `column::<T>` through `Deserializable`, `@generate` structs included.
+  - `src/pipeline.kama` and `src/batch.kama`: a queue of commands written at once and read in order.
+  - `src/transaction.kama`.
+- **What phase 2 leaves ready:**
+  - `Command` holds a command's arguments as whole bulk strings. `RedisArg` and the `cmd"…"` tag build `Command`s,
+    and `Command.encode` already writes any number of them into one `resp::Writer`.
+  - `Wire.send` reads while a write waits, so a pipeline's replies cannot deadlock its writes.
+    `connection_test`'s jammed server proves it.
+  - `Connection.call` returns a `resp::Value`. Typed replies read from it.
+  - Push messages are set aside (`pendingPushes()`). Phase 4 decides how they are read.
+- **To decide early and write down here,** with what the peers do (redis-rs `ToRedisArgs`/`FromRedisValue`, go-redis
+  `Cmd` types, redis-py, Lettuce):
+  - **Typed replies across protocols.** RESP2 sends a map as a flat array and a double as a bulk string.
+    `reply::<T>` reads both forms into the same T, so a `@generate` struct reads from `HGETALL` either way.
+  - **Pipelines.** How a pipeline is built and read; what one failed command does to the rest (nothing: each reply
+    stands alone); and the deadline, one for the whole pipeline.
+  - **Transactions.** `MULTI`/`EXEC`/`WATCH`, `EXECABORT`, and `EXEC`'s null when a watched key changed.
+  - **Scripts.** `EVALSHA`, falling back to `EVAL` on `NOSCRIPT`; `FCALL`.
+  - **`SCAN` cursors**, as an iterator.
+  - **Blocking commands.** A command's own timeout plus `command_timeout`, so `BLPOP key 30` is not cut off at 5 s;
+    and `0`, which means forever.
+- **Vectors:** typed replies come from the servers' real replies under both protocols (`tools/gen-server-vectors.sh`
+  and `gen-resp-vectors.sh` extended), never typed by hand.
 
 ## Decided, and why
 
@@ -241,3 +258,20 @@ What the peer clients do was read from their current source, not remembered: go-
 - **Push messages** (RESP3's `>`) that arrive in place of a reply are set aside in arrival order, and never taken for
   the reply. Phase 4 decides how they are read.
 - **TLS** (`rediss://`, `valkeys://`) is refused until phase 5, never connected in plaintext.
+- **What building it settled:**
+  - A connect attempt holds the `IoError` that ended it, not a `RedisError`. Only I/O ends an attempt, and this also
+    keeps `RedisError` clear of KRD-5.
+  - The library's version for `CLIENT SETINFO` is `redis::libraryVersion()`, which `tools/test.sh` checks against
+    kama.json's. go-redis has `redis.Version()` too.
+  - `Command` is phase 2's whole command surface: a name and whole arguments. Phase 3 builds on it, and adds no
+    second way.
+  - The scripted server (`tests/unit/src/fake_server.kama`) is an in-memory `Transport`, as postgres's is. It reads
+    each command with `resp::Reader`, and plays only bytes from the generated vectors. Its steps:
+    - `Expect`, `Any` and `Late` answer the next command;
+    - `Send` sends bytes of the server's own accord, as soon as the script reaches it;
+    - `Silent` leaves the next command unanswered;
+    - `Close` reads the next command, then closes, as twemproxy does;
+    - `Hangup` closes as soon as the script reaches it.
+  - The error codes come from the servers' own binaries: each string literal `-CODE message`, plus MOVED and ASK
+    from cluster.c's format. The source tarballs would have needed eight more pins, and the binaries are exactly
+    what the matrix runs.

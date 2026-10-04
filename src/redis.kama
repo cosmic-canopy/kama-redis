@@ -2,8 +2,11 @@
 // std::net; there is no hiredis and nothing to install. TLS will come from @kama/tls.
 //
 // The shape of the package, as it fills in (docs/ROADMAP.md):
-//   redis            RedisUrl (src/url.kama); to come: Connection, Config, Command and the `cmd"…"` tag, Reply and
-//                    `reply::<T>`, RedisError
+//   redis            Connection (src/connection.kama), Config (src/config.kama), RedisError, ServerError and
+//                    ServerCode (src/error.kama), Command (src/command.kama), ServerInfo (src/server.kama), the
+//                    Transport and Dialer contracts (src/transport.kama), RedisUrl (src/url.kama); to come: the
+//                    `cmd"…"` tag, Reply and `reply::<T>`
+//   redis::wire      internal: a deadline, and RESP over a transport
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
 //   redis::cluster   key slots (src/cluster/slot.kama); to come: the slot map and redirections
 //   redis::pool      a connection pool shared by isolates
