@@ -1,0 +1,332 @@
+import { std::collections::ConstView, std::time::Duration, redis::RedisUrl, redis::UrlTransport, redis::UrlError,
+         redis::RedisError, redis::resp::Limits };
+export { Config, Protocol, socketPathMax };
+
+// How to reach a server and what to ask of it: from a URL (`Config.parse`), or from a host or a socket and typed
+// settings (`Config.tcp`, `Config.unix`, then the setters). Every setting is honoured or refused. A URL option this
+// client does not know is refused, never ignored (go-redis refuses one too), and so is a value it cannot use.
+//
+// The URL options (docs/ROADMAP.md, "Phase 2", has what the peer clients call each and why these defaults):
+//   protocol=2|3          unset: RESP3, or the RESP2 path when the server refuses HELLO; 3: RESP3 only; 2: RESP2,
+//                         without HELLO, for a proxy that does not know it
+//   connect_timeout=S     seconds, to the millisecond; 0 for no limit. Default 5. It bounds each address: its TCP
+//                         connect and then the handshake. Resolving the host's name is not bounded.
+//   command_timeout=S     seconds, to the millisecond; 0 for no limit. Default 5. One deadline per call, from the
+//                         first byte written to the last byte of the reply; when it passes, the connection closes.
+//   client_name=NAME      CLIENT SETNAME's name: the bytes ! to ~, as the server allows
+//   keepalive=S           TCP keepalive, as hiredis sets it: idle S seconds, a probe every S/3, 3 probes. 0 is off.
+//                         Default 15, redis-cli's.
+// The database is the URL's path (redis://host/2), or ?db= on unix://, as RedisUrl reads it.
+
+// The protocol a connection speaks.
+type enum Protocol implements Sendable {
+    Resp2,
+    Resp3;
+
+    // 2 or 3, as HELLO takes it.
+    public const fn int32 number() { return match (this) { case Resp2: 2; case Resp3: 3; }; }
+}
+
+// The longest socket path the platform takes: sizeof(sun_path) less its terminator.
+@compileFor(OS_MACOS) fn isize socketPathMax() { return 103; }
+@compileFor(!OS_MACOS) fn isize socketPathMax() { return 107; }
+
+comptime int32 DEFAULT_PORT = 6379;
+comptime int64 DEFAULT_TIMEOUT_SECS = 5i64;
+comptime int64 DEFAULT_KEEPALIVE_SECS = 15i64;
+// TCP_KEEPIDLE's ceiling on Linux (MAX_TCP_KEEPIDLE), the strictest of the platforms.
+comptime int64 MAX_KEEPALIVE_SECS = 32767i64;
+// A timeout is at most nine digits of seconds, which a Duration's nanoseconds hold with room to spare.
+comptime isize MAX_SECONDS_DIGITS = 9;
+
+type resource Config implements Sendable, Copyable<This>(bare: give) {
+    UrlTransport kind;
+    string hostText;
+    int32 portNumber = 6379;
+    string pathText;
+    Optional<string> userName;
+    Optional<string> secret;
+    int64 dbIndex = 0i64;
+    Optional<Protocol> protocolChoice;
+    Optional<string> nameText;
+    Duration connectLimit;
+    Duration commandLimit;
+    Duration keepAliveIdle;
+    Limits readerLimits;
+    bool identify = true;
+
+    ctor blank(UrlTransport kind) {
+        this.kind = kind;
+        this.hostText = "127.0.0.1";
+        this.portNumber = DEFAULT_PORT;
+        this.pathText = "";
+        this.userName = Optional::None;
+        this.secret = Optional::None;
+        this.dbIndex = 0i64;
+        this.protocolChoice = Optional::None;
+        this.nameText = Optional::None;
+        this.connectLimit = Duration.fromSecs(s: DEFAULT_TIMEOUT_SECS);
+        this.commandLimit = Duration.fromSecs(s: DEFAULT_TIMEOUT_SECS);
+        this.keepAliveIdle = Duration.fromSecs(s: DEFAULT_KEEPALIVE_SECS);
+        this.readerLimits = Limits.defaults();
+        this.identify = true;
+    }
+
+    public ctor copy(ref Config source) {
+        this.kind = source.kind;
+        this.hostText = copy source.hostText;
+        this.portNumber = source.portNumber;
+        this.pathText = copy source.pathText;
+        this.userName = copy source.userName;
+        this.secret = copy source.secret;
+        this.dbIndex = source.dbIndex;
+        this.protocolChoice = source.protocolChoice;
+        this.nameText = copy source.nameText;
+        this.connectLimit = source.connectLimit;
+        this.commandLimit = source.commandLimit;
+        this.keepAliveIdle = source.keepAliveIdle;
+        this.readerLimits = source.readerLimits;
+        this.identify = source.identify;
+    }
+
+    // A connection URL: redis://, valkey://, or unix:// (src/url.kama says how each is read), with the options
+    // above. rediss:// and valkeys:// are refused until TLS arrives (docs/ROADMAP.md, phase 5); they never fall back
+    // to plaintext.
+    public ctor Result<Config, RedisError> parse(const ref string url) {
+        Result<RedisUrl, UrlError> read = RedisUrl.parse(text: url);
+        RedisUrl u = match (give read) {
+            case Ok(value: v): give v;
+            case Err(error: e): { return Result::Err(error: RedisError::Config(detail: e.message())); }
+        };
+        UrlTransport kind = u.transport();
+        if (kind == UrlTransport::Tls) { return Result::Err(error: tlsRefused()); }
+        Config c = Config.blank(kind: kind);
+        if (kind == UrlTransport::Unix) {
+            string path = u.socketPath();
+            Optional<RedisError> bad = checkPath(path: path);
+            match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+            c.pathText = give path;
+        } else {
+            Optional<string> h = u.host();
+            match (give h) { case Some(value: v): { c.hostText = give v; } case None: { } };
+            Optional<int32> p = u.port();
+            match (p) { case Some(value: v): { c.portNumber = v; } case None: { } };
+        }
+        c.userName = u.user();
+        c.secret = u.password();
+        Optional<int64> d = u.db();
+        match (d) { case Some(value: v): { c.dbIndex = v; } case None: { } };
+        isize i = 0;
+        while (i < u.queryLength()) {
+            string key = u.queryKey(index: i);
+            string value = u.queryValue(index: i);
+            Optional<RedisError> bad = c.option(key: key, value: value);
+            match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+            i = i + 1;
+        }
+        return Result::Ok(value: give c);
+    }
+
+    // A server at `host` (a name, or an IP address without brackets) and `port`, over TCP.
+    public ctor Result<Config, RedisError> tcp(string host, int32 port) {
+        if (host.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the host is empty: give a name or an address")); }
+        if (port < 1 || port > 65535) { return Result::Err(error: RedisError::Config(detail: "the port is a number from 1 to 65535")); }
+        Config c = Config.blank(kind: UrlTransport::Tcp);
+        c.hostText = give host;
+        c.portNumber = port;
+        return Result::Ok(value: give c);
+    }
+
+    // A server on the Unix-domain socket at `path`.
+    public ctor Result<Config, RedisError> unix(string path) {
+        Optional<RedisError> bad = checkPath(path: path);
+        match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        Config c = Config.blank(kind: UrlTransport::Unix);
+        c.pathText = give path;
+        return Result::Ok(value: give c);
+    }
+
+    // AUTH's user and password. With no user, the password is the `default` user's, as `requirepass` sets it.
+    public fn Result<Unit, RedisError> setAuth(Optional<string> user, string password) {
+        if (password.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the password is empty: an empty password authenticates no one, so leave it out")); }
+        bool emptyUser = match (user) { case Some(value: u): u.length() == 0; case None: false; };
+        if (emptyUser) { return Result::Err(error: RedisError::Config(detail: "the user is empty: give a user, or none for the default user")); }
+        this.userName = give user;
+        this.secret = Optional::Some(value: give password);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The database to SELECT. 0, the server's default, sends no SELECT. The server refuses one past its last.
+    public fn Result<Unit, RedisError> setDatabase(int64 db) {
+        if (db < 0i64) { return Result::Err(error: RedisError::Config(detail: "the database is a number from 0")); }
+        this.dbIndex = db;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // RESP3 only, or RESP2 only. Without this, a connection speaks RESP3, or RESP2 where the server refuses HELLO.
+    public fn void setProtocol(Protocol protocol) { this.protocolChoice = Optional::Some(value: protocol); }
+
+    // The connection's name, as CLIENT SETNAME sets it.
+    public fn Result<Unit, RedisError> setClientName(string name) {
+        Optional<RedisError> bad = checkName(name: name.bytes(), what: "client_name");
+        match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        this.nameText = Optional::Some(value: give name);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // How long each address may take to connect and finish the handshake. Zero is no limit.
+    public fn Result<Unit, RedisError> setConnectTimeout(Duration timeout) {
+        if (timeout.isNegative()) { return Result::Err(error: RedisError::Config(detail: "connect_timeout cannot be negative: 0 is no limit")); }
+        this.connectLimit = timeout;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // How long a call may take, from the first byte written to the last byte of the reply. Zero is no limit.
+    public fn Result<Unit, RedisError> setCommandTimeout(Duration timeout) {
+        if (timeout.isNegative()) { return Result::Err(error: RedisError::Config(detail: "command_timeout cannot be negative: 0 is no limit")); }
+        this.commandLimit = timeout;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // TCP keepalive, in whole seconds, as hiredis's redisKeepAlive takes it. Zero turns it off.
+    public fn Result<Unit, RedisError> setKeepAlive(Duration interval) {
+        int64 n = interval.asNanos();
+        if (n < 0i64 || n % 1000000000i64 != 0i64 || interval.asSecs() > MAX_KEEPALIVE_SECS) {
+            return Result::Err(error: keepAliveRefused());
+        }
+        this.keepAliveIdle = interval;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The bounds on what the server may send (resp::Limits).
+    public fn void setLimits(Limits limits) { this.readerLimits = limits; }
+
+    // Whether the connection names this library to the server (CLIENT SETINFO lib-name and lib-ver). On by default.
+    public fn void setIdentity(bool on) { this.identify = on; }
+
+    // TCP, or a Unix-domain socket. (TLS waits for phase 5.)
+    public const fn UrlTransport transport() { return this.kind; }
+    // The host as given, without brackets ("127.0.0.1" when none was); "" for a socket.
+    public const fn const ref string host() { return this.hostText; }
+    public const fn int32 port() { return this.portNumber; }
+    // The socket's path; "" for TCP.
+    public const fn const ref string socketPath() { return this.pathText; }
+    public const fn Optional<string> user() { return copy this.userName; }
+    public const fn Optional<string> password() { return copy this.secret; }
+    public const fn int64 database() { return this.dbIndex; }
+    // The protocol asked for; None to speak RESP3, or RESP2 where the server refuses HELLO.
+    public const fn Optional<Protocol> protocol() { return this.protocolChoice; }
+    public const fn Optional<string> clientName() { return copy this.nameText; }
+    public const fn Duration connectTimeout() { return this.connectLimit; }
+    public const fn Duration commandTimeout() { return this.commandLimit; }
+    // The keepalive's idle time; zero when it is off.
+    public const fn Duration keepAlive() { return this.keepAliveIdle; }
+    public const fn Limits limits() { return this.readerLimits; }
+    public const fn bool identity() { return this.identify; }
+
+    // One URL option; None when it was honoured.
+    fn Optional<RedisError> option(const ref string key, const ref string value) {
+        if (key == "protocol") {
+            if (value == "2") { this.protocolChoice = Optional::Some(value: Protocol::Resp2); return Optional::None; }
+            if (value == "3") { this.protocolChoice = Optional::Some(value: Protocol::Resp3); return Optional::None; }
+            return refused(m: "protocol is 2 or 3: protocol=3");
+        }
+        if (key == "connect_timeout" || key == "command_timeout") {
+            Optional<Duration> d = seconds(b: value.bytes());
+            Duration t = match (d) {
+                case Some(value: v): v;
+                case None: { return refused(m: key.concat(other: " is seconds, to the millisecond, and 0 for no limit: ").concat(other: key).concat(other: "=2.5")); }
+            };
+            if (key == "connect_timeout") { this.connectLimit = t; } else { this.commandLimit = t; }
+            return Optional::None;
+        }
+        if (key == "client_name") {
+            Optional<RedisError> bad = checkName(name: value.bytes(), what: "client_name");
+            match (give bad) { case Some(value: e): { return Optional::Some(value: give e); } case None: { } };
+            this.nameText = Optional::Some(value: copy value);
+            return Optional::None;
+        }
+        if (key == "keepalive") {
+            Optional<int64> n = wholeSeconds(b: value.bytes());
+            int64 secs = match (n) { case Some(value: v): v; case None: -1i64; };
+            if (secs < 0i64 || secs > MAX_KEEPALIVE_SECS) { return Optional::Some(value: keepAliveRefused()); }
+            this.keepAliveIdle = Duration.fromSecs(s: secs);
+            return Optional::None;
+        }
+        // RedisUrl has read a unix:// URL's database already.
+        if (key == "db" && this.kind == UrlTransport::Unix) { return Optional::None; }
+        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive"));
+    }
+}
+
+fn Optional<RedisError> refused(const ref string m) { return Optional::Some(value: RedisError::Config(detail: copy m)); }
+
+fn RedisError tlsRefused() {
+    return RedisError::Config(detail: "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://");
+}
+
+fn RedisError keepAliveRefused() {
+    return RedisError::Config(detail: "keepalive is whole seconds up to 32767, and 0 for off: keepalive=15");
+}
+
+// The server's rule for a client name (validateClientName in networking.c): the bytes ! to ~. An empty name would
+// set none, so it is refused rather than sent.
+fn Optional<RedisError> checkName(ConstView<uint8> name, const ref string what) {
+    if (name.length() == 0) { return refused(m: what.concat(other: " is empty: an empty name sets none, so leave it out")); }
+    isize i = 0;
+    while (i < name.length()) {
+        if (name[i] < 33ui8 || name[i] > 126ui8) {
+            return refused(m: what.concat(other: " cannot contain spaces, newlines or special characters: the server takes the bytes ! to ~"));
+        }
+        i = i + 1;
+    }
+    return Optional::None;
+}
+
+fn Optional<RedisError> checkPath(const ref string path) {
+    if (path.length() == 0) { return refused(m: "the socket path is empty"); }
+    if (path.length() > socketPathMax()) {
+        isize most = socketPathMax();
+        return refused(m: "the socket path is longer than the ${most} bytes this platform's sockets take");
+    }
+    return Optional::None;
+}
+
+// Seconds as a decimal number, to the millisecond: "5", "0.25", "2.5"; at most nine digits before the point.
+fn Optional<Duration> seconds(ConstView<uint8> b) {
+    isize n = b.length();
+    isize i = 0;
+    int64 whole = 0i64;
+    while (i < n && b[i] >= 48ui8 && b[i] <= 57ui8) {
+        whole = whole * 10i64 + cast<int64>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    if (i == 0 || i > MAX_SECONDS_DIGITS) { return Optional::None; }
+    int64 millis = 0i64;
+    if (i < n) {
+        if (b[i] != 46ui8) { return Optional::None; }
+        i = i + 1;
+        isize digits = 0;
+        while (i < n && b[i] >= 48ui8 && b[i] <= 57ui8 && digits < 3) {
+            millis = millis * 10i64 + cast<int64>(b[i] - 48ui8);
+            i = i + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0 || i < n) { return Optional::None; }
+        while (digits < 3) { millis = millis * 10i64; digits = digits + 1; }
+    }
+    return Optional::Some(value: Duration.fromMillis(ms: whole * 1000i64 + millis));
+}
+
+// Whole seconds: one or more digits, at most nine.
+fn Optional<int64> wholeSeconds(ConstView<uint8> b) {
+    if (b.length() == 0 || b.length() > MAX_SECONDS_DIGITS) { return Optional::None; }
+    int64 v = 0i64;
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] < 48ui8 || b[i] > 57ui8) { return Optional::None; }
+        v = v * 10i64 + cast<int64>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    return Optional::Some(value: v);
+}

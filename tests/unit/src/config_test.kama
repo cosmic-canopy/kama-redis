@@ -1,0 +1,182 @@
+// redis::Config. The URL's own reading is RedisUrl's (url_test.kama); these are the options this package decides
+// (src/config.kama's header, docs/ROADMAP.md "Phase 2"), each honoured or refused, and the typed setters.
+import { core::println, std::collections::DynamicArray, std::time::Duration, redis::Config, redis::Protocol,
+         redis::RedisError, redis::UrlTransport, redis::socketPathMax, redis_unit_tests::check };
+export { configTests };
+
+fn string refusal(const ref string url) {
+    Result<Config, RedisError> r = Config.parse(url: url);
+    return match (r) { case Ok(value: c): "accepted"; case Err(error: e): e.message(); };
+}
+
+fn bool accepted(const ref string url) { return refusal(url: url) == "accepted"; }
+
+fn Config parsed(const ref string url) {
+    Result<Config, RedisError> r = Config.parse(url: url);
+    Config c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "config_test: ${m}"); return parsed(url: "redis://"); }
+    };
+    return give c;
+}
+
+// `n` bytes of x.
+fn string xs(isize n) {
+    string s = "";
+    isize i = 0;
+    while (i < n) { s = s.concat(other: "x"); i = i + 1; }
+    return s;
+}
+
+fn int64 ms(Duration d) { return d.asMillis(); }
+
+fn bool refusedConfig(const ref Result<Config, RedisError> r) { return match (r) { case Ok(value: c): false; case Err(error: e): true; }; }
+fn bool refusedSetting(const ref Result<Unit, RedisError> r) { return match (r) { case Ok(value: u): false; case Err(error: e): true; }; }
+
+fn bool isNone(Optional<Protocol> p) { return match (p) { case Some(value: v): false; case None: true; }; }
+fn bool isProtocol(Optional<Protocol> p, int32 n) { return match (p) { case Some(value: v): v.number() == n; case None: false; }; }
+fn string orDash(Optional<string> s) { return match (s) { case Some(value: v): copy v; case None: "-"; }; }
+
+fn int32 defaultTests() {
+    int32 f = 0;
+    Config c = parsed(url: "redis://");
+    f = f + check(ok: c.transport() == UrlTransport::Tcp && c.host() == "127.0.0.1" && c.port() == 6379, what: "defaults: 127.0.0.1:6379 over TCP");
+    f = f + check(ok: c.database() == 0i64 && isNone(p: c.protocol()), what: "defaults: database 0, protocol unset");
+    f = f + check(ok: ms(d: c.connectTimeout()) == 5000i64 && ms(d: c.commandTimeout()) == 5000i64, what: "defaults: 5 s timeouts");
+    f = f + check(ok: c.keepAlive().asSecs() == 15i64, what: "defaults: keepalive 15 s, as redis-cli");
+    f = f + check(ok: c.identity() && orDash(s: c.clientName()) == "-" && orDash(s: c.user()) == "-" && orDash(s: c.password()) == "-",
+                  what: "defaults: identity on, no name, no credentials");
+    f = f + check(ok: c.limits().maxDepth == 1024, what: "defaults: the reader's limits");
+    return f;
+}
+
+fn int32 optionTests() {
+    int32 f = 0;
+    Config c = parsed(url: "redis://kr_acl:kr_acl_pw@example.com:6390/3?protocol=2&connect_timeout=2.5&command_timeout=0&client_name=app-1&keepalive=0");
+    f = f + check(ok: c.host() == "example.com" && c.port() == 6390 && c.database() == 3i64, what: "options: host, port, database");
+    f = f + check(ok: orDash(s: c.user()) == "kr_acl" && orDash(s: c.password()) == "kr_acl_pw", what: "options: user and password");
+    f = f + check(ok: isProtocol(p: c.protocol(), n: 2), what: "options: protocol=2");
+    f = f + check(ok: ms(d: c.connectTimeout()) == 2500i64 && ms(d: c.commandTimeout()) == 0i64, what: "options: timeouts");
+    f = f + check(ok: orDash(s: c.clientName()) == "app-1" && c.keepAlive().asNanos() == 0i64, what: "options: client_name, keepalive off");
+
+    Config v = parsed(url: "valkey://:secret@[::1]/1?protocol=3&keepalive=32767");
+    f = f + check(ok: v.host() == "::1" && orDash(s: v.user()) == "-" && orDash(s: v.password()) == "secret", what: "options: valkey://, a password alone, IPv6");
+    f = f + check(ok: isProtocol(p: v.protocol(), n: 3) && v.keepAlive().asSecs() == 32767i64, what: "options: protocol=3, the largest keepalive");
+
+    Config u = parsed(url: "unix:///tmp/redis.sock?db=2&command_timeout=0.001");
+    f = f + check(ok: u.transport() == UrlTransport::Unix && u.socketPath() == "/tmp/redis.sock" && u.database() == 2i64, what: "options: unix:// and ?db=");
+    f = f + check(ok: ms(d: u.commandTimeout()) == 1i64, what: "options: a millisecond");
+    return f;
+}
+
+fn int32 refusalTests() {
+    int32 f = 0;
+    string tls = "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://";
+    f = f + check(ok: refusal(url: "rediss://host") == tls && refusal(url: "valkeys://host") == tls, what: "refused: TLS, never plaintext instead");
+    string unknown = refusal(url: "redis://host?socket_timeout=1");
+    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive",
+                  what: "refused: an unknown option: ${unknown}");
+    f = f + check(ok: !accepted(url: "redis://host?dial_timeout=1") && !accepted(url: "redis://host?timeout=1"), what: "refused: other clients' names");
+    f = f + check(ok: refusal(url: "http://host").startsWith(prefix: "not a URL") || refusal(url: "http://host").startsWith(prefix: "unknown scheme"), what: "refused: RedisUrl's refusal passes through");
+
+    DynamicArray<string> protocols = DynamicArray.empty();
+    protocols.add(item: "1"); protocols.add(item: "4"); protocols.add(item: "resp3"); protocols.add(item: ""); protocols.add(item: "03");
+    isize i = 0;
+    while (i < protocols.length()) {
+        string p = copy protocols[i];
+        string m = refusal(url: "redis://host?protocol=".concat(other: p));
+        f = f + check(ok: m == "protocol is 2 or 3: protocol=3", what: "refused: protocol=${p}: ${m}");
+        i = i + 1;
+    }
+
+    DynamicArray<string> badTimes = DynamicArray.empty();
+    badTimes.add(item: "2s"); badTimes.add(item: "-1"); badTimes.add(item: ""); badTimes.add(item: "1."); badTimes.add(item: ".5");
+    badTimes.add(item: "1.2345"); badTimes.add(item: "1e3"); badTimes.add(item: "1234567890"); badTimes.add(item: "%201"); badTimes.add(item: "1,5");
+    i = 0;
+    while (i < badTimes.length()) {
+        string t = copy badTimes[i];
+        string m = refusal(url: "redis://host?connect_timeout=".concat(other: t));
+        f = f + check(ok: m == "connect_timeout is seconds, to the millisecond, and 0 for no limit: connect_timeout=2.5", what: "refused: connect_timeout=${t}: ${m}");
+        string n = refusal(url: "redis://host?command_timeout=".concat(other: t));
+        f = f + check(ok: n == "command_timeout is seconds, to the millisecond, and 0 for no limit: command_timeout=2.5", what: "refused: command_timeout=${t}");
+        i = i + 1;
+    }
+    Config big = parsed(url: "redis://host?connect_timeout=999999999.999");
+    f = f + check(ok: big.connectTimeout().asMillis() == 999999999999i64, what: "accepted: nine digits of seconds");
+
+    DynamicArray<string> badKeep = DynamicArray.empty();
+    badKeep.add(item: "1.5"); badKeep.add(item: "-1"); badKeep.add(item: ""); badKeep.add(item: "32768"); badKeep.add(item: "abc");
+    i = 0;
+    while (i < badKeep.length()) {
+        string k = copy badKeep[i];
+        string m = refusal(url: "redis://host?keepalive=".concat(other: k));
+        f = f + check(ok: m == "keepalive is whole seconds up to 32767, and 0 for off: keepalive=15", what: "refused: keepalive=${k}: ${m}");
+        i = i + 1;
+    }
+
+    string spaced = "client_name cannot contain spaces, newlines or special characters: the server takes the bytes ! to ~";
+    f = f + check(ok: refusal(url: "redis://host?client_name=a%20b") == spaced, what: "refused: a client_name with a space");
+    f = f + check(ok: refusal(url: "redis://host?client_name=a%0Ab") == spaced, what: "refused: a client_name with a newline");
+    f = f + check(ok: refusal(url: "redis://host?client_name=%C3%A9") == spaced, what: "refused: a client_name past ~");
+    f = f + check(ok: refusal(url: "redis://host?client_name=") == "client_name is empty: an empty name sets none, so leave it out", what: "refused: an empty client_name");
+    f = f + check(ok: accepted(url: "redis://host?client_name=!~"), what: "accepted: a client_name of ! and ~");
+
+    string longPath = "unix:///".concat(other: xs(n: socketPathMax()));
+    f = f + check(ok: refusal(url: longPath).startsWith(prefix: "the socket path is longer than the "), what: "refused: a socket path too long");
+    string fitting = "unix://".concat(other: "/".concat(other: xs(n: socketPathMax() - 1)));
+    f = f + check(ok: accepted(url: fitting), what: "accepted: a socket path of the longest length");
+    return f;
+}
+
+fn int32 setterTests() {
+    int32 f = 0;
+    Result<Config, RedisError> noHost = Config.tcp(host: "", port: 6379);
+    f = f + check(ok: refusedConfig(r: noHost), what: "tcp: an empty host is refused");
+    Result<Config, RedisError> port0 = Config.tcp(host: "h", port: 0);
+    Result<Config, RedisError> portBig = Config.tcp(host: "h", port: 65536);
+    f = f + check(ok: refusedConfig(r: port0) && refusedConfig(r: portBig),
+                  what: "tcp: a port outside 1 to 65535 is refused");
+    Result<Config, RedisError> noPath = Config.unix(path: "");
+    Result<Config, RedisError> longPath = Config.unix(path: "/".concat(other: xs(n: socketPathMax())));
+    f = f + check(ok: refusedConfig(r: noPath) && refusedConfig(r: longPath),
+                  what: "unix: an empty or too long path is refused");
+
+    Result<Config, RedisError> made = Config.tcp(host: "example.com", port: 6380);
+    Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "config_test: tcp"); return 1; } };
+    f = f + check(ok: c.host() == "example.com" && c.port() == 6380 && c.transport() == UrlTransport::Tcp, what: "tcp: host and port");
+
+    Result<Unit, RedisError> emptyPw = c.setAuth(user: Optional::None, password: "");
+    f = f + check(ok: refusedSetting(r: emptyPw), what: "setAuth: an empty password is refused");
+    Result<Unit, RedisError> emptyUser = c.setAuth(user: Optional::Some(value: ""), password: "pw");
+    f = f + check(ok: refusedSetting(r: emptyUser), what: "setAuth: an empty user is refused");
+    Result<Unit, RedisError> auth = c.setAuth(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw");
+    f = f + check(ok: !refusedSetting(r: auth) && orDash(s: c.user()) == "kr_acl", what: "setAuth: a user and password");
+
+    Result<Unit, RedisError> negDb = c.setDatabase(db: -1i64);
+    f = f + check(ok: refusedSetting(r: negDb), what: "setDatabase: below 0 is refused");
+    Result<Unit, RedisError> spaced = c.setClientName(name: "a b");
+    f = f + check(ok: refusedSetting(r: spaced), what: "setClientName: a space is refused");
+    Result<Unit, RedisError> negWait = c.setConnectTimeout(timeout: Duration.fromMillis(ms: -1i64));
+    f = f + check(ok: refusedSetting(r: negWait), what: "setConnectTimeout: negative is refused");
+    Result<Unit, RedisError> noWait = c.setCommandTimeout(timeout: Duration.zero());
+    f = f + check(ok: !refusedSetting(r: noWait) && c.commandTimeout().asNanos() == 0i64, what: "setCommandTimeout: zero is no limit");
+    Result<Unit, RedisError> partKeep = c.setKeepAlive(interval: Duration.fromMillis(ms: 1500i64));
+    Result<Unit, RedisError> bigKeep = c.setKeepAlive(interval: Duration.fromSecs(s: 32768i64));
+    f = f + check(ok: refusedSetting(r: partKeep) && refusedSetting(r: bigKeep),
+                  what: "setKeepAlive: a part of a second, or past 32767, is refused");
+    c.setProtocol(protocol: Protocol::Resp2);
+    c.setIdentity(on: false);
+    Config twin = copy c;
+    f = f + check(ok: isProtocol(p: twin.protocol(), n: 2) && !twin.identity() && orDash(s: twin.password()) == "kr_acl_pw" && twin.port() == 6380,
+                  what: "copy: every setting");
+    return f;
+}
+
+fn int32 configTests() {
+    int32 f = 0;
+    f = f + defaultTests();
+    f = f + optionTests();
+    f = f + refusalTests();
+    f = f + setterTests();
+    return f;
+}
