@@ -1,0 +1,53 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, redis::resp::Writer };
+export { Command };
+
+// One command: its name and arguments, each a whole RESP bulk string, never text spliced into other text. A
+// connection sends it as RESP's array of bulk strings, the only shape a client sends.
+//
+//   Command c = Command.of(name: "SET");
+//   c.arg(text: key);
+//   c.argBytes(bytes: payload.view());
+//   c.arg(text: "EX");
+//   c.argInt(value: 10i64);
+//
+// Phase 3 builds typed arguments (`RedisArg`) and the `cmd"…"` tag on this.
+type resource Command implements Sendable {
+    DynamicArray<DynamicArray<uint8>> parts;
+
+    // A command named `name` ("GET", "CLIENT"), with no arguments yet.
+    public ctor of(const ref string name) {
+        this.parts = DynamicArray.empty();
+        this.arg(text: name);
+    }
+
+    // An argument: the text's bytes.
+    public fn void arg(const ref string text) { this.argBytes(bytes: text.bytes()); }
+
+    // An argument: any bytes, as they are.
+    public fn void argBytes(ConstView<uint8> bytes) {
+        DynamicArray<uint8> one = DynamicArray.withCapacity(capacity: bytes.length());
+        one.addAll(items: bytes);
+        this.parts.add(item: give one);
+    }
+
+    // An argument: a decimal integer, as the server reads one.
+    public fn void argInt(int64 value) {
+        string digits = i64Str(v: value);
+        this.argBytes(bytes: digits.bytes());
+    }
+
+    // How many parts it has, the name included.
+    public const fn isize length() { return this.parts.length(); }
+    // Part `index`: 0 is the name.
+    public const fn ConstView<uint8> part(isize index) { return this.parts[index].view(); }
+
+    // Write it as RESP: an array of bulk strings.
+    public const fn void encode(ref Writer into) {
+        into.arrayHeader(count: this.parts.length());
+        isize i = 0;
+        while (i < this.parts.length()) {
+            into.bulk(bytes: this.parts[i].view());
+            i = i + 1;
+        }
+    }
+}

@@ -1,0 +1,241 @@
+// A scripted server, in memory: a `Transport` a connection runs over as it would a socket, with no network and no
+// clock. It reads each command the client sends (with resp::Reader, as a server would) and answers it with the next
+// step of its script. The replies a script plays are real servers' bytes (server_vectors.kama), never typed here.
+//
+// Every connection test runs it at `chunk: 1` (the client reads one byte at a time) and `writeLimit: 3` (it writes
+// three at a time), so every test also proves framing across any split, and writes that come up short.
+//
+// Its `wait` never blocks: a wait with nothing to read comes back at once without the side asked for, which is how
+// a deadline passing looks to a connection. So a script that falls silent ends in `Timeout` at once, whatever the
+// timeout, and no test waits on a clock.
+import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::io::IoError,
+         std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::memory::Owned, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::Transport, redis::Dialer, redis::DialTarget, redis::RedisError,
+         redis::resp::Reader, redis::resp::Read, redis::resp::Value };
+export { FakeServer, Step, ScriptDialer, Dial };
+
+type enum Step implements Sendable {
+    // The client's next command must be exactly `args`; `reply` answers it. Any other command is answered with an
+    // error naming both, and the server hangs up.
+    Expect(DynamicArray<string> args, DynamicArray<uint8> reply),
+    // The client's next command, whatever it is, is answered with `reply`.
+    Any(DynamicArray<uint8> reply),
+    // Bytes the server sends of its own accord, as soon as the script reaches them: a push message.
+    Send(DynamicArray<uint8> bytes),
+    // The client's next command gets no answer, ever.
+    Silent,
+    // The client's next command is read, and the server closes the connection without answering it, as twemproxy
+    // does on a command it does not know.
+    Close,
+    // The server closes the connection as soon as the script reaches this step, once the client has read what was
+    // sent before it.
+    Hangup,
+    // The client's next command is answered with `reply`, but only after the client's next wait has come back empty.
+    Late(DynamicArray<uint8> reply);
+}
+
+type resource FakeServer implements Transport, Sendable {
+    DynamicArray<Step> steps;
+    isize next = 0;
+    DynamicArray<uint8> toClient;
+    isize readAt = 0;
+    Reader fromClient;
+    bool hungUp = false;
+    isize chunk = 1;
+    isize writeLimit = 3;
+    // With more than `backlog` bytes of its replies unread by the client, the server takes none of the client's
+    // bytes (a write would block, and the transport is not writable) until the client reads. -1: never.
+    isize backlog = -1;
+    DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
+
+    public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
+        this.steps = give steps;
+        this.toClient = DynamicArray.empty();
+        this.fromClient = Reader.make();
+        this.chunk = chunk;
+        this.writeLimit = writeLimit;
+        this.backlog = -1;
+        this.held = DynamicArray.empty();
+        this.advance();
+    }
+
+    // `make`, blocked on its own output past `backlog` bytes of unread replies.
+    public ctor jammed(DynamicArray<Step> steps, isize chunk, isize writeLimit, isize backlog) {
+        this.steps = give steps;
+        this.toClient = DynamicArray.empty();
+        this.fromClient = Reader.make();
+        this.chunk = chunk;
+        this.writeLimit = writeLimit;
+        this.backlog = backlog;
+        this.held = DynamicArray.empty();
+        this.advance();
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        isize available = this.toClient.length() - this.readAt;
+        if (available == 0) {
+            if (this.hungUp) { return Result::Ok(value: 0); }
+            return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock));
+        }
+        isize n = available;
+        if (n > this.chunk) { n = this.chunk; }
+        if (n > into.length()) { n = into.length(); }
+        isize i = 0;
+        while (i < n) { into[i] = this.toClient[this.readAt + i]; i = i + 1; }
+        this.readAt = this.readAt + n;
+        return Result::Ok(value: n);
+    }
+
+    fn bool blocked() { return this.backlog >= 0 && this.toClient.length() - this.readAt > this.backlog; }
+
+    // After a hangup, what the client still sends is lost, as it is on a socket whose peer has gone.
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        if (this.hungUp) { return Result::Ok(value: bytes.length()); }
+        if (this.blocked()) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        isize n = bytes.length();
+        if (n > this.writeLimit) { n = this.writeLimit; }
+        this.fromClient.feed(bytes: bytes.slice(from: 0, count: n));
+        this.serve();
+        return Result::Ok(value: n);
+    }
+
+    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (this.held.length() > 0) {
+            // This wait ends without the late reply; it is there for the next.
+            this.toClient.addAll(items: this.held.view());
+            this.held = DynamicArray.empty();
+            return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
+        }
+        bool readable = this.readAt < this.toClient.length() || this.hungUp;
+        return Result::Ok(value: Ready.of(readable: readable, writable: !this.blocked()));
+    }
+
+    public fn void shutdown() { }
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+
+    // Answer every whole command the client has sent with the next step.
+    unsafe fn void serve() {
+        while (!this.hungUp) {
+            Read r = this.fromClient.next();
+            match (give r) {
+                case Incomplete: { return; }
+                case Invalid(error: e): { this.hungUp = true; return; }
+                case Complete(value: v): { this.answer(args: argsOf(v: v)); }
+            };
+        }
+    }
+
+    unsafe fn void answer(DynamicArray<string> args) {
+        if (this.next >= this.steps.length()) { return; }
+        isize at = this.next;
+        this.next = this.next + 1;
+        match (this.steps[at]) {
+            case Expect(args: want, reply: r): {
+                if (sameArgs(a: want, b: args)) {
+                    this.toClient.addAll(items: r.view());
+                } else {
+                    string wanted = joined(args: want);
+                    string got = joined(args: args);
+                    string line = "-ERR fake server: expected [".concat(other: wanted).concat(other: "], got [").concat(other: got).concat(other: "]\r\n");
+                    this.toClient.addAll(items: line.bytes());
+                    this.hungUp = true;
+                    return;
+                }
+            }
+            case Any(reply: r): { this.toClient.addAll(items: r.view()); }
+            case Send(bytes: b): { this.toClient.addAll(items: b.view()); }
+            case Silent: { }
+            case Close: { this.hungUp = true; return; }
+            case Hangup: { this.hungUp = true; return; }
+            case Late(reply: r): { this.held.addAll(items: r.view()); }
+        };
+        this.advance();
+    }
+
+    // The steps that need no command: bytes sent of the server's own accord, and a hangup.
+    fn void advance() {
+        while (this.next < this.steps.length() && !this.hungUp) {
+            bool own = match (this.steps[this.next]) { case Send(bytes: b): true; case Hangup: true; case _: false; };
+            if (!own) { return; }
+            match (this.steps[this.next]) {
+                case Send(bytes: b): { this.toClient.addAll(items: b.view()); }
+                case _: { this.hungUp = true; }
+            };
+            this.next = this.next + 1;
+        }
+    }
+}
+
+// A command's arguments as text; a part that is not UTF-8 shows as "?".
+fn DynamicArray<string> argsOf(const ref Value v) {
+    DynamicArray<string> list = DynamicArray.empty();
+    match (v) {
+        case Array(items: parts): {
+            isize i = 0;
+            while (i < parts.length()) {
+                string text = match (parts[i]) {
+                    case Bulk(bytes: b): utf8OrMark(b: b.view());
+                    case _: "?";
+                };
+                list.add(item: give text);
+                i = i + 1;
+            }
+        }
+        case _: { list.add(item: "?"); }
+    };
+    return give list;
+}
+
+fn string utf8OrMark(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): "?"; };
+}
+
+fn bool sameArgs(const ref DynamicArray<string> a, const ref DynamicArray<string> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn string joined(const ref DynamicArray<string> args) {
+    string text = "";
+    isize i = 0;
+    while (i < args.length()) {
+        if (i > 0) { text = text.concat(other: " "); }
+        text = text.concat(other: args[i]);
+        i = i + 1;
+    }
+    return text;
+}
+
+// What one dial does: refuse, give up on its deadline, or connect to a scripted server.
+type enum Dial implements Sendable {
+    Refuse,
+    TimeOut,
+    Serve(DynamicArray<Step> steps);
+}
+
+// A `Dialer` that answers each dial with the next entry; with none left, it refuses as a closed port would.
+type resource ScriptDialer implements Dialer, Sendable {
+    DynamicArray<Dial> dials;
+
+    public ctor make(DynamicArray<Dial> dials) { this.dials = give dials; }
+
+    public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
+        if (this.dials.length() == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
+        Dial d = this.dials.remove(index: 0);
+        match (give d) {
+            case Refuse: { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
+            case TimeOut: { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+            case Serve(steps: s): {
+                Owned<Transport> fake = new FakeServer.make(steps: give s, chunk: 1, writeLimit: 3);
+                return Result::Ok(value: give fake);
+            }
+        };
+        return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused));
+    }
+}

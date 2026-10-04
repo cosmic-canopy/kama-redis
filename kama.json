@@ -16,6 +16,7 @@
   "modules": {
     ".": { "visibility": "public" },
     "resp": { "visibility": "public" },
-    "cluster": { "visibility": "public" }
+    "cluster": { "visibility": "public" },
+    "wire": { "visibility": "internal" }
   }
 }

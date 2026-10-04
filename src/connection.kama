@@ -1,0 +1,401 @@
+import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
+         std::net::SocketAddr, std::net::resolve, std::time::Duration,
+         redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
+         redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
+         redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
+         redis::wire::Wire, redis::wire::Deadline, redis::resp::Writer, redis::resp::Value };
+export { Connection, libraryName, libraryVersion };
+
+// One connection to a Redis or Valkey server. It belongs to one isolate at a time and moves between them whole.
+//
+// Connecting (docs/ROADMAP.md, "Phase 2", says why each step is as it is):
+//   1. The config's host resolves to its addresses, tried in the resolver's order; a unix:// config has its one
+//      socket. Each address gets `connect_timeout` for its connect and, once connected, the handshake. A failed
+//      connect moves on to the next address; once one connects, the handshake's outcome is the connect's.
+//   2. The handshake is one write and, normally, one round trip: HELLO 3 with AUTH and SETNAME, then SELECT and the
+//      two CLIENT SETINFOs that name this library. A server that refuses HELLO (a proxy) gets the RESP2 path on the
+//      same connection: AUTH, CLIENT SETNAME and SELECT. `protocol=2` goes straight to that path; `protocol=3`
+//      never takes it.
+//
+// After that, `call` sends one command and returns its reply. An error reply is `RedisError::Server`, and the
+// connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) closes
+// it, and every later call answers `Closed`.
+
+// This library's name and version, as CLIENT SETINFO's lib-name and lib-ver tell them to the server.
+// tools/test.sh checks the version against kama.json's.
+fn string libraryName() { return "kama-redis"; }
+fn string libraryVersion() { return "0.1.0"; }
+
+type resource Connection implements Sendable {
+    Wire wire;
+    Writer outbox;
+    bool live = false;
+    Protocol speaking;
+    // The server's HELLO, when the handshake sent one: zero or one.
+    DynamicArray<ServerInfo> identified;
+    // Push messages that arrived in place of a reply, oldest first. Phase 4 decides how they are read.
+    DynamicArray<Value> pushes;
+    Duration commandLimit;
+
+    ctor over(Owned<Transport> transport, const ref Config config) {
+        this.wire = Wire.over(transport: give transport, limits: config.limits());
+        this.outbox = Writer.make();
+        this.live = true;
+        this.speaking = Protocol::Resp3;
+        this.identified = DynamicArray.empty();
+        this.pushes = DynamicArray.empty();
+        this.commandLimit = config.commandTimeout();
+    }
+
+    // Connect to the server `config` names, over a socket of this client's.
+    public unsafe ctor Result<Connection, RedisError> connect(const ref Config config) {
+        Opener opener = Opener.builtIn(keepAlive: config.keepAlive());
+        return Connection.establish(config: config, opener: opener);
+    }
+
+    // `connect`, with each address's transport opened by `dialer` (a tunnel, a proxy) rather than by this client.
+    public unsafe ctor Result<Connection, RedisError> connectWith(Owned<Dialer> dialer, const ref Config config) {
+        Opener opener = Opener.through(dialer: give dialer);
+        return Connection.establish(config: config, opener: opener);
+    }
+
+    // The handshake over a transport the caller opened. `config` supplies everything but where to connect;
+    // `connect_timeout` bounds the handshake.
+    public unsafe ctor Result<Connection, RedisError> connectOver(Owned<Transport> transport, const ref Config config) {
+        Deadline deadline = Deadline.within(span: config.connectTimeout());
+        Connection c = Connection.over(transport: give transport, config: config);
+        Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
+        return match (give done) {
+            case Ok(value: u): Result::Ok(value: give c);
+            case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
+        };
+    }
+
+    unsafe ctor Result<Connection, RedisError> establish(const ref Config config, ref Opener opener) {
+        ConnectError failures = ConnectError.make();
+        DynamicArray<DialTarget> targets = Connection::targetsOf(config: config, failures: failures);
+        isize i = 0;
+        while (i < targets.length()) {
+            Deadline deadline = Deadline.within(span: config.connectTimeout());
+            Result<Owned<Transport>, IoError> opened = opener.open(target: targets[i], timeoutMs: deadline.remainingMs());
+            match (give opened) {
+                case Err(error: e): { failures.add(attempt: ConnectAttempt.make(place: targets[i].place(), failure: e)); }
+                case Ok(value: t): {
+                    Connection c = Connection.over(transport: give t, config: config);
+                    Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
+                    match (give done) {
+                        case Ok(value: u): { return Result::Ok(value: give c); }
+                        case Err(error: e): { Connection failed = give c; return Result::Err(error: give e); }
+                    };
+                }
+            };
+            i = i + 1;
+        }
+        return Result::Err(error: RedisError::Connect(error: give failures));
+    }
+
+    // Where `config` can be reached: its socket, or every address its host resolves to. A name that does not resolve
+    // is recorded as the one attempt, and there is nowhere to go.
+    static unsafe fn DynamicArray<DialTarget> targetsOf(const ref Config config, ref ConnectError failures) {
+        DynamicArray<DialTarget> targets = DynamicArray.empty();
+        if (config.transport() == UrlTransport::Unix) {
+            targets.add(item: DialTarget.overSocket(path: copy config.socketPath()));
+            return give targets;
+        }
+        uint16 port = cast<uint16>(config.port());
+        Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: config.host(), port: port);
+        match (give found) {
+            case Ok(value: all): {
+                isize i = 0;
+                while (i < all.length()) {
+                    targets.add(item: DialTarget.overTcp(host: copy config.host(), address: all[i]));
+                    i = i + 1;
+                }
+                if (all.length() == 0) {
+                    failures.add(attempt: ConnectAttempt.make(place: hostAndPort(config: config), failure: IoError.of(kind: IoErrorKind::NotFound)));
+                }
+            }
+            case Err(error: e): { failures.add(attempt: ConnectAttempt.make(place: hostAndPort(config: config), failure: e)); }
+        };
+        return give targets;
+    }
+
+    // Send `command` and return its reply. An error reply is `Server`, and the connection is still usable; an error
+    // inside a reply (one of EXEC's) stays a `Value::Error` there. A push message that comes in place of the reply
+    // is set aside, never taken for it.
+    public unsafe fn Result<Value, RedisError> call(const ref Command command) {
+        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        Deadline deadline = Deadline.within(span: this.commandLimit);
+        this.outbox.clear();
+        command.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        while (true) {
+            Result<Value, RedisError> got = this.wire.receive(deadline: deadline);
+            Value v = match (give got) {
+                case Ok(value: x): give x;
+                case Err(error: e): { this.lose(); return Result::Err(error: give e); }
+            };
+            bool push = match (v) { case Push(items: p): true; case _: false; };
+            if (push) {
+                this.pushes.add(item: give v);
+                continue;
+            }
+            if (v.isError()) {
+                ServerError refused = serverError(v: v);
+                Value dropped = give v;
+                return Result::Err(error: RedisError::Server(error: give refused));
+            }
+            return Result::Ok(value: give v);
+        }
+        return Result::Err(error: RedisError::Closed);
+    }
+
+    // Close the connection. It sends no QUIT, which is deprecated since 7.2. Closing twice is harmless.
+    public unsafe fn void close() { this.lose(); }
+
+    public const fn bool isClosed() { return !this.live; }
+
+    // The protocol the handshake settled on.
+    public const fn Protocol protocol() { return this.speaking; }
+
+    // What the server said of itself in its HELLO reply; None when the handshake took the RESP2 path, which sends
+    // no HELLO.
+    public const fn Optional<ServerInfo> server() {
+        if (this.identified.length() == 0) { return Optional::None; }
+        return Optional::Some(value: copy this.identified[0]);
+    }
+
+    // How many push messages have been set aside. (Phase 4 decides how they are read.)
+    public const fn isize pendingPushes() { return this.pushes.length(); }
+
+    // How long each later call may take; zero is no limit. It starts as the config's `command_timeout`.
+    public fn Result<Unit, RedisError> setCommandTimeout(Duration timeout) {
+        if (timeout.isNegative()) { return Result::Err(error: RedisError::Config(detail: "command_timeout cannot be negative: 0 is no limit")); }
+        this.commandLimit = timeout;
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn Duration commandTimeout() { return this.commandLimit; }
+
+    unsafe ~Connection() { this.close(); }
+
+    // HELLO, then what follows it in the same write (docs/ROADMAP.md, "Phase 2", "The handshake is one round trip").
+    unsafe fn Result<Unit, RedisError> handshake(const ref Config config, Deadline deadline) {
+        Optional<Protocol> asked = config.protocol();
+        bool resp2 = match (asked) { case Some(value: p): p == Protocol::Resp2; case None: false; };
+        if (resp2) { return this.resp2Handshake(config: config, deadline: deadline); }
+        bool required = match (asked) { case Some(value: p): true; case None: false; };
+
+        Command hello = Command.of(name: "HELLO");
+        hello.arg(text: "3");
+        Optional<string> password = config.password();
+        bool carriesAuth = false;
+        match (password) {
+            case Some(value: pw): {
+                Optional<string> user = config.user();
+                string name = match (user) { case Some(value: u): copy u; case None: "default"; };
+                hello.arg(text: "AUTH");
+                hello.arg(text: name);
+                hello.arg(text: pw);
+                carriesAuth = true;
+            }
+            case None: { }
+        };
+        Optional<string> clientName = config.clientName();
+        match (clientName) { case Some(value: n): { hello.arg(text: "SETNAME"); hello.arg(text: n); } case None: { } };
+        this.outbox.clear();
+        hello.encode(into: this.outbox);
+        isize after = 0;
+        bool selecting = config.database() != 0i64;
+        if (selecting) {
+            Command select = Command.of(name: "SELECT");
+            select.argInt(value: config.database());
+            select.encode(into: this.outbox);
+            after = after + 1;
+        }
+        bool identifying = config.identity();
+        if (identifying) {
+            Command libName = Command.of(name: "CLIENT");
+            libName.arg(text: "SETINFO"); libName.arg(text: "LIB-NAME"); libName.arg(text: libraryName());
+            libName.encode(into: this.outbox);
+            Command libVer = Command.of(name: "CLIENT");
+            libVer.arg(text: "SETINFO"); libVer.arg(text: "LIB-VER"); libVer.arg(text: libraryVersion());
+            libVer.encode(into: this.outbox);
+            after = after + 2;
+        }
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+
+        Result<Value, RedisError> first = this.wire.receive(deadline: deadline);
+        Value reply = match (give first) {
+            case Ok(value: v): give v;
+            case Err(error: e): { this.lose(); return Result::Err(error: helloFailure(e: give e)); }
+        };
+        if (reply.isError()) {
+            ServerError refused = serverError(v: reply);
+            bool fatal = match (refused.code()) {
+                case WrongPass: true;
+                case NoPerm: true;
+                // A server wants a password and none was given. A NOAUTH to a HELLO that carried AUTH means the peer
+                // never read it (Envoy checks its password before it looks at HELLO).
+                case NoAuth: !carriesAuth;
+                case _: required;
+            };
+            if (fatal) { this.lose(); return Result::Err(error: RedisError::Server(error: give refused)); }
+            // HELLO is not supported here: drop the rest of the write's replies, then the RESP2 path.
+            isize k = 0;
+            while (k < after) {
+                Result<Value, RedisError> dropped = this.wire.receive(deadline: deadline);
+                match (give dropped) { case Ok(value: v): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+                k = k + 1;
+            }
+            return this.resp2Handshake(config: config, deadline: deadline);
+        }
+        Result<ServerInfo, RedisError> read = ServerInfo.fromHello(reply: give reply);
+        ServerInfo info = match (give read) {
+            case Ok(value: i): give i;
+            case Err(error: why): { this.lose(); return Result::Err(error: give why); }
+        };
+        int64 proto = info.proto();
+        if (proto != 3i64) {
+            this.lose();
+            return Result::Err(error: RedisError::Unexpected(detail: "the server answered HELLO 3 with protocol ${proto}"));
+        }
+        if (selecting) {
+            Result<Unit, RedisError> chosen = this.expectOk(what: "SELECT", deadline: deadline);
+            match (give chosen) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        }
+        if (identifying) {
+            // CLIENT SETINFO's own documentation asks clients to ignore its failure: a server before 7.2 lacks it.
+            isize k = 0;
+            while (k < 2) {
+                Result<Value, RedisError> named = this.wire.receive(deadline: deadline);
+                match (give named) { case Ok(value: v): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+                k = k + 1;
+            }
+        }
+        this.speaking = Protocol::Resp3;
+        this.identified.add(item: give info);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The RESP2 path: AUTH, CLIENT SETNAME and SELECT, each only when needed, in one write; each must answer OK.
+    // No CLIENT SETINFO, because twemproxy closes the connection on any CLIENT command it was not asked for.
+    unsafe fn Result<Unit, RedisError> resp2Handshake(const ref Config config, Deadline deadline) {
+        this.outbox.clear();
+        DynamicArray<string> steps = DynamicArray.empty();
+        Optional<string> password = config.password();
+        match (password) {
+            case Some(value: pw): {
+                Command auth = Command.of(name: "AUTH");
+                Optional<string> user = config.user();
+                match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
+                auth.arg(text: pw);
+                auth.encode(into: this.outbox);
+                steps.add(item: "AUTH");
+            }
+            case None: { }
+        };
+        Optional<string> clientName = config.clientName();
+        match (clientName) {
+            case Some(value: n): {
+                Command setName = Command.of(name: "CLIENT");
+                setName.arg(text: "SETNAME");
+                setName.arg(text: n);
+                setName.encode(into: this.outbox);
+                steps.add(item: "CLIENT SETNAME");
+            }
+            case None: { }
+        };
+        if (config.database() != 0i64) {
+            Command select = Command.of(name: "SELECT");
+            select.argInt(value: config.database());
+            select.encode(into: this.outbox);
+            steps.add(item: "SELECT");
+        }
+        this.speaking = Protocol::Resp2;
+        if (steps.length() == 0) { return Result::Ok(value: Unit::Unit); }
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        isize i = 0;
+        while (i < steps.length()) {
+            Result<Unit, RedisError> ok = this.expectOk(what: steps[i], deadline: deadline);
+            match (give ok) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            i = i + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The next reply, which must be OK: an error reply is `Server`, anything else `Unexpected`.
+    unsafe fn Result<Unit, RedisError> expectOk(const ref string what, Deadline deadline) {
+        Result<Value, RedisError> got = this.wire.receive(deadline: deadline);
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (v.isError()) { return Result::Err(error: RedisError::Server(error: serverError(v: v))); }
+        bool ok = match (v) { case Simple(bytes: b): b.length() == 2 && b[0] == 79ui8 && b[1] == 75ui8; case _: false; };
+        if (!ok) { return Result::Err(error: RedisError::Unexpected(detail: what.concat(other: " answered with something other than OK"))); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The connection is unusable: stop the transport, and answer `Closed` from now on.
+    unsafe fn void lose() {
+        if (!this.live) { return; }
+        this.live = false;
+        this.wire.shutdown();
+    }
+}
+
+// The error a `Value::Error` holds.
+fn ServerError serverError(const ref Value v) {
+    return match (v) {
+        case Error(bytes: b): ServerError.of(bytes: b.view());
+        case _: ServerError.of(bytes: "".bytes());
+    };
+}
+
+// A hangup in answer to HELLO says what it most likely means.
+fn RedisError helloFailure(RedisError e) {
+    bool eof = match (e) { case Io(error: x): match (x.kind()) { case UnexpectedEof: true; case _: false; }; case _: false; };
+    if (!eof) { return give e; }
+    return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. A proxy that does not know HELLO, such as twemproxy, closes the connection: connect to one with protocol=2");
+}
+
+// "host:port", the host in brackets when it is an IPv6 address.
+fn string hostAndPort(const ref Config config) {
+    int32 port = config.port();
+    string host = copy config.host();
+    if (host.contains(substring: ":")) { host = "[".concat(other: host).concat(other: "]"); }
+    return "${host}:${port}";
+}
+
+// Opens one address's transport: a socket of this client's, or the caller's dialer.
+type resource Opener implements Sendable {
+    DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
+    Duration keepIdle;
+
+    public ctor builtIn(Duration keepAlive) { this.dialers = DynamicArray.empty(); this.keepIdle = keepAlive; }
+    public ctor through(Owned<Dialer> dialer) {
+        this.dialers = DynamicArray.empty();
+        this.dialers.add(item: give dialer);
+        this.keepIdle = Duration.zero();
+    }
+
+    public unsafe fn Result<Owned<Transport>, IoError> open(const ref DialTarget target, int32 timeoutMs) {
+        if (this.dialers.length() > 0) { return this.dialers[0].dial(target: target, timeoutMs: timeoutMs); }
+        if (target.isSocket()) {
+            Result<Owned<UnixTransport>, IoError> local = new UnixTransport.connect(path: target.socketPath(), timeoutMs: timeoutMs);
+            Owned<UnixTransport> unix = match (give local) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: e); } };
+            Owned<Transport> socket = give unix;
+            return Result::Ok(value: give socket);
+        }
+        Optional<SocketAddr> at = target.address();
+        SocketAddr address = match (at) { case Some(value: a): a; case None: { return Result::Err(error: IoError.of(kind: IoErrorKind::InvalidInput)); } };
+        Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: address, timeoutMs: timeoutMs);
+        Owned<TcpTransport> tcp = match (give made) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: e); } };
+        if (this.keepIdle.asNanos() > 0i64) {
+            Result<Unit, IoError> kept = tcp.keepAlive(idle: this.keepIdle);
+            match (kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        Owned<Transport> transport = give tcp;
+        return Result::Ok(value: give transport);
+    }
+}

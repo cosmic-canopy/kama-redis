@@ -1,0 +1,151 @@
+import { std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::memory::Owned, std::net::Interest,
+         std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
+         redis::Transport, redis::RedisError, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
+         redis::resp::Limits };
+export { Wire, Deadline };
+
+// redis::wire — RESP over a `Transport`: replies read as they arrive, straight into the reader's buffer
+// (`resp::Reader.spare`/`commit`), and requests written out, each step bounded by a deadline. Internal: a
+// connection is the only user.
+
+// When a wait must end: never, or at an instant of the monotonic clock.
+type value Deadline implements Sendable {
+    bool bounded = false;
+    Instant at;
+
+    public ctor none() { this.bounded = false; this.at = Instant.of(rawNanos: 0ui64); }
+    public unsafe ctor after(Duration span) { this.bounded = true; this.at = monotonicNow() + span; }
+    // `after(span)`, or `none()` for a zero span, which is how a setting says "no limit".
+    public unsafe ctor within(Duration span) {
+        this.bounded = span.asNanos() > 0i64;
+        this.at = Instant.of(rawNanos: 0ui64);
+        if (this.bounded) { this.at = monotonicNow() + span; }
+    }
+
+    public const fn bool isBounded() { return this.bounded; }
+
+    // What `Transport.wait` takes: -1 for no limit, else the milliseconds left, rounded up so a wait never ends
+    // just short of the deadline and spins; 0 once it has passed.
+    public unsafe const fn int32 remainingMs() {
+        if (!this.bounded) { return -1; }
+        Instant now = monotonicNow();
+        if (now >= this.at) { return 0; }
+        int64 nanos = (this.at - now).asNanos();
+        int64 ms = (nanos + 999999i64) / 1000000i64;
+        if (ms > 2147483647i64) { return 2147483647; }
+        return cast<int32>(ms);
+    }
+}
+
+// How much room a read asks the reader for: hiredis's own read size.
+comptime isize READ_BYTES = 16384;
+
+type resource Wire implements Sendable {
+    Owned<Transport> link;
+    Reader reader;
+
+    public ctor over(Owned<Transport> transport, Limits limits) {
+        this.link = give transport;
+        this.reader = Reader.withLimits(limits: limits);
+    }
+
+    // The next value from the server, once all its bytes have come. Bytes that break RESP are `Protocol`, and the
+    // reader answers the same from then on: nothing says where the next reply starts.
+    public unsafe fn Result<Value, RedisError> receive(Deadline deadline) {
+        while (true) {
+            Read r = this.reader.next();
+            match (give r) {
+                case Complete(value: v): { return Result::Ok(value: give v); }
+                case Invalid(error: e): { return Result::Err(error: RedisError::Protocol(error: e)); }
+                case Incomplete: {
+                    Result<Unit, RedisError> filled = this.fill(deadline: deadline);
+                    match (give filled) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+            };
+        }
+        return Result::Err(error: RedisError::Closed);
+    }
+
+    // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`. While a write must
+    // wait, whatever the server sends is read into the reader, as libpq's pqSendSome reads: a server answering the
+    // commands it already has stops reading once its own output fills, so a client that only wrote would wait
+    // forever on a long pipeline. Once the server has stopped sending (EOF, an error), only writing is waited for;
+    // the reader meets the end when it gets there.
+    public unsafe fn Result<Unit, RedisError> send(ConstView<uint8> bytes, Deadline deadline) {
+        isize sent = 0;
+        bool reading = true;
+        while (sent < bytes.length()) {
+            Result<isize, IoError> w = this.link.write(bytes: bytes.slice(from: sent, count: bytes.length() - sent));
+            bool wait = false;
+            match (w) {
+                case Ok(value: n): { if (n > 0) { sent = sent + n; } else { wait = true; } }
+                case Err(error: e): {
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                }
+            };
+            if (wait) {
+                Interest want = Interest::Write;
+                if (reading) { want = Interest::ReadWrite; }
+                Result<Ready, IoError> ready = this.link.wait(interest: want, timeoutMs: deadline.remainingMs());
+                Ready r = match (ready) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
+                if (!r.writable && !(reading && r.readable)) { return Result::Err(error: RedisError::Timeout); }
+                if (reading && r.readable) { reading = this.drain(); }
+            }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Whether no reply is in progress: nothing buffered, nothing half read.
+    public const fn bool isIdle() { return this.reader.isIdle(); }
+
+    // Stop the transport in both directions.
+    public unsafe fn void shutdown() { this.link.shutdown(); }
+
+    // One read of whatever has arrived, into the reader. False once the server has stopped sending: at EOF, or on
+    // an error, which a later read reports.
+    unsafe fn bool drain() {
+        Result<isize, IoError> r = this.link.read(into: this.reader.spare(minimum: READ_BYTES));
+        match (r) {
+            case Ok(value: n): {
+                if (n == 0) { return false; }
+                this.reader.commit(count: n);
+            }
+            case Err(error: e): {
+                match (e.kind()) { case WouldBlock: { } case Interrupted: { } case _: { return false; } };
+            }
+        };
+        return true;
+    }
+
+    // Read until at least one more byte has come.
+    unsafe fn Result<Unit, RedisError> fill(Deadline deadline) {
+        while (true) {
+            Result<isize, IoError> r = this.link.read(into: this.reader.spare(minimum: READ_BYTES));
+            bool wait = false;
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return Result::Err(error: this.failure(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
+                    this.reader.commit(count: n);
+                    return Result::Ok(value: Unit::Unit);
+                }
+                case Err(error: e): {
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                }
+            };
+            if (wait) {
+                Result<Ready, IoError> w = this.link.wait(interest: Interest::Read, timeoutMs: deadline.remainingMs());
+                Ready ready = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
+                // Only the side asked for counts: a transport ready to write has not let a read proceed.
+                if (!ready.readable) { return Result::Err(error: RedisError::Timeout); }
+            }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A failure the transport reported, in its own words when it has them (a TLS transport's), else as the I/O
+    // error it is.
+    fn RedisError failure(IoError error) {
+        Optional<RedisError> own = this.link.explain(error: error);
+        return match (give own) { case Some(value: p): give p; case None: RedisError::Io(error: error); };
+    }
+}

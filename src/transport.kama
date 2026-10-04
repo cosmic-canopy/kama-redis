@@ -1,0 +1,190 @@
+import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
+         std::net::SocketAddr, std::net::IpAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
+         std::net::UnixStream, std::net::UnixAddr, std::time::Duration, std::memory::Owned, redis::RedisError };
+export { Transport, TcpTransport, UnixTransport, Dialer, DialTarget };
+
+// The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
+// `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. That is what lets every step
+// of a connection keep its deadline, and later lets a pipeline write and read at once. (@kama/postgres's shape,
+// which is libpq's and hiredis's: a non-blocking socket and poll with a deadline.)
+//
+// `Connection.connect` opens TCP, or a Unix-domain socket for a unix:// config. `Connection.connectOver` takes any
+// transport: a tunnel, a proxy, or a test's scripted server.
+type contract Transport for resource implements Sendable {
+    // The bytes available now, up to `into`'s length: the count, or 0 when the peer has closed its side.
+    // `WouldBlock` when none are available.
+    fn Result<isize, IoError> read(View<uint8> into);
+    // As many of `bytes` as can be written now: the count. `WouldBlock` when none can.
+    fn Result<isize, IoError> write(ConstView<uint8> bytes);
+    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit). A timeout is a `Ready` without
+    // the side asked for. A peer that closed or failed reads as readable, so the following read reports it.
+    fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs);
+    // Stop both directions. Called once, when the connection closes; the transport may still be dropped later.
+    fn void shutdown();
+    // This transport's own account of a failure it reported, when it has one (a TLS transport words its failures
+    // as its TLS layer does); `None` to report the `IoError` as it is.
+    fn Optional<RedisError> explain(IoError error);
+}
+
+// Opens the transports `Connection.connectWith` makes, one per address tried, so a connection through a tunnel or
+// a proxy still gets the whole procedure: every address a name resolves to, in turn, each within
+// `connect_timeout`. It is go-redis's `Dialer` and pgx's `DialFunc`. The transports a dialer opens are its own:
+// the keepalive setting applies to the sockets this client opens.
+type contract Dialer for resource implements Sendable {
+    // A connected transport to `target`, within `timeoutMs` (< 0: no limit). A `TimedOut` error is the deadline
+    // passing, and the next address is tried, as for any failure to connect.
+    fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs);
+}
+
+// One place a connection attempt goes: an address of a host, or a Unix-domain socket.
+type resource DialTarget implements Sendable, Copyable<This>(bare: give) {
+    string hostText;
+    Optional<SocketAddr> tcp;
+    string pathText;
+
+    ctor overTcp(string host, SocketAddr address) {
+        this.hostText = give host; this.tcp = Optional::Some(value: address); this.pathText = "";
+    }
+    ctor overSocket(string path) {
+        this.hostText = ""; this.tcp = Optional::None; this.pathText = give path;
+    }
+    public ctor copy(ref DialTarget source) {
+        this.hostText = copy source.hostText; this.tcp = source.tcp; this.pathText = copy source.pathText;
+    }
+    friend redis::Connection::targetsOf[overTcp, overSocket];
+
+    // The host as configured: a name, or an address; "" for a socket.
+    public const fn const ref string host() { return this.hostText; }
+    // The TCP address to connect to; None for a socket.
+    public const fn Optional<SocketAddr> address() { return this.tcp; }
+    // The socket's path; "" for TCP.
+    public const fn const ref string socketPath() { return this.pathText; }
+    public const fn bool isSocket() { return match (this.tcp) { case Some(value: a): false; case None: true; }; }
+
+    // How an attempt names this place: "127.0.0.1:6379", "localhost at [::1]:6379", or the socket's path.
+    public const fn string place() {
+        return match (this.tcp) {
+            case None: copy this.pathText;
+            case Some(value: a): placeOf(host: this.hostText, address: a);
+        };
+    }
+}
+
+fn string placeOf(const ref string host, SocketAddr address) {
+    string shown = "${address}";
+    IpAddr ip = address.ip;
+    string ipText = "${ip}";
+    if (host == ipText || host.length() == 0) { return shown; }
+    return host.concat(other: " at ").concat(other: shown);
+}
+
+// TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.
+type resource TcpTransport implements Transport, Sendable {
+    TcpStream stream;
+    Poller poller;
+    isize handle = 0;
+
+    unsafe ctor make(TcpStream stream, Poller poller) {
+        this.handle = stream.rawHandle();
+        this.stream = give stream;
+        this.poller = give poller;
+    }
+
+    // Connect to `address` within `timeoutMs` (< 0: no limit). A timeout is a `TimedOut` error that no OS code
+    // backs. TCP_NODELAY is set, as hiredis sets it: every command this client sends is whole when it is written.
+    public unsafe ctor Result<TcpTransport, IoError> connect(const ref SocketAddr address, int32 timeoutMs) {
+        Result<TcpStream, IoError> started = TcpStream.connectToNonBlocking(address: address);
+        TcpStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
+        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
+        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
+        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<Unit, IoError> connected = stream.checkConnected();
+        match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        Result<Unit, IoError> nodelay = stream.setNoDelay(on: true);
+        match (nodelay) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: TcpTransport.make(stream: give stream, poller: give poller));
+    }
+
+    // TCP keepalive as hiredis's redisKeepAlive sets it: on, idle `idle`, a probe every idle/3 (at least one
+    // second), and 3 probes before the connection is dropped.
+    public unsafe fn Result<Unit, IoError> keepAlive(Duration idle) {
+        Result<Unit, IoError> on = this.stream.setKeepAlive(on: true);
+        match (on) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        Result<Unit, IoError> wait = this.stream.setKeepAliveIdle(idle: idle);
+        match (wait) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        int64 every = idle.asSecs() / 3i64;
+        if (every < 1i64) { every = 1i64; }
+        Result<Unit, IoError> probe = this.stream.setKeepAliveInterval(interval: Duration.fromSecs(s: every));
+        match (probe) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        return this.stream.setKeepAliveCount(count: 3ui32);
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.stream.read(into: into); }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        this.poller.add(fd: this.handle, interest: interest);
+        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
+        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+    }
+
+    public unsafe fn void shutdown() {
+        Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
+    }
+
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+}
+
+// A Unix-domain socket, as `Connection.connect` makes it for a unix:// config: a non-blocking `UnixStream` and its
+// own `Poller`. The connect is non-blocking too, so `connect_timeout` bounds it.
+type resource UnixTransport implements Transport, Sendable {
+    UnixStream stream;
+    Poller poller;
+    isize handle = 0;
+
+    unsafe ctor make(UnixStream stream, Poller poller) {
+        this.handle = stream.rawHandle();
+        this.stream = give stream;
+        this.poller = give poller;
+    }
+
+    // Connect to the socket at `path` within `timeoutMs` (< 0: no limit). A timeout is a `TimedOut` error.
+    public unsafe ctor Result<UnixTransport, IoError> connect(const ref string path, int32 timeoutMs) {
+        Result<UnixAddr, IoError> address = UnixAddr.fromPath(path: path);
+        UnixAddr target = match (address) { case Ok(value: a): a; case Err(error: e): { return Result::Err(error: e); } };
+        Result<UnixStream, IoError> started = UnixStream.connectToNonBlocking(address: target);
+        UnixStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        // A local connect has usually completed already; one in flight resolves once the socket is writable.
+        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
+        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
+        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
+        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<Unit, IoError> connected = stream.checkConnected();
+        match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: UnixTransport.make(stream: give stream, poller: give poller));
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.stream.read(into: into); }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        this.poller.add(fd: this.handle, interest: interest);
+        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
+        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+    }
+
+    public unsafe fn void shutdown() {
+        Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
+    }
+
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+}

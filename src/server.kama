@@ -1,0 +1,204 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::resp::Value, redis::RedisError };
+export { ServerInfo };
+
+// What a server says of itself in its HELLO reply: a map under RESP3, a flat array of the same pairs under RESP2.
+//
+//   server             "redis", or "valkey" from Valkey 8.0 on. Valkey 7.2 says "redis" (it is Redis 7.2's code),
+//                      and so does Valkey with `extended-redis-compatibility yes`, with version 7.2.4.
+//   version            "7.4.11"
+//   proto              2 or 3
+//   id                 the connection's client id, as CLIENT ID and CLIENT KILL ID take it
+//   mode               "standalone", "cluster" or "sentinel"
+//   role               "master" or "replica"; a sentinel sends none
+//   modules            each loaded module's map: name, ver, path, args
+//   availability_zone  Valkey 8.1 and later, when the server is given one
+//
+// The reply is kept whole (`hello()`), so a field this type does not name is still there.
+type resource ServerInfo implements Sendable, Copyable<This>(bare: give) {
+    string productText;
+    string versionText;
+    int64 major = -1i64;
+    int64 minor = -1i64;
+    int64 patch = -1i64;
+    int64 protoNumber = 0i64;
+    int64 clientId = 0i64;
+    string modeText;
+    string roleText;
+    DynamicArray<string> moduleNames;
+    Optional<string> zone;
+    Value reply;
+
+    ctor blank(Value reply) {
+        this.productText = "";
+        this.versionText = "";
+        this.modeText = "";
+        this.roleText = "";
+        this.moduleNames = DynamicArray.empty();
+        this.zone = Optional::None;
+        this.reply = give reply;
+    }
+
+    public ctor copy(ref ServerInfo source) {
+        this.productText = copy source.productText;
+        this.versionText = copy source.versionText;
+        this.major = source.major; this.minor = source.minor; this.patch = source.patch;
+        this.protoNumber = source.protoNumber;
+        this.clientId = source.clientId;
+        this.modeText = copy source.modeText;
+        this.roleText = copy source.roleText;
+        this.moduleNames = copy source.moduleNames;
+        this.zone = copy source.zone;
+        this.reply = copy source.reply;
+    }
+
+    // The server's account of itself from its HELLO reply, or why the reply is not one (`Unexpected`): a value that
+    // is not a map (or, under RESP2, an array of pairs), or one without `server`, `version` and `proto`.
+    public ctor Result<ServerInfo, RedisError> fromHello(Value reply) {
+        ServerInfo info = ServerInfo.blank(reply: give reply);
+        Optional<string> bad = info.read();
+        return match (give bad) {
+            case Some(value: why): { ServerInfo dropped = give info; := Result::Err(error: RedisError::Unexpected(detail: give why)); }
+            case None: Result::Ok(value: give info);
+        };
+    }
+
+    // "redis" or "valkey", as the server names itself.
+    public const fn const ref string product() { return this.productText; }
+    public const fn const ref string version() { return this.versionText; }
+    // Whether the version is `major`.`minor` or later; false for a version that is not numbers.
+    public const fn bool atLeast(int64 major, int64 minor) {
+        if (this.major < 0i64 || this.minor < 0i64) { return false; }
+        if (this.major != major) { return this.major > major; }
+        return this.minor >= minor;
+    }
+    public const fn int64 proto() { return this.protoNumber; }
+    public const fn int64 id() { return this.clientId; }
+    public const fn const ref string mode() { return this.modeText; }
+    // "master" or "replica"; "" when the server sent none (a sentinel).
+    public const fn const ref string role() { return this.roleText; }
+    public const fn const ref DynamicArray<string> modules() { return this.moduleNames; }
+    public const fn Optional<string> availabilityZone() { return copy this.zone; }
+    // The HELLO reply as it came.
+    public const fn const ref Value hello() { return this.reply; }
+
+    fn Optional<string> read() {
+        Optional<string> bad = Optional::None;
+        bool haveServer = false;
+        bool haveVersion = false;
+        bool haveProto = false;
+        match (this.reply) {
+            case Map(entries: e): { bad = this.readPairs(pairs: e, haveServer: ref haveServer, haveVersion: ref haveVersion, haveProto: ref haveProto); }
+            case Array(items: e): {
+                if (e.length() % 2 != 0) { return Optional::Some(value: "the HELLO reply is an array of odd length, not key and value pairs"); }
+                bad = this.readPairs(pairs: e, haveServer: ref haveServer, haveVersion: ref haveVersion, haveProto: ref haveProto);
+            }
+            case _: { return Optional::Some(value: "the HELLO reply is not a map"); }
+        };
+        match (give bad) { case Some(value: why): { return Optional::Some(value: give why); } case None: { } };
+        if (!haveServer || !haveVersion || !haveProto) { return Optional::Some(value: "the HELLO reply has no server, version or proto"); }
+        return Optional::None;
+    }
+
+    fn Optional<string> readPairs(const ref DynamicArray<Value> pairs, ref bool haveServer, ref bool haveVersion, ref bool haveProto) {
+        isize i = 0;
+        while (i + 1 < pairs.length()) {
+            Optional<string> k = textOf(v: pairs[i]);
+            string key = match (give k) { case Some(value: t): give t; case None: ""; };
+            if (key == "server" || key == "version" || key == "mode" || key == "role" || key == "availability_zone") {
+                Optional<string> t = textOf(v: pairs[i + 1]);
+                string value = match (give t) {
+                    case Some(value: s): give s;
+                    case None: { return Optional::Some(value: "the HELLO reply's ".concat(other: key).concat(other: " is not text")); }
+                };
+                if (key == "server") { this.productText = give value; haveServer = true; }
+                else if (key == "version") { this.readVersion(text: value); this.versionText = give value; haveVersion = true; }
+                else if (key == "mode") { this.modeText = give value; }
+                else if (key == "role") { this.roleText = give value; }
+                else { this.zone = Optional::Some(value: give value); }
+            } else if (key == "proto" || key == "id") {
+                int64 n = match (pairs[i + 1]) {
+                    case Integer(value: x): x;
+                    case _: { return Optional::Some(value: "the HELLO reply's ".concat(other: key).concat(other: " is not an integer")); }
+                };
+                if (key == "proto") { this.protoNumber = n; haveProto = true; } else { this.clientId = n; }
+            } else if (key == "modules") {
+                this.readModules(v: pairs[i + 1]);
+            }
+            i = i + 2;
+        }
+        return Optional::None;
+    }
+
+    // Each module's name, from its map (RESP3) or its array of pairs (RESP2).
+    fn void readModules(const ref Value v) {
+        match (v) {
+            case Array(items: mods): {
+                isize m = 0;
+                while (m < mods.length()) {
+                    match (mods[m]) {
+                        case Map(entries: e): { this.addModule(pairs: e); }
+                        case Array(items: e): { this.addModule(pairs: e); }
+                        case _: { }
+                    };
+                    m = m + 1;
+                }
+            }
+            case _: { }
+        };
+    }
+
+    fn void addModule(const ref DynamicArray<Value> pairs) {
+        isize i = 0;
+        while (i + 1 < pairs.length()) {
+            Optional<string> k = textOf(v: pairs[i]);
+            bool isName = match (k) { case Some(value: t): t == "name"; case None: false; };
+            if (isName) {
+                Optional<string> n = textOf(v: pairs[i + 1]);
+                match (give n) { case Some(value: t): { this.moduleNames.add(item: give t); } case None: { } };
+                return;
+            }
+            i = i + 2;
+        }
+    }
+
+    // "major.minor.patch", each a number; anything else leaves them unknown.
+    fn void readVersion(const ref string text) {
+        int64 parts = 0i64;
+        int64 current = -1i64;
+        int64 got0 = -1i64;
+        int64 got1 = -1i64;
+        int64 got2 = -1i64;
+        foreach (uint8 b in text) {
+            if (b >= 48ui8 && b <= 57ui8) {
+                if (current < 0i64) { current = 0i64; }
+                if (current > 99999999i64) { return; }
+                current = current * 10i64 + cast<int64>(b - 48ui8);
+            } else if (b == 46ui8 && current >= 0i64) {
+                if (parts == 0i64) { got0 = current; } else if (parts == 1i64) { got1 = current; } else { return; }
+                parts = parts + 1i64;
+                current = -1i64;
+            } else {
+                return;
+            }
+        }
+        if (current < 0i64 || parts != 2i64) { return; }
+        got2 = current;
+        this.major = got0; this.minor = got1; this.patch = got2;
+    }
+}
+
+// A bulk string's or a simple string's text; None for any other value, or bytes that are not UTF-8.
+fn Optional<string> textOf(const ref Value v) {
+    return match (v) {
+        case Bulk(bytes: b): utf8(b: b.view());
+        case Simple(bytes: b): utf8(b: b.view());
+        case Verbatim(format: f, bytes: b): utf8(b: b.view());
+        case _: Optional::None;
+    };
+}
+
+fn Optional<string> utf8(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): Optional::Some(value: give s); case Err(error: e): Optional::None; };
+}

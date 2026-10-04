@@ -158,6 +158,8 @@ my @cases = (
     ['unknown', 7000, [], ['NOSUCHCOMMAND']],
     ['noscript', 7000, [], ['EVALSHA', 'ffffffffffffffffffffffffffffffffffffffff', '0']],
     ['execabort', 7000, [['MULTI'], ['NOSUCHCOMMAND']], ['EXEC']],
+    # An error inside a reply: EXEC's array, whose second command failed when it ran.
+    ['exec-error', 7000, [['MULTI'], ['SET', 'kr:e', 'v'], ['LPUSH', 'kr:e', 'x']], ['EXEC']],
     ['busygroup', 7000, [['XGROUP', 'CREATE', 'kr:x', 'g', '$', 'MKSTREAM']], ['XGROUP', 'CREATE', 'kr:x', 'g', '$', 'MKSTREAM']],
     ['nogroup', 7000, [['XADD', 'kr:y', '*', 'f', 'v']], ['XREADGROUP', 'GROUP', 'nog', 'c', 'STREAMS', 'kr:y', '>']],
     ['noperm', 7000, [['AUTH', 'kr_ro', 'kr_ro_pw']], ['SET', 'kr:k', 'v']],

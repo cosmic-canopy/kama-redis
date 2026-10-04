@@ -1,0 +1,643 @@
+// redis::Connection over the scripted server (fake_server.kama). Every reply a script plays is a real server's or
+// Envoy's bytes (server_vectors.kama, resp_vectors.kama); what the client must send is the handshake decided in
+// docs/ROADMAP.md, "Phase 2", written here as the commands a script expects.
+import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned,
+         std::time::Duration, std::io::IoError, std::net::SocketAddr, std::net::resolve, std::encoding::utf8::decode as utf8Decode,
+         std::encoding::utf8::Utf8Error,
+         redis::Connection, redis::libraryVersion, redis::Config, redis::Command, redis::Protocol, redis::RedisError, redis::ServerError,
+         redis::ServerCode, redis::ServerInfo, redis::Transport, redis::Dialer, redis::resp::Value, redis::resp::Limits,
+         redis::resp::Reader, redis::resp::Read,
+         redis_unit_tests::check, unhex, FakeServer, Step, ScriptDialer, Dial,
+         serverVersions, replyNames, replyHex, proxyNames, proxyHex, respNames, respInputs };
+export { connectionTests };
+
+// ---- the vectors ----
+
+// The reply `server` (a version, "redis-7.4.11") sent to case `kase` ("hello3").
+fn DynamicArray<uint8> reply(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> hex = replyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: hex[i]); }
+        i = i + 1;
+    }
+    panic(msg: "connection_test: no server vector ${name}");
+    return DynamicArray.empty();
+}
+
+fn bool hasReply(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = replyNames();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn DynamicArray<uint8> proxy(const ref string name) {
+    DynamicArray<string> names = proxyNames();
+    DynamicArray<string> hex = proxyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: hex[i]); }
+        i = i + 1;
+    }
+    panic(msg: "connection_test: no proxy vector ${name}");
+    return DynamicArray.empty();
+}
+
+fn DynamicArray<uint8> resp(const ref string name) {
+    DynamicArray<string> names = respNames();
+    DynamicArray<string> inputs = respInputs();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: inputs[i]); }
+        i = i + 1;
+    }
+    panic(msg: "connection_test: no resp vector ${name}");
+    return DynamicArray.empty();
+}
+
+// The bytes of the first push message in `b`, which holds whole RESP values. (DEBUG PROTOCOL push sends an ordinary
+// reply beside its push, and the capture holds both.)
+fn DynamicArray<uint8> pushIn(const ref DynamicArray<uint8> b) {
+    Reader r = Reader.make();
+    r.feed(bytes: b.view());
+    isize start = 0;
+    while (start < b.length()) {
+        Read got = r.next();
+        isize end = b.length() - r.buffered();
+        bool push = match (got) { case Complete(value: v): match (v) { case Push(items: p): true; case _: false; }; case _: false; };
+        if (push) {
+            DynamicArray<uint8> bytes = DynamicArray.empty();
+            bytes.addAll(items: b.view().slice(from: start, count: end - start));
+            return give bytes;
+        }
+        bool whole = match (got) { case Complete(value: v): true; case _: false; };
+        if (!whole) { break; }
+        start = end;
+    }
+    panic(msg: "connection_test: no push message in the vector");
+    return DynamicArray.empty();
+}
+
+// ---- scripts ----
+
+fn DynamicArray<string> words(const ref string text) {
+    DynamicArray<string> list = DynamicArray.empty();
+    string current = "";
+    foreach (uint8 b in text) {
+        if (b == 32ui8) { list.add(item: give current); current = ""; }
+        else {
+            DynamicArray<uint8> one = DynamicArray.empty();
+            one.add(item: b);
+            current = current.concat(other: textOf(b: one.view()));
+        }
+    }
+    list.add(item: give current);
+    return give list;
+}
+
+fn string textOf(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = utf8Decode(bytes: b);
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): "?"; };
+}
+
+fn Step expect(const ref string command, DynamicArray<uint8> answer) { return Step::Expect(args: words(text: command), reply: give answer); }
+
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// The two CLIENT SETINFOs that end a default handshake, answered as `server` answers them.
+fn void identity(ref DynamicArray<Step> s, const ref string server) {
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server, kase: "setinfo-name")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server, kase: "setinfo-ver")));
+}
+
+// A default handshake with `server`: HELLO 3, then the two SETINFOs.
+fn DynamicArray<Step> welcome(const ref string server) {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3", answer: reply(server: server, kase: "hello3")));
+    identity(s: s, server: server);
+    return give s;
+}
+
+fn Config configOf(const ref string url) {
+    Result<Config, RedisError> r = Config.parse(url: url);
+    Config c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "connection_test: ${m}"); return configOf(url: "redis://"); }
+    };
+    return give c;
+}
+
+unsafe fn Result<Connection, RedisError> overConfig(DynamicArray<Step> script, const ref Config config) {
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+unsafe fn Result<Connection, RedisError> over(DynamicArray<Step> script, const ref string url) {
+    Config config = configOf(url: url);
+    return overConfig(script: give script, config: config);
+}
+
+// What a connect came to: "ok", or the error's message.
+fn string outcome(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+}
+
+fn bool codeIs(const ref Result<Connection, RedisError> r, const ref string code) {
+    return match (r) {
+        case Err(error: e): match (e) { case Server(error: s): s.codeText() == code; case _: false; };
+        case Ok(value: c): false;
+    };
+}
+
+fn bool isUnexpected(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Unexpected(detail: d): true; case _: false; }; case Ok(value: c): false; };
+}
+
+fn bool isTimeout(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: c): false; };
+}
+
+fn bool isProtocolError(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Protocol(error: p): true; case _: false; }; case Ok(value: c): false; };
+}
+
+// The connection a script must give; panics otherwise, naming the test.
+unsafe fn Connection connected(DynamicArray<Step> script, const ref string url, const ref string what) {
+    Result<Connection, RedisError> r = over(script: give script, url: url);
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "connection_test: ${what}: ${m}"); return connected(script: steps(), url: url, what: what); }
+    };
+    return give c;
+}
+
+fn string serverVersionOf(const ref string server) {
+    isize dash = 0;
+    while (dash < server.length() && server.bytes()[dash] != 45ui8) { dash = dash + 1; }
+    return server.substring(start: dash + 1, end: server.length());
+}
+
+// The product a server names itself as in HELLO: Valkey from 8.0, Redis otherwise (docs/ROADMAP.md, "Phase 2").
+fn string productOf(const ref string server) {
+    if (server.startsWith(prefix: "valkey-") && !server.startsWith(prefix: "valkey-7.")) { return "valkey"; }
+    return "redis";
+}
+
+fn Command commandOf(const ref string text) {
+    DynamicArray<string> parts = words(text: text);
+    Command c = Command.of(name: parts[0]);
+    isize i = 1;
+    while (i < parts.length()) { c.arg(text: parts[i]); i = i + 1; }
+    return give c;
+}
+
+fn bool isSimple(const ref Result<Value, RedisError> r, const ref string text) {
+    return match (r) {
+        case Ok(value: v): match (v) { case Simple(bytes: b): textOf(b: b.view()) == text; case _: false; };
+        case Err(error: e): false;
+    };
+}
+
+fn string callOutcome(const ref Result<Value, RedisError> r) {
+    return match (r) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+}
+
+fn bool callClosed(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Closed: true; case _: false; }; case Ok(value: v): false; };
+}
+
+// ---- the handshake, on every server ----
+
+unsafe fn int32 handshakeTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+
+        // The default: HELLO 3 and the two SETINFOs, in one write. A server before 7.2 refuses SETINFO, and the
+        // connect goes on.
+        DynamicArray<Step> plain = welcome(server: s);
+        plain.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+        Result<Connection, RedisError> r = over(script: give plain, url: "redis://");
+        string got = outcome(r: r);
+        f = f + check(ok: got == "ok", what: "${s}: the default handshake: ${got}");
+        match (give r) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                bool resp3 = conn.protocol() == Protocol::Resp3;
+                Optional<ServerInfo> info = conn.server();
+                string product = match (info) { case Some(value: v): copy v.product(); case None: "-"; };
+                string version = match (info) { case Some(value: v): copy v.version(); case None: "-"; };
+                string wantProduct = productOf(server: s);
+                string wantVersion = serverVersionOf(server: s);
+                f = f + check(ok: resp3 && product == wantProduct && version == wantVersion,
+                              what: "${s}: identified as ${wantProduct} ${wantVersion} over RESP3 (got ${product} ${version})");
+                Command ping = Command.of(name: "PING");
+                Result<Value, RedisError> pong = conn.call(command: ping);
+                f = f + check(ok: isSimple(r: pong, text: "PONG"), what: "${s}: PING after the handshake");
+            }
+            case Err(error: e): { }
+        };
+
+        // protocol=3 asks for the same, and allows no fallback.
+        Result<Connection, RedisError> three = over(script: welcome(server: s), url: "redis://?protocol=3");
+        string threeGot = outcome(r: three);
+        f = f + check(ok: threeGot == "ok", what: "${s}: protocol=3: ${threeGot}");
+
+        // A user, a password, a name and a database: HELLO carries AUTH and SETNAME, SELECT follows it.
+        DynamicArray<Step> full = steps();
+        full.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw SETNAME kama-test", answer: reply(server: s, kase: "hello3-auth-setname")));
+        full.add(item: expect(command: "SELECT 1", answer: reply(server: s, kase: "select1")));
+        identity(s: full, server: s);
+        Result<Connection, RedisError> rf = over(script: give full, url: "redis://kr_acl:kr_acl_pw@/1?client_name=kama-test");
+        string fullGot = outcome(r: rf);
+        f = f + check(ok: fullGot == "ok", what: "${s}: AUTH, SETNAME and SELECT: ${fullGot}");
+
+        // A password alone is the default user's, as requirepass sets it.
+        DynamicArray<Step> locked = steps();
+        locked.add(item: expect(command: "HELLO 3 AUTH default kr_default_pw", answer: reply(server: s, kase: "locked-hello3-auth")));
+        identity(s: locked, server: s);
+        Result<Connection, RedisError> rl = over(script: give locked, url: "redis://:kr_default_pw@");
+        string lockedGot = outcome(r: rl);
+        f = f + check(ok: lockedGot == "ok", what: "${s}: a password alone, as the default user: ${lockedGot}");
+
+        // A wrong password, and a disabled user: WRONGPASS ends the connect.
+        DynamicArray<Step> wrong = steps();
+        wrong.add(item: expect(command: "HELLO 3 AUTH kr_acl wrong", answer: reply(server: s, kase: "hello3-auth-wrong")));
+        Result<Connection, RedisError> rw = over(script: give wrong, url: "redis://kr_acl:wrong@");
+        string wrongGot = outcome(r: rw);
+        f = f + check(ok: codeIs(r: rw, code: "WRONGPASS") && wrongGot == "WRONGPASS invalid username-password pair or user is disabled.",
+                      what: "${s}: a wrong password: ${wrongGot}");
+        DynamicArray<Step> off = steps();
+        off.add(item: expect(command: "HELLO 3 AUTH kr_off kr_off_pw", answer: reply(server: s, kase: "hello3-auth-off")));
+        Result<Connection, RedisError> ro = over(script: give off, url: "redis://kr_off:kr_off_pw@");
+        f = f + check(ok: codeIs(r: ro, code: "WRONGPASS"), what: "${s}: a disabled user");
+
+        // A server with a password, and none given: NOAUTH ends the connect.
+        DynamicArray<Step> noAuth = steps();
+        noAuth.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "locked-hello3")));
+        Result<Connection, RedisError> rn = over(script: give noAuth, url: "redis://");
+        f = f + check(ok: codeIs(r: rn, code: "NOAUTH"), what: "${s}: NOAUTH with no password given");
+
+        // SELECT past the last database fails the connect.
+        DynamicArray<Step> range = steps();
+        range.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "hello3")));
+        range.add(item: expect(command: "SELECT 16", answer: reply(server: s, kase: "select-range")));
+        Result<Connection, RedisError> rr = over(script: give range, url: "redis:///16");
+        string rangeGot = outcome(r: rr);
+        f = f + check(ok: codeIs(r: rr, code: "ERR") && rangeGot == "ERR DB index is out of range", what: "${s}: SELECT out of range: ${rangeGot}");
+
+        // The RESP2 path: AUTH, CLIENT SETNAME and SELECT, no HELLO and no SETINFO.
+        DynamicArray<Step> two = steps();
+        two.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: s, kase: "auth2")));
+        two.add(item: expect(command: "CLIENT SETNAME kama-test", answer: reply(server: s, kase: "setname")));
+        two.add(item: expect(command: "SELECT 1", answer: reply(server: s, kase: "select1")));
+        Result<Connection, RedisError> rt = over(script: give two, url: "redis://kr_acl:kr_acl_pw@/1?protocol=2&client_name=kama-test");
+        string twoGot = outcome(r: rt);
+        bool twoOk = match (rt) { case Ok(value: c): c.protocol() == Protocol::Resp2 && match (c.server()) { case Some(value: v): false; case None: true; }; case Err(error: e): false; };
+        f = f + check(ok: twoOk, what: "${s}: protocol=2: AUTH, CLIENT SETNAME, SELECT, and no HELLO: ${twoGot}");
+        DynamicArray<Step> one = steps();
+        one.add(item: expect(command: "AUTH kr_default_pw", answer: reply(server: s, kase: "locked-auth1")));
+        Result<Connection, RedisError> r1 = over(script: give one, url: "redis://:kr_default_pw@?protocol=2");
+        string oneGot = outcome(r: r1);
+        f = f + check(ok: oneGot == "ok", what: "${s}: protocol=2: AUTH with the password alone: ${oneGot}");
+        DynamicArray<Step> oneWrong = steps();
+        oneWrong.add(item: expect(command: "AUTH wrong", answer: reply(server: s, kase: "locked-auth1-wrong")));
+        Result<Connection, RedisError> r1w = over(script: give oneWrong, url: "redis://:wrong@?protocol=2");
+        f = f + check(ok: codeIs(r: r1w, code: "WRONGPASS"), what: "${s}: protocol=2: a wrong password");
+
+        // Valkey 8 and later: a server that says it is Redis 7.2.4, and one in an availability zone.
+        if (hasReply(server: s, kase: "compat-hello3")) {
+            DynamicArray<Step> compat = steps();
+            compat.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "compat-hello3")));
+            identity(s: compat, server: s);
+            Connection cc = connected(script: give compat, url: "redis://", what: "compat");
+            Optional<ServerInfo> ci = cc.server();
+            bool says = match (ci) { case Some(value: v): v.product() == "redis" && v.version() == "7.2.4" && v.atLeast(major: 7i64, minor: 2i64) && !v.atLeast(major: 7i64, minor: 3i64); case None: false; };
+            f = f + check(ok: says, what: "${s}: extended-redis-compatibility says redis 7.2.4");
+            DynamicArray<Step> az = steps();
+            az.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "az-hello3")));
+            identity(s: az, server: s);
+            Connection ca = connected(script: give az, url: "redis://", what: "availability zone");
+            Optional<ServerInfo> ai = ca.server();
+            Optional<string> zone = match (ai) { case Some(value: v): v.availabilityZone(); case None: Optional::None; };
+            bool inZone = match (zone) { case Some(value: z): z == "az-1"; case None: false; };
+            f = f + check(ok: inZone, what: "${s}: the availability zone");
+        }
+        i = i + 1;
+    }
+    f = f + check(ok: servers.length() == 8, what: "server vectors: eight servers");
+
+    // Identity off: no SETINFO is sent, so a script that answers only HELLO is enough.
+    Config quiet = configOf(url: "redis://");
+    quiet.setIdentity(on: false);
+    DynamicArray<Step> bare = steps();
+    bare.add(item: expect(command: "HELLO 3", answer: reply(server: "redis-8.10.2", kase: "hello3")));
+    Result<Connection, RedisError> rq = overConfig(script: give bare, config: quiet);
+    string quietGot = outcome(r: rq);
+    f = f + check(ok: quietGot == "ok", what: "identity off: no CLIENT SETINFO: ${quietGot}");
+    return f;
+}
+
+// ---- a proxy that refuses HELLO: the RESP2 path, by code ----
+
+unsafe fn int32 fallbackTests() {
+    int32 f = 0;
+    // What a proxy answers to the CLIENT SETINFOs after a refused HELLO does not matter: the client drops it.
+    string old = "redis-6.2.24";
+    DynamicArray<string> envoys = DynamicArray.empty();
+    envoys.add(item: "envoy-1.32.0"); envoys.add(item: "envoy-1.36.0"); envoys.add(item: "envoy-1.39.0");
+    isize i = 0;
+    while (i < envoys.length()) {
+        string e = copy envoys[i];
+
+        // No password: the refusal, then the RESP2 path, which has nothing to send.
+        DynamicArray<Step> plain = steps();
+        plain.add(item: expect(command: "HELLO 3", answer: proxy(name: e.concat(other: " HELLO 3"))));
+        plain.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-name")));
+        plain.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-ver")));
+        Result<Connection, RedisError> r = over(script: give plain, url: "redis://");
+        string got = outcome(r: r);
+        bool resp2 = match (r) { case Ok(value: c): c.protocol() == Protocol::Resp2 && match (c.server()) { case Some(value: v): false; case None: true; }; case Err(error: x): false; };
+        f = f + check(ok: resp2, what: "${e}: HELLO refused, the RESP2 path: ${got}");
+
+        // A password: the RESP2 path sends AUTH.
+        DynamicArray<Step> auth = steps();
+        auth.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: proxy(name: e.concat(other: " HELLO 3 AUTH kr_acl kr_acl_pw"))));
+        auth.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-name")));
+        auth.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-ver")));
+        auth.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: old, kase: "auth2")));
+        Result<Connection, RedisError> ra = over(script: give auth, url: "redis://kr_acl:kr_acl_pw@");
+        string authGot = outcome(r: ra);
+        f = f + check(ok: authGot == "ok", what: "${e}: HELLO with AUTH refused, then AUTH: ${authGot}");
+
+        // A proxy that requires a password answers NOAUTH before it reads HELLO's AUTH (1.32, 1.39): the RESP2 path.
+        DynamicArray<Step> required = steps();
+        required.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: proxy(name: e.concat(other: " HELLO 3 AUTH kr_acl kr_acl_pw, password required"))));
+        required.add(item: Step::Any(reply: reply(server: old, kase: "locked-setinfo-name")));
+        required.add(item: Step::Any(reply: reply(server: old, kase: "locked-setinfo-name")));
+        required.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: old, kase: "auth2")));
+        Result<Connection, RedisError> rr = over(script: give required, url: "redis://kr_acl:kr_acl_pw@");
+        string reqGot = outcome(r: rr);
+        f = f + check(ok: reqGot == "ok", what: "${e}: NOAUTH to HELLO with AUTH, then AUTH: ${reqGot}");
+
+        // protocol=3 takes no fallback: the refusal is the error.
+        DynamicArray<Step> strict = steps();
+        strict.add(item: expect(command: "HELLO 3", answer: proxy(name: e.concat(other: " HELLO 3"))));
+        Result<Connection, RedisError> rs = over(script: give strict, url: "redis://?protocol=3");
+        bool refused = match (rs) { case Err(error: x): match (x) { case Server(error: s): true; case _: false; }; case Ok(value: c): false; };
+        string strictGot = outcome(r: rs);
+        f = f + check(ok: refused, what: "${e}: protocol=3, HELLO refused, no fallback: ${strictGot}");
+        i = i + 1;
+    }
+    // No password given, and a proxy that requires one: NOAUTH to a HELLO without AUTH ends the connect.
+    DynamicArray<Step> none = steps();
+    none.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3, password required")));
+    Result<Connection, RedisError> rn = over(script: give none, url: "redis://");
+    f = f + check(ok: codeIs(r: rn, code: "NOAUTH"), what: "envoy-1.39.0: NOAUTH with no password given");
+    return f;
+}
+
+// ---- a handshake that goes wrong ----
+
+unsafe fn int32 hostileHandshakeTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    // HELLO answered with something that is not a map.
+    DynamicArray<Step> notMap = steps();
+    notMap.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "select1")));
+    Result<Connection, RedisError> r1 = over(script: give notMap, url: "redis://");
+    string g1 = outcome(r: r1);
+    f = f + check(ok: isUnexpected(r: r1) && g1 == "the HELLO reply is not a map", what: "hostile: HELLO answered with +OK: ${g1}");
+    // HELLO 3 answered with protocol 2.
+    DynamicArray<Step> proto = steps();
+    proto.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "hello2")));
+    Result<Connection, RedisError> r2 = over(script: give proto, url: "redis://");
+    string g2 = outcome(r: r2);
+    f = f + check(ok: isUnexpected(r: r2) && g2 == "the server answered HELLO 3 with protocol 2", what: "hostile: HELLO 3 answered with protocol 2: ${g2}");
+    // The connection closed in answer to HELLO, as twemproxy closes it.
+    DynamicArray<Step> twem = steps();
+    twem.add(item: Step::Close);
+    Result<Connection, RedisError> r3 = over(script: give twem, url: "redis://");
+    string g3 = outcome(r: r3);
+    f = f + check(ok: isUnexpected(r: r3) && g3.contains(substring: "twemproxy") && g3.contains(substring: "protocol=2"), what: "hostile: a hangup in answer to HELLO names twemproxy: ${g3}");
+    DynamicArray<Step> twem2 = steps();
+    twem2.add(item: Step::Close);
+    Result<Connection, RedisError> r4 = over(script: give twem2, url: "redis://:pw@?protocol=2");
+    string g4 = outcome(r: r4);
+    f = f + check(ok: g4 == "Server closed the connection", what: "hostile: a hangup on the RESP2 path, in hiredis's words: ${g4}");
+    // Silence, and a late reply: Timeout.
+    DynamicArray<Step> silent = steps();
+    silent.add(item: Step::Silent);
+    Result<Connection, RedisError> r5 = over(script: give silent, url: "redis://");
+    f = f + check(ok: isTimeout(r: r5), what: "hostile: a silent server times out");
+    DynamicArray<Step> late = steps();
+    late.add(item: Step::Late(reply: reply(server: s, kase: "hello3")));
+    Result<Connection, RedisError> r6 = over(script: give late, url: "redis://");
+    f = f + check(ok: isTimeout(r: r6), what: "hostile: a late HELLO reply times out");
+    // Bytes that are not RESP.
+    DynamicArray<Step> garbage = steps();
+    garbage.add(item: expect(command: "HELLO 3", answer: resp(name: "hostile: type byte 0x00")));
+    Result<Connection, RedisError> r7 = over(script: give garbage, url: "redis://");
+    f = f + check(ok: isProtocolError(r: r7), what: "hostile: HELLO answered with bytes that are not RESP");
+    // A hangup after every step of the fullest handshake: an error each time, never a panic or a connection.
+    isize k = 0;
+    while (k < 4) {
+        DynamicArray<Step> cut = steps();
+        if (k > 0) { cut.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw SETNAME kama-test", answer: reply(server: s, kase: "hello3-auth-setname"))); }
+        if (k > 1) { cut.add(item: expect(command: "SELECT 1", answer: reply(server: s, kase: "select1"))); }
+        if (k > 2) { cut.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: s, kase: "setinfo-name"))); }
+        cut.add(item: Step::Close);
+        Result<Connection, RedisError> rk = over(script: give cut, url: "redis://kr_acl:kr_acl_pw@/1?client_name=kama-test");
+        string gk = outcome(r: rk);
+        f = f + check(ok: gk != "ok", what: "hostile: a hangup after step ${k} of the handshake is an error: ${gk}");
+        k = k + 1;
+    }
+    return f;
+}
+
+// ---- calls ----
+
+unsafe fn int32 callTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+
+    // An error reply is Server, and the connection goes on.
+    DynamicArray<Step> errs = welcome(server: s);
+    errs.add(item: expect(command: "LPUSH kr:s x", answer: reply(server: s, kase: "wrongtype")));
+    errs.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    errs.add(item: expect(command: "EXEC", answer: reply(server: s, kase: "exec-error")));
+    Connection c = connected(script: give errs, url: "redis://", what: "calls");
+    Command lpush = commandOf(text: "LPUSH kr:s x");
+    Result<Value, RedisError> wt = c.call(command: lpush);
+    bool wrongType = match (wt) { case Err(error: e): match (e.serverCode()) { case Some(value: k): match (k) { case WrongType: true; case _: false; }; case None: false; }; case Ok(value: v): false; };
+    f = f + check(ok: wrongType && !c.isClosed(), what: "call: an error reply is Server, by its code, and the connection goes on");
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> pong = c.call(command: ping);
+    f = f + check(ok: isSimple(r: pong, text: "PONG"), what: "call: the next call after an error reply");
+    // An error inside a reply stays a value there.
+    Command exec = Command.of(name: "EXEC");
+    Result<Value, RedisError> ex = c.call(command: exec);
+    bool inside = match (ex) {
+        case Ok(value: v): match (v) { case Array(items: it): it.length() == 2 && !it[0].isError() && it[1].isError(); case _: false; };
+        case Err(error: e): false;
+    };
+    f = f + check(ok: inside, what: "call: EXEC's error stays inside its array");
+
+    // A push message before the reply is set aside.
+    DynamicArray<Step> pushed = welcome(server: s);
+    pushed.add(item: Step::Send(bytes: pushIn(b: resp(name: "redis-7.2.16 RESP3 DEBUG PROTOCOL push"))));
+    pushed.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Connection cp = connected(script: give pushed, url: "redis://", what: "push");
+    Command ping2 = Command.of(name: "PING");
+    Result<Value, RedisError> p2 = cp.call(command: ping2);
+    f = f + check(ok: isSimple(r: p2, text: "PONG") && cp.pendingPushes() == 1, what: "call: a push before the reply is set aside, not taken for it");
+
+    // Bytes that are not RESP close the connection.
+    DynamicArray<Step> bad = welcome(server: s);
+    bad.add(item: expect(command: "PING", answer: resp(name: "hostile: type byte 0x00")));
+    Connection cb = connected(script: give bad, url: "redis://", what: "garbage");
+    Command ping3 = Command.of(name: "PING");
+    Result<Value, RedisError> p3 = cb.call(command: ping3);
+    bool protocol = match (p3) { case Err(error: e): match (e) { case Protocol(error: x): true; case _: false; }; case Ok(value: v): false; };
+    Command ping4 = Command.of(name: "PING");
+    Result<Value, RedisError> p4 = cb.call(command: ping4);
+    f = f + check(ok: protocol && cb.isClosed() && callClosed(r: p4), what: "call: bytes that are not RESP, then Closed");
+
+    // A string longer than the reader allows.
+    Config tight = configOf(url: "redis://");
+    Limits small = Limits.defaults();
+    small.maxBulk = 16i64;
+    tight.setLimits(limits: small);
+    DynamicArray<Step> big = welcome(server: s);
+    big.add(item: expect(command: "COMMAND DOCS GET", answer: resp(name: "redis-7.2.16 RESP3 COMMAND DOCS GET")));
+    Result<Connection, RedisError> rbig = overConfig(script: give big, config: tight);
+    match (give rbig) {
+        case Ok(value: cbig): {
+            Connection conn = give cbig;
+            Command docs = commandOf(text: "COMMAND DOCS GET");
+            Result<Value, RedisError> d = conn.call(command: docs);
+            string dGot = callOutcome(r: d);
+            f = f + check(ok: dGot == "Bulk string length out of range" && conn.isClosed(), what: "call: a bulk past maxBulk: ${dGot}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "call: maxBulk 16 connects: ${m}"); }
+    };
+
+    // A late reply: Timeout, and the connection is closed, because the reply may still come.
+    DynamicArray<Step> late = welcome(server: s);
+    late.add(item: Step::Late(reply: reply(server: s, kase: "ping")));
+    Connection cl = connected(script: give late, url: "redis://", what: "late");
+    Command ping5 = Command.of(name: "PING");
+    Result<Value, RedisError> p5 = cl.call(command: ping5);
+    bool timedOut = match (p5) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: v): false; };
+    Command ping6 = Command.of(name: "PING");
+    Result<Value, RedisError> p6 = cl.call(command: ping6);
+    f = f + check(ok: timedOut && cl.isClosed() && callClosed(r: p6), what: "call: a late reply times out and closes the connection");
+
+    // A hangup halfway through a reply.
+    DynamicArray<uint8> whole = reply(server: s, kase: "ping");
+    DynamicArray<uint8> half = DynamicArray.empty();
+    half.addAll(items: whole.view().slice(from: 0, count: whole.length() / 2));
+    DynamicArray<Step> cut = welcome(server: s);
+    cut.add(item: expect(command: "PING", answer: give half));
+    cut.add(item: Step::Hangup);
+    Connection ch = connected(script: give cut, url: "redis://", what: "hangup");
+    Command ping7 = Command.of(name: "PING");
+    Result<Value, RedisError> p7 = ch.call(command: ping7);
+    string p7Got = callOutcome(r: p7);
+    f = f + check(ok: p7Got == "Server closed the connection" && ch.isClosed(), what: "call: a hangup mid-reply: ${p7Got}");
+
+    // A server that stops reading while its own output is unread: the client reads while it writes.
+    DynamicArray<Step> jam = welcome(server: s);
+    jam.add(item: Step::Send(bytes: pushIn(b: resp(name: "redis-7.2.16 RESP3 DEBUG PROTOCOL push"))));
+    jam.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Config jamConfig = configOf(url: "redis://");
+    Owned<Transport> jammed = new FakeServer.jammed(steps: give jam, chunk: 1, writeLimit: 3, backlog: 4);
+    Result<Connection, RedisError> rj = Connection.connectOver(transport: give jammed, config: jamConfig);
+    match (give rj) {
+        case Ok(value: cj): {
+            Connection conn = give cj;
+            Command ping8 = Command.of(name: "PING");
+            Result<Value, RedisError> p8 = conn.call(command: ping8);
+            f = f + check(ok: isSimple(r: p8, text: "PONG") && conn.pendingPushes() == 1, what: "call: a jammed server: the client reads as it writes");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "call: a jammed server's handshake: ${m}"); }
+    };
+
+    // close: every later call is Closed, and closing twice is harmless.
+    Connection cc = connected(script: welcome(server: s), url: "redis://", what: "close");
+    cc.close();
+    cc.close();
+    Command ping9 = Command.of(name: "PING");
+    Result<Value, RedisError> p9 = cc.call(command: ping9);
+    f = f + check(ok: cc.isClosed() && callClosed(r: p9), what: "close: then Closed");
+    Result<Unit, RedisError> neg = cc.setCommandTimeout(timeout: Duration.fromMillis(ms: -1i64));
+    bool negRefused = match (neg) { case Ok(value: u): false; case Err(error: e): true; };
+    f = f + check(ok: negRefused, what: "setCommandTimeout: negative is refused");
+    return f;
+}
+
+// ---- a dialer: every address in turn ----
+
+unsafe fn int32 dialerTests() {
+    int32 f = 0;
+    // One address, refused.
+    DynamicArray<Dial> refuse = DynamicArray.empty();
+    refuse.add(item: Dial::Refuse);
+    Owned<Dialer> d1 = new ScriptDialer.make(dials: give refuse);
+    Config one = configOf(url: "redis://127.0.0.1:6379");
+    Result<Connection, RedisError> r1 = Connection.connectWith(dialer: give d1, config: one);
+    string g1 = outcome(r: r1);
+    f = f + check(ok: g1 == "Could not connect to 127.0.0.1:6379: connection refused", what: "dialer: a refused address, in redis-cli's frame: ${g1}");
+    // A dial that gives up on its deadline.
+    DynamicArray<Dial> slow = DynamicArray.empty();
+    slow.add(item: Dial::TimeOut);
+    Owned<Dialer> d2 = new ScriptDialer.make(dials: give slow);
+    Result<Connection, RedisError> r2 = Connection.connectWith(dialer: give d2, config: one);
+    string g2 = outcome(r: r2);
+    f = f + check(ok: g2 == "Could not connect to 127.0.0.1:6379: Connection timed out", what: "dialer: a connect that timed out: ${g2}");
+
+    // localhost: every address it resolves to, in turn. The last one serves.
+    Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: "localhost", port: 6379ui16);
+    isize n = match (found) { case Ok(value: all): all.length(); case Err(error: e): 0; };
+    if (n > 0) {
+        DynamicArray<Dial> tries = DynamicArray.empty();
+        isize k = 0;
+        while (k < n - 1) { tries.add(item: Dial::Refuse); k = k + 1; }
+        tries.add(item: Dial::Serve(steps: welcome(server: "redis-8.10.2")));
+        Owned<Dialer> d3 = new ScriptDialer.make(dials: give tries);
+        Config local = configOf(url: "redis://localhost");
+        Result<Connection, RedisError> r3 = Connection.connectWith(dialer: give d3, config: local);
+        string g3 = outcome(r: r3);
+        f = f + check(ok: g3 == "ok", what: "dialer: localhost's last address serves, after ${n} tried: ${g3}");
+        // Every address refused: each is in the error, by name and address.
+        DynamicArray<Dial> none = DynamicArray.empty();
+        k = 0;
+        while (k < n) { none.add(item: Dial::Refuse); k = k + 1; }
+        Owned<Dialer> d4 = new ScriptDialer.make(dials: give none);
+        Result<Connection, RedisError> r4 = Connection.connectWith(dialer: give d4, config: local);
+        isize attempts = match (r4) { case Err(error: e): match (e) { case Connect(error: c): c.count(); case _: -1; }; case Ok(value: c): -1; };
+        string g4 = outcome(r: r4);
+        f = f + check(ok: attempts == n && g4.startsWith(prefix: "Could not connect to localhost at "), what: "dialer: every address refused, each kept: ${g4}");
+    }
+    return f;
+}
+
+unsafe fn int32 connectionTests() {
+    int32 f = 0;
+    f = f + handshakeTests();
+    f = f + fallbackTests();
+    f = f + hostileHandshakeTests();
+    f = f + callTests();
+    f = f + dialerTests();
+    return f;
+}
