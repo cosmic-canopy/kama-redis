@@ -5,8 +5,8 @@ covers what a publishable library needs. `kama agents install` writes both, so t
 hand-edited; a re-install rewrites them. This file is the project-specific third, and it is the one to
 edit.
 
-**Read [docs/ROADMAP.md](docs/ROADMAP.md) first.** It gives the order of work, and the decisions still to
-confirm. Read [KAMA_GAPS.md](KAMA_GAPS.md) for the compiler gaps this package has hit.
+**Read [docs/ROADMAP.md](docs/ROADMAP.md) first.** It gives the order of work, where the next phase starts, and every
+decision made so far with its reason. Read [KAMA_GAPS.md](KAMA_GAPS.md) for the compiler gaps this package has hit.
 
 **The sibling `@kama/postgres` (`../kama-postgres`) is the model.** It is the same kind of package (a native wire
 protocol over `std::net`, a non-blocking `Transport` with deadlines, TLS from `@kama/tls`, typed values through

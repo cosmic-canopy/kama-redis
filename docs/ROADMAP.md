@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-03: phases 0 and 1 are done. Phase 2 is next.
+Where this is, 2026-10-04: phases 0 and 1 are done. Phase 2 is next: see "Phase 2: where to start" below.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -30,32 +30,73 @@ does its discipline:
 | 7 | Pool (cross-isolate), reconnection, examples, hardening (server restart, failover, bounded memory), docs | |
 | — | Publish `@kama/redis` 0.1.0 — only on the maintainer's word | |
 
-## Proposed, for the maintainer to confirm
+## Phase 2: where to start
 
-These are the scaffold's working assumptions. Each is cheap to change now and expensive after phase 2.
+The bar is the one `@kama/postgres` set: comprehensive and production-grade. Every setting is honoured or refused,
+every failure path is tested against a scripted server, and the whole matrix passes live, debug and release.
 
-- **Native protocol, not hiredis.** Consumers install nothing, the rule every `@kama` package keeps, and the package
-  controls the reader's bounds, pipelining and push messages. This mirrors `@kama/postgres` and libpq.
-- **Redis and Valkey both, in one matrix.** They speak the same protocol. Valkey forked from Redis 7.2, and the
-  forks have diverged since (Redis 8 adds commands, Valkey 8 and 9 add others). Where they differ, the client
-  follows the server it is talking to. The floor is Redis 6.2 and Valkey 7.2: the oldest servers with RESP3, ACL
-  users and channel permissions that are still widely deployed.
-- **RESP3 by default.** `HELLO 3` gives typed replies (maps, sets, doubles, booleans, nulls) and push messages on the
-  same connection. RESP2 stays fully supported, because proxies such as twemproxy and older Envoy speak only RESP2.
-- **The reference implementation is the one the server ships.** For PostgreSQL that was libpq, and psql beside
-  it. For Redis it is hiredis, and redis-cli beside it, from the server's own repository:
-  - the RESP reader and its edge cases follow hiredis's, with its reader tests as vectors;
-  - `redis://` and `rediss://` URLs mean what they mean to redis-cli, asked live in the container, as libpq was
-    asked;
-  - `unix://` has no reference, because Redis defines none: see "Decided", phase 1.
+- **Before writing anything**, read the matching parts of `@kama/postgres`:
+  - `src/transport.kama`: the `Transport` contract, and `TcpTransport` and `UnixTransport`, non-blocking, with
+    connect timeouts and TCP keepalive.
+  - `src/wire/wire.kama`: `Deadline`, and framing over a transport. Here, `Wire` reads into
+    `resp::Reader.spare`/`commit`.
+  - `src/config.kama` and `src/conninfo/`: settings resolved in one order, each honoured or refused.
+  - `src/connection.kama`: the connect procedure, step by step, and `busy`.
+  - `src/error.kama`: `PgError`.
+  - `tests/unit/src/fake_server.kama`: the scripted server.
+  - `tools/test-integration.sh`: the live suite on every server, debug and release.
+- **To decide early and write down here:**
+  - **`RedisError`.**
+    - The server's code is the error's first word (`ERR`, `WRONGTYPE`, `NOAUTH`, `WRONGPASS`, `NOPERM`, `MOVED`,
+      `ASK`, `LOADING`, `BUSY`, `READONLY`, `NOSCRIPT`, `NOPROTO`, …). It is a value to match, beside the server's
+      message.
+    - Transport, timeout, protocol (`resp::ProtocolError`), config and closed errors sit beside it.
+  - **`Config` and its URL query keys.** `RedisUrl` keeps the query for this.
+    - Which keys are honoured and under what names: `protocol`, connect and command timeouts, client name,
+      keepalive.
+    - Every other key is refused.
+    - Write down what redis-py and go-redis call each key before choosing.
+  - **The handshake.**
+    - `HELLO 3 [AUTH user pass] [SETNAME name]` in one round trip, then `SELECT`.
+    - With `protocol=2`, or when a proxy answers `HELLO` with an unknown-command error, fall back to `AUTH`
+      (one or two arguments) and RESP2.
+    - Valkey's `HELLO` reports `server: valkey`. Its `INFO` reports `redis_version:7.2.4` whatever the real
+      version, so the server is identified by `HELLO`, never by `INFO`.
+- **The test servers** are ready: all eight passed `tools/redis.sh smoke` on 2026-10-04, at the versions above.
+  `tests/integration` does not exist yet; phase 2 creates it, as postgres's.
+- **The compiler** is cstar's own build (0.9.530). CI pins v0.9.530, which must be tagged before CI can install it.
+
+## Decided, and why
+
+### The foundations (confirmed by the maintainer, 2026-10-04)
+
+- **Native protocol, not hiredis.**
+  - Consumers install nothing, the rule every `@kama` package keeps.
+  - The package controls the reader's bounds, pipelining and push messages.
+  - It mirrors `@kama/postgres` and libpq, and it is what redis-rs, go-redis and Lettuce do.
+- **One package for Redis and Valkey, named for Redis.**
+  - The protocol and nearly every command are shared, and "redis" is the name users search for. Valkey is named
+    everywhere the package says what it supports.
+  - Both run in one test matrix. Valkey forked from Redis 7.2, and the forks have diverged since (Redis 8 adds
+    commands, Valkey 8 and 9 add others). Where they differ, the client follows the server it is talking to,
+    identified by `HELLO`.
+  - The floor is Redis 6.2 and Valkey 7.2: the oldest servers with RESP3, ACL users and channel permissions that
+    are still widely deployed.
+- **RESP3 by default.**
+  - `HELLO 3` gives typed replies (maps, sets, doubles, booleans, nulls) and push messages on the same connection.
+  - go-redis v9 and Lettuce 6 default to it as well.
+  - RESP2 stays fully supported, because proxies such as twemproxy and older Envoy speak only RESP2.
+- **The reference implementation is the one the server ships.** For PostgreSQL that was libpq, and psql beside it.
+  For Redis it is hiredis, and redis-cli beside it, from the server's own repository:
+  - the RESP reader follows hiredis (phase 1, below);
+  - URLs follow redis-cli, and connection behaviour does too;
+  - `unix://` has no reference, because Redis defines none (phase 1, below).
 
   Behaviour that no reference fixes, such as URL options for timeouts, is decided here and written down.
 - **Errors carry the server's code**, as a value a caller can match, beside the server's own message. They are
   never parsed for prose.
 - **Typed access goes through `Deserializable`**, as in `@kama/postgres`. So a `@generate` struct reads from a
   RESP3 map (`HGETALL`, `XINFO`), and `Uuid` and `Timestamp` need no special case.
-
-## Decided, and why
 
 ### Phase 1
 
@@ -104,6 +145,3 @@ These are the scaffold's working assumptions. Each is cheap to change now and ex
   A duplicate key, `password`, `user` and, on TCP, `db` are refused at parse.
 - **Modules:** `redis::resp` and `redis::cluster` are public, and `RedisUrl` is in the root module beside the
   coming `Config`.
-
-- **One package for Redis and Valkey, named for Redis.** The protocol and nearly every command are shared, and
-  "redis" is the name users search for. Valkey is named everywhere the package says what it supports.
