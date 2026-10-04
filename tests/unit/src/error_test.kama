@@ -1,0 +1,182 @@
+// redis::RedisError and redis::ServerError. Every code a server in the matrix can send, and every error reply the
+// servers and Envoy's proxy sent, come from server_vectors.kama (tools/gen-server-vectors.sh). The edges of the
+// code's window are the server's own rule (afterErrorReply in networking.c), written here.
+import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::io::IoError,
+         std::io::IoErrorKind, redis::RedisError, redis::ServerError, redis::ServerCode, redis::ConnectError,
+         redis::ConnectAttempt, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
+         redis_unit_tests::check, unhex, sentCodes, replyNames, replyHex, proxyNames, proxyHex };
+export { errorTests, errorOf };
+
+fn ServerError ofText(const ref string line) { return ServerError.of(bytes: line.bytes()); }
+
+// The error a whole reply holds; panics on anything else, which a test's vectors never hold.
+fn ServerError errorOf(ConstView<uint8> reply) {
+    Reader r = Reader.make();
+    r.feed(bytes: reply);
+    Read got = r.next();
+    return match (give got) {
+        case Complete(value: v): match (give v) {
+            case Error(bytes: b): ServerError.of(bytes: b.view());
+            case _: { panic(msg: "errorOf: not an error reply"); := ServerError.of(bytes: "".bytes()); }
+        };
+        case _: { panic(msg: "errorOf: not a whole reply"); := ServerError.of(bytes: "".bytes()); }
+    };
+}
+
+fn bool isOther(ServerCode c) { return match (c) { case Other: true; case _: false; }; }
+
+// Every code the servers send has a variant of its own, named as the server spells it.
+fn int32 codeTests() {
+    int32 f = 0;
+    DynamicArray<string> codes = sentCodes();
+    isize i = 0;
+    while (i < codes.length()) {
+        string line = codes[i].concat(other: " a message");
+        ServerError e = ofText(line: line);
+        string code = copy codes[i];
+        string named = e.code().text();
+        f = f + check(ok: !isOther(c: e.code()) && named == code, what: "code ${code} has its own variant (got '${named}')");
+        f = f + check(ok: e.codeText() == code, what: "code ${code}: codeText");
+        i = i + 1;
+    }
+    f = f + check(ok: codes.length() >= 36, what: "server vectors: at least 36 codes");
+    return f;
+}
+
+// Every error a server sent reads as a named code, and its message is the line as sent.
+fn int32 replyTests() {
+    int32 f = 0;
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> hex = replyHex();
+    isize errors = 0;
+    isize i = 0;
+    while (i < names.length()) {
+        DynamicArray<uint8> reply = unhex(text: hex[i]);
+        if (reply[0] == 45ui8) {
+            ServerError e = errorOf(reply: reply.view());
+            string name = copy names[i];
+            string text = e.message();
+            f = f + check(ok: !isOther(c: e.code()), what: "${name}: a named code (${text})");
+            // The message is the line between the '-' and the CR LF.
+            bool same = text.bytes().length() == reply.length() - 3;
+            f = f + check(ok: same, what: "${name}: the message is the whole line");
+            errors = errors + 1;
+        }
+        i = i + 1;
+    }
+    f = f + check(ok: errors > 150, what: "server vectors: more than 150 error replies");
+    return f;
+}
+
+// Envoy's refusals: its own words, read by the same rule.
+fn int32 proxyTests() {
+    int32 f = 0;
+    DynamicArray<string> names = proxyNames();
+    DynamicArray<string> hex = proxyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        DynamicArray<uint8> reply = unhex(text: hex[i]);
+        ServerError e = errorOf(reply: reply.view());
+        string name = copy names[i];
+        string code = e.codeText();
+        bool known = match (e.code()) { case Err: true; case NoAuth: true; case NoProto: true; case _: false; };
+        bool envoyOld = name.startsWith(prefix: "envoy-1.32.0") && !name.endsWith(suffix: "password required");
+        if (envoyOld) {
+            f = f + check(ok: isOther(c: e.code()) && code == "unsupported", what: "${name}: code 'unsupported', not named (got ${code})");
+        } else {
+            f = f + check(ok: known, what: "${name}: ERR, NOAUTH or NOPROTO (got ${code})");
+        }
+        i = i + 1;
+    }
+    f = f + check(ok: names.length() == 12, what: "proxy vectors: 12 answers");
+    return f;
+}
+
+// The server's window: a code is what comes before a space in the line's first 31 bytes after the '-'.
+fn int32 windowTests() {
+    int32 f = 0;
+    ServerError plain = ofText(line: "WRONGTYPE Operation against a key holding the wrong kind of value");
+    f = f + check(ok: plain.codeText() == "WRONGTYPE" && plain.detail() == "Operation against a key holding the wrong kind of value",
+                  what: "window: code and detail");
+    // 30 bytes of code, the space at index 30: still the code.
+    string thirty = "ABCDEFGHIJABCDEFGHIJABCDEFGHIJ";
+    ServerError atEdge = ofText(line: thirty.concat(other: " message"));
+    string edgeCode = atEdge.codeText();
+    f = f + check(ok: edgeCode == thirty && isOther(c: atEdge.code()), what: "window: a space at index 30 ends a 30-byte code (got ${edgeCode})");
+    // 31 bytes: the space is past the window, so the server counts it as ERR, and the whole line is the detail.
+    string past = thirty.concat(other: "K message");
+    ServerError beyond = ofText(line: past);
+    string beyondCode = beyond.codeText();
+    bool isErr = match (beyond.code()) { case Err: true; case _: false; };
+    f = f + check(ok: isErr && beyondCode == "ERR" && beyond.detail() == past, what: "window: a space at index 31 is past it, ERR (got ${beyondCode})");
+    // No space at all.
+    ServerError bare = ofText(line: "NOSPACE");
+    bool bareErr = match (bare.code()) { case Err: true; case _: false; };
+    f = f + check(ok: bareErr && bare.detail() == "NOSPACE" && bare.message() == "NOSPACE", what: "window: no space is ERR");
+    // A space first: an empty code, which names nothing.
+    ServerError empty = ofText(line: " leading space");
+    f = f + check(ok: isOther(c: empty.code()) && empty.codeText() == "" && empty.detail() == "leading space", what: "window: an empty code");
+    // Codes are case-sensitive, as the server's are.
+    ServerError lower = ofText(line: "err lower case");
+    f = f + check(ok: isOther(c: lower.code()) && lower.codeText() == "err", what: "window: 'err' is not ERR");
+    // A module's code.
+    ServerError module = ofText(line: "MYMODULE something went wrong");
+    f = f + check(ok: isOther(c: module.code()) && module.codeText() == "MYMODULE", what: "window: a module's code is Other, kept as sent");
+    return f;
+}
+
+// Bytes that are not UTF-8 are shown as \xNN; the bytes themselves are kept.
+fn int32 bytesTests() {
+    int32 f = 0;
+    DynamicArray<uint8> raw = DynamicArray.empty();
+    raw.addAll(items: "ERR unknown command '".bytes());
+    raw.add(item: 255ui8);
+    raw.add(item: 195ui8);      // a lead byte with no continuation
+    raw.addAll(items: "', with args beginning with: \u{e9}".bytes());
+    ServerError e = ServerError.of(bytes: raw.view());
+    string m = e.message();
+    f = f + check(ok: m == "ERR unknown command '\\xff\\xc3', with args beginning with: \u{e9}", what: "bytes: \\xNN for what is not UTF-8, UTF-8 kept: ${m}");
+    f = f + check(ok: e.bytes().length() == raw.length(), what: "bytes: kept as sent");
+    bool isErr = match (e.code()) { case Err: true; case _: false; };
+    f = f + check(ok: isErr, what: "bytes: the code still reads");
+    return f;
+}
+
+fn int32 messageTests() {
+    int32 f = 0;
+    RedisError eof = RedisError::Io(error: IoError.of(kind: IoErrorKind::UnexpectedEof));
+    f = f + check(ok: eof.message() == "Server closed the connection", what: "message: a hangup in hiredis's words");
+    RedisError late = RedisError::Timeout;
+    f = f + check(ok: late.message() == "timed out", what: "message: Timeout");
+    RedisError closed = RedisError::Closed;
+    f = f + check(ok: closed.message() == "the connection is closed", what: "message: Closed");
+    RedisError server = RedisError::Server(error: ofText(line: "NOAUTH Authentication required."));
+    f = f + check(ok: server.message() == "NOAUTH Authentication required.", what: "message: a server error is its line");
+    Optional<ServerCode> code = server.serverCode();
+    bool noAuth = match (code) { case Some(value: c): match (c) { case NoAuth: true; case _: false; }; case None: false; };
+    f = f + check(ok: noAuth, what: "serverCode: a server error's code");
+    Optional<ServerCode> none = late.serverCode();
+    f = f + check(ok: match (none) { case Some(value: c): false; case None: true; }, what: "serverCode: None for a timeout");
+
+    ConnectError tried = ConnectError.make();
+    tried.add(attempt: ConnectAttempt.make(place: "localhost at [::1]:6379", failure: IoError.of(kind: IoErrorKind::ConnectionRefused)));
+    tried.add(attempt: ConnectAttempt.make(place: "localhost at 127.0.0.1:6379", failure: IoError.of(kind: IoErrorKind::TimedOut)));
+    RedisError failed = RedisError::Connect(error: give tried);
+    string m = failed.message();
+    f = f + check(ok: m == "Could not connect to localhost at [::1]:6379: connection refused\nCould not connect to localhost at 127.0.0.1:6379: Connection timed out",
+                  what: "message: every attempt, in redis-cli's frame: ${m}");
+    bool lastTimeout = match (failed) { case Connect(error: c): match (c.last()) { case Timeout: true; case _: false; }; case _: false; };
+    f = f + check(ok: lastTimeout, what: "connect: a deadline is a Timeout");
+    return f;
+}
+
+fn int32 errorTests() {
+    int32 f = 0;
+    f = f + codeTests();
+    f = f + replyTests();
+    f = f + proxyTests();
+    f = f + windowTests();
+    f = f + bytesTests();
+    f = f + messageTests();
+    return f;
+}

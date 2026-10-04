@@ -1,0 +1,321 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::io::IoError, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::resp::ProtocolError };
+export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt };
+
+// What can go wrong talking to Redis or Valkey. A data error is one of these; a contract violation (an index out of
+// range) panics, as one does on a collection.
+//
+// Wherever hiredis or redis-cli has words for a failure, the message uses them ("Server closed the connection",
+// "Could not connect to …"), so a log line from this client reads the same as one from the server's own tools.
+type enum RedisError implements Error, Sendable {
+    // A setting that cannot be used: a URL that does not parse, an option this client does not know, a value out
+    // of range, TLS before it is supported.
+    Config(string detail),
+    // The socket failed. A server that closed the connection is `UnexpectedEof`.
+    Io(IoError error),
+    // A deadline passed: `connect_timeout` while connecting, `command_timeout` during a call. A call that times out
+    // closes the connection, because its reply may still arrive and nothing could tell it from the next one.
+    Timeout,
+    // The server sent bytes that are not RESP. The connection is closed: nothing says where the next reply starts.
+    Protocol(ProtocolError error),
+    // A well-formed reply the exchange does not allow: a HELLO reply that is not a map, a protocol version other
+    // than the one asked for, something other than OK where only OK will do. The connection is closed.
+    Unexpected(string detail),
+    // The server answered with an error. Its code is a value to match (`ServerError.code()`); after a command's
+    // error the connection is still usable.
+    Server(ServerError error),
+    // No address of the host accepted a connection. Each attempt is kept, with its own error.
+    Connect(ConnectError error),
+    // The connection is closed: by `close()`, or by an earlier failure that left it unusable.
+    Closed,
+    // A call this client does not make in this form. The connection is still usable.
+    Usage(string detail);
+
+    public const fn string message() {
+        return match (this) {
+            case Config(detail: d): copy d;
+            case Io(error: e): ioMessage(e: e);
+            case Timeout: "timed out";
+            case Protocol(error: e): e.message();
+            case Unexpected(detail: d): copy d;
+            case Server(error: e): e.message();
+            case Connect(error: e): e.message();
+            case Closed: "the connection is closed";
+            case Usage(detail: d): copy d;
+        };
+    }
+
+    // The server's code, when the server sent this error.
+    public const fn Optional<ServerCode> serverCode() {
+        return match (this) {
+            case Server(error: e): Optional::Some(value: e.code());
+            case _: Optional::None;
+        };
+    }
+}
+
+// An I/O failure as hiredis words it: "Server closed the connection" for a hangup, the operating system's own text
+// for an error it reported ("Connection refused"), and the kind's for one kama raised.
+fn string ioMessage(const ref IoError e) {
+    bool eof = match (e.kind()) { case UnexpectedEof: true; case _: false; };
+    if (eof) { return "Server closed the connection"; }
+    Optional<string> words = e.osMessage();
+    return match (give words) { case Some(value: w): give w; case None: e.message(); };
+}
+
+// The code an error reply starts with. There is a variant for every code the servers in the test matrix can send
+// (tests/unit/src/server_vectors.kama reads them out of each server's binary), and `Other` for the rest: a module's,
+// a script's, a proxy's. `ServerError.codeText()` has the code as sent, whichever it is.
+type enum ServerCode implements Sendable {
+    Err,            // ERR: the generic error
+    WrongType,      // WRONGTYPE: an operation against a key holding the wrong kind of value
+    NoAuth,         // NOAUTH: authentication required
+    WrongPass,      // WRONGPASS: a wrong user or password, or a disabled user
+    NoPerm,         // NOPERM: the user's ACL does not allow the command, key or channel
+    Moved,          // MOVED: the slot is served by another node, from now on
+    Ask,            // ASK: the slot is migrating; ask the other node, this once
+    TryAgain,       // TRYAGAIN: a multi-key command during resharding
+    CrossSlot,      // CROSSSLOT: the keys hash to different slots
+    ClusterDown,    // CLUSTERDOWN: the cluster is down, or the slot is not served
+    Loading,        // LOADING: the server is loading its dataset into memory
+    Busy,           // BUSY: a script, function or module is running
+    BusyKey,        // BUSYKEY: the target key already exists
+    MasterDown,     // MASTERDOWN: the link to the primary is down and stale data is not served
+    Misconf,        // MISCONF: persistence is failing, so writes are refused
+    ReadOnly,       // READONLY: a write against a read-only replica
+    NoReplicas,     // NOREPLICAS: too few replicas for min-replicas-to-write
+    NoScript,       // NOSCRIPT: EVALSHA of a script the server does not have
+    NoProto,        // NOPROTO: HELLO with a protocol version the server does not speak
+    ExecAbort,      // EXECABORT: a transaction discarded because of an earlier error
+    Oom,            // OOM: used memory is over maxmemory
+    Unblocked,      // UNBLOCKED: a blocked client released by CLIENT UNBLOCK … ERROR
+    Unkillable,     // UNKILLABLE: SCRIPT KILL of a script that already wrote
+    NotBusy,        // NOTBUSY: a kill with nothing running
+    BusyGroup,      // BUSYGROUP: the consumer group already exists
+    NoGroup,        // NOGROUP: no such stream key or consumer group
+    NoMasterLink,   // NOMASTERLINK: a replica that is not linked to its primary
+    IoErr,          // IOERR: MIGRATE's I/O failed or timed out
+    Denied,         // DENIED: protected mode refused a remote client
+    InvalidObj,     // INVALIDOBJ: a corrupt HyperLogLog
+    NotReady,       // NOTREADY: the cluster is not ready to migrate slots (Redis 8.10)
+    NoGoodSlave,    // NOGOODSLAVE: Sentinel found no replica to promote
+    NoGoodPrimary,  // NOGOODPRIMARY: the same, in Valkey 9's words
+    NoQuorum,       // NOQUORUM: SENTINEL CKQUORUM failed
+    InProg,         // INPROG: Sentinel already has a failover in progress
+    Redirect,       // REDIRECT: Valkey 8's redirect from a replica, for a client that asked for it
+    Other;
+
+    // The code as the server spells it; "" for `Other`.
+    public const fn string text() {
+        return match (this) {
+            case Err: "ERR";
+            case WrongType: "WRONGTYPE";
+            case NoAuth: "NOAUTH";
+            case WrongPass: "WRONGPASS";
+            case NoPerm: "NOPERM";
+            case Moved: "MOVED";
+            case Ask: "ASK";
+            case TryAgain: "TRYAGAIN";
+            case CrossSlot: "CROSSSLOT";
+            case ClusterDown: "CLUSTERDOWN";
+            case Loading: "LOADING";
+            case Busy: "BUSY";
+            case BusyKey: "BUSYKEY";
+            case MasterDown: "MASTERDOWN";
+            case Misconf: "MISCONF";
+            case ReadOnly: "READONLY";
+            case NoReplicas: "NOREPLICAS";
+            case NoScript: "NOSCRIPT";
+            case NoProto: "NOPROTO";
+            case ExecAbort: "EXECABORT";
+            case Oom: "OOM";
+            case Unblocked: "UNBLOCKED";
+            case Unkillable: "UNKILLABLE";
+            case NotBusy: "NOTBUSY";
+            case BusyGroup: "BUSYGROUP";
+            case NoGroup: "NOGROUP";
+            case NoMasterLink: "NOMASTERLINK";
+            case IoErr: "IOERR";
+            case Denied: "DENIED";
+            case InvalidObj: "INVALIDOBJ";
+            case NotReady: "NOTREADY";
+            case NoGoodSlave: "NOGOODSLAVE";
+            case NoGoodPrimary: "NOGOODPRIMARY";
+            case NoQuorum: "NOQUORUM";
+            case InProg: "INPROG";
+            case Redirect: "REDIRECT";
+            case Other: "";
+        };
+    }
+}
+
+// Every named code, in declaration order, for reading one from its text.
+fn DynamicArray<ServerCode> namedCodes() {
+    DynamicArray<ServerCode> v = DynamicArray.empty();
+    v.add(item: ServerCode::Err); v.add(item: ServerCode::WrongType); v.add(item: ServerCode::NoAuth);
+    v.add(item: ServerCode::WrongPass); v.add(item: ServerCode::NoPerm); v.add(item: ServerCode::Moved);
+    v.add(item: ServerCode::Ask); v.add(item: ServerCode::TryAgain); v.add(item: ServerCode::CrossSlot);
+    v.add(item: ServerCode::ClusterDown); v.add(item: ServerCode::Loading); v.add(item: ServerCode::Busy);
+    v.add(item: ServerCode::BusyKey); v.add(item: ServerCode::MasterDown); v.add(item: ServerCode::Misconf);
+    v.add(item: ServerCode::ReadOnly); v.add(item: ServerCode::NoReplicas); v.add(item: ServerCode::NoScript);
+    v.add(item: ServerCode::NoProto); v.add(item: ServerCode::ExecAbort); v.add(item: ServerCode::Oom);
+    v.add(item: ServerCode::Unblocked); v.add(item: ServerCode::Unkillable); v.add(item: ServerCode::NotBusy);
+    v.add(item: ServerCode::BusyGroup); v.add(item: ServerCode::NoGroup); v.add(item: ServerCode::NoMasterLink);
+    v.add(item: ServerCode::IoErr); v.add(item: ServerCode::Denied); v.add(item: ServerCode::InvalidObj);
+    v.add(item: ServerCode::NotReady); v.add(item: ServerCode::NoGoodSlave); v.add(item: ServerCode::NoGoodPrimary);
+    v.add(item: ServerCode::NoQuorum); v.add(item: ServerCode::InProg); v.add(item: ServerCode::Redirect);
+    return v;
+}
+
+fn ServerCode codeNamed(const ref string text) {
+    DynamicArray<ServerCode> all = namedCodes();
+    isize i = 0;
+    while (i < all.length()) {
+        if (all[i].text() == text) { return all[i]; }
+        i = i + 1;
+    }
+    return ServerCode::Other;
+}
+
+// The server reads an error's code out of its first 32 bytes, the `-` included (afterErrorReply in networking.c,
+// for its errorstats): the code is what comes before the first space there.
+comptime isize CODE_WINDOW = 31;
+
+// An error reply, whole: what came after its `-` or `!`, which is the code, a space, then the message.
+type resource ServerError implements Sendable {
+    DynamicArray<uint8> line;
+    // Where the code ends, at the space after it; -1 when no space falls inside the server's window, in which case
+    // the server counts the error as ERR.
+    isize codeEnd = -1;
+    ServerCode kind;
+
+    // The error from the bytes of a `Value::Error`.
+    public ctor of(ConstView<uint8> bytes) {
+        this.line = DynamicArray.withCapacity(capacity: bytes.length());
+        this.line.addAll(items: bytes);
+        this.codeEnd = -1;
+        isize i = 0;
+        while (i < bytes.length() && i < CODE_WINDOW) {
+            if (bytes[i] == 32ui8) { this.codeEnd = i; break; }
+            i = i + 1;
+        }
+        if (this.codeEnd < 0) {
+            this.kind = ServerCode::Err;
+        } else {
+            Result<string, Utf8Error> t = decode(bytes: bytes.slice(from: 0, count: this.codeEnd));
+            this.kind = match (give t) { case Ok(value: s): codeNamed(text: s); case Err(error: e): ServerCode::Other; };
+        }
+    }
+
+    public const fn ServerCode code() { return this.kind; }
+
+    // The code as sent ("WRONGTYPE", or a module's own); "ERR" when the line has none the server would count.
+    public const fn string codeText() {
+        if (this.codeEnd < 0) { return "ERR"; }
+        return shown(b: this.line.view().slice(from: 0, count: this.codeEnd));
+    }
+
+    // The message after the code; the whole line when it has no code.
+    public const fn string detail() {
+        if (this.codeEnd < 0) { return shown(b: this.line.view()); }
+        return shown(b: this.line.view().slice(from: this.codeEnd + 1, count: this.line.length() - this.codeEnd - 1));
+    }
+
+    // The whole line, code and message, as the server sent it.
+    public const fn string message() { return shown(b: this.line.view()); }
+
+    // The bytes as sent.
+    public const fn ConstView<uint8> bytes() { return this.line.view(); }
+}
+
+// Bytes as text: UTF-8 as it is, and each byte that is not part of it as \xNN.
+fn string shown(ConstView<uint8> b) {
+    string text = "";
+    isize from = 0;
+    while (from < b.length()) {
+        Result<string, Utf8Error> part = decode(bytes: b.slice(from: from, count: b.length() - from));
+        isize bad = match (give part) {
+            case Ok(value: s): { text = text.concat(other: s); := b.length(); }
+            case Err(error: e): match (e) { case Invalid(at: a): a + from; };
+        };
+        if (bad >= b.length()) { break; }
+        if (bad > from) {
+            Result<string, Utf8Error> good = decode(bytes: b.slice(from: from, count: bad - from));
+            match (give good) { case Ok(value: s): { text = text.concat(other: s); } case Err(error: e): { } };
+        }
+        text = text.concat(other: hexByte(b: b[bad]));
+        from = bad + 1;
+    }
+    return text;
+}
+
+fn string hexByte(uint8 b) {
+    string digits = "0123456789abcdef";
+    isize hi = cast<isize>(b >> 4);
+    isize lo = cast<isize>(b & 15ui8);
+    return "\\x".concat(other: digits.substring(start: hi, end: hi + 1)).concat(other: digits.substring(start: lo, end: lo + 1));
+}
+
+// One place a connection was tried: a host's address and port, or a socket's path, and the I/O failure that ended
+// the attempt. Only I/O ends one: once a connection is made, the handshake's outcome is the connect's, not an
+// attempt's.
+type resource ConnectAttempt implements Sendable {
+    string placeText;
+    IoError failure;
+
+    // `place` is how the attempt is named: "127.0.0.1:6379", "localhost at [::1]:6379", or a socket's path. A
+    // connect that gave up on its deadline is a `TimedOut` error that no OS code backs.
+    public ctor make(string place, IoError failure) {
+        this.placeText = give place;
+        this.failure = failure;
+    }
+
+    public const fn const ref string place() { return this.placeText; }
+    public const fn IoError cause() { return this.failure; }
+
+    // The failure as an error: `Timeout` for a deadline that passed, `Io` for the rest.
+    public const fn RedisError error() {
+        if (isDeadline(e: this.failure)) { return RedisError::Timeout; }
+        return RedisError::Io(error: this.failure);
+    }
+
+    // redis-cli's words, without the product's name, which is not known before HELLO: "Could not connect to
+    // 127.0.0.1:6379: Connection refused". A deadline that passed says so as the operating system does.
+    public const fn string message() {
+        string why = ioMessage(e: this.failure);
+        if (isDeadline(e: this.failure)) { why = "Connection timed out"; }
+        return "Could not connect to ".concat(other: this.placeText).concat(other: ": ").concat(other: why);
+    }
+}
+
+// A `TimedOut` this client raised: a deadline, not the operating system's own ETIMEDOUT.
+fn bool isDeadline(IoError e) {
+    bool timedOut = match (e.kind()) { case TimedOut: true; case _: false; };
+    bool raised = match (e.rawOsError()) { case Some(value: c): false; case None: true; };
+    return timedOut && raised;
+}
+
+// Every attempt of a failed connect, in the order made. There is at least one.
+type resource ConnectError implements Sendable {
+    DynamicArray<ConnectAttempt> tried;
+
+    public ctor make() { this.tried = DynamicArray.empty(); }
+    public fn void add(ConnectAttempt attempt) { this.tried.add(item: give attempt); }
+
+    public const fn isize count() { return this.tried.length(); }
+    public const fn const ref ConnectAttempt attempt(isize index) { return this.tried[index]; }
+    // The last attempt's error.
+    public const fn RedisError last() { return this.tried[this.tried.length() - 1].error(); }
+
+    // Each attempt's message, one per line.
+    public const fn string message() {
+        string text = "";
+        isize i = 0;
+        while (i < this.tried.length()) {
+            if (i > 0) { text = text.concat(other: "\n"); }
+            text = text.concat(other: this.tried[i].message());
+            i = i + 1;
+        }
+        return text;
+    }
+}
