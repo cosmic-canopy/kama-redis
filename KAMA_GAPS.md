@@ -11,7 +11,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-5 (HIGH). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Priorities:**
@@ -23,7 +23,57 @@ filed is cited by its KPG number rather than filed again.
 
 ## OPEN
 
-(none)
+### KRD-5 · HIGH · A type that holds a collection of itself through a resource no longer compiles — since KRD-4's fix
+
+**Found:** 2026-10-04, writing `src/error.kama` (phase 2). **Version:** fails on 0.9.530 (`e01de340`); the same
+program prints `ok` on the 0.9.523 release (`~/.kama/versions/v0.9.523`). **Suspected:** `fdccadda` (KRD-4,
+0.9.527). Its message says "a recursive mention is assumed to copy while it is being judged"; that provisional
+answer appears to reach the instantiation of `DynamicArray<E>`'s `copy` ctor.
+
+**Why HIGH:** the published **@kama/postgres 0.2.0 does not compile** on 0.9.530. `kama check kama.json` there
+fails on `DynamicArray<postgres::PgError>` (`src/connection.kama:519`) and on `DynamicArray<postgres::BatchResult>`
+(`src/connection.kama:1108`), with the same three errors. Any error type whose aggregate variant keeps the errors
+it gathered has this shape: `PgError::Connect` → `ConnectError` → `ConnectAttempt` → `DynamicArray<PgError>`.
+
+Repro (nothing in it copies anything):
+
+```kama
+import { core::println, std::collections::DynamicArray };
+
+type enum E {
+    A,
+    B(Box box);
+}
+
+type resource Box {
+    DynamicArray<E> items;
+    public ctor make() { this.items = DynamicArray.empty(); }
+}
+
+fn int32 main() {
+    Box b = Box.make();
+    println(s: "ok");
+    return 0;
+}
+```
+
+On 0.9.530:
+
+```
+repro.kama:12:0: error: `std::collections::DynamicArray<E>` has no method `copyAllFrom` — it is declared `when [T: Copyable]`, and `E` (for `T`) does not satisfy `Copyable` (in `DynamicArray<E, GlobalAllocator>`, instantiated here; raised at …/std/collections/dynamic_array.kama:239)
+…/std/collections/view.kama:15:0: error: `E` has no `copy` method — use `give` to move it
+…/std/collections/dynamic_array.kama:23:0: error: `E` has no `copy` method — use `give` to move it
+```
+
+Adding `implements Sendable` to both types changes nothing. `E` is correctly not Copyable: its `B` payload is a
+resource without a copy ctor.
+
+**Expected:** the program builds and prints `ok`, as on 0.9.523. `DynamicArray<E>`'s `copy` ctor is not
+instantiated for an `E` that does not copy.
+
+**Workaround here:** none needed. `@kama/redis` has no such type: a connect attempt holds the `IoError` that ended
+it, not a `RedisError`, because an attempt only ever fails on I/O. That is the design we would choose anyway, so
+nothing will need undoing. @kama/postgres has no workaround, and its next build needs this fixed.
 
 ## FIXED — kept for the record
 
