@@ -12,7 +12,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-7 (MED). KPG-38 (@kama/postgres's) is fixed upstream but not yet in a tagged release, so its
+**Open now:** KRD-8 (HIGH, a regression in cstar's newest build), KRD-7 (MED). KPG-38 (@kama/postgres's) is fixed upstream but not yet in a tagged release, so its
 workaround stays. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
@@ -28,6 +28,50 @@ the commit that made it pass.
 ---
 
 ## OPEN
+
+### KRD-8 · HIGH · Regression in 0.9.559/0.9.560: std's `deserialize`, instantiated with a type of the program's, resolves its names in std's module
+
+**Found** in phase 3, step 9, when `tools/test.sh`'s unit program stopped compiling on cstar's newest build with no
+change of its own: the tree at `af520b1` checks clean on `0.9.542` and fails on `0.9.560+gb8c3df4a`. The commits
+between are KR-120's (`be22bf4a`, 0.9.559, and `b8c3df4a`, 0.9.560: "a constructor builds its value where it will
+live"), and `deserialize` is a constructor. Reduced, in one file, with std's own JSON reader and nothing else:
+
+```kama
+import { core::println, std::collections::DynamicArray, std::collections::Map, std::memory::Owned,
+         std::serialization::text::json::deserializeJsonBuffer };
+
+@generate(Deserializable)
+type resource Entry {
+    @field string id;
+    public const fn string named() { return copy this.id; }
+}
+
+fn int32 main() {
+    Result<Map<string, DynamicArray<Entry>>, Owned<Error>> r =
+        deserializeJsonBuffer::<Map<string, DynamicArray<Entry>>>(src: "[{\"key\": \"s\", \"value\": [{\"id\": \"1-1\"}]}]");
+    isize n = match (r) { case Ok(value: m): m.length(); case Err(error: e): -1; };
+    println(s: "entries ${n}");
+    return 0;
+}
+```
+
+- `0.9.542`: builds, and prints `entries 1`.
+- `0.9.560`: refused, at the `deserializeJsonBuffer` line:
+  ```
+  src/main.kama:11:0: error: `Entry` is declared in `…/lib/std/collections/map.kama` and this file does not import it — add `import { Entry };` …
+  src/main.kama:11:0: error: `DynamicArray` is declared in `…/lib/std/collections/dynamic_array.kama` and this file does not import it — add `import { DynamicArray };` …
+  ```
+  The file imports `DynamicArray`, and its `Entry` is its own. The first message names std's `Entry` (Map's
+  key-value pair), so the program's `Entry` was looked up in `std::collections`. Two variants:
+  - Renamed `Record`, the same program fails with the `DynamicArray` message alone.
+  - Reading `DynamicArray<Entry>` alone, with no Map, fails with the `Entry` message alone.
+
+**Why HIGH:** reading a list or map of one's own struct is what `Deserializable` is for, and it is how this
+package's typed replies read XREAD and XRANGE. The next tagged release would break this package's tests (and its
+users) the moment CI moves to it.
+
+**Workaround:** none. The tests are correct as written. Until a fix, this package is gated on `0.9.542` (CI's pin)
+alone, and cstar's newest build is not used as a second gate.
 
 ### KRD-7 · MED · An adapter over a std type cannot name a type of its own module in a method's signature
 
