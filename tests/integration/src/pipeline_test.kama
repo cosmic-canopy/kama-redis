@@ -1,0 +1,61 @@
+// Pipelines against the server, under RESP3 and RESP2: 1000 commands in one write, with an error among them.
+import { redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::reply,
+         redis::resp::Value, redis_integration_tests::check, open, mainUrl, ask, commandOf };
+export { pipelineTests };
+
+unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "pipeline: connect under ${protocol}: ${m}"); }
+    };
+    string cleared = ask(c: c, text: "DEL kr:p:n kr:p:s");
+    string set = ask(c: c, text: "SET kr:p:s x");
+    // 999 INCRs, and at 500 an LPUSH onto a string: WRONGTYPE, for that command alone.
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < 1000) {
+        if (i == 500) {
+            Command wrong = commandOf(text: "LPUSH kr:p:s y");
+            p.add(command: wrong);
+        } else {
+            Command incr = commandOf(text: "INCR kr:p:n");
+            p.add(command: incr);
+        }
+        i = i + 1;
+    }
+    Result<Replies, RedisError> ran = c.run(pipeline: p);
+    Replies rs = match (give ran) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "pipeline: 1000 commands under ${protocol}: ${m}"); }
+    };
+    isize right = 0;
+    string wrongCode = "";
+    i = 0;
+    while (i < rs.length()) {
+        if (i == 500) {
+            Result<Value, RedisError> w = rs.take(index: i);
+            string code = match (w) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text(); case None: e.message(); }; case Ok(value: v): "ok"; };
+            wrongCode = give code;
+        } else {
+            Result<int64, RedisError> n = reply::<int64>(result: rs.take(index: i));
+            int64 want = cast<int64>(i) + 1i64;
+            if (i > 500) { want = cast<int64>(i); }
+            bool same = match (n) { case Ok(value: v): v == want; case Err(error: e): false; };
+            if (same) { right = right + 1; }
+        }
+        i = i + 1;
+    }
+    string still = ask(c: c, text: "GET kr:p:n");
+    f = f + check(ok: rs.length() == 1000 && right == 999 && wrongCode == "WRONGTYPE" && still == "999",
+                  what: "pipeline: 1000 commands under ${protocol}: ${right} INCRs in order, the error ${wrongCode}, the counter ${still}");
+    return f;
+}
+
+unsafe fn int32 pipelineTests() {
+    int32 f = 0;
+    f = f + runTests(tail: "", protocol: "RESP3");
+    f = f + runTests(tail: "?protocol=2", protocol: "RESP2");
+    return f;
+}

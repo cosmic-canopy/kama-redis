@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 5 is next.
+its session plan, and step 6 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -450,6 +450,14 @@ confirmed the kama facts underneath, and are listed at the end.
   - Each reply stands alone.
   - I/O, protocol errors or a timeout fail the whole call and close the connection.
   - No size limit, as none of the peers has one.
+  - **What building it settled (step 5):**
+    - A command is checked as it is added, as `call` checks one. The first refusal refuses the whole pipeline before
+      anything is written, naming the command ("command 2: …"), as `Usage` or `Value`.
+    - An empty pipeline writes nothing and has no replies.
+    - A reply taken twice is `Usage`. An index past the end panics, as a collection's does (RedisError's rule for a
+      contract violation).
+    - `call` and `run` share one read loop (`nextReply`), which sets push messages aside.
+    - A `Value::Error`'s `ServerError` comes from the internal `redis::wire`, so it is not public API.
 - **Blocking commands:** the deadline is the command's own timeout plus `command_timeout`; a timeout of 0 sets no
   deadline. (go-redis adds 10 s. redis-py and redis-rs cut BLPOP off at their socket timeout.)
 

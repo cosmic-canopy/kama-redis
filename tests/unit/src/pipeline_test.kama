@@ -1,0 +1,169 @@
+// Pipelines (src/pipeline.kama, Connection.run) over the scripted server: every command in one write, every reply
+// in order, and each failure path a pipeline can meet.
+import { std::collections::DynamicArray, std::memory::Owned,
+         redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError,
+         redis::Transport, redis::resp::Value,
+         redis_unit_tests::check, FakeServer, Step, welcome, connected, expect, reply as vector, callOutcome, callClosed,
+         isSimple, resp, pushIn, configOf, commandOf };
+export { pipelineTests };
+
+// What run came to: the replies, each "PONG", "(error) CODE", or another value's kind; or "(failed) …".
+fn string ran(Result<Replies, RedisError> r) {
+    Replies rs = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); return "(failed) ".concat(other: m); }
+    };
+    string shown = "";
+    isize i = 0;
+    while (i < rs.length()) {
+        Result<Value, RedisError> one = rs.take(index: i);
+        string item = match (one) {
+            case Ok(value: v): match (v) { case Simple(bytes: b): "simple"; case Integer(value: n): "${n}"; case Null: "null"; case _: "value"; };
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): "(error) ".concat(other: c.text()); case None: "(failed)"; };
+        };
+        if (i > 0) { shown = shown.concat(other: ","); }
+        shown = shown.concat(other: item);
+        i = i + 1;
+    }
+    return shown;
+}
+
+fn Pipeline pings(isize n) {
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < n) {
+        Command ping = Command.of(name: "PING");
+        p.add(command: ping);
+        i = i + 1;
+    }
+    return p;
+}
+
+unsafe fn int32 pipelineTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+
+    // 1000 commands through a server that stops reading while its own output is unread: the client reads as it
+    // writes, so the one write finishes, and every reply comes back in order.
+    DynamicArray<Step> jam = welcome(server: s);
+    isize i = 0;
+    while (i < 1000) { jam.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping"))); i = i + 1; }
+    Config config = configOf(url: "redis://");
+    Owned<Transport> jammed = new FakeServer.jammed(steps: give jam, chunk: 1, writeLimit: 3, backlog: 4);
+    Result<Connection, RedisError> rj = Connection.connectOver(transport: give jammed, config: config);
+    match (give rj) {
+        case Ok(value: cj): {
+            Connection c = give cj;
+            Pipeline p = pings(n: 1000);
+            Result<Replies, RedisError> r = c.run(pipeline: p);
+            Replies rs = match (give r) {
+                case Ok(value: x): give x;
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pipeline: 1000 through a jammed server: ${m}"); return f; }
+            };
+            isize pongs = 0;
+            isize k = 0;
+            while (k < rs.length()) {
+                Result<Value, RedisError> one = rs.take(index: k);
+                if (isSimple(r: one, text: "PONG")) { pongs = pongs + 1; }
+                k = k + 1;
+            }
+            f = f + check(ok: rs.length() == 1000 && pongs == 1000 && p.length() == 1000, what: "pipeline: 1000 commands through a jammed server, ${pongs} PONGs");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pipeline: a jammed server's handshake: ${m}"); }
+    };
+
+    // An error reply in the middle is that command's; a push message in the middle is set aside.
+    DynamicArray<Step> mixed = welcome(server: s);
+    mixed.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    mixed.add(item: Step::Send(bytes: pushIn(b: resp(name: "redis-7.2.16 RESP3 DEBUG PROTOCOL push"))));
+    mixed.add(item: expect(command: "LPUSH kr:s x", answer: vector(server: s, kase: "wrongtype")));
+    mixed.add(item: expect(command: "EXISTS kr:k kr:none", answer: vector(server: s, kase: "exists/3")));
+    mixed.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection cm = connected(script: give mixed, url: "redis://", what: "pipeline: mixed");
+    Pipeline pm = Pipeline.make();
+    Command m1 = commandOf(text: "PING");
+    Command m2 = commandOf(text: "LPUSH kr:s x");
+    Command m3 = commandOf(text: "EXISTS kr:k kr:none");
+    pm.add(command: m1);
+    pm.add(command: m2);
+    pm.add(command: m3);
+    string gm = ran(r: cm.run(pipeline: pm));
+    Command after = commandOf(text: "PING");
+    Result<Value, RedisError> pa = cm.call(command: after);
+    f = f + check(ok: gm == "simple,(error) WRONGTYPE,1" && cm.pendingPushes() == 1 && isSimple(r: pa, text: "PONG"),
+                  what: "pipeline: an error reply stands alone, a push is set aside, and the connection goes on: ${gm}");
+
+    // Each reply is taken once.
+    DynamicArray<Step> twice = welcome(server: s);
+    twice.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection ct = connected(script: give twice, url: "redis://", what: "pipeline: twice");
+    Pipeline pt = pings(n: 1);
+    Result<Replies, RedisError> rt = ct.run(pipeline: pt);
+    Replies rts = match (give rt) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pipeline: one PING: ${m}"); return f; }
+    };
+    Result<Value, RedisError> first = rts.take(index: 0);
+    Result<Value, RedisError> second = rts.take(index: 0);
+    string g2 = callOutcome(r: second);
+    f = f + check(ok: isSimple(r: first, text: "PONG") && g2 == "reply 0 was taken already: each reply is taken once", what: "pipeline: a reply taken twice: ${g2}");
+
+    // A late reply: the pipeline times out and closes the connection, as a call does.
+    DynamicArray<Step> late = welcome(server: s);
+    late.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    late.add(item: Step::Late(reply: vector(server: s, kase: "ping")));
+    Connection cl = connected(script: give late, url: "redis://", what: "pipeline: late");
+    Pipeline pl = pings(n: 2);
+    string gl = ran(r: cl.run(pipeline: pl));
+    Command ping9 = Command.of(name: "PING");
+    Result<Value, RedisError> p9 = cl.call(command: ping9);
+    f = f + check(ok: gl == "(failed) timed out" && cl.isClosed() && callClosed(r: p9), what: "pipeline: a late reply times out and closes: ${gl}");
+
+    // A hangup after the first reply fails the whole pipeline.
+    DynamicArray<Step> cut = welcome(server: s);
+    cut.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    cut.add(item: Step::Hangup);
+    Connection ch = connected(script: give cut, url: "redis://", what: "pipeline: hangup");
+    Pipeline ph = pings(n: 3);
+    string gh = ran(r: ch.run(pipeline: ph));
+    f = f + check(ok: gh == "(failed) Server closed the connection" && ch.isClosed(), what: "pipeline: a hangup partway: ${gh}");
+
+    // Refused commands refuse the whole pipeline before anything is written, naming the command; an empty pipeline
+    // writes nothing. The script's next step is a PING, so anything written would have broken it.
+    DynamicArray<Step> quiet = welcome(server: s);
+    quiet.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection cq = connected(script: give quiet, url: "redis://", what: "pipeline: refused");
+    Pipeline pu = Pipeline.make();
+    Command u1 = commandOf(text: "PING");
+    Command u2 = commandOf(text: "subscribe kr:c");
+    Command u3 = commandOf(text: "monitor");
+    pu.add(command: u1);
+    pu.add(command: u2);
+    pu.add(command: u3);
+    Result<Replies, RedisError> ru = cq.run(pipeline: pu);
+    bool usage = match (ru) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: x): false; };
+    string gu = ran(r: give ru);
+    Pipeline pv = Pipeline.make();
+    Command v1 = Command.of(name: "SET");
+    v1.refuse(detail: "NaN is not a number the server reads");
+    pv.add(command: v1);
+    Result<Replies, RedisError> rv = cq.run(pipeline: pv);
+    bool value = match (rv) { case Err(error: e): match (e) { case Value(detail: d): true; case _: false; }; case Ok(value: x): false; };
+    string gv = ran(r: give rv);
+    Pipeline pe = Pipeline.make();
+    Result<Replies, RedisError> re = cq.run(pipeline: pe);
+    bool empty = match (re) { case Ok(value: x): x.length() == 0; case Err(error: e): false; };
+    Command last = Command.of(name: "PING");
+    Result<Value, RedisError> pq = cq.call(command: last);
+    f = f + check(ok: usage && gu == "(failed) command 2: a connection does not carry pub/sub commands: a subscribed connection's replies are messages, not replies to its commands",
+                  what: "pipeline: a command a connection does not carry refuses it: ${gu}");
+    f = f + check(ok: value && gv == "(failed) command 1: argument 1: NaN is not a number the server reads", what: "pipeline: a command refused while it was built refuses it: ${gv}");
+    f = f + check(ok: empty && isSimple(r: pq, text: "PONG") && !cq.isClosed(), what: "pipeline: an empty pipeline, and nothing refused was written");
+
+    // A closed connection runs nothing.
+    cq.close();
+    Pipeline pc = pings(n: 1);
+    string gc = ran(r: cq.run(pipeline: pc));
+    f = f + check(ok: gc == "(failed) the connection is closed", what: "pipeline: on a closed connection: ${gc}");
+    return f;
+}

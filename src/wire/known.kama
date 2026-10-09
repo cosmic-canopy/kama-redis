@@ -1,5 +1,5 @@
-import { std::collections::ConstView, redis::Command, redis::RedisError };
-export { admit };
+import { std::collections::ConstView, redis::Command, redis::RedisError, redis::ServerError, redis::resp::Value };
+export { admit, serverError };
 
 // What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
 //
@@ -52,6 +52,14 @@ fn string refusal(const ref Command command) {
         return "a connection does not carry QUIT, which is deprecated since 7.2: close() closes the connection";
     }
     return "";
+}
+
+// The error a `Value::Error` holds.
+fn ServerError serverError(const ref Value v) {
+    return match (v) {
+        case Error(bytes: b): ServerError.of(bytes: b.view());
+        case _: ServerError.of(bytes: "".bytes());
+    };
 }
 
 fn bool named(const ref Command command, const ref string word) {

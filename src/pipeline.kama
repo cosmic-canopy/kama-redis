@@ -1,0 +1,100 @@
+import { std::collections::DynamicArray, std::collections::ConstView, redis::Command, redis::RedisError,
+         redis::resp::Writer, redis::resp::Value, redis::wire::admit, redis::wire::serverError };
+export { Pipeline, Replies };
+
+// Commands sent together: `Connection.run` writes them all in one write and reads their replies in order, one round
+// trip for all of them (docs/ROADMAP.md, "Decided, and why", "Phase 3", "Pipelines").
+//
+//   Pipeline p = Pipeline.make();
+//   p.add(command: cmd"INCR ${counter}");
+//   p.add(command: cmd"GET ${key}");
+//   Result<Replies, RedisError> rs = conn.run(pipeline: p);
+//   Replies replies = …;
+//   Result<int64, RedisError> n = reply::<int64>(result: replies.take(index: 0));
+//
+// Each command is checked as it is added, as `call` checks one: a command refused while it was built, or one a
+// connection does not carry, refuses the whole pipeline before anything is written, naming the command
+// ("command 2: …"). Each reply stands alone: an error reply is that command's, and the others are still read.
+type resource Pipeline implements Sendable {
+    Writer encoded;
+    isize count = 0;
+    bool refused = false;
+    bool misuse = false;
+    string trouble = "";
+
+    friend redis::Connection::run[bytes, problem];
+
+    public ctor make() { this.encoded = Writer.make(); }
+
+    // Add `command`. The pipeline keeps its own copy, as the bytes it will send.
+    public fn void add(const ref Command command) {
+        this.count = this.count + 1;
+        Result<Unit, RedisError> admitted = admit(command: command);
+        match (admitted) {
+            case Ok(value: u): { }
+            case Err(error: e): {
+                if (!this.refused) {
+                    isize n = this.count;
+                    this.refused = true;
+                    bool value = match (e) { case Value(detail: d): true; case _: false; };
+                    this.misuse = !value;
+                    this.trouble = "command ${n}: ".concat(other: e.message());
+                }
+            }
+        };
+        if (!this.refused) { command.encode(into: this.encoded); }
+    }
+
+    // How many commands it has.
+    public const fn isize length() { return this.count; }
+
+    const fn ConstView<uint8> bytes() { return this.encoded.view(); }
+
+    // Why it will not be sent, if it will not: `Value` for an argument, `Usage` otherwise.
+    const fn Optional<RedisError> problem() {
+        if (!this.refused) { return Optional::None; }
+        if (this.misuse) { return Optional::Some(value: RedisError::Usage(detail: copy this.trouble)); }
+        return Optional::Some(value: RedisError::Value(detail: copy this.trouble));
+    }
+}
+
+// A pipeline's replies, in the order of its commands. Each is taken once.
+type resource Replies implements Sendable {
+    DynamicArray<Value> values;
+    DynamicArray<bool> taken;
+
+    friend redis::Connection::run[of];
+
+    ctor of(DynamicArray<Value> values) {
+        this.taken = DynamicArray.empty();
+        isize i = 0;
+        while (i < values.length()) { this.taken.add(item: false); i = i + 1; }
+        this.values = give values;
+    }
+
+    public const fn isize length() { return this.values.length(); }
+
+    // The reply to command `index` (0 for the first), taken out: an error reply is `Server`, as `call` gives one, and
+    // the other replies are still there. A reply taken already is `Usage`; an index past the end panics, as a
+    // collection's does.
+    public fn Result<Value, RedisError> take(isize index) {
+        if (index < 0 || index >= this.values.length()) {
+            isize n = this.values.length();
+            panic(msg: "Replies.take: index ${index} of ${n} replies");
+        }
+        if (this.taken[index]) {
+            return Result::Err(error: RedisError::Usage(detail: "reply ${index} was taken already: each reply is taken once"));
+        }
+        this.taken[index] = true;
+        this.values.add(item: Value::Null);
+        this.values.swap(i: index, j: this.values.length() - 1);
+        Optional<Value> removed = this.values.pop();
+        Value v = match (give removed) { case Some(value: x): give x; case None: Value::Null; };
+        if (v.isError()) {
+            RedisError e = RedisError::Server(error: serverError(v: v));
+            Value dropped = give v;
+            return Result::Err(error: give e);
+        }
+        return Result::Ok(value: give v);
+    }
+}
