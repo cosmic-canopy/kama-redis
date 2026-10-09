@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 3 is next.
+its session plan, and step 4 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -371,11 +371,15 @@ confirmed the kama facts underneath, and are listed at the end.
     | type | becomes |
     |---|---|
     | int8 to int64, isize, uint16 to uint64 | decimal |
-    | float32, float64 | shortest round-trip, `inf`/`-inf`; NaN refused (the server rejects it too) |
+    | float32, float64 | shortest round-trip (a float32's own, "0.1"), `inf`/`-inf`; NaN refused (the server rejects it too) |
     | string | its bytes |
     | `DynamicArray<uint8>` | exactly one binary argument, even when empty (after KRD-7) |
     | `DynamicArray<T: RedisArg>` | one argument per element, so an empty list is none (after KRD-7) |
     | Uuid | its text (after KRD-7) |
+
+    Step 3 found, live: every float in the table comes back from ZADD and ZSCORE as the same value under both
+    protocols, except the sign of zero. `-0` is sent as `-0`; Redis 6.2 keeps its sign, and 7.0 and later answer `0`
+    for it (ZSCORE, ZRANGE, INCRBYFLOAT), so the sign of a zero is the server's.
 
     The last three wait for KRD-7's fix in a tagged compiler. Until then a caller writes them through `Command`:
     `argBytes`, a loop of `add`, `arg(text: "${id}")`.

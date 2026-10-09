@@ -1,7 +1,7 @@
 // The live tests: one program, run against each server in the matrix by tools/test-integration.sh, which starts the
 // server (tools/redis.sh) and exports its REDISTEST_* settings. A failing case prints its name. When cases fail, run
 // `tools/redis.sh smoke --server S` first: it tells a misconfigured server from a wrong client.
-import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests };
+import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests, argTests };
 export { check, setting };
 
 fn int32 check(bool ok, string what) {
@@ -25,6 +25,7 @@ fn int32 main() {
     failed = failed + socketTests();
     failed = failed + timeoutTests();
     failed = failed + failureTests();
+    failed = failed + argTests();
     string server = setting(name: "REDISTEST_SERVER");
     if (failed != 0) { println(s: "redis integration tests on ${server}: ${failed} failed"); return 1; }
     println(s: "redis integration tests on ${server}: OK");

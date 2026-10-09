@@ -1,0 +1,146 @@
+// RedisArg and the cmd"…" tag (src/arg.kama). This is the unit program's one file that converts a value to RedisArg:
+// on a compiler before 0.9.543, a release build fails when two files convert the same primitive (KAMA_GAPS.md,
+// KPG-38). Every other file builds its commands with Command's `arg` methods.
+import { std::collections::DynamicArray, redis::Command, redis::cmd, redis::Connection, redis::RedisError,
+         redis::resp::Value, redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple,
+         textOf };
+export { argTests };
+
+// A command's parts, each in brackets: "[SET][kr:k][v]".
+fn string partsOf(const ref Command c) {
+    string text = "";
+    isize i = 0;
+    while (i < c.length()) {
+        string p = textOf(b: c.part(index: i));
+        text = text.concat(other: "[").concat(other: p).concat(other: "]");
+        i = i + 1;
+    }
+    return text;
+}
+
+fn int32 formTests() {
+    int32 f = 0;
+    string k = "kr:k";
+    string spaced = "a b\r\nc";
+    Command set = cmd"SET ${k} ${spaced} EX 10";
+    string g1 = partsOf(c: set);
+    f = f + check(ok: g1 == "[SET][kr:k][a b\r\nc][EX][10]", what: "cmd: words, and each hole a whole argument, spaces and line breaks in it: ${g1}");
+    Command loose = cmd"  GET\t${k}  \n";
+    string g2 = partsOf(c: loose);
+    f = f + check(ok: g2 == "[GET][kr:k]", what: "cmd: any ASCII whitespace separates, and none is an argument: ${g2}");
+    string empty = "";
+    Command blank = cmd"SET ${k} ${empty}";
+    string g3 = partsOf(c: blank);
+    f = f + check(ok: g3 == "[SET][kr:k][]" && blank.length() == 3, what: "cmd: an empty string is one argument: ${g3}");
+    Command ping = cmd"PING";
+    string g4 = partsOf(c: ping);
+    f = f + check(ok: g4 == "[PING]", what: "cmd: a literal with no holes: ${g4}");
+
+    // The integers, at their extremes, through the tag and through add.
+    int8 a8 = -128;
+    int16 a16 = -32768;
+    int32 a32 = -2147483648;
+    int64 lo = -9223372036854775807i64 - 1i64;
+    int64 hi = 9223372036854775807i64;
+    isize z = -1;
+    uint16 u16 = 65535;
+    uint32 u32 = 4294967295;
+    uint64 u64 = 18446744073709551615ui64;
+    Command ints = cmd"X ${a8} ${a16} ${a32} ${lo} ${hi} ${z} ${u16} ${u32} ${u64}";
+    string g5 = partsOf(c: ints);
+    string want5 = "[X][-128][-32768][-2147483648][-9223372036854775808][9223372036854775807][-1][65535][4294967295][18446744073709551615]";
+    f = f + check(ok: g5 == want5, what: "cmd: the integers' extremes, in decimal: ${g5}");
+    Command added = Command.of(name: "X");
+    added.add(value: a8);
+    added.add(value: a16);
+    added.add(value: a32);
+    added.add(value: lo);
+    added.add(value: hi);
+    added.add(value: z);
+    added.add(value: u16);
+    added.add(value: u32);
+    added.add(value: u64);
+    string g6 = partsOf(c: added);
+    f = f + check(ok: g6 == want5, what: "add: the same as the tag: ${g6}");
+
+    // Floats: the shortest decimal that reads back as the same value, and the infinities spelled out.
+    float64 tenth = 0.1;
+    float64 big = 1e21;
+    float64 tiny = 5e-324;
+    float64 negZero = -0.0;
+    float64 inf = 1e308 * 10.0;
+    float64 ninf = -inf;
+    float32 t32 = 0.1f32;
+    float32 inf32 = 3e38f32 * 10.0f32;
+    Command floats = cmd"X ${tenth} ${big} ${tiny} ${negZero} ${inf} ${ninf} ${t32} ${inf32}";
+    string g7 = partsOf(c: floats);
+    f = f + check(ok: g7 == "[X][0.1][1e+21][5e-324][-0][inf][-inf][0.1][inf]", what: "cmd: floats, shortest and exact: ${g7}");
+    return f;
+}
+
+// `bad` is refused when it is sent, as `kind` ("Usage", "Value") with `want`; nothing is written, so the connection
+// goes on.
+unsafe fn int32 refused(ref Connection c, const ref Command bad, const ref string kind, const ref string want, const ref string what) {
+    Result<Value, RedisError> r = c.call(command: bad);
+    string got = match (r) {
+        case Err(error: e): match (e) {
+            case Usage(detail: d): "Usage: ".concat(other: d);
+            case Value(detail: d): "Value: ".concat(other: d);
+            case _: "other: ".concat(other: e.message());
+        };
+        case Ok(value: v): "sent";
+    };
+    string wanted = kind.concat(other: ": ").concat(other: want);
+    return check(ok: got == wanted && !c.isClosed(), what: "cmd: ${what} is refused: ${got}");
+}
+
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    DynamicArray<Step> script = welcome(server: s);
+    script.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection c = connected(script: give script, url: "redis://", what: "cmd refusals");
+    string id = "7";
+    string other = "x";
+    string touching = "cmd: text touches hole 1: a hole is a whole argument, never spliced into a word; build the word first and pass it as the hole";
+    Command before = cmd"GET user:${id}";
+    f = f + refused(c: c, bad: before, kind: "Usage", want: touching, what: "text before a hole");
+    Command after = cmd"GET ${id}:x";
+    f = f + refused(c: c, bad: after, kind: "Usage", want: touching, what: "text after a hole");
+    Command together = cmd"MSET ${id}${other}";
+    f = f + refused(c: c, bad: together, kind: "Usage", want: "cmd: hole 1 and hole 2 are side by side: separate them with a space", what: "two holes side by side");
+    string quoting = "cmd: a quote in the literal: each hole is a whole argument, spaces and all, so nothing needs quoting";
+    Command dq = cmd"SET \"a b\" ${id}";
+    f = f + refused(c: c, bad: dq, kind: "Usage", want: quoting, what: "a double quote");
+    Command sq = cmd"SET 'a' ${id}";
+    f = f + refused(c: c, bad: sq, kind: "Usage", want: quoting, what: "a single quote");
+    Command none = cmd"";
+    f = f + refused(c: c, bad: none, kind: "Usage", want: "cmd: an empty command", what: "an empty literal");
+    Command spaces = cmd"   ";
+    f = f + refused(c: c, bad: spaces, kind: "Usage", want: "cmd: an empty command", what: "a literal of spaces");
+    Command holeName = cmd"${id} k";
+    f = f + refused(c: c, bad: holeName, kind: "Usage", want: "cmd: the command's name is a hole: write the name as literal text", what: "a name that is a hole");
+    float64 zero = 0.0;
+    float64 nan = zero / zero;
+    Command nanScore = cmd"ZADD kr:z ${nan} m";
+    f = f + refused(c: c, bad: nanScore, kind: "Value", want: "argument 2: NaN is not a number the server reads", what: "a NaN");
+    float32 zero32 = 0.0f32;
+    float32 nan32 = zero32 / zero32;
+    Command nanAdded = Command.of(name: "ZADD");
+    nanAdded.arg(text: "kr:z");
+    nanAdded.add(value: nan32);
+    nanAdded.add(value: nan);
+    f = f + refused(c: c, bad: nanAdded, kind: "Value", want: "argument 2: NaN is not a number the server reads", what: "a float32 NaN, through add, with the first reason kept");
+    // Nothing was written: the script's PING is still next.
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> p = c.call(command: ping);
+    f = f + check(ok: isSimple(r: p, text: "PONG"), what: "cmd: nothing refused was written");
+    return f;
+}
+
+unsafe fn int32 argTests() {
+    int32 f = 0;
+    f = f + formTests();
+    f = f + refusalTests();
+    return f;
+}

@@ -1,0 +1,167 @@
+// RedisArg and the cmd"…" tag, against the server. This is the integration program's one file that converts a value
+// to RedisArg: on a compiler before 0.9.543, a release build fails when two files convert the same primitive
+// (KAMA_GAPS.md, KPG-38). Every other file builds its commands with Command's `arg` methods.
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::f64Str, std::fmt::parse,
+         std::fmt::ParseError, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         redis::Connection, redis::Command, redis::cmd, redis::RedisError, redis::resp::Value,
+         redis_integration_tests::check, open, mainUrl, ask, shown };
+export { argTests };
+
+unsafe fn Connection reach(const ref string tail) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "arg_test: connect: ${m}"); return reach(tail: tail); }
+    };
+    return give c;
+}
+
+// A call's reply as text, as support.kama's `ask` shows one.
+unsafe fn string sent(ref Connection c, const ref Command command) {
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.message()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+// Whether a call's reply is a bulk string of exactly `want`.
+unsafe fn bool bulkIs(ref Connection c, const ref Command command, const ref DynamicArray<uint8> want) {
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Ok(value: v): match (v) { case Bulk(bytes: b): b.equals(other: want); case _: false; };
+        case Err(error: e): false;
+    };
+}
+
+// ZSCORE's reply as a float: a double under RESP3, the server's text under RESP2. -1 and false when it is neither.
+unsafe fn float64 score(ref Connection c, ref bool ok) {
+    Command zs = Command.of(name: "ZSCORE");
+    zs.arg(text: "kr:zf");
+    zs.arg(text: "m");
+    Result<Value, RedisError> r = c.call(command: zs);
+    ok = true;
+    float64 d = match (r) {
+        case Ok(value: v): match (v) { case Double(value: x): x; case Bulk(bytes: b): parsed(b: b.view(), ok: ok); case _: -1.0; };
+        case Err(error: e): -1.0;
+    };
+    bool numeric = match (r) { case Ok(value: v): match (v) { case Double(value: x): true; case Bulk(bytes: b): true; case _: false; }; case Err(error: e): false; };
+    if (!numeric) { ok = false; }
+    return d;
+}
+
+fn float64 parsed(ConstView<uint8> b, ref bool ok) {
+    Result<string, Utf8Error> t = decode(bytes: b);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): ""; };
+    Result<float64, ParseError> p = parse::<float64>(s: text);
+    return match (p) { case Ok(value: x): x; case Err(error: e): { ok = false; := -1.0; } };
+}
+
+unsafe fn int32 bytesTests() {
+    int32 f = 0;
+    Connection c = reach(tail: "");
+    DynamicArray<uint8> all = DynamicArray.empty();
+    isize i = 0;
+    while (i < 256) { all.add(item: truncate<uint8>(i)); i = i + 1; }
+    // Every byte value, as a value and as a key.
+    Command set = Command.of(name: "SET");
+    set.arg(text: "kr:bytes");
+    set.argBytes(bytes: all.view());
+    string stored = sent(c: c, command: set);
+    Command get = Command.of(name: "GET");
+    get.arg(text: "kr:bytes");
+    f = f + check(ok: stored == "OK" && bulkIs(c: c, command: get, want: all), what: "arg: all 256 byte values, as a value");
+    Command setKey = Command.of(name: "SET");
+    setKey.argBytes(bytes: all.view());
+    setKey.arg(text: "v");
+    string storedKey = sent(c: c, command: setKey);
+    Command getKey = Command.of(name: "GET");
+    getKey.argBytes(bytes: all.view());
+    string back = sent(c: c, command: getKey);
+    f = f + check(ok: storedKey == "OK" && back == "v", what: "arg: all 256 byte values, as a key: ${back}");
+    return f;
+}
+
+unsafe fn int32 tagTests() {
+    int32 f = 0;
+    Connection c = reach(tail: "");
+    // A hole is one argument, whatever is in it: spaces, line breaks, and RESP of its own.
+    string k = "kr:tag";
+    string v = "a b\r\n*1\r\n$4\r\nPING\r\n";
+    int32 ttl = 10;
+    Command set = cmd"SET ${k} ${v} EX ${ttl}";
+    string stored = sent(c: c, command: set);
+    Command get = cmd"GET ${k}";
+    string back = sent(c: c, command: get);
+    Command ttlOf = cmd"TTL ${k}";
+    string left = sent(c: c, command: ttlOf);
+    f = f + check(ok: stored == "OK" && back == v && (left == "10" || left == "9"), what: "cmd: a hole is one argument, even one holding RESP: ${stored}, ${left}");
+    string still = ask(c: c, text: "PING");
+    f = f + check(ok: still == "PONG", what: "cmd: the connection is still in step after it: ${still}");
+
+    // The integers' extremes, as the server reads them.
+    int64 lo = -9223372036854775807i64 - 1i64;
+    int64 hi = 9223372036854775807i64;
+    uint64 top = 18446744073709551615ui64;
+    Command setLo = cmd"SET kr:lo ${lo}";
+    string s1 = sent(c: c, command: setLo);
+    Command incr = cmd"INCRBY kr:hi ${hi}";
+    string s2 = sent(c: c, command: incr);
+    Command setTop = cmd"SET kr:top ${top}";
+    string s3 = sent(c: c, command: setTop);
+    string g1 = ask(c: c, text: "GET kr:lo");
+    string g3 = ask(c: c, text: "GET kr:top");
+    f = f + check(ok: s1 == "OK" && g1 == "-9223372036854775808" && s2 == "9223372036854775807" && s3 == "OK" && g3 == "18446744073709551615",
+                  what: "cmd: int64 and uint64 extremes: ${g1}, ${s2}, ${g3}");
+
+    // A NaN is refused before it is sent, and the connection goes on.
+    float64 zero = 0.0;
+    float64 nan = zero / zero;
+    Command bad = cmd"ZADD kr:zf ${nan} m";
+    string refused = sent(c: c, command: bad);
+    string after = ask(c: c, text: "PING");
+    f = f + check(ok: refused == "(failed) argument 2: NaN is not a number the server reads" && after == "PONG",
+                  what: "cmd: a NaN is refused before it is sent: ${refused}, then ${after}");
+    return f;
+}
+
+// Each float goes in through ZADD and comes back through ZSCORE as the same value, under RESP3 (a double) and RESP2
+// (the server's text).
+unsafe fn int32 floatTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Connection c = reach(tail: tail);
+    DynamicArray<float64> values = DynamicArray.empty();
+    values.add(item: 0.1);
+    values.add(item: 1e21);
+    values.add(item: 5e-324);
+    values.add(item: -0.0);
+    values.add(item: 1e308 * 10.0);
+    values.add(item: -1e308 * 10.0);
+    values.add(item: 1.0 / 3.0);
+    isize i = 0;
+    while (i < values.length()) {
+        float64 x = values[i];
+        Command zadd = cmd"ZADD kr:zf ${x} m";
+        string added = sent(c: c, command: zadd);
+        bool ok = false;
+        float64 back = score(c: c, ok: ok);
+        string want = f64Str(v: x);
+        string got = f64Str(v: back);
+        // -0 is sent as "-0" (the unit tests prove it). Redis 6.2 keeps its sign; 7.0 and later answer 0 for it, under
+        // both protocols and in ZRANGE too, so the sign of a zero is the server's.
+        bool same = got == want || (x == 0.0 && got == "0");
+        f = f + check(ok: ok && back == x && same && (added == "1" || added == "0"),
+                      what: "cmd: ${want} through ZADD and ZSCORE under ${protocol}: ${got} (${added})");
+        i = i + 1;
+    }
+    return f;
+}
+
+unsafe fn int32 argTests() {
+    int32 f = 0;
+    f = f + bytesTests();
+    f = f + tagTests();
+    f = f + floatTests(tail: "", protocol: "RESP3");
+    f = f + floatTests(tail: "?protocol=2", protocol: "RESP2");
+    return f;
+}

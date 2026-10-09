@@ -1,5 +1,5 @@
-import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, redis::RedisError,
-         redis::resp::Writer };
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, std::fmt::f64Str,
+         redis::RedisError, redis::RedisArg, redis::resp::Writer };
 export { Command };
 
 // One command: its name and arguments, each a whole RESP bulk string, never text spliced into other text. A
@@ -11,7 +11,8 @@ export { Command };
 //   c.arg(text: "EX");
 //   c.argInt(value: 10i64);
 //
-// Phase 3 builds typed arguments (`RedisArg`) and the `cmd"…"` tag on this.
+// or, with typed arguments (`RedisArg`), `c.add(value: ttl)`, or all at once with the tag: `cmd"SET ${key} ${payload}
+// EX 10"` (src/arg.kama).
 //
 // A command can be refused while it is built: an argument that cannot be sent (`refuse`) is `RedisError::Value`, and
 // a malformed `cmd"…"` literal is `Usage`. The first reason is kept, and a connection reports it before writing
@@ -23,6 +24,7 @@ type resource Command implements Sendable {
     string trouble = "";
 
     friend redis::wire::admit[problem];
+    friend redis::cmd[misused];
 
     // A command named `name` ("GET", "CLIENT"), with no arguments yet.
     public ctor of(const ref string name) {
@@ -60,6 +62,32 @@ type resource Command implements Sendable {
         if (!this.refused) { return Optional::None; }
         if (this.misuse) { return Optional::Some(value: RedisError::Usage(detail: copy this.trouble)); }
         return Optional::Some(value: RedisError::Value(detail: copy this.trouble));
+    }
+
+    // An argument: a float, in the shortest decimal that reads back as the same value ("0.1", "1e+21", "-0"), and
+    // `inf` or `-inf`. A NaN is refused: the server reads none (ZADD, INCRBYFLOAT and the rest refuse it).
+    public fn void argFloat(float64 value) {
+        if (value != value) {
+            this.refuse(detail: "NaN is not a number the server reads");
+            return;
+        }
+        if (value != 0.0 && value * 0.5 == value) {
+            if (value > 0.0) { this.arg(text: "inf"); } else { this.arg(text: "-inf"); }
+            return;
+        }
+        string digits = f64Str(v: value);
+        this.argBytes(bytes: digits.bytes());
+    }
+
+    // An argument, or several, from a value that writes itself (`RedisArg`): an integer, a float, a string.
+    public fn void add(RedisArg value) { value.writeRedisArg(into: ref this); }
+
+    // The `cmd"…"` literal around the holes is malformed; `detail` says how. Reported as `Usage`.
+    fn void misused(const ref string detail) {
+        if (this.refused) { return; }
+        this.refused = true;
+        this.misuse = true;
+        this.trouble = copy detail;
     }
 
     // How many parts it has, the name included.

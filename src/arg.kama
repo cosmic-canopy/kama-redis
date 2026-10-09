@@ -1,0 +1,151 @@
+import { std::fmt::u64Str, std::fmt::f32Str, redis::Command };
+export { RedisArg, cmd };
+
+// A value that is a command's argument: it writes itself into a `Command` as one or more whole arguments, through
+// `Command`'s own `arg` methods. `Command.add(value:)` takes one, and so does each hole of the `cmd"…"` tag.
+//
+//   - the integers, `isize` included: their decimal;
+//   - float32 and float64: the shortest decimal that reads back as the same value, `inf` and `-inf`. A NaN is
+//     refused (`RedisError::Value`), as the server refuses one;
+//   - string: its bytes.
+//
+// Nothing else converts, so each of these is refused where it is written: `bool` and `char` (redis-py refuses a bool;
+// redis-rs and go-redis send 1 or 0); `Optional` (redis-rs drops a None, go-redis sends ""); `uint8`, `Timestamp`,
+// `Date` and `Duration`, which have no one meaning (EXPIREAT wants seconds, PEXPIREAT milliseconds). Bytes, lists and
+// Uuids go through `Command`: `argBytes`, a loop of `add`, `arg(text: "${id}")`. Their own adapters come with a
+// compiler that can write them (KAMA_GAPS.md, KRD-7).
+//
+// A type of your own implements it in its declaration, and may `refuse` a value it has no form for.
+type contract RedisArg for value, resource, enum, intrinsic { const fn void writeRedisArg(ref Command into); }
+
+type adapter <int8, int16, int32, int64, isize, uint16, uint32> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) { into.argInt(value: cast<int64>(this)); }
+}
+
+type adapter <uint64> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) {
+        string digits = u64Str(v: this);
+        into.arg(text: digits);
+    }
+}
+
+type adapter <float64> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) { into.argFloat(value: this); }
+}
+
+// A float32's own shortest decimal ("0.1"), not the float64 it widens to ("0.10000000149011612").
+type adapter <float32> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) {
+        bool nan = this != this;
+        bool infinite = this != 0.0f32 && this * 0.5f32 == this;
+        if (nan || infinite) {
+            into.argFloat(value: cast<float64>(this));
+            return;
+        }
+        string digits = f32Str(v: this);
+        into.arg(text: digits);
+    }
+}
+
+type adapter <string> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) { into.arg(text: this); }
+}
+
+// The `cmd` tag: `cmd"SET ${key} ${value} EX 10"` is a Command. Its literal text is split on ASCII whitespace into
+// whole arguments, the first word is the command's name, and each hole is a whole argument of its own, never text
+// spliced into a word. These are refused (`RedisError::Usage`), when the command is sent and before anything is
+// written:
+//   - text touching a hole (`user:${id}`): build the word first, and pass it as the hole;
+//   - two holes side by side;
+//   - a quote anywhere in the literal: a hole carries an argument with spaces in it, so nothing needs quoting;
+//   - a name that is a hole, and a literal with no words.
+fn Command cmd(Template<RedisArg> t) {
+    int32 holes = t.holeCount();
+    string name = firstWord(text: t.part(at: 0));
+    Command c = Command.of(name: name);
+    string trouble = literalTrouble(t: t);
+    if (trouble.length() > 0) { c.misused(detail: trouble); }
+    addWords(c: c, text: t.part(at: 0), skipFirst: true);
+    int32 i = 0;
+    while (i < holes) {
+        c.add(value: t.hole(at: i));
+        addWords(c: c, text: t.part(at: i + 1), skipFirst: false);
+        i = i + 1;
+    }
+    return c;
+}
+
+// What is wrong with the literal around the holes; "" when nothing is.
+fn string literalTrouble(Template<RedisArg> t) {
+    int32 holes = t.holeCount();
+    int32 i = 0;
+    while (i <= holes) {
+        if (hasQuote(text: t.part(at: i))) {
+            return "cmd: a quote in the literal: each hole is a whole argument, spaces and all, so nothing needs quoting";
+        }
+        i = i + 1;
+    }
+    string name = firstWord(text: t.part(at: 0));
+    if (name.length() == 0) {
+        if (holes == 0) { return "cmd: an empty command"; }
+        return "cmd: the command's name is a hole: write the name as literal text";
+    }
+    i = 0;
+    while (i < holes) {
+        int32 number = i + 1;
+        if (i > 0 && t.part(at: i).length() == 0) {
+            return "cmd: hole ${i} and hole ${number} are side by side: separate them with a space";
+        }
+        if (!endsWithSpace(text: t.part(at: i))) {
+            return "cmd: text touches hole ${number}: a hole is a whole argument, never spliced into a word; build the word first and pass it as the hole";
+        }
+        if (!startsWithSpace(text: t.part(at: i + 1)) && t.part(at: i + 1).length() > 0) {
+            return "cmd: text touches hole ${number}: a hole is a whole argument, never spliced into a word; build the word first and pass it as the hole";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn bool isSpace(uint8 b) { return b == 32 || (b >= 9 && b <= 13); }
+
+fn bool hasQuote(const ref string text) {
+    isize i = 0;
+    while (i < text.length()) {
+        uint8 b = text[i];
+        if (b == 34 || b == 39) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn bool endsWithSpace(const ref string text) { return text.length() > 0 && isSpace(b: text[text.length() - 1]); }
+fn bool startsWithSpace(const ref string text) { return text.length() > 0 && isSpace(b: text[0]); }
+
+// The first word of `text`; "" when it has none.
+fn string firstWord(const ref string text) {
+    isize start = 0;
+    while (start < text.length() && isSpace(b: text[start])) { start = start + 1; }
+    isize end = start;
+    while (end < text.length() && !isSpace(b: text[end])) { end = end + 1; }
+    return text.substring(start: start, end: end);
+}
+
+// Each word of `text` as an argument of `c`; with `skipFirst`, all but the first (the command's name).
+fn void addWords(ref Command c, const ref string text, bool skipFirst) {
+    bool skip = skipFirst;
+    isize i = 0;
+    while (i < text.length()) {
+        while (i < text.length() && isSpace(b: text[i])) { i = i + 1; }
+        if (i == text.length()) { return; }
+        isize end = i;
+        while (end < text.length() && !isSpace(b: text[end])) { end = end + 1; }
+        if (skip) {
+            skip = false;
+        } else {
+            string word = text.substring(start: i, end: end);
+            c.arg(text: word);
+        }
+        i = end;
+    }
+}
