@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 1 is next.
+its session plan, and step 2 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -81,7 +81,9 @@ Each step ends green before its commit:
    - **SCAN pages:** SCAN, SSCAN, HSCAN, ZSCAN.
    - **BLPOP:** its null and a success, under each protocol, and the server's refusal of the timeouts `abc` and `-1`.
    - **Blocking:** `ACL CAT blocking` on every server, and `COMMAND DOCS` of each @blocking command on 7.0 and later.
-     Redis 6.2 has neither, so its commands are classified from the 7.x data.
+     Redis 6.2 has the category (eight commands) but no COMMAND DOCS, so its commands are classified from the 7.x
+     data. ACL CAT lists in hash order, so the generator sorts it; COMMAND DOCS is reduced to each argument's name,
+     type, token, flags and child count.
 
    Every capture must come out the same on every run, or `git diff` after a rerun is not empty:
    - stream IDs are explicit (`XADD k 1-1 …`);
@@ -439,13 +441,22 @@ confirmed the kama facts underneath, and are listed at the end.
   | commands | timeout |
   |---|---|
   | BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BZPOPMIN, BZPOPMAX | last argument, seconds |
+  | BLMOVEM (Redis 8.10) | 5th argument, seconds; a COUNT or EXACTLY and OBO or BULK may follow it |
   | BLMPOP, BZMPOP | first argument, seconds |
   | XREAD, XREADGROUP | `BLOCK`, milliseconds |
   | WAIT | 2nd argument, milliseconds |
   | WAITAOF | 3rd argument, milliseconds |
 
-  The table is checked against the servers: `ACL CAT blocking` on all eight (Redis 6.2 has no `blocking` command flag),
-  and each position and unit against `COMMAND DOCS` (an integer is milliseconds, a double seconds).
+  - **Checked against the servers.** Every name in each server's `ACL CAT blocking` must be in the table. That covers
+    eight commands on Redis 6.2, and WAIT and WAITAOF from Redis 7.4 and Valkey 8.1 on. Each position and unit must
+    match `COMMAND DOCS` on 7.0 and later: an integer is milliseconds, a double is seconds.
+  - **XREAD and XREADGROUP.** `BLOCK` is found by stepping over each option before `STREAMS` by its arity:
+    - GROUP takes two;
+    - COUNT, MAXCOUNT, MAXSIZE (8.10) and CLAIM (8.4) take one each;
+    - NOACK takes none.
+
+    The server's own parser steps the same way, and COMMAND DOCS lists every option on every server, so a new one
+    fails the unit test when the vectors are regenerated.
 - **Transactions:** `transact(pipeline:)` writes MULTI, the commands and EXEC in one write. It reads every reply before
   it decides, so the connection stays in step with the server.
   - Its outcome is `TxOutcome { Committed(Replies), WatchConflict }`. EXEC's null is `WatchConflict`, an outcome

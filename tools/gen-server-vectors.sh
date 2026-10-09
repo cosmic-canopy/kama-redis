@@ -9,6 +9,14 @@
 #     in every form, AUTH, SELECT, CLIENT SETNAME and SETINFO, each right and wrong, on an open server and on one
 #     with a password) and for every error a standalone server can be made to send. A case's reply is recorded raw,
 #     exactly as it came.
+#   - Typed pairs (phase 3): what a command's reply is under RESP2 and under RESP3, from the same setup on a fresh
+#     connection after FLUSHALL each time, so a typed read of either must give the same values. The setup is written
+#     beside each reply, so a test derives its expected values from it rather than from memory. Transactions (MULTI,
+#     QUEUED, EXEC, EXEC's null after a broken WATCH), scripts (SCRIPT LOAD and an EVALSHA hit), SCAN pages and
+#     BLPOP's replies are captured the same way.
+#   - Blocking commands: each server's `ACL CAT blocking`, sorted (the server lists them in hash order), and for each
+#     blocking command the server documents (7.0 and later), its arguments as COMMAND DOCS gives them, so the
+#     client's table of where each one's timeout is can be checked against every server.
 #   - Proxies: Envoy's redis proxy answers HELLO itself, differently in each release. Its messages are read from its
 #     source (command_splitter_impl.cc and .h at v1.32.0, v1.36.0 and v1.39.0, pinned by SHA256), and laid out in
 #     the order that source checks them, which the script verifies before using it. twemproxy has no entry: it
@@ -117,8 +125,29 @@ sub value {
 }
 sub reply { my $c = shift; value($c); my $r = substr($c->{buf}, 0, $c->{pos}); $c->{buf} = substr($c->{buf}, $c->{pos}); $c->{pos} = 0; return $r; }
 sub call { my ($c, @cmd) = @_; print { $c->{s} } enc(@cmd); return reply($c); }
-sub shown { return join(' ', map { /[ ']/ || $_ eq '' ? "'$_'" : $_ } @_); }
-sub record { my ($case, $cmd, $r) = @_; print "$case\t", shown(@$cmd), "\t", unpack('H*', $r), "\n"; }
+# An argument with a byte outside printable ASCII is shown as <hex:…>, so every shown command is exact.
+sub shown { return join(' ', map { /[^\x20-\x7e]/ ? '<hex:' . unpack('H*', $_) . '>' : /[ ']/ || $_ eq '' ? "'$_'" : $_ } @_); }
+# <case> TAB <command> TAB <reply, hex> TAB <setup: its commands, shown, joined by " ; "; a string is taken as written>
+sub record {
+    my ($case, $cmd, $r, $setup) = @_;
+    my $set = join(' ; ', map { ref $_ ? shown(@$_) : $_ } @{ $setup // [] });
+    print "$case\t", shown(@$cmd), "\t", unpack('H*', $r), "\t$set\n";
+}
+# A whole RESP2 reply as Perl data: a string, undef for a null, an array ref, or { error => message }.
+sub parsed {
+    my $c = shift;
+    my $l = line($c); my $t = substr($l, 0, 1); my $n = substr($l, 1);
+    if ($t eq '$') {
+        return undef if $n < 0;
+        more($c) while length($c->{buf}) < $c->{pos} + $n + 2;
+        my $s = substr($c->{buf}, $c->{pos}, $n); $c->{pos} += $n + 2; return $s;
+    }
+    if ($t eq '*') { return undef if $n < 0; return [map { parsed($c) } 1 .. $n]; }
+    return { error => $n } if $t eq '-';
+    die "unexpected reply line '$l'\n" unless $t =~ /[+:]/;
+    return $n;
+}
+sub ask { my ($c, @cmd) = @_; print { $c->{s} } enc(@cmd); my $v = parsed($c); $c->{buf} = substr($c->{buf}, $c->{pos}); $c->{pos} = 0; return $v; }
 
 my @cases = (
     # The handshake on the main server.
@@ -176,7 +205,7 @@ for my $k (@cases) {
     next unless $up{$port};
     my $c = open_to($port);
     call($c, @$_) for @$setup;
-    record($case, $cmd, call($c, @$cmd));
+    record($case, $cmd, call($c, @$cmd), $setup);
     close $c->{s};
 }
 # BUSYKEY: RESTORE over a key that exists, with the key's own DUMP.
@@ -186,7 +215,7 @@ for my $k (@cases) {
     my $d = call($c, 'DUMP', 'kr:b');
     $d =~ /\A\$(\d+)\r\n/ or die "DUMP: $d\n";
     my $payload = substr($d, length($1) + 3, $1);
-    record('busykey', ['RESTORE', 'kr:b', '0', '<the DUMP of kr:b>'], call($c, 'RESTORE', 'kr:b', '0', $payload));
+    record('busykey', ['RESTORE', 'kr:b', '0', '<the DUMP of kr:b>'], call($c, 'RESTORE', 'kr:b', '0', $payload), [['SET', 'kr:b', '1']]);
 }
 # UNBLOCKED: a BLPOP that another connection ends with CLIENT UNBLOCK … ERROR.
 {
@@ -196,7 +225,110 @@ for my $k (@cases) {
     my $unblocked;
     for (1 .. 200) { $unblocked = call($b, 'CLIENT', 'UNBLOCK', $id, 'ERROR'); last if $unblocked eq ":1\r\n"; select(undef, undef, undef, 0.05); }
     die "CLIENT UNBLOCK: $unblocked\n" unless $unblocked eq ":1\r\n";
-    record('unblocked', ['BLPOP', 'kr:none', '0'], reply($a));
+    record('unblocked', ['BLPOP', 'kr:none', '0'], reply($a), ['CLIENT UNBLOCK <its id> ERROR, from another connection']);
+}
+
+# ---- Phase 3: typed pairs, each under RESP2 and RESP3 ----
+# Every case runs on a fresh connection, after FLUSHALL, so the two protocols see the same data. Its name is
+# "<case>/2" or "<case>/3". Sets hold integers (an intset, in order: a hashtable's order follows a per-process seed),
+# stream IDs are explicit, and SCAN runs on one key, so every capture is the same on every run.
+my $big = '0123456789abcdef' x 64;
+my $bin = join('', map { chr } 0 .. 255);
+my @stream = (['XADD', 'kr:x', '1-1', 'f', 'v'], ['XADD', 'kr:x', '2-1', 'g', 'w', 'h', 'u']);
+my @typed = (
+    ['get-hit', [['SET', 'kr:k', 'hello']], ['GET', 'kr:k']],
+    ['get-missing', [], ['GET', 'kr:none']],
+    ['get-big', [['SET', 'kr:big', $big]], ['GET', 'kr:big']],
+    ['get-binary', [['SET', 'kr:bin', $bin]], ['GET', 'kr:bin']],
+    ['mget', [['MSET', 'kr:a', '1', 'kr:b', '2']], ['MGET', 'kr:a', 'kr:none', 'kr:b']],
+    ['incrbyfloat', [['SET', 'kr:f', '10.5']], ['INCRBYFLOAT', 'kr:f', '0.1']],
+    ['hgetall', [['HSET', 'kr:h', 'f1', 'v1', 'f2', 'v2']], ['HGETALL', 'kr:h']],
+    ['hmget', [['HSET', 'kr:h', 'f1', 'v1', 'f2', 'v2']], ['HMGET', 'kr:h', 'f1', 'nofield', 'f2']],
+    ['smembers', [['SADD', 'kr:set', '3', '1', '2']], ['SMEMBERS', 'kr:set']],
+    ['smismember', [['SADD', 'kr:set', '3', '1', '2']], ['SMISMEMBER', 'kr:set', '1', '9']],
+    ['zrange-withscores', [['ZADD', 'kr:z', '1.5', 'a', '2', 'b']], ['ZRANGE', 'kr:z', '0', '-1', 'WITHSCORES']],
+    ['zscore', [['ZADD', 'kr:z', '1.5', 'a', '2', 'b']], ['ZSCORE', 'kr:z', 'a']],
+    ['xrange', [@stream], ['XRANGE', 'kr:x', '-', '+']],
+    ['xread', [@stream], ['XREAD', 'STREAMS', 'kr:x', '0']],
+    ['lpos', [['RPUSH', 'kr:l', 'a', 'b', 'c', 'b']], ['LPOS', 'kr:l', 'b', 'COUNT', '0']],
+    ['config-get', [], ['CONFIG', 'GET', 'maxmemory-policy']],
+    ['exists', [['SET', 'kr:k', 'hello']], ['EXISTS', 'kr:k', 'kr:none']],
+    ['type', [['SET', 'kr:k', 'hello']], ['TYPE', 'kr:k']],
+    ['eval', [], ['EVAL', "return {1, 'two', {3, 4}}", '0']],
+    # An error inside a reply that is not EXEC's: redis.pcall's error, returned inside an array.
+    ['eval-error-inside', [['SET', 'kr:s', 'v']], ['EVAL', "return {1, redis.pcall('LPUSH', KEYS[1], 'x')}", '1', 'kr:s']],
+    ['eval-ro', [], ['EVAL_RO', 'return 1', '0']],
+    # Transactions: MULTI's reply, a command's while queued, a command refused while queued, and EXEC's array.
+    ['multi', [], ['MULTI']],
+    ['queued', [['MULTI']], ['SET', 'kr:q', 'v']],
+    ['queued-error', [['MULTI']], ['NOSUCHCOMMAND']],
+    ['exec-ok', [['MULTI'], ['SET', 'kr:t', '1'], ['INCR', 'kr:t']], ['EXEC']],
+    # SCAN pages: each is the whole collection on one page.
+    ['scan', [['SET', 'kr:only', '1']], ['SCAN', '0']],
+    ['sscan', [['SADD', 'kr:ss', '3', '1', '2']], ['SSCAN', 'kr:ss', '0']],
+    ['hscan', [['HSET', 'kr:hs', 'a', '1', 'b', '2']], ['HSCAN', 'kr:hs', '0']],
+    ['hscan-novalues', [['HSET', 'kr:hs', 'a', '1', 'b', '2']], ['HSCAN', 'kr:hs', '0', 'NOVALUES']],
+    ['zscan', [['ZADD', 'kr:zs', '1', 'a', '2', 'b']], ['ZSCAN', 'kr:zs', '0']],
+    # BLPOP: timing out, popping, and the timeouts the server refuses.
+    ['blpop-null', [], ['BLPOP', 'kr:none', '0.01']],
+    ['blpop-hit', [['RPUSH', 'kr:bl', 'a']], ['BLPOP', 'kr:bl', '1']],
+    ['blpop-not-float', [], ['BLPOP', 'kr:none', 'abc']],
+    ['blpop-negative', [], ['BLPOP', 'kr:none', '-1']],
+);
+for my $proto (2, 3) {
+    for my $k (@typed) {
+        my ($case, $setup, $cmd) = @$k;
+        my $c = open_to(7000);
+        call($c, 'HELLO', '3') if $proto == 3;
+        call($c, 'FLUSHALL');
+        call($c, @$_) for @$setup;
+        record("$case/$proto", $cmd, call($c, @$cmd), $setup);
+        close $c->{s};
+    }
+    # EXEC's null: another connection writes a key this one WATCHes.
+    my $a = open_to(7000); my $b = open_to(7000);
+    call($a, 'HELLO', '3') if $proto == 3;
+    call($a, 'FLUSHALL');
+    call($a, 'WATCH', 'kr:w'); call($b, 'SET', 'kr:w', 'x'); call($a, 'MULTI'); call($a, 'SET', 'kr:w', 'y');
+    record("exec-null/$proto", ['EXEC'], call($a, 'EXEC'), [['WATCH', 'kr:w'], 'SET kr:w x, from another connection', ['MULTI'], ['SET', 'kr:w', 'y']]);
+    close $a->{s}; close $b->{s};
+}
+# Scripts: SCRIPT LOAD's SHA-1, and EVALSHA by it.
+{
+    my $c = open_to(7000);
+    call($c, 'FLUSHALL');
+    my $src = "return redis.call('GET', KEYS[1])";
+    my $r = call($c, 'SCRIPT', 'LOAD', $src);
+    record('script-load', ['SCRIPT', 'LOAD', $src], $r);
+    $r =~ /\A\$40\r\n([0-9a-f]{40})\r\n\z/ or die "SCRIPT LOAD: $r\n";
+    my $sha = $1;
+    call($c, 'SET', 'kr:k', 'hello');
+    record('evalsha-hit', ['EVALSHA', $sha, '1', 'kr:k'], call($c, 'EVALSHA', $sha, '1', 'kr:k'), [['SCRIPT', 'LOAD', $src], ['SET', 'kr:k', 'hello']]);
+    close $c->{s};
+}
+# Blocking commands: the category, sorted, and the arguments of each blocking command the server documents. The
+# names asked about are the category's and those the client's table knows, since WAIT and WAITAOF block without being
+# in the category before 8.0.
+{
+    sub kv { my $a = shift; my %h; for (my $i = 0; $i + 1 < @$a; $i += 2) { $h{$a->[$i]} = $a->[$i + 1]; } return \%h; }
+    # name:type:token:flags:children, flags sorted and joined by commas.
+    sub argument {
+        my $a = kv(shift);
+        my $kids = ref $a->{arguments} eq 'ARRAY' ? scalar(@{ $a->{arguments} }) : 0;
+        return join(':', $a->{name}, $a->{type}, $a->{token} // '', join(',', sort @{ $a->{flags} // [] }), $kids);
+    }
+    my $c = open_to(7000);
+    my $cat = ask($c, 'ACL', 'CAT', 'blocking');
+    my %ask = map { $_ => 1 } qw(blpop brpop brpoplpush blmove blmovem blmpop bzpopmin bzpopmax bzmpop xread xreadgroup wait waitaof);
+    if (ref $cat eq 'ARRAY') { print "blocking\t", join(' ', sort @$cat), "\n"; $ask{$_} = 1 for @$cat; }
+    else { print "blocking\t-\n"; }
+    for my $name (sort keys %ask) {
+        my $d = ask($c, 'COMMAND', 'DOCS', $name);
+        next unless ref $d eq 'ARRAY' && @$d == 2;   # a server before 7.0 has no COMMAND DOCS; one without the command, no entry
+        my $doc = kv($d->[1]);
+        print "docs\t$name\t", join(' ', map { argument($_) } @{ $doc->{arguments} // [] }), "\n";
+    }
+    close $c->{s};
 }
 PERL
 
@@ -217,7 +349,7 @@ use strict; use warnings;
 my ($tmp, $out) = @ARGV;
 
 # ---- the servers ----
-my (@versions, %codeServers, @replies, %seen);
+my (@versions, %codeServers, @replies, %seen, @blocking, @docs);
 open my $f, '<', "$tmp/live.tsv" or die;
 while (<$f>) {
     chomp; my ($version, $what, @rest) = split /\t/, $_, -1;
@@ -228,13 +360,19 @@ while (<$f>) {
         push @{ $codeServers{$_} }, $version for qw(MOVED ASK);
         next;
     }
-    push @replies, ["$version $what", $rest[0], $rest[1]];
+    if ($what eq 'blocking') { push @blocking, [$version, $rest[0]]; next; }
+    if ($what eq 'docs') { push @docs, ["$version $rest[0]", $rest[1]]; next; }
+    push @replies, ["$version $what", $rest[0], $rest[1], $rest[2] // ''];
 }
 my %count; $count{(split / /, $_->[0])[1]}++ for @replies;
-for my $must (qw(hello3 hello2 hello3-auth hello3-auth-wrong locked-hello3 locked-auth1 wrongtype unblocked busykey)) {
+for my $must (qw(hello3 hello2 hello3-auth hello3-auth-wrong locked-hello3 locked-auth1 wrongtype unblocked busykey
+                 get-hit/2 get-hit/3 exec-null/2 exec-null/3 exec-ok/3 queued/2 script-load evalsha-hit blpop-null/3)) {
     die "gen-server-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 die "gen-server-vectors: no compat-hello3 case\n" unless $count{'compat-hello3'};
+die "gen-server-vectors: a server gave no blocking category\n" unless @blocking == @versions;
+my %docServers; $docServers{(split / /, $_->[0])[0]}++ for @docs;
+die "gen-server-vectors: no COMMAND DOCS from any server\n" unless %docServers;
 for my $code (qw(ERR WRONGTYPE NOAUTH WRONGPASS NOPERM NOPROTO MOVED ASK)) {
     die "gen-server-vectors: $code is not sent by every server\n" unless @{ $codeServers{$code} // [] } == @versions;
 }
@@ -293,10 +431,16 @@ print $o <<"HEAD";
 //   - replyNames / replyCommands / replyHex: "<server> <case>", the command sent, and the reply exactly as it
 //     came. A case is a handshake step (hello3, locked-auth1, …) or an error a standalone server sends (wrongtype,
 //     noperm, …); tools/gen-server-vectors.sh lists them.
+//   - replySetups: the commands that ran before each case's command, on the same connection (joined by " ; "). The
+//     typed pairs ("<case>/2", "<case>/3") ran on a fresh connection after FLUSHALL, under that protocol.
+//   - blockingServers / blockingNames: each server's `ACL CAT blocking`, sorted.
+//   - docsNames / docsArgs: "<server> <command>" for each blocking command a server documents (7.0 and later), and
+//     its arguments from COMMAND DOCS, each name:type:token:flags:children.
 //   - proxyNames / proxyHex: Envoy's redis proxy's answers to HELLO, read from its source (v1.32.0, v1.36.0,
 //     v1.39.0), with and without a password required.
 import { std::collections::DynamicArray };
-export { serverVersions, sentCodes, codeServers, replyNames, replyCommands, replyHex, proxyNames, proxyHex };
+export { serverVersions, sentCodes, codeServers, replyNames, replyCommands, replyHex, replySetups, blockingServers,
+         blockingNames, docsNames, docsArgs, proxyNames, proxyHex };
 
 HEAD
 sub column {
@@ -312,10 +456,15 @@ column('codeServers', map { lit(join(' ', @{ $codeServers{$_} })) } @codes);
 column('replyNames', map { lit($_->[0]) } @replies);
 column('replyCommands', map { lit($_->[1]) } @replies);
 column('replyHex', map { lit($_->[2]) } @replies);
+column('replySetups', map { lit($_->[3]) } @replies);
+column('blockingServers', map { lit($_->[0]) } @blocking);
+column('blockingNames', map { lit($_->[1]) } @blocking);
+column('docsNames', map { lit($_->[0]) } @docs);
+column('docsArgs', map { lit($_->[1]) } @docs);
 column('proxyNames', map { lit($_->[0]) } @proxy);
 column('proxyHex', map { lit($_->[1]) } @proxy);
 close $o;
-printf "gen-server-vectors: %d codes, %d replies, %d proxy answers, from %s into %s\n", scalar(@codes), scalar(@replies), scalar(@proxy), $who, $out;
+printf "gen-server-vectors: %d codes, %d replies, %d blocking commands documented, %d proxy answers, from %s into %s\n", scalar(@codes), scalar(@replies), scalar(@docs), scalar(@proxy), $who, $out;
 PERL
 
 perl "$tmp/gen.pl" "$tmp" "$OUT"
