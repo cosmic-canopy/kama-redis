@@ -1,0 +1,134 @@
+// SCAN, SSCAN, HSCAN and ZSCAN against the server, a page at a time, under RESP3 and RESP2: large collections come
+// back whole across many pages, with MATCH, COUNT and TYPE; NOVALUES where the server has it.
+import { std::collections::DynamicArray, std::collections::Map, std::collections::Set, std::fmt::i64Str,
+         redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::Scan, redis::RedisError, redis::reply,
+         redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask,
+         setScan, hashScan, zsetScan, matchingIn };
+export { scanTests };
+
+unsafe fn Connection reach(const ref string tail, const ref string what) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "scan_test: ${what}: connect: ${m}"); return reach(tail: tail, what: what); }
+    };
+    return give c;
+}
+
+// `n` commands of `name key prefixN [value]` in one pipeline.
+unsafe fn int32 filled(ref Connection c, const ref string name, const ref string key, const ref string prefix, isize n, bool withValue) {
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < n) {
+        Command command = Command.of(name: name);
+        string item = prefix.concat(other: i64Str(v: cast<int64>(i)));
+        if (key.length() > 0) { command.arg(text: key); }
+        if (name == "ZADD") { command.argInt(value: cast<int64>(i)); }
+        command.arg(text: item);
+        if (withValue) { command.arg(text: "v"); }
+        p.add(command: command);
+        i = i + 1;
+    }
+    Result<Replies, RedisError> r = c.run(pipeline: p);
+    isize got = match (r) { case Ok(value: rs): rs.length(); case Err(error: e): -1; };
+    return check(ok: got == n, what: "scan: filling ${name} ${key} with ${n}");
+}
+
+// Every page of `scan`, its items read as strings into one set; the page count in `pages`.
+unsafe fn Set<string> gathered(ref Connection c, ref Scan scan, ref isize pages, ref string failure) {
+    Set<string> all = Set.empty();
+    pages = 0;
+    while (!scan.isDone() && pages < 100000) {
+        Result<DynamicArray<string>, RedisError> page = reply::<DynamicArray<string>>(result: scan.next(conn: c));
+        pages = pages + 1;
+        match (page) {
+            case Ok(value: xs): { foreach (string x in xs) { all.add(key: copy x); } }
+            case Err(error: e): { failure = e.message(); return give all; }
+        };
+    }
+    return give all;
+}
+
+unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Connection c = reach(tail: tail, what: protocol);
+    string cleared = ask(c: c, text: "DEL kr:sc:set kr:sc:hash kr:sc:zset");
+    f = f + filled(c: c, name: "SET", key: "", prefix: "kr:sc:k:", n: 1000, withValue: true);
+    f = f + filled(c: c, name: "SADD", key: "kr:sc:set", prefix: "m", n: 1000, withValue: false);
+    f = f + filled(c: c, name: "HSET", key: "kr:sc:hash", prefix: "f", n: 500, withValue: true);
+    f = f + filled(c: c, name: "ZADD", key: "kr:sc:zset", prefix: "z", n: 300, withValue: false);
+
+    // SCAN with MATCH and COUNT: all 1000 keys, over many pages.
+    Scan keys = Scan.keys();
+    matchingIn(scan: keys, pattern: "kr:sc:k:*");
+    keys.countHint(count: 100i64);
+    isize pages = 0;
+    string failed = "";
+    Set<string> found = gathered(c: c, scan: keys, pages: pages, failure: failed);
+    isize n = found.length();
+    f = f + check(ok: failed.length() == 0 && n == 1000 && pages > 1 && found.contains(key: "kr:sc:k:0") && found.contains(key: "kr:sc:k:999"),
+                  what: "scan: SCAN MATCH COUNT under ${protocol}: ${n} keys in ${pages} pages ${failed}");
+
+    // TYPE: the hash, not the strings.
+    Scan hashes = Scan.keys();
+    matchingIn(scan: hashes, pattern: "kr:sc:*");
+    hashes.ofType(typeName: "hash");
+    isize hp = 0;
+    string hf = "";
+    Set<string> typed = gathered(c: c, scan: hashes, pages: hp, failure: hf);
+    isize tn = typed.length();
+    f = f + check(ok: hf.length() == 0 && tn == 1 && typed.contains(key: "kr:sc:hash"), what: "scan: SCAN TYPE hash under ${protocol}: ${tn} ${hf}");
+
+    // SSCAN: 1000 members, a hashtable, so many pages.
+    Scan members = setScan(key: "kr:sc:set");
+    isize sp = 0;
+    string sf = "";
+    Set<string> got = gathered(c: c, scan: members, pages: sp, failure: sf);
+    isize sn = got.length();
+    f = f + check(ok: sf.length() == 0 && sn == 1000 && sp > 1, what: "scan: SSCAN under ${protocol}: ${sn} in ${sp} pages ${sf}");
+
+    // HSCAN: 500 fields and their values, read as maps; then NOVALUES, where the server has it.
+    Scan fields = hashScan(key: "kr:sc:hash");
+    Map<string, string> all = Map.empty();
+    isize fp = 0;
+    while (!fields.isDone() && fp < 100000) {
+        Result<Map<string, string>, RedisError> page = reply::<Map<string, string>>(result: fields.next(conn: c));
+        fp = fp + 1;
+        match (give page) {
+            case Ok(value: m): { Map<string, string> one = give m; foreach (string k in one) { all.put(key: copy k, value: "v"); } }
+            case Err(error: e): { fp = 100000; }
+        };
+    }
+    isize fn2 = all.length();
+    f = f + check(ok: fn2 == 500 && fp < 100000, what: "scan: HSCAN under ${protocol}: ${fn2} fields in ${fp} pages");
+    Scan names = hashScan(key: "kr:sc:hash");
+    names.noValues();
+    Result<Value, RedisError> first = names.next(conn: c);
+    string server = setting(name: "REDISTEST_SERVER");
+    bool has = !(server == "redis-6.2" || server == "redis-7.2" || server == "valkey-7.2");
+    bool refused = match (first) { case Err(error: e): match (e) { case Server(error: s): true; case _: false; }; case Ok(value: v): false; };
+    f = f + check(ok: has != refused, what: "scan: HSCAN NOVALUES under ${protocol} on ${server}: refused ${refused}");
+
+    // ZSCAN: 300 members and their scores.
+    Scan scored = zsetScan(key: "kr:sc:zset");
+    Map<string, float64> scores = Map.empty();
+    isize zp = 0;
+    while (!scored.isDone() && zp < 100000) {
+        Result<Map<string, float64>, RedisError> page = reply::<Map<string, float64>>(result: scored.next(conn: c));
+        zp = zp + 1;
+        match (give page) {
+            case Ok(value: m): { Map<string, float64> one = give m; foreach (string k in one) { scores.put(key: copy k, value: 0.0); } }
+            case Err(error: e): { zp = 100000; }
+        };
+    }
+    isize zn = scores.length();
+    f = f + check(ok: zn == 300 && zp < 100000, what: "scan: ZSCAN under ${protocol}: ${zn} members in ${zp} pages");
+    return f;
+}
+
+unsafe fn int32 scanTests() {
+    int32 f = 0;
+    f = f + runTests(tail: "", protocol: "RESP3");
+    f = f + runTests(tail: "?protocol=2", protocol: "RESP2");
+    return f;
+}

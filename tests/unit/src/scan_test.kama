@@ -1,0 +1,99 @@
+// SCAN, SSCAN, HSCAN and ZSCAN a page at a time (src/scan.kama) over the scripted server: each page every server sent,
+// read as typed items; the options in order; refusals before anything is written; a reply that is not a page.
+// (A scan of many pages needs a live server: tests/integration's scan_test.)
+import { std::collections::DynamicArray, std::collections::Map, redis::Connection, redis::Command, redis::Scan,
+         redis::RedisError, redis::reply, redis::resp::Value,
+         redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, callOutcome, isSimple,
+         setScan, hashScan, zsetScan, matchingIn };
+export { scanTests };
+
+fn string listed(const ref Result<DynamicArray<string>, RedisError> r) {
+    return match (r) {
+        case Ok(value: xs): {
+            string s = "";
+            isize i = 0;
+            while (i < xs.length()) { if (i > 0) { s = s.concat(other: ","); } s = s.concat(other: xs[i]); i = i + 1; }
+            := s;
+        }
+        case Err(error: e): "(failed) ".concat(other: e.message());
+    };
+}
+
+unsafe fn int32 scanTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    DynamicArray<Step> script = welcome(server: s);
+    script.add(item: expect(command: "SCAN 0", answer: vector(server: s, kase: "scan/3")));
+    script.add(item: expect(command: "SSCAN kr:ss 0", answer: vector(server: s, kase: "sscan/3")));
+    script.add(item: expect(command: "HSCAN kr:hs 0", answer: vector(server: s, kase: "hscan/3")));
+    script.add(item: expect(command: "HSCAN kr:hs 0 NOVALUES", answer: vector(server: s, kase: "hscan-novalues/3")));
+    script.add(item: expect(command: "ZSCAN kr:zs 0", answer: vector(server: s, kase: "zscan/3")));
+    script.add(item: expect(command: "SCAN 0 MATCH kr:* COUNT 100 TYPE string", answer: vector(server: s, kase: "scan/3")));
+    script.add(item: expect(command: "SCAN 0", answer: vector(server: s, kase: "ping")));
+    script.add(item: expect(command: "SSCAN kr:s 0", answer: vector(server: s, kase: "wrongtype")));
+    script.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection c = connected(script: give script, url: "redis://", what: "scan");
+
+    // SCAN: one page, then done.
+    Scan keys = Scan.keys();
+    Result<DynamicArray<string>, RedisError> k1 = reply::<DynamicArray<string>>(result: keys.next(conn: c));
+    string g1 = listed(r: k1);
+    Result<Value, RedisError> after = keys.next(conn: c);
+    string g1b = callOutcome(r: after);
+    f = f + check(ok: g1 == "kr:only" && keys.isDone() && g1b == "the scan is done: the server answered cursor 0",
+                  what: "scan: SCAN's one page, then done: ${g1}; ${g1b}");
+
+    // SSCAN, HSCAN (with values and without), ZSCAN: each page read as typed items.
+    Scan members = setScan(key: "kr:ss");
+    Result<DynamicArray<string>, RedisError> m1 = reply::<DynamicArray<string>>(result: members.next(conn: c));
+    string g2 = listed(r: m1);
+    f = f + check(ok: g2 == "1,2,3" && members.isDone(), what: "scan: SSCAN's page: ${g2}");
+    Scan fields = hashScan(key: "kr:hs");
+    Result<Map<string, string>, RedisError> h1 = reply::<Map<string, string>>(result: fields.next(conn: c));
+    bool hashed = match (h1) { case Ok(value: m): m.length() == 2 && m.contains(key: "a") && m.contains(key: "b"); case Err(error: e): false; };
+    f = f + check(ok: hashed && fields.isDone(), what: "scan: HSCAN's page as a Map");
+    Scan names = hashScan(key: "kr:hs");
+    names.noValues();
+    Result<DynamicArray<string>, RedisError> h2 = reply::<DynamicArray<string>>(result: names.next(conn: c));
+    string g3 = listed(r: h2);
+    f = f + check(ok: g3 == "a,b", what: "scan: HSCAN NOVALUES's page: ${g3}");
+    Scan scored = zsetScan(key: "kr:zs");
+    Result<Map<string, float64>, RedisError> z1 = reply::<Map<string, float64>>(result: scored.next(conn: c));
+    bool zs = match (z1) { case Ok(value: m): m.length() == 2; case Err(error: e): false; };
+    f = f + check(ok: zs, what: "scan: ZSCAN's page as a Map of scores");
+
+    // The options, in the order given, after the cursor.
+    Scan opts = Scan.keys();
+    matchingIn(scan: opts, pattern: "kr:*");
+    opts.countHint(count: 100i64);
+    opts.ofType(typeName: "string");
+    Result<DynamicArray<string>, RedisError> o1 = reply::<DynamicArray<string>>(result: opts.next(conn: c));
+    string g4 = listed(r: o1);
+    f = f + check(ok: g4 == "kr:only", what: "scan: MATCH, COUNT and TYPE after the cursor: ${g4}");
+
+    // A reply that is not a cursor and a page is Value, and the connection goes on; an error reply is the server's.
+    Scan odd = Scan.keys();
+    Result<Value, RedisError> o2 = odd.next(conn: c);
+    string g5 = callOutcome(r: o2);
+    Scan wrong = setScan(key: "kr:s");
+    Result<Value, RedisError> o3 = wrong.next(conn: c);
+    bool wrongType = match (o3) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text() == "WRONGTYPE"; case None: false; }; case Ok(value: v): false; };
+    f = f + check(ok: g5 == "SCAN's reply is not a cursor and a page" && wrongType && !c.isClosed(), what: "scan: not a page: ${g5}; an error reply is the server's");
+
+    // Options a scan does not have are refused before anything is written: the script's PING is next.
+    Scan typed = setScan(key: "kr:ss");
+    typed.ofType(typeName: "string");
+    string g6 = callOutcome(r: typed.next(conn: c));
+    Scan valueless = Scan.keys();
+    valueless.noValues();
+    string g7 = callOutcome(r: valueless.next(conn: c));
+    Scan none = Scan.keys();
+    none.countHint(count: 0i64);
+    string g8 = callOutcome(r: none.next(conn: c));
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> p = c.call(command: ping);
+    f = f + check(ok: g6 == "TYPE is SCAN's option: a key's members have no type of their own" && g7 == "NOVALUES is HSCAN's option"
+                  && g8 == "COUNT must be at least 1" && isSimple(r: p, text: "PONG"),
+                  what: "scan: options it does not have are refused before anything is written: ${g6}; ${g7}; ${g8}");
+    return f;
+}

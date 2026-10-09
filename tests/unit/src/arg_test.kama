@@ -2,10 +2,17 @@
 // on a compiler before 0.9.543, a release build fails when two files convert the same primitive (KAMA_GAPS.md,
 // KPG-38). Every other file builds its commands with Command's `arg` methods.
 import { std::collections::DynamicArray, redis::Command, redis::cmd, redis::Connection, redis::RedisError,
-         redis::Script, redis::ScriptCall,
+         redis::Script, redis::ScriptCall, redis::Scan,
          redis::resp::Value, redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple,
          textOf };
-export { argTests };
+export { argTests, setScan, hashScan, zsetScan, matchingIn };
+
+// Scans of a key, and a MATCH pattern, from text: the program's other files build theirs here, so this file alone
+// converts a string to RedisArg (KPG-38).
+fn Scan setScan(const ref string key) { return Scan.setMembers(key: key); }
+fn Scan hashScan(const ref string key) { return Scan.hashFields(key: key); }
+fn Scan zsetScan(const ref string key) { return Scan.sortedSetMembers(key: key); }
+fn void matchingIn(ref Scan scan, const ref string pattern) { scan.matching(pattern: pattern); }
 
 // A command's parts, each in brackets: "[SET][kr:k][v]".
 fn string partsOf(const ref Command c) {

@@ -1,0 +1,114 @@
+import { std::collections::DynamicArray, redis::Command, redis::Connection, redis::RedisArg, redis::RedisError,
+         redis::resp::Value };
+export { Scan };
+
+// SCAN, SSCAN, HSCAN and ZSCAN, a page at a time (docs/ROADMAP.md, "Decided, and why", "Phase 3", "SCAN").
+//
+//   Scan scan = Scan.keys();
+//   scan.matching(pattern: "user:*");
+//   while (!scan.isDone()) {
+//       Result<DynamicArray<string>, RedisError> page = reply::<DynamicArray<string>>(result: scan.next(conn: conn));
+//       …
+//   }
+//
+// Each `next` is one round trip, and returns that page's items, an empty page included, so no call makes an unbounded
+// number of them. The scan is done when the server answers cursor 0. The cursor is the server's bytes, kept as they
+// came. As the server documents, an item may come more than once, and one added or removed while the scan runs may
+// or may not come; an item there from start to end comes at least once.
+type resource Scan implements Sendable {
+    string name;
+    Command key;        // the key (SSCAN, HSCAN, ZSCAN), as an argument
+    Command options;    // MATCH, COUNT, TYPE, NOVALUES, as arguments
+    DynamicArray<uint8> cursor;
+    bool done = false;
+    string trouble = "";
+
+    public ctor keys() { return Scan.named(name: "SCAN"); }
+    public ctor setMembers(RedisArg key) {
+        Scan s = Scan.named(name: "SSCAN");
+        s.key.add(value: key);
+        return s;
+    }
+    public ctor hashFields(RedisArg key) {
+        Scan s = Scan.named(name: "HSCAN");
+        s.key.add(value: key);
+        return s;
+    }
+    public ctor sortedSetMembers(RedisArg key) {
+        Scan s = Scan.named(name: "ZSCAN");
+        s.key.add(value: key);
+        return s;
+    }
+
+    ctor named(const ref string name) {
+        this.name = copy name;
+        this.key = Command.of(name: "KEY");
+        this.options = Command.of(name: "OPTIONS");
+        this.cursor = DynamicArray.empty();
+        this.cursor.add(item: 48);
+        this.done = false;
+        this.trouble = "";
+    }
+
+    // Only what matches the glob `pattern` (MATCH).
+    public fn void matching(RedisArg pattern) {
+        this.options.arg(text: "MATCH");
+        this.options.add(value: pattern);
+    }
+
+    // About how many to look at per page (COUNT): a hint the server may exceed, and must be at least 1.
+    public fn void countHint(int64 count) {
+        if (count < 1i64 && this.trouble.length() == 0) { this.trouble = "COUNT must be at least 1"; }
+        this.options.arg(text: "COUNT");
+        this.options.argInt(value: count);
+    }
+
+    // Only keys of type `typeName` ("string", "hash", …; TYPE): SCAN's alone.
+    public fn void ofType(const ref string typeName) {
+        if (this.name != "SCAN" && this.trouble.length() == 0) { this.trouble = "TYPE is SCAN's option: a key's members have no type of their own"; }
+        this.options.arg(text: "TYPE");
+        this.options.arg(text: typeName);
+    }
+
+    // Only a hash's fields, without their values (NOVALUES): HSCAN's alone, from Redis 7.4 and Valkey 8.0.
+    public fn void noValues() {
+        if (this.name != "HSCAN" && this.trouble.length() == 0) { this.trouble = "NOVALUES is HSCAN's option"; }
+        this.options.arg(text: "NOVALUES");
+    }
+
+    public const fn bool isDone() { return this.done; }
+
+    // The next page's items: SCAN's keys, SSCAN's members, HSCAN's fields and values (or fields alone), ZSCAN's
+    // members and scores, read as any reply is (reply::<T>). A reply that is not a cursor and a page is `Value`,
+    // and the connection goes on. After the last page, `Usage`.
+    public unsafe fn Result<Value, RedisError> next(ref Connection conn) {
+        if (this.trouble.length() > 0) { return Result::Err(error: RedisError::Usage(detail: copy this.trouble)); }
+        if (this.done) { return Result::Err(error: RedisError::Usage(detail: "the scan is done: the server answered cursor 0")); }
+        Command c = Command.of(name: this.name);
+        c.appendFrom(other: this.key);
+        c.argBytes(bytes: this.cursor.view());
+        c.appendFrom(other: this.options);
+        Result<Value, RedisError> r = conn.call(command: c);
+        Value v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        DynamicArray<Value> parts = match (give v) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
+        if (parts.length() != 2) { return Result::Err(error: notAPage(name: this.name)); }
+        Optional<Value> page = parts.pop();
+        Optional<Value> next = parts.pop();
+        Value items = match (give page) { case Some(value: x): give x; case None: Value::Null; };
+        Value at = match (give next) { case Some(value: x): give x; case None: Value::Null; };
+        bool list = match (items) { case Array(items: xs): true; case Set(items: xs): true; case _: false; };
+        DynamicArray<uint8> moved = match (give at) { case Bulk(bytes: b): give b; case Simple(bytes: b): give b; case _: DynamicArray.empty(); };
+        if (!list || moved.length() == 0) {
+            Value dropped = give items;
+            return Result::Err(error: notAPage(name: this.name));
+        }
+        this.done = moved.length() == 1 && moved[0] == 48;
+        this.cursor = give moved;
+        return Result::Ok(value: give items);
+    }
+
+}
+
+fn RedisError notAPage(const ref string name) {
+    return RedisError::Value(detail: name.concat(other: "'s reply is not a cursor and a page"));
+}

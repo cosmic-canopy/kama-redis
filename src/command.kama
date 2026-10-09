@@ -26,6 +26,7 @@ type resource Command implements Sendable {
     friend redis::wire::admit[problem];
     friend redis::cmd[misused];
     friend redis::ScriptCall::finish[appendFrom];
+    friend redis::Scan::next[appendFrom];
 
     // A command named `name` ("GET", "CLIENT"), with no arguments yet.
     public ctor of(const ref string name) {

@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 9 is next.
+its session plan, and step 10 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -530,6 +530,17 @@ confirmed the kama facts underneath, and are listed at the end.
   - `Scan.next(conn:)` returns every page, empty ones included, so no call makes an unbounded number of round trips.
   - The cursor is opaque bytes (Valkey 9.1's CLUSTERSCAN has string cursors, and Lettuce keeps a String).
   - Repeats are documented.
+  - **What building it settled (step 9):**
+    - The shape is `Scan.keys()`, `setMembers(key:)`, `hashFields(key:)` and `sortedSetMembers(key:)`, with the
+      options `matching(pattern:)`, `countHint(count:)`, `ofType(typeName:)` and `noValues()`. `next(conn:)`
+      returns the page's items as a reply, so they read with `reply::<T>` as any reply does.
+    - Keys and patterns are `RedisArg`s; a key as bytes comes with KRD-7's `DynamicArray<uint8>` adapter.
+    - An option a scan does not have (TYPE on a key's members, NOVALUES off HSCAN, COUNT below 1) is `Usage`,
+      before anything is written. A reply that is not a cursor and a page is `Value`, and the connection goes on.
+      `next` after the last page is `Usage`.
+    - NOVALUES is answered by Redis 7.4 and later and Valkey 8.1 and later in the matrix; the others refuse it.
+    - Live, under both protocols: 1000 keys over many pages with MATCH and COUNT, TYPE, 1000 set members, 500 hash
+      fields and 300 sorted-set members all come back whole.
 
 - **What step 0b's repros showed** (in the session's scratchpad; each on 0.9.542 and 0.9.558, debug and release):
   - `RedisArg`'s adapters for the integers, `isize` (`cast<int64>(this)`), `uint64`, the floats and `string` build,
