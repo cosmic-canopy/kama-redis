@@ -98,6 +98,15 @@ everything this package relies on:
   - The first error is final, and `ProtocolError` has scalar payloads so it can be handed back on every call.
   - `spare`/`commit` let a connection read straight into the buffer.
 
+- **Two compiler gaps bound `RedisArg` until CI is on a tag that fixes them** (docs/ROADMAP.md, "Phase 3: where to
+  start"):
+  - KPG-38: a release build fails when two files convert the same primitive to the same contract. So each test
+    program converts primitives to `RedisArg` (a `cmd"…"` hole, `Command.add`) in exactly one file, `arg_test.kama`,
+    and every other test file builds commands with `arg`, `argBytes` and `argInt`. The package itself never
+    converts: adapter bodies and helpers write through `Command`'s `arg*` methods.
+  - KRD-7: an adapter over a std type cannot name `Command`, so there is no adapter for `DynamicArray<uint8>`,
+    `DynamicArray<T>` or `Uuid`. Bytes go through `argBytes`, lists through a loop of `add`.
+
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.
   - A malformed reply is `RedisError::Protocol`, never a panic. The unit tests feed truncated and oversized
@@ -129,6 +138,8 @@ everything this package relies on:
   - Before 0.9.533, an inner `if` whose arms all move a value and `return` read as not moving it (KRD-6, fixed). The
     floor is 0.9.529, so keep writing early exits: `if (push) { …; continue; }`, then `if (error) { …; return …; }`.
   - A `Result`'s error type must implement `Error`: `Result<T, string>` is refused. Return a `RedisError`.
+  - A struct with a `string` field owns, so it is a `type resource`, and its fields are private. A typed reply's
+    struct gives its caller accessors.
   - A constructor that delegates the whole job is a private ctor (`Connection.establish`), not a static returning
     the type.
   - A path dependency's path is relative to its manifest; an absolute one is not found.

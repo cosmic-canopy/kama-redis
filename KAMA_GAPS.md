@@ -5,13 +5,15 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.542` (tag `v0.9.542`).
+**Current compiler:** `kama 0.9.542` (tag `v0.9.542`), which CI pins. Each repro is also run on cstar's newest build
+(`0.9.558+gc28cee24` on 2026-10-08).
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-7 (MED). KPG-38 (@kama/postgres's) is fixed upstream but not yet in a tagged release, so its
+workaround stays. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -27,7 +29,74 @@ the commit that made it pass.
 
 ## OPEN
 
-(none)
+### KRD-7 · MED · An adapter over a std type cannot name a type of its own module in a method's signature
+
+**Found** prototyping phase 3's `RedisArg` contract (`const fn void writeRedisArg(ref Command into)`), on `kama
+0.9.542` and `0.9.558+gc28cee24`. Adapters over `int32`, `string`, `float64` and the other primitives build. The
+same method in an adapter over `DynamicArray<uint8>`, `<DynamicArray> when [T: RedisArg]` or `Uuid` is refused,
+naming the same type on both sides. Reduced, in one file:
+
+```kama
+import { core::println, std::collections::DynamicArray };
+type resource Sink {
+    int64 n = 0;
+    public ctor make() { }
+    public fn void bump(int64 by) { this.n = this.n + by; }
+    public const fn int64 total() { return this.n; }
+}
+type contract Arg for value, resource, enum, intrinsic { const fn void put(ref Sink into); }
+type adapter <int32> implements Arg { public const fn void put(ref Sink into) { into.bump(by: cast<int64>(this)); } }
+type adapter <DynamicArray<uint8>> implements Arg { public const fn void put(ref Sink into) { into.bump(by: cast<int64>(this.length())); } }
+fn void feed(ref Sink s, Arg a) { a.put(into: ref s); }
+fn int32 main() {
+    Sink s = Sink.make();
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.add(item: 1ui8);
+    int32 n = 5;
+    feed(s: ref s, a: n);
+    feed(s: ref s, a: b);
+    int64 t = s.total();
+    println(s: "total ${t}");
+    return 0;
+}
+```
+
+`kama build kama.json --debug` fails on both compilers:
+
+```
+src/main.kama:10:0: error: `std::collections::DynamicArray<uint8>` implements `r2::Arg`, but its `put` takes `Sink` as parameter 1 — the contract declares `Sink`; a conformance must match the signature the contract declares
+```
+
+The same happens with `const ref Sink`, with a generic `<DynamicArray> implements Arg when [T: Arg]` (on its
+`DynamicArray<int32>` instance), and with an adapter over `std::uuid::Uuid`. Without the `DynamicArray<uint8>`
+adapter it prints `total 5`. Spelling the parameter `r2::Sink` is refused ("a module path is written only in an
+`import`"). A contract whose parameter is a prelude type (postgres's `ref Serializer`) does not hit it.
+
+**Where it seems to come from** (read, not run): `CEmitter::implSigOf` (`src/kama.cemit.cpp`, before
+`checkConformanceSignature`) re-renders the implementation's parameter types under the declaring class's scope.
+For an adapter's method injected into `DynamicArray` that is `std::collections`, where `Sink` does not resolve. A
+primitive's synthetic class records no scope, so its adapter keeps the adapter's own, which is why `<int32>` passes.
+
+**Why MED:** a Redis argument is binary, so `cmd"SET ${key} ${payload}"` with a `DynamicArray<uint8>` payload, a
+list hole that becomes one argument per element, and a `Uuid` hole are all part of the design (docs/ROADMAP.md,
+phase 3, "The adapters"). None of them can be written.
+
+**Workaround:** the package ships `RedisArg` adapters for the primitives and `string` only. Bytes, lists and Uuids
+go through `Command.argBytes`, a loop of `add`, and `arg(text: "${id}")`. The three adapters are added (nothing
+is undone) once a tagged compiler has the fix.
+
+### KPG-38 (cited) · HIGH · Two files that convert the same primitive to the same contract fail every release build
+
+Filed by @kama/postgres, and fixed upstream in `0.9.543` by `7872c6b6` (KR-114: a release build's one translation
+unit now emits each adapter vtable and thunk once). No tagged release has it yet, and CI pins `v0.9.542`. Run here as
+a library with `RedisArg` and `cmd`, and two application files that each pass an `int32`, a `string`, a `float64` and
+an `isize`, through the tag and through `Command.add`:
+- `0.9.542`: debug builds and runs; `--release` fails with `redefinition of 'kama_string__as_rlib__RedisArg'`.
+- `0.9.558`: debug and release both build and print the same arguments.
+
+**Workaround, until CI is on a tag that has the fix:** each test program converts primitives to `RedisArg` in exactly
+one file (`arg_test.kama`), and the package never converts: adapter bodies and helpers write through `Command`'s
+`arg*` methods. The README says that an application on a compiler before `0.9.543` must do the same.
 
 ## FIXED — kept for the record
 
