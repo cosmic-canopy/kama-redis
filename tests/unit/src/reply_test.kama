@@ -1,0 +1,654 @@
+// Typed replies (src/reply.kama). Every typed pair is read from what all eight servers sent, under RESP2 and RESP3,
+// and must give the same values, which are derived from the setup the generator ran (server_vectors.kama's
+// replySetups) rather than typed here. Then the edges, and every resp vector read as each type, which must be Ok or
+// Err and never a panic.
+import { std::collections::DynamicArray, std::collections::ConstView, std::collections::Map, std::collections::Set,
+         std::fmt::parse, std::fmt::ParseError,
+         redis::reply, redis::replyOpt, redis::replyOpts, redis::replyRecord, redis::replyRecordOpt, redis::RedisError,
+         redis::resp::Value, redis::resp::Reader, redis::resp::Read,
+         redis_unit_tests::check, unhex, serverVersions, replyNames, replyCommands, replyHex, replySetups, respNames,
+         respInputs };
+export { replyTests };
+
+// ---- the types read ----
+
+@generate(Deserializable)
+type resource HashPair {
+    @field string f1;
+    @field string f2;
+    public const fn string first() { return copy this.f1; }
+    public const fn string second() { return copy this.f2; }
+}
+
+@generate(Deserializable)
+type resource Scored {
+    @field string member;
+    @field float64 score;
+    public const fn string name() { return copy this.member; }
+    public const fn float64 value() { return this.score; }
+}
+
+@generate(Deserializable)
+type resource Entry {
+    @field string id;
+    @field Map<string, string> fields;
+    public const fn string named() { return copy this.id; }
+    public const fn isize count() { return this.fields.length(); }
+    public const fn string field(const ref string name) {
+        Optional<string> v = this.fields.get(key: name);
+        return match (give v) { case Some(value: s): give s; case None: "(none)"; };
+    }
+}
+
+@generate(Deserializable)
+type resource Policy {
+    @field(name: "maxmemory-policy") string policy;
+    public const fn string value() { return copy this.policy; }
+}
+
+@generate(Deserializable)
+type resource Popped {
+    @field string key;
+    @field string value;
+    public const fn string shown() { return copy this.key.concat(other: "=").concat(other: this.value); }
+}
+
+@generate(Deserializable)
+type resource Mixed {
+    @field int64 a;
+    @field string b;
+    @field DynamicArray<int64> c;
+    public const fn string shown() {
+        int64 x = this.a;
+        isize n = this.c.length();
+        string s = "${x} ".concat(other: this.b).concat(other: " [");
+        isize i = 0;
+        while (i < n) {
+            int64 v = this.c[i];
+            if (i > 0) { s = s.concat(other: " "); }
+            s = s.concat(other: "${v}");
+            i = i + 1;
+        }
+        return s.concat(other: "]");
+    }
+}
+
+@generate(Deserializable)
+type resource Executed {
+    @field string status;
+    @field int64 count;
+    public const fn string shown() { int64 n = this.count; return copy this.status.concat(other: " ${n}"); }
+}
+
+@generate(Deserializable)
+type resource Page {
+    @field string cursor;
+    @field DynamicArray<string> items;
+    public const fn string shown() { return copy this.cursor.concat(other: " ").concat(other: joined(xs: this.items)); }
+}
+
+// ---- the vectors ----
+
+fn isize indexOf(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = replyNames();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return i; }
+        i = i + 1;
+    }
+    panic(msg: "reply_test: no server vector ${name}");
+    return -1;
+}
+
+fn Result<Value, RedisError> valueOf(ConstView<uint8> b) {
+    Reader r = Reader.make();
+    r.feed(bytes: b);
+    Read got = r.next();
+    return match (give got) {
+        case Complete(value: v): Result::Ok(value: give v);
+        case _: Result::Err(error: RedisError::Unexpected(detail: "reply_test: not one whole reply"));
+    };
+}
+
+// The reply `server` sent for `kase`, as the connection would hand it over.
+fn Result<Value, RedisError> captured(const ref string server, const ref string kase) {
+    isize i = indexOf(server: server, kase: kase);
+    DynamicArray<string> hex = replyHex();
+    DynamicArray<uint8> bytes = unhex(text: hex[i]);
+    return valueOf(b: bytes.view());
+}
+
+fn Result<Value, RedisError> wire(const ref string text) { return valueOf(b: text.bytes()); }
+
+fn DynamicArray<string> splitOn(const ref string text, const ref string sep) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    isize start = 0;
+    isize i = 0;
+    while (i + sep.length() <= text.length()) {
+        if (text.substring(start: i, end: i + sep.length()) == sep) {
+            parts.add(item: text.substring(start: start, end: i));
+            i = i + sep.length();
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    parts.add(item: text.substring(start: start, end: text.length()));
+    return give parts;
+}
+
+// The words of setup command `n` of a case (the commands that ran before it).
+fn DynamicArray<string> setupOf(const ref string server, const ref string kase, isize n) {
+    isize i = indexOf(server: server, kase: kase);
+    DynamicArray<string> setups = replySetups();
+    DynamicArray<string> commands = splitOn(text: setups[i], sep: " ; ");
+    return splitOn(text: commands[n], sep: " ");
+}
+
+// The words of a case's own command.
+fn DynamicArray<string> commandOf(const ref string server, const ref string kase) {
+    isize i = indexOf(server: server, kase: kase);
+    DynamicArray<string> commands = replyCommands();
+    return splitOn(text: commands[i], sep: " ");
+}
+
+// A shown argument's bytes: "<hex:…>" is the generator's spelling of bytes that are not printable.
+fn DynamicArray<uint8> argBytes(const ref string shown) {
+    if (shown.startsWith(prefix: "<hex:")) { return unhex(text: shown.substring(start: 5, end: shown.length() - 1)); }
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.addAll(items: shown.bytes());
+    return give b;
+}
+
+fn int64 intOf(const ref string text) {
+    Result<int64, ParseError> p = parse::<int64>(s: text);
+    return match (p) { case Ok(value: v): v; case Err(error: e): { panic(msg: "reply_test: not an integer: ${text}"); := 0i64; } };
+}
+
+fn float64 floatOf(const ref string text) {
+    Result<float64, ParseError> p = parse::<float64>(s: text);
+    return match (p) { case Ok(value: v): v; case Err(error: e): { panic(msg: "reply_test: not a float: ${text}"); := 0.0; } };
+}
+
+fn string joined(const ref DynamicArray<string> xs) {
+    string s = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        if (i > 0) { s = s.concat(other: ","); }
+        s = s.concat(other: xs[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+// A failed read as text, "ok" otherwise.
+fn string failure<T>(const ref Result<T, RedisError> r) {
+    return match (r) {
+        case Ok(value: v): "ok";
+        case Err(error: e): match (e) {
+            case Value(detail: d): "Value: ".concat(other: d);
+            case Server(error: s): "Server: ".concat(other: s.codeText());
+            case _: "other: ".concat(other: e.message());
+        };
+    };
+}
+
+// ---- every typed pair, from every server, under each protocol ----
+
+fn int32 stringCase(const ref string s, const ref string kase, const ref string want) {
+    int32 f = 0;
+    int32 p = 2;
+    while (p <= 3) {
+        string k = kase.concat(other: "/${p}");
+        Result<string, RedisError> r = reply::<string>(result: captured(server: s, kase: k));
+        string got = match (r) { case Ok(value: v): copy v; case Err(error: e): "(failed) ".concat(other: e.message()); };
+        f = f + check(ok: got == want, what: "reply: ${s} ${k} as string: ${got}");
+        p = p + 1;
+    }
+    return f;
+}
+
+fn int32 pairTests(const ref string s) {
+    int32 f = 0;
+    int32 p = 2;
+    while (p <= 3) {
+        // GET: a hit, a miss, a big value, and bytes that are not UTF-8.
+        string hit = "get-hit/${p}";
+        DynamicArray<string> setHit = setupOf(server: s, kase: hit, n: 0);
+        Result<string, RedisError> g1 = reply::<string>(result: captured(server: s, kase: hit));
+        string g1s = match (g1) { case Ok(value: v): copy v; case Err(error: e): "(failed)"; };
+        f = f + check(ok: g1s == setHit[2], what: "reply: ${s} ${hit}: ${g1s}");
+        string miss = "get-missing/${p}";
+        Result<Optional<string>, RedisError> g2 = replyOpt::<string>(result: captured(server: s, kase: miss));
+        bool none = match (g2) { case Ok(value: o): match (o) { case None: true; case Some(value: v): false; }; case Err(error: e): false; };
+        Result<string, RedisError> g2b = reply::<string>(result: captured(server: s, kase: miss));
+        string why = failure::<string>(r: g2b);
+        f = f + check(ok: none && why == "Value: reply: null cannot be read as string: read it with replyOpt or replyOpts, or into an Optional",
+                      what: "reply: ${s} ${miss}: None with replyOpt, refused without: ${why}");
+        string big = "get-big/${p}";
+        DynamicArray<string> setBig = setupOf(server: s, kase: big, n: 0);
+        Result<string, RedisError> g3 = reply::<string>(result: captured(server: s, kase: big));
+        bool bigSame = match (g3) { case Ok(value: v): v == setBig[2]; case Err(error: e): false; };
+        f = f + check(ok: bigSame, what: "reply: ${s} ${big}");
+        string bin = "get-binary/${p}";
+        DynamicArray<string> setBin = setupOf(server: s, kase: bin, n: 0);
+        DynamicArray<uint8> wantBytes = argBytes(shown: setBin[2]);
+        Result<DynamicArray<uint8>, RedisError> g4 = reply::<DynamicArray<uint8>>(result: captured(server: s, kase: bin));
+        bool binSame = match (g4) { case Ok(value: v): v.equals(other: wantBytes); case Err(error: e): false; };
+        Result<string, RedisError> g4b = reply::<string>(result: captured(server: s, kase: bin));
+        string why4 = failure::<string>(r: g4b);
+        f = f + check(ok: binSame && wantBytes.length() == 256 && why4.startsWith(prefix: "Value: reply: a bulk string ") && why4.endsWith(suffix: " is not UTF-8, so it cannot be read as string: read it as DynamicArray<uint8>"),
+                      what: "reply: ${s} ${bin}: all 256 bytes as DynamicArray<uint8>; as string: ${why4}");
+
+        // MGET: each key MSET set, and None for the one it did not.
+        string mget = "mget/${p}";
+        DynamicArray<string> mset = setupOf(server: s, kase: mget, n: 0);
+        DynamicArray<string> keys = commandOf(server: s, kase: mget);
+        Result<DynamicArray<Optional<int64>>, RedisError> g5 = replyOpts::<int64>(result: captured(server: s, kase: mget));
+        string want5 = "";
+        isize i = 1;
+        while (i < keys.length()) {
+            string item = "none";
+            isize j = 1;
+            while (j + 1 < mset.length()) { if (mset[j] == keys[i]) { item = copy mset[j + 1]; } j = j + 2; }
+            want5 = want5.concat(other: item).concat(other: ";");
+            i = i + 1;
+        }
+        string got5 = "";
+        match (g5) {
+            case Ok(value: xs): {
+                isize k = 0;
+                while (k < xs.length()) {
+                    string item = match (xs[k]) { case Some(value: v): "${v}"; case None: "none"; };
+                    got5 = got5.concat(other: item).concat(other: ";");
+                    k = k + 1;
+                }
+            }
+            case Err(error: e): { got5 = "(failed) ".concat(other: e.message()); }
+        };
+        f = f + check(ok: got5 == want5, what: "reply: ${s} ${mget} as replyOpts<int64>: ${got5}, want ${want5}");
+
+        // INCRBYFLOAT: the setup's value plus the increment.
+        string inc = "incrbyfloat/${p}";
+        DynamicArray<string> setF = setupOf(server: s, kase: inc, n: 0);
+        DynamicArray<string> incCmd = commandOf(server: s, kase: inc);
+        float64 want6 = floatOf(text: setF[2]) + floatOf(text: incCmd[2]);
+        Result<float64, RedisError> g6 = reply::<float64>(result: captured(server: s, kase: inc));
+        float64 got6 = match (g6) { case Ok(value: v): v; case Err(error: e): -1.0; };
+        f = f + check(ok: got6 == want6, what: "reply: ${s} ${inc}: ${got6}, want ${want6}");
+
+        // HGETALL: a std Map, a struct by name, and a flat list; HMGET with a field that is not there.
+        string all = "hgetall/${p}";
+        DynamicArray<string> hset = setupOf(server: s, kase: all, n: 0);
+        Result<Map<string, string>, RedisError> g7 = reply::<Map<string, string>>(result: captured(server: s, kase: all));
+        bool mapSame = match (g7) {
+            case Ok(value: m): m.length() == 2 && sameIn(m: m, key: hset[2], want: hset[3]) && sameIn(m: m, key: hset[4], want: hset[5]);
+            case Err(error: e): false;
+        };
+        Result<HashPair, RedisError> g8 = reply::<HashPair>(result: captured(server: s, kase: all));
+        string got8 = match (g8) { case Ok(value: h): h.first().concat(other: ",").concat(other: h.second()); case Err(error: e): failure::<HashPair>(r: g8); };
+        Result<DynamicArray<string>, RedisError> g9 = reply::<DynamicArray<string>>(result: captured(server: s, kase: all));
+        string got9 = match (g9) { case Ok(value: xs): joined(xs: xs); case Err(error: e): "(failed)"; };
+        string want9 = joined(xs: hset).substring(start: 10, end: joined(xs: hset).length());
+        f = f + check(ok: mapSame && got8 == "v1,v2" && got9 == want9, what: "reply: ${s} ${all}: as a Map, a struct (${got8}), a list (${got9})");
+        string hm = "hmget/${p}";
+        Result<DynamicArray<Optional<string>>, RedisError> g10 = replyOpts::<string>(result: captured(server: s, kase: hm));
+        string got10 = match (g10) {
+            case Ok(value: xs): optionals(xs: xs);
+            case Err(error: e): "(failed)";
+        };
+        f = f + check(ok: got10 == "v1;none;v2;", what: "reply: ${s} ${hm}: ${got10}");
+
+        // Sets of integers: SMEMBERS as a std Set and as a list; SMISMEMBER as bools.
+        string sm = "smembers/${p}";
+        DynamicArray<string> sadd = setupOf(server: s, kase: sm, n: 0);
+        Result<Set<int64>, RedisError> g11 = reply::<Set<int64>>(result: captured(server: s, kase: sm));
+        bool setSame = match (g11) {
+            case Ok(value: set): set.length() == sadd.length() - 2 && set.contains(key: intOf(text: sadd[2])) && set.contains(key: intOf(text: sadd[3])) && set.contains(key: intOf(text: sadd[4]));
+            case Err(error: e): false;
+        };
+        f = f + check(ok: setSame, what: "reply: ${s} ${sm} as Set<int64>");
+        string smis = "smismember/${p}";
+        Result<DynamicArray<bool>, RedisError> g12 = reply::<DynamicArray<bool>>(result: captured(server: s, kase: smis));
+        string got12 = match (g12) { case Ok(value: bs): boolsOf(bs: bs); case Err(error: e): failure::<DynamicArray<bool>>(r: g12); };
+        f = f + check(ok: got12 == "true,false", what: "reply: ${s} ${smis}: ${got12}");
+
+        // ZRANGE WITHSCORES: a flat list under RESP2, a list of pairs under RESP3; both read the same.
+        string zr = "zrange-withscores/${p}";
+        DynamicArray<string> zadd = setupOf(server: s, kase: zr, n: 0);
+        string want13 = zadd[3].concat(other: "=").concat(other: zadd[2]).concat(other: ";").concat(other: zadd[5]).concat(other: "=").concat(other: zadd[4]).concat(other: ";");
+        Result<DynamicArray<Scored>, RedisError> g13 = reply::<DynamicArray<Scored>>(result: captured(server: s, kase: zr));
+        string got13 = match (g13) { case Ok(value: xs): scoredOf(xs: xs); case Err(error: e): failure::<DynamicArray<Scored>>(r: g13); };
+        Result<Map<string, float64>, RedisError> g14 = reply::<Map<string, float64>>(result: captured(server: s, kase: zr));
+        bool scores = match (g14) { case Ok(value: m): m.length() == 2 && scoreIn(m: m, key: zadd[3], want: floatOf(text: zadd[2])); case Err(error: e): false; };
+        f = f + check(ok: got13 == want13 && scores, what: "reply: ${s} ${zr}: ${got13}, want ${want13}");
+        string zs = "zscore/${p}";
+        Result<float64, RedisError> g15 = reply::<float64>(result: captured(server: s, kase: zs));
+        bool zsSame = match (g15) { case Ok(value: v): v == floatOf(text: zadd[2]); case Err(error: e): false; };
+        f = f + check(ok: zsSame, what: "reply: ${s} ${zs}");
+
+        // XRANGE: records of an ID and a flat list of fields; XREAD: a map of streams to them (an array of pairs under
+        // RESP2).
+        string xr = "xrange/${p}";
+        DynamicArray<string> x1 = setupOf(server: s, kase: xr, n: 0);
+        DynamicArray<string> x2 = setupOf(server: s, kase: xr, n: 1);
+        Result<DynamicArray<Entry>, RedisError> g16 = reply::<DynamicArray<Entry>>(result: captured(server: s, kase: xr));
+        string got16 = match (g16) { case Ok(value: xs): entriesOf(xs: xs); case Err(error: e): failure::<DynamicArray<Entry>>(r: g16); };
+        string want16 = x1[2].concat(other: ":").concat(other: x1[4]).concat(other: ";").concat(other: x2[2]).concat(other: ":").concat(other: x2[4]).concat(other: ",").concat(other: x2[6]).concat(other: ";");
+        f = f + check(ok: got16 == want16, what: "reply: ${s} ${xr}: ${got16}, want ${want16}");
+        string xd = "xread/${p}";
+        Result<Map<string, DynamicArray<Entry>>, RedisError> g17 = reply::<Map<string, DynamicArray<Entry>>>(result: captured(server: s, kase: xd));
+        string got17 = match (g17) {
+            case Ok(value: m): streamOf(m: m, key: x1[1]);
+            case Err(error: e): failure::<Map<string, DynamicArray<Entry>>>(r: g17);
+        };
+        f = f + check(ok: got17 == want16, what: "reply: ${s} ${xd}: ${got17}");
+
+        // LPOS COUNT 0: every position of the element.
+        string lp = "lpos/${p}";
+        DynamicArray<string> rpush = setupOf(server: s, kase: lp, n: 0);
+        DynamicArray<string> lpCmd = commandOf(server: s, kase: lp);
+        string want18 = "";
+        isize li = 2;
+        while (li < rpush.length()) {
+            isize at = li - 2;
+            if (rpush[li] == lpCmd[2]) { want18 = want18.concat(other: "${at};"); }
+            li = li + 1;
+        }
+        Result<DynamicArray<int64>, RedisError> g18 = reply::<DynamicArray<int64>>(result: captured(server: s, kase: lp));
+        string got18 = match (g18) { case Ok(value: xs): intsOf(xs: xs); case Err(error: e): "(failed)"; };
+        f = f + check(ok: got18 == want18, what: "reply: ${s} ${lp}: ${got18}, want ${want18}");
+
+        // CONFIG GET: a map under RESP3, a flat list under RESP2; read by name into a struct.
+        string cg = "config-get/${p}";
+        Result<Policy, RedisError> g19 = reply::<Policy>(result: captured(server: s, kase: cg));
+        string got19 = match (g19) { case Ok(value: v): v.value(); case Err(error: e): failure::<Policy>(r: g19); };
+        f = f + check(ok: got19 == "noeviction", what: "reply: ${s} ${cg}: ${got19}");
+
+        // EXISTS: how many of the keys the setup set.
+        string ex = "exists/${p}";
+        Result<int64, RedisError> g20 = reply::<int64>(result: captured(server: s, kase: ex));
+        bool exSame = match (g20) { case Ok(value: v): v == 1i64; case Err(error: e): false; };
+        f = f + check(ok: exSame, what: "reply: ${s} ${ex}");
+
+        // EVAL's table, as a record; an error inside it is the server's.
+        string ev = "eval/${p}";
+        Result<Mixed, RedisError> g21 = replyRecord::<Mixed>(result: captured(server: s, kase: ev));
+        string got21 = match (g21) { case Ok(value: v): v.shown(); case Err(error: e): failure::<Mixed>(r: g21); };
+        f = f + check(ok: got21 == "1 two [3 4]", what: "reply: ${s} ${ev} as a record: ${got21}");
+        string ee = "eval-error-inside/${p}";
+        Result<DynamicArray<int64>, RedisError> g22 = reply::<DynamicArray<int64>>(result: captured(server: s, kase: ee));
+        string got22 = failure::<DynamicArray<int64>>(r: g22);
+        f = f + check(ok: got22 == "Server: WRONGTYPE", what: "reply: ${s} ${ee}: an error inside the reply that is read is the server's: ${got22}");
+
+        // Transactions: MULTI's OK, QUEUED, EXEC's record and EXEC's null.
+        string eo = "exec-ok/${p}";
+        Result<Executed, RedisError> g23 = replyRecord::<Executed>(result: captured(server: s, kase: eo));
+        string got23 = match (g23) { case Ok(value: v): v.shown(); case Err(error: e): failure::<Executed>(r: g23); };
+        f = f + check(ok: got23 == "OK 2", what: "reply: ${s} ${eo}: ${got23}");
+        string en = "exec-null/${p}";
+        Result<Optional<Executed>, RedisError> g24 = replyRecordOpt::<Executed>(result: captured(server: s, kase: en));
+        bool nullExec = match (g24) { case Ok(value: o): match (o) { case None: true; case Some(value: v): false; }; case Err(error: e): false; };
+        f = f + check(ok: nullExec, what: "reply: ${s} ${en}: None");
+
+        // BLPOP: a record, or null when it timed out.
+        string bh = "blpop-hit/${p}";
+        DynamicArray<string> push = setupOf(server: s, kase: bh, n: 0);
+        Result<Optional<Popped>, RedisError> g25 = replyRecordOpt::<Popped>(result: captured(server: s, kase: bh));
+        string got25 = match (g25) { case Ok(value: o): match (o) { case Some(value: v): v.shown(); case None: "none"; }; case Err(error: e): "(failed)"; };
+        f = f + check(ok: got25 == push[1].concat(other: "=").concat(other: push[2]), what: "reply: ${s} ${bh}: ${got25}");
+        string bn = "blpop-null/${p}";
+        Result<Optional<Popped>, RedisError> g26 = replyRecordOpt::<Popped>(result: captured(server: s, kase: bn));
+        bool nullPop = match (g26) { case Ok(value: o): match (o) { case None: true; case Some(value: v): false; }; case Err(error: e): false; };
+        f = f + check(ok: nullPop, what: "reply: ${s} ${bn}: None");
+
+        // SCAN pages: the cursor and the items, as a record.
+        f = f + pageCase(s: s, kase: "scan/${p}", want: "0 kr:only");
+        f = f + pageCase(s: s, kase: "sscan/${p}", want: "0 1,2,3");
+        f = f + pageCase(s: s, kase: "hscan/${p}", want: "0 a,1,b,2");
+        f = f + pageCase(s: s, kase: "zscan/${p}", want: "0 a,1,b,2");
+        p = p + 1;
+    }
+    f = f + stringCase(s: s, kase: "type", want: "string");
+    f = f + stringCase(s: s, kase: "multi", want: "OK");
+    f = f + stringCase(s: s, kase: "queued", want: "QUEUED");
+    return f;
+}
+
+fn int32 pageCase(const ref string s, const ref string kase, const ref string want) {
+    Result<Page, RedisError> r = replyRecord::<Page>(result: captured(server: s, kase: kase));
+    string got = match (r) { case Ok(value: v): v.shown(); case Err(error: e): failure::<Page>(r: r); };
+    return check(ok: got == want, what: "reply: ${s} ${kase}: ${got}");
+}
+
+fn bool sameIn(const ref Map<string, string> m, const ref string key, const ref string want) {
+    Optional<string> v = m.get(key: key);
+    return match (v) { case Some(value: x): x == want; case None: false; };
+}
+
+fn bool scoreIn(const ref Map<string, float64> m, const ref string key, float64 want) {
+    Optional<float64> v = m.get(key: key);
+    return match (v) { case Some(value: x): x == want; case None: false; };
+}
+
+fn string optionals(const ref DynamicArray<Optional<string>> xs) {
+    string s = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        string item = match (xs[i]) { case Some(value: v): copy v; case None: "none"; };
+        s = s.concat(other: item).concat(other: ";");
+        i = i + 1;
+    }
+    return s;
+}
+
+fn string boolsOf(const ref DynamicArray<bool> bs) {
+    string s = "";
+    isize i = 0;
+    while (i < bs.length()) {
+        if (i > 0) { s = s.concat(other: ","); }
+        if (bs[i]) { s = s.concat(other: "true"); } else { s = s.concat(other: "false"); }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn string intsOf(const ref DynamicArray<int64> xs) {
+    string s = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        int64 v = xs[i];
+        s = s.concat(other: "${v};");
+        i = i + 1;
+    }
+    return s;
+}
+
+// "member=score;" for each, the score as the setup wrote it (ZADD's own text: 1.5, 2).
+fn string scoredOf(const ref DynamicArray<Scored> xs) {
+    string s = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        float64 v = xs[i].value();
+        string shown = "${v}";
+        s = s.concat(other: xs[i].name()).concat(other: "=").concat(other: shown).concat(other: ";");
+        i = i + 1;
+    }
+    return s;
+}
+
+// "id:field,field;" for each entry, its fields' values in the order the setup gave them.
+fn string entriesOf(const ref DynamicArray<Entry> xs) {
+    string s = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        s = s.concat(other: xs[i].named()).concat(other: ":");
+        if (xs[i].count() == 1) { s = s.concat(other: xs[i].field(name: "f")); }
+        else { s = s.concat(other: xs[i].field(name: "g")).concat(other: ",").concat(other: xs[i].field(name: "h")); }
+        s = s.concat(other: ";");
+        i = i + 1;
+    }
+    return s;
+}
+
+fn string streamOf(const ref Map<string, DynamicArray<Entry>> m, const ref string key) {
+    if (!m.contains(key: key) || m.length() != 1) { return "(no stream ${key})"; }
+    return entriesOf(xs: m.getRef(key: key));
+}
+
+// ---- the edges ----
+
+fn string asInt(const ref string text) {
+    Result<int64, RedisError> r = reply::<int64>(result: wire(text: text));
+    return match (r) { case Ok(value: v): "${v}"; case Err(error: e): failure::<int64>(r: r); };
+}
+
+fn int32 edgeTests() {
+    int32 f = 0;
+    // Integers: the server's own grammar only, every width checked.
+    f = f + check(ok: asInt(text: ":42\r\n") == "42", what: "reply: an integer");
+    f = f + check(ok: asInt(text: "$3\r\n-17\r\n") == "-17", what: "reply: a decimal string as an integer");
+    string plus = asInt(text: "$2\r\n+5\r\n");
+    f = f + check(ok: plus == "Value: reply: a bulk string \"+5\" cannot be read as int64", what: "reply: '+5' is not the server's grammar: ${plus}");
+    string lead = asInt(text: "$3\r\n007\r\n");
+    f = f + check(ok: lead.startsWith(prefix: "Value: "), what: "reply: a leading zero is not the server's grammar: ${lead}");
+    string negZero = asInt(text: "$2\r\n-0\r\n");
+    f = f + check(ok: negZero.startsWith(prefix: "Value: "), what: "reply: '-0' is not the server's grammar: ${negZero}");
+    string over = asInt(text: "$19\r\n9223372036854775808\r\n");
+    f = f + check(ok: over.startsWith(prefix: "Value: "), what: "reply: one past int64's max is refused: ${over}");
+    f = f + check(ok: asInt(text: "$20\r\n-9223372036854775808\r\n") == "-9223372036854775808", what: "reply: int64's min");
+    f = f + check(ok: asInt(text: ",3\r\n") == "3", what: "reply: an integral double as an integer");
+    string half = asInt(text: ",2.5\r\n");
+    f = f + check(ok: half == "Value: reply: a double 2.5 cannot be read as int64", what: "reply: 2.5 is not an integer: ${half}");
+    string inf = asInt(text: ",inf\r\n");
+    f = f + check(ok: inf == "Value: reply: a double inf cannot be read as int64", what: "reply: inf is not an integer: ${inf}");
+    string huge = asInt(text: ",1e300\r\n");
+    f = f + check(ok: huge.startsWith(prefix: "Value: "), what: "reply: 1e300 is not an int64: ${huge}");
+    f = f + check(ok: asInt(text: "(12345\r\n") == "12345", what: "reply: a big number that fits");
+    Result<int8, RedisError> i8 = reply::<int8>(result: wire(text: ":300\r\n"));
+    string i8s = failure::<int8>(r: i8);
+    f = f + check(ok: i8s == "Value: reply: an integer 300 is out of range for int8", what: "reply: 300 is not an int8: ${i8s}");
+    Result<uint64, RedisError> u64 = reply::<uint64>(result: wire(text: "(18446744073709551615\r\n"));
+    bool u64ok = match (u64) { case Ok(value: v): v == 18446744073709551615ui64; case Err(error: e): false; };
+    f = f + check(ok: u64ok, what: "reply: uint64's max, from a big number");
+    Result<uint64, RedisError> u64over = reply::<uint64>(result: wire(text: "(18446744073709551616\r\n"));
+    string uo = failure::<uint64>(r: u64over);
+    f = f + check(ok: uo.startsWith(prefix: "Value: "), what: "reply: one past uint64's max: ${uo}");
+    Result<uint32, RedisError> neg = reply::<uint32>(result: wire(text: ":-1\r\n"));
+    string ng = failure::<uint32>(r: neg);
+    f = f + check(ok: ng == "Value: reply: an integer -1 is out of range for uint32", what: "reply: -1 is not a uint32: ${ng}");
+
+    // Floats, bools, strings.
+    Result<float64, RedisError> fi = reply::<float64>(result: wire(text: "$4\r\n-inf\r\n"));
+    bool negInf = match (fi) { case Ok(value: v): v < 0.0 && v * 0.5 == v; case Err(error: e): false; };
+    f = f + check(ok: negInf, what: "reply: -inf as text");
+    Result<float32, RedisError> f32 = reply::<float32>(result: wire(text: "$3\r\n0.1\r\n"));
+    bool tenth = match (f32) { case Ok(value: v): v == 0.1f32; case Err(error: e): false; };
+    f = f + check(ok: tenth, what: "reply: 0.1 as float32, rounded once");
+    Result<bool, RedisError> bt = reply::<bool>(result: wire(text: "#t\r\n"));
+    Result<bool, RedisError> b1 = reply::<bool>(result: wire(text: ":1\r\n"));
+    Result<bool, RedisError> b2 = reply::<bool>(result: wire(text: ":2\r\n"));
+    bool bools = match (bt) { case Ok(value: v): v; case Err(error: e): false; } && match (b1) { case Ok(value: v): v; case Err(error: e): false; };
+    string b2s = failure::<bool>(r: b2);
+    f = f + check(ok: bools && b2s == "Value: reply: an integer 2 cannot be read as bool", what: "reply: bools from #t and 1, not from 2: ${b2s}");
+    Result<string, RedisError> vb = reply::<string>(result: wire(text: "=15\r\ntxt:Some string\r\n"));
+    string vbs = match (vb) { case Ok(value: v): copy v; case Err(error: e): "(failed)"; };
+    f = f + check(ok: vbs == "Some string", what: "reply: a verbatim string's text: ${vbs}");
+    Result<string, RedisError> ds = reply::<string>(result: wire(text: ",-inf\r\n"));
+    string dss = match (ds) { case Ok(value: v): copy v; case Err(error: e): "(failed)"; };
+    f = f + check(ok: dss == "-inf", what: "reply: a double as a string: ${dss}");
+    Result<char, RedisError> ch = reply::<char>(result: wire(text: "+é\r\n"));
+    bool oneChar = match (ch) { case Ok(value: c): c == 'é'; case Err(error: e): false; };
+    f = f + check(ok: oneChar, what: "reply: one codepoint as char");
+
+    // Null, attributes, odd maps, missing fields, and where a failure is.
+    string nul = asInt(text: "_\r\n");
+    f = f + check(ok: nul == "Value: reply: null cannot be read as int64: read it with replyOpt or replyOpts, or into an Optional", what: "reply: null: ${nul}");
+    f = f + check(ok: asInt(text: "|1\r\n+key\r\n+val\r\n:5\r\n") == "5", what: "reply: an attribute is unwrapped");
+    Result<HashPair, RedisError> odd = reply::<HashPair>(result: wire(text: "*3\r\n$2\r\nf1\r\n$1\r\na\r\n$2\r\nf2\r\n"));
+    string odds = failure::<HashPair>(r: odd);
+    f = f + check(ok: odds == "Value: reply: an array of 3 items cannot be read as a struct by name: its items are not key-value pairs (replyRecord reads it by position)",
+                  what: "reply: an odd array as a struct: ${odds}");
+    Result<HashPair, RedisError> missing = reply::<HashPair>(result: wire(text: "%1\r\n+f1\r\n+a\r\n"));
+    string ms = failure::<HashPair>(r: missing);
+    f = f + check(ok: ms == "Value: reply: a field that is neither Optional nor @field(default) is not in the reply", what: "reply: a missing field: ${ms}");
+    Result<Scored, RedisError> named = reply::<Scored>(result: wire(text: "%2\r\n+member\r\n+a\r\n+score\r\n+abc\r\n"));
+    string ns = failure::<Scored>(r: named);
+    f = f + check(ok: ns == "Value: reply.score: a simple string \"abc\" cannot be read as float64", what: "reply: a field's failure names the field: ${ns}");
+    Result<DynamicArray<Scored>, RedisError> nested = reply::<DynamicArray<Scored>>(result: wire(text: "*2\r\n*2\r\n+a\r\n,1\r\n*2\r\n+b\r\n+x\r\n"));
+    string nes = failure::<DynamicArray<Scored>>(r: nested);
+    f = f + check(ok: nes == "Value: reply[1][1]: a simple string \"x\" cannot be read as float64", what: "reply: a nested failure names its place: ${nes}");
+    Result<int64, RedisError> passed = reply::<int64>(result: Result::Err(error: RedisError::Timeout));
+    string ps = failure::<int64>(r: passed);
+    f = f + check(ok: ps == "other: timed out", what: "reply: a call's own failure passes through: ${ps}");
+
+    // EXEC's error element, from every server: the server's error, by its code.
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        Result<DynamicArray<string>, RedisError> er = reply::<DynamicArray<string>>(result: captured(server: s, kase: "exec-error"));
+        string es = failure::<DynamicArray<string>>(r: er);
+        f = f + check(ok: es == "Server: WRONGTYPE", what: "reply: ${s} exec-error: ${es}");
+        i = i + 1;
+    }
+
+    // A reply as deep as the protocol reader allows is read without recursion, and refused as what it is.
+    string deep = "";
+    isize d = 0;
+    while (d < 1023) { deep = deep.concat(other: "*1\r\n"); d = d + 1; }
+    deep = deep.concat(other: ":1\r\n");
+    string dd = asInt(text: deep);
+    Result<Map<string, string>, RedisError> dm = reply::<Map<string, string>>(result: wire(text: deep));
+    string dms = failure::<Map<string, string>>(r: dm);
+    f = f + check(ok: dd == "Value: reply: an array cannot be read as int64" && dms.startsWith(prefix: "Value: "), what: "reply: 1024 deep: ${dd}; ${dms}");
+    return f;
+}
+
+// ---- every resp vector, read as each type ----
+
+fn int32 sweepTests() {
+    int32 f = 0;
+    DynamicArray<string> inputs = respInputs();
+    isize read = 0;
+    isize ok = 0;
+    isize i = 0;
+    while (i < inputs.length()) {
+        DynamicArray<uint8> bytes = unhex(text: inputs[i]);
+        Result<Value, RedisError> first = valueOf(b: bytes.view());
+        bool whole = match (first) { case Ok(value: v): true; case Err(error: e): false; };
+        Value v = match (give first) { case Ok(value: x): give x; case Err(error: e): Value::Null; };
+        if (whole) {
+            read = read + 1;
+            Result<int64, RedisError> a = reply::<int64>(result: Result::Ok(value: copy v));
+            Result<float64, RedisError> b = reply::<float64>(result: Result::Ok(value: copy v));
+            Result<bool, RedisError> c = reply::<bool>(result: Result::Ok(value: copy v));
+            Result<string, RedisError> d = reply::<string>(result: Result::Ok(value: copy v));
+            Result<DynamicArray<uint8>, RedisError> e = reply::<DynamicArray<uint8>>(result: Result::Ok(value: copy v));
+            Result<DynamicArray<string>, RedisError> g = reply::<DynamicArray<string>>(result: Result::Ok(value: copy v));
+            Result<Map<string, string>, RedisError> h = reply::<Map<string, string>>(result: Result::Ok(value: copy v));
+            Result<HashPair, RedisError> k = reply::<HashPair>(result: Result::Ok(value: copy v));
+            if (failure::<int64>(r: a) == "ok") { ok = ok + 1; }
+            if (failure::<string>(r: d) == "ok") { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    // Reaching here is the test: no read panicked. The counts show it read something.
+    f = f + check(ok: read > 0 && ok > 0, what: "reply: every resp vector as eight types, Ok or Err: ${read} read, ${ok} as int64 or string");
+    return f;
+}
+
+fn int32 replyTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        f = f + pairTests(s: s);
+        i = i + 1;
+    }
+    f = f + edgeTests();
+    f = f + sweepTests();
+    return f;
+}

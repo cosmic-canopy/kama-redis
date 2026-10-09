@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 4 is next.
+its session plan, and step 5 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -403,8 +403,9 @@ confirmed the kama facts underneath, and are listed at the end.
 
   WATCH and UNWATCH stay allowed. The table lives in the internal `redis::wire` module (`known.kama`), so it is not
   public API.
-- **Typed replies:** `reply::<T>`, `replyOpt::<T>` and `replyOpts::<T>` (MGET; `Optional<T>` is not
-  `Deserializable` on its own), each consuming a `Result<Value, RedisError>`. So `reply::<T>(result:
+- **Typed replies:** `reply::<T>`, `replyOpt::<T>`, `replyOpts::<T>` (MGET; `Optional<T>` is not
+  `Deserializable` on its own), `replyRecord::<T>` and `replyRecordOpt::<T>` (a top-level array read by position:
+  EXEC's, and BLPOP's or its null), each consuming a `Result<Value, RedisError>`. So `reply::<T>(result:
   conn.call(command: c))` is the one way, for `call`, pipeline and transaction replies alike. One rule set covers
   both protocols:
 
@@ -427,6 +428,16 @@ confirmed the kama facts underneath, and are listed at the end.
     Maps.
   - A struct with a `string` field is a `type resource` (it owns), so its fields are private, and the caller gives it
     accessors.
+  - **What building it settled (step 4):**
+    - An integer read from text follows the server's own grammar (string2ll): no `+`, no leading zero, no `-0`.
+      std's `parse` accepts `+`, so the reader checks the bytes itself.
+    - A double reads as an integer only when it is whole and in range, checked before the cast: kama has no
+      `try cast` from a float, because an out-of-range float cast traps.
+    - A float32 is parsed from text as a float32, so it is rounded once.
+    - A string that is read as a list is read as its bytes, so `DynamicArray<uint8>` reads any string reply.
+    - After a type reads itself without error, a reply it did not read to its end is `Value`.
+    - Every typed pair reads the same from all eight servers' RESP2 and RESP3 bytes, and the reader has been run
+      over every resp vector as eight types without a panic.
   - Null reads only into an Optional, and `readNull` consumes it, as std's JSON reader does (postgres's does not,
     because a cell is not a cursor). Attributes are unwrapped.
   - An Error element that is read fails as `Server` with its code.

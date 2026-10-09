@@ -1,0 +1,822 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned, std::fmt::parse,
+         std::fmt::ParseError, std::fmt::i64Str, std::fmt::f64Str, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::RedisError, redis::ServerError, redis::resp::Value };
+export { reply, replyOpt, replyOpts, replyRecord, replyRecordOpt };
+
+// Typed replies: a reply read into a kama type through `Deserializable`, as @kama/postgres reads a column.
+//
+//   Result<int64, RedisError> n = reply::<int64>(result: conn.call(command: incr));
+//   Result<Optional<string>, RedisError> v = replyOpt::<string>(result: conn.call(command: get));
+//   Result<DynamicArray<Optional<string>>, RedisError> vs = replyOpts::<string>(result: conn.call(command: mget));
+//
+// One set of rules reads both protocols, so a type reads the same from RESP2 and RESP3 (docs/ROADMAP.md, "Decided,
+// and why", "Phase 3", "Typed replies"):
+//   - an integer from an integer, a decimal string as the server writes one (no '+', no leading zero), an integral
+//     double that fits, or a big number that fits;
+//   - a float from a double, an integer, a big number, or text (`inf` and `nan` included);
+//   - a bool from a boolean, or the integer 0 or 1;
+//   - a string from any string reply (a verbatim string's text), an integer, a double or a big number; text that is
+//     not UTF-8 is refused, pointing at `DynamicArray<uint8>`, which reads any string reply's bytes;
+//   - a list or a set from an array, a set, or a map flattened to key, value, …;
+//   - a struct by name from a map, or from a flat array at the top (HGETALL under RESP2), and by position from an
+//     array inside another reply, which is a record (XRANGE's `[id, fields]`). `replyRecord` reads a top-level array
+//     by position (EXEC's), and `replyRecordOpt` one that may be null (BLPOP's `[key, value]`);
+//   - a std Map from a map, a flat array of key, value, …, or an array of pairs.
+//
+// Null reads only into an Optional: `replyOpt`, `replyOpts` (MGET), or an Optional field. An attribute is unwrapped
+// to the value it describes. An error inside the reply that is read (one of EXEC's) is `RedisError::Server`, with its
+// code; any other failure is `RedisError::Value`, naming where in the reply and what was asked:
+// "reply[3].score: a bulk string \"x\" cannot be read as float64". The reply was read whole either way, so the
+// connection is still usable.
+//
+// The reader takes the reply apart into a flat list of nodes, in order, moving each string out of it rather than
+// copying it, and walks that list. A reply as deep as the protocol reader allows (resp::Limits.maxDepth) is read
+// without recursion.
+
+type enum Shape implements Sendable { Simple, Bulk, Verbatim, Array, Map, Set, Push }
+
+// One value of the reply. An aggregate is followed by its `count` children, each with its own children after it.
+type enum Node implements Sendable {
+    Text(DynamicArray<uint8> bytes, Shape shape),
+    Integer(int64 value),
+    Double(float64 value),
+    Boolean(bool value),
+    Null,
+    Big(DynamicArray<uint8> digits),
+    Failure(DynamicArray<uint8> line),
+    Many(isize count, Shape shape);
+}
+
+// How an open aggregate is being read: as a list's elements, as a map's entries, as a struct's fields by name or by
+// position, or as the bytes of one string.
+type enum Hold implements Sendable { List, Entries, Named, Fields, Bytes }
+
+type value Frame implements Sendable {
+    public Hold hold;
+    public isize end;     // the node after the frame's last one
+    public isize seen;    // elements or fields begun
+    public isize key;     // Named: the node of the key being read
+    public isize node;    // Bytes: the string's node
+    public isize byteAt;  // Bytes: the next byte
+    public ctor of(Hold hold, isize end) {
+        this.hold = hold;
+        this.end = end;
+        this.seen = 0;
+        this.key = -1;
+        this.node = -1;
+        this.byteAt = 0;
+    }
+}
+
+type resource ReplyReader implements Deserializer {
+    DynamicArray<Node> nodes;
+    DynamicArray<isize> ends;     // the node after node i's last descendant
+    DynamicArray<Frame> frames;
+    isize at = 0;
+    bool records = false;
+    // The first failure is the one reported, with where it happened; every later read does nothing.
+    bool err = false;
+    bool server = false;
+    isize failedAt = -1;
+    DeError code = DeError::Malformed;
+    string where = "";
+    string why = "";
+
+    friend readerOf[over];
+    friend readFailure[derived];
+    friend unfinished[reported, unread];
+
+    ctor over(Value value, bool records) {
+        this.nodes = DynamicArray.empty();
+        this.ends = DynamicArray.empty();
+        this.frames = DynamicArray.empty();
+        this.records = records;
+        DynamicArray<Value> work = DynamicArray.empty();
+        work.add(item: give value);
+        while (work.length() > 0) {
+            Optional<Value> next = work.pop();
+            Value v = match (give next) { case Some(value: x): give x; case None: Value::Null; };
+            match (give v) {
+                case Simple(bytes: b): { this.nodes.add(item: Node::Text(bytes: give b, shape: Shape::Simple)); }
+                case Error(bytes: b): { this.nodes.add(item: Node::Failure(line: give b)); }
+                case Integer(value: n): { this.nodes.add(item: Node::Integer(value: n)); }
+                case Double(value: d): { this.nodes.add(item: Node::Double(value: d)); }
+                case Boolean(value: t): { this.nodes.add(item: Node::Boolean(value: t)); }
+                case Null: { this.nodes.add(item: Node::Null); }
+                case BigNumber(digits: d): { this.nodes.add(item: Node::Big(digits: give d)); }
+                case Bulk(bytes: b): { this.nodes.add(item: Node::Text(bytes: give b, shape: Shape::Bulk)); }
+                case Verbatim(format: form, bytes: b): { this.nodes.add(item: Node::Text(bytes: give b, shape: Shape::Verbatim)); }
+                case Array(items: xs): { this.nodes.add(item: Node::Many(count: xs.length(), shape: Shape::Array)); stacked(work: work, items: give xs); }
+                case Map(entries: xs): { this.nodes.add(item: Node::Many(count: xs.length(), shape: Shape::Map)); stacked(work: work, items: give xs); }
+                case Set(items: xs): { this.nodes.add(item: Node::Many(count: xs.length(), shape: Shape::Set)); stacked(work: work, items: give xs); }
+                case Push(items: xs): { this.nodes.add(item: Node::Many(count: xs.length(), shape: Shape::Push)); stacked(work: work, items: give xs); }
+                // An attribute describes the value after it, which is the last part: that is what is read.
+                case Attributed(parts: xs): {
+                    DynamicArray<Value> parts = give xs;
+                    Optional<Value> described = parts.pop();
+                    match (give described) {
+                        case Some(value: d): { work.add(item: give d); }
+                        case None: { this.nodes.add(item: Node::Null); }
+                    };
+                }
+            };
+        }
+        // Each aggregate ends where its last child does; computed from the back, so every child's end is known.
+        isize n = this.nodes.length();
+        isize i = 0;
+        while (i < n) { this.ends.add(item: i + 1); i = i + 1; }
+        i = n - 1;
+        while (i >= 0) {
+            isize kids = match (this.nodes[i]) { case Many(count: c, shape: s): c; case _: 0; };
+            isize e = i + 1;
+            isize k = 0;
+            while (k < kids) { e = this.ends[e]; k = k + 1; }
+            this.ends[i] = e;
+            i = i - 1;
+        }
+    }
+
+    // ---- where the reader is ----
+
+    const fn isize limit() {
+        if (this.frames.length() == 0) { return this.nodes.length(); }
+        return this.frames[this.frames.length() - 1].end;
+    }
+    const fn bool topIs(Hold h) { return this.frames.length() > 0 && this.frames[this.frames.length() - 1].hold == h; }
+    const fn bool isMany() { return match (this.nodes[this.at]) { case Many(count: c, shape: s): true; case _: false; }; }
+    const fn bool isMap() { return match (this.nodes[this.at]) { case Many(count: c, shape: s): s == Shape::Map; case _: false; }; }
+    const fn bool isNullAt() { return match (this.nodes[this.at]) { case Null: true; case _: false; }; }
+    const fn bool isFailureAt() { return match (this.nodes[this.at]) { case Failure(line: l): true; case _: false; }; }
+    const fn isize countAt() { return match (this.nodes[this.at]) { case Many(count: c, shape: s): c; case _: 0; }; }
+
+    // Where the reader is, as a path: "reply", then [i] for an element or a position, .name for a field read by name.
+    const fn string path() {
+        string p = "reply";
+        isize k = 0;
+        while (k < this.frames.length()) {
+            isize n = this.frames[k].seen - 1;
+            bool named = this.frames[k].hold == Hold::Named;
+            if (named && this.frames[k].key >= 0) {
+                string name = this.textAt(i: this.frames[k].key);
+                p = p.concat(other: ".").concat(other: name);
+            } else if (!named && n >= 0) {
+                p = p.concat(other: "[${n}]");
+            }
+            k = k + 1;
+        }
+        return p;
+    }
+
+    // Node i as text, for a path or a message: a string as it is (cut at 40 bytes), a number in decimal.
+    const fn string textAt(isize i) {
+        return match (this.nodes[i]) {
+            case Text(bytes: b, shape: s): shortText(b: b.view());
+            case Big(digits: d): shortText(b: d.view());
+            case Integer(value: n): i64Str(v: n);
+            case Double(value: d): floatText(v: d);
+            case _: "?";
+        };
+    }
+
+    // What node i is, for a message: "a bulk string \"abc\"", "an integer 300", "an array".
+    const fn string described(isize i) {
+        return match (this.nodes[i]) {
+            case Text(bytes: b, shape: s): shapeName(s: s).concat(other: " \"").concat(other: shortText(b: b.view())).concat(other: "\"");
+            case Integer(value: n): "an integer ".concat(other: i64Str(v: n));
+            case Double(value: d): "a double ".concat(other: floatText(v: d));
+            case Boolean(value: t): boolName(t: t);
+            case Null: "null";
+            case Big(digits: d): "a big number ".concat(other: shortText(b: d.view()));
+            case Failure(line: l): "an error";
+            case Many(count: c, shape: s): shapeName(s: s);
+        };
+    }
+
+    // ---- failing ----
+
+    fn void refuse(DeError e, const ref string why) {
+        if (this.err) { return; }
+        this.err = true;
+        this.code = e;
+        this.failedAt = this.at;
+        this.where = this.path();
+        this.why = copy why;
+    }
+
+    // The node here cannot be read as `asked`: an error reply is the server's error; anything else is a mismatch.
+    fn void mismatch(const ref string asked) {
+        if (this.err) { return; }
+        if (this.at >= this.limit()) {
+            this.refuse(e: DeError::UnexpectedEnd, why: "nothing is left to read as ${asked}");
+            return;
+        }
+        if (this.isFailureAt()) {
+            this.refuse(e: DeError::TypeMismatch, why: "an error");
+            this.server = true;
+            return;
+        }
+        if (this.isNullAt()) {
+            this.refuse(e: DeError::TypeMismatch, why: "null cannot be read as ${asked}: read it with replyOpt or replyOpts, or into an Optional");
+            return;
+        }
+        string what = this.described(i: this.at);
+        this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " cannot be read as ").concat(other: asked));
+    }
+
+    // Whether a single value can be read here as `asked`; refused when it cannot.
+    fn bool ready(const ref string asked) {
+        if (this.err) { return false; }
+        if (this.topIs(h: Hold::Bytes)) {
+            this.refuse(e: DeError::TypeMismatch, why: "a string's bytes cannot be read as ${asked}");
+            return false;
+        }
+        if (this.at >= this.limit() || this.isNullAt() || this.isFailureAt()) {
+            this.mismatch(asked: asked);
+            return false;
+        }
+        return true;
+    }
+
+    // The failure, as the error a caller gets.
+    const fn RedisError reported() {
+        if (this.server) {
+            return match (this.nodes[this.failedAt]) {
+                case Failure(line: l): RedisError::Server(error: ServerError.of(bytes: l.view()));
+                case _: RedisError::Value(detail: "reply: an error");
+            };
+        }
+        string d = this.where.concat(other: ": ").concat(other: this.why);
+        return RedisError::Value(detail: give d);
+    }
+
+    // The type's own refusal, when the reader saw nothing wrong: the derive's missing field, or a type rejecting
+    // what it read (Uuid's text).
+    const fn RedisError derived(Owned<Error> e) {
+        if (this.err) { return this.reported(); }
+        Optional<DeError> verdict = e.as<DeError>();
+        bool missing = match (verdict) { case Some(value: c): match (c) { case MissingField: true; case _: false; }; case None: false; };
+        if (missing) {
+            return RedisError::Value(detail: "reply: a field that is neither Optional nor @field(default) is not in the reply");
+        }
+        string m = e.message();
+        return RedisError::Value(detail: "reply: ".concat(other: m));
+    }
+
+    // ---- integers ----
+
+    // The value here as an integer in [lo, hi], as `asked`; 0 when it is not one.
+    fn int64 whole(int64 lo, int64 hi, const ref string asked) {
+        if (!this.ready(asked: asked)) { return 0i64; }
+        Optional<int64> got = match (this.nodes[this.at]) {
+            case Integer(value: n): Optional::Some(value: n);
+            case Text(bytes: b, shape: s): decimal(b: b.view());
+            case Big(digits: d): decimal(b: d.view());
+            case Double(value: d): integral(d: d);
+            case _: Optional::None;
+        };
+        bool known = match (got) { case Some(value: v): true; case None: false; };
+        if (!known) {
+            this.mismatch(asked: asked);
+            return 0i64;
+        }
+        int64 v = match (got) { case Some(value: x): x; case None: 0i64; };
+        if (v < lo || v > hi) {
+            string what = this.described(i: this.at);
+            this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is out of range for ").concat(other: asked));
+            return 0i64;
+        }
+        this.at = this.at + 1;
+        return v;
+    }
+
+    // ---- floats ----
+
+    fn float64 real(bool narrow, const ref string asked) {
+        if (!this.ready(asked: asked)) { return 0.0; }
+        Optional<float64> got = match (this.nodes[this.at]) {
+            case Double(value: d): Optional::Some(value: d);
+            case Integer(value: n): Optional::Some(value: cast<float64>(n));
+            case Text(bytes: b, shape: s): realOf(b: b.view(), narrow: narrow);
+            case Big(digits: d): realOf(b: d.view(), narrow: narrow);
+            case _: Optional::None;
+        };
+        bool known = match (got) { case Some(value: v): true; case None: false; };
+        if (!known) {
+            this.mismatch(asked: asked);
+            return 0.0;
+        }
+        this.at = this.at + 1;
+        return match (got) { case Some(value: x): x; case None: 0.0; };
+    }
+
+    // ---- Deserializer ----
+
+    public fn void beginObject(usize count) {
+        string w = "a struct";
+        if (this.err) { return; }
+        if (this.topIs(h: Hold::Bytes) || this.at >= this.limit()) {
+            this.mismatch(asked: w);
+            return;
+        }
+        // An entry of a map, or a key and value in a flat list: a pair, read by position.
+        bool pair = this.topIs(h: Hold::Entries) || (this.topIs(h: Hold::List) && !this.isMany() && !this.isNullAt() && !this.isFailureAt());
+        if (pair) {
+            isize second = this.ends[this.at];
+            if (second >= this.limit()) {
+                this.refuse(e: DeError::UnexpectedEnd, why: "a key with no value");
+                return;
+            }
+            this.frames.add(item: Frame.of(hold: Hold::Fields, end: this.ends[second]));
+            return;
+        }
+        if (!this.isMany()) {
+            this.mismatch(asked: w);
+            return;
+        }
+        Hold h = Hold::Fields;
+        if (this.isMap()) { h = Hold::Named; }
+        if (!this.isMap() && this.frames.length() == 0 && !this.records) {
+            isize c = this.countAt();
+            if (c % 2 != 0) {
+                string what = this.described(i: this.at);
+                this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " of ${c} items cannot be read as a struct by name: its items are not key-value pairs (replyRecord reads it by position)"));
+                return;
+            }
+            h = Hold::Named;
+        }
+        this.frames.add(item: Frame.of(hold: h, end: this.ends[this.at]));
+        this.at = this.at + 1;
+    }
+
+    public fn void endObject() {
+        if (this.err) { return; }
+        Optional<Frame> f = this.frames.pop();
+        match (f) { case Some(value: x): { this.at = x.end; } case None: { } };
+    }
+
+    public fn bool moreFields() { return !this.err && this.frames.length() > 0 && this.at < this.limit(); }
+
+    public fn FieldKey field() {
+        if (this.err || this.frames.length() == 0) {
+            this.refuse(e: DeError::Malformed, why: "a field read outside a struct");
+            return FieldKey::Position(rank: 0ui32);
+        }
+        isize k = this.frames.length() - 1;
+        isize rank = this.frames[k].seen;
+        this.frames[k].seen = rank + 1;
+        if (this.frames[k].hold != Hold::Named) { return FieldKey::Position(rank: truncate<uint32>(rank)); }
+        this.frames[k].key = this.at;
+        if (this.at + 1 >= this.frames[k].end) {
+            this.refuse(e: DeError::UnexpectedEnd, why: "a key with no value");
+            return FieldKey::Position(rank: 0ui32);
+        }
+        bool usable = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): true; case Integer(value: n): true; case _: false; };
+        if (!usable) {
+            string what = this.described(i: this.at);
+            this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is not a field's name"));
+            return FieldKey::Position(rank: 0ui32);
+        }
+        string name = this.textAt(i: this.at);
+        this.at = this.at + 1;
+        return FieldKey::Name(name: give name);
+    }
+
+    public fn FieldKey variant() {
+        string w = "an enum";
+        if (!this.ready(asked: w)) { return FieldKey::Position(rank: 0ui32); }
+        bool text = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): true; case _: false; };
+        if (!text) {
+            this.mismatch(asked: w);
+            return FieldKey::Position(rank: 0ui32);
+        }
+        string name = this.textAt(i: this.at);
+        this.at = this.at + 1;
+        return FieldKey::Name(name: give name);
+    }
+
+    public fn void beginArray() {
+        string w = "a list";
+        if (this.err) { return; }
+        if (this.topIs(h: Hold::Bytes) || this.at >= this.limit()) {
+            this.mismatch(asked: w);
+            return;
+        }
+        bool text = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): true; case Big(digits: d): true; case _: false; };
+        if (text) {
+            // A string read as a list is read as its bytes (DynamicArray<uint8>).
+            Frame f = Frame.of(hold: Hold::Bytes, end: this.at + 1);
+            f.node = this.at;
+            this.frames.add(item: f);
+            return;
+        }
+        if (!this.isMany()) {
+            this.mismatch(asked: w);
+            return;
+        }
+        Hold h = Hold::List;
+        if (this.isMap()) { h = Hold::Entries; }
+        this.frames.add(item: Frame.of(hold: h, end: this.ends[this.at]));
+        this.at = this.at + 1;
+    }
+
+    public fn bool moreElems() {
+        if (this.err || this.frames.length() == 0) { return false; }
+        isize k = this.frames.length() - 1;
+        if (this.frames[k].hold == Hold::Bytes) {
+            isize size = match (this.nodes[this.frames[k].node]) {
+                case Text(bytes: b, shape: s): b.length();
+                case Big(digits: d): d.length();
+                case _: 0;
+            };
+            if (this.frames[k].byteAt < size) {
+                this.frames[k].seen = this.frames[k].seen + 1;
+                return true;
+            }
+            Optional<Frame> done = this.frames.pop();
+            this.at = this.at + 1;
+            return false;
+        }
+        if (this.frames[k].hold != Hold::List && this.frames[k].hold != Hold::Entries) {
+            this.refuse(e: DeError::Malformed, why: "a list's elements read outside a list");
+            return false;
+        }
+        if (this.at < this.frames[k].end) {
+            this.frames[k].seen = this.frames[k].seen + 1;
+            return true;
+        }
+        Optional<Frame> done = this.frames.pop();
+        return false;
+    }
+
+    public fn int8 readI8() { string w = "int8"; return truncate<int8>(this.whole(lo: -128i64, hi: 127i64, asked: w)); }
+    public fn int16 readI16() { string w = "int16"; return truncate<int16>(this.whole(lo: -32768i64, hi: 32767i64, asked: w)); }
+    public fn int32 readI32() { string w = "int32"; return truncate<int32>(this.whole(lo: -2147483648i64, hi: 2147483647i64, asked: w)); }
+    public fn int64 readI64() { string w = "int64"; return this.whole(lo: -9223372036854775807i64 - 1i64, hi: 9223372036854775807i64, asked: w); }
+
+    // A byte: of the string being read as bytes, or an integer 0 to 255.
+    public fn uint8 readU8() {
+        if (!this.err && this.topIs(h: Hold::Bytes)) {
+            isize k = this.frames.length() - 1;
+            isize i = this.frames[k].byteAt;
+            if (i >= this.frames[k].seen) {
+                this.refuse(e: DeError::Malformed, why: "a byte read past the string's end");
+                return 0ui8;
+            }
+            uint8 b = match (this.nodes[this.frames[k].node]) {
+                case Text(bytes: t, shape: s): t[i];
+                case Big(digits: d): d[i];
+                case _: 0ui8;
+            };
+            this.frames[k].byteAt = i + 1;
+            return b;
+        }
+        string w = "uint8";
+        return truncate<uint8>(this.whole(lo: 0i64, hi: 255i64, asked: w));
+    }
+    public fn uint16 readU16() { string w = "uint16"; return truncate<uint16>(this.whole(lo: 0i64, hi: 65535i64, asked: w)); }
+    public fn uint32 readU32() { string w = "uint32"; return truncate<uint32>(this.whole(lo: 0i64, hi: 4294967295i64, asked: w)); }
+
+    public fn uint64 readU64() {
+        string w = "uint64";
+        if (!this.ready(asked: w)) { return 0ui64; }
+        Optional<uint64> got = match (this.nodes[this.at]) {
+            case Integer(value: n): nonNegative(n: n);
+            case Text(bytes: b, shape: s): unsignedDecimal(b: b.view());
+            case Big(digits: d): unsignedDecimal(b: d.view());
+            case Double(value: d): unsignedIntegral(d: d);
+            case _: Optional::None;
+        };
+        bool known = match (got) { case Some(value: v): true; case None: false; };
+        if (!known) {
+            this.mismatch(asked: w);
+            return 0ui64;
+        }
+        this.at = this.at + 1;
+        return match (got) { case Some(value: x): x; case None: 0ui64; };
+    }
+
+    public fn float32 readF32() { string w = "float32"; return cast<float32>(this.real(narrow: true, asked: w)); }
+    public fn float64 readF64() { string w = "float64"; return this.real(narrow: false, asked: w); }
+
+    public fn bool readBool() {
+        string w = "bool";
+        if (!this.ready(asked: w)) { return false; }
+        bool known = match (this.nodes[this.at]) {
+            case Boolean(value: t): true;
+            case Integer(value: n): n == 0i64 || n == 1i64;
+            case _: false;
+        };
+        if (!known) {
+            this.mismatch(asked: w);
+            return false;
+        }
+        bool v = match (this.nodes[this.at]) { case Boolean(value: t): t; case Integer(value: n): n == 1i64; case _: false; };
+        this.at = this.at + 1;
+        return v;
+    }
+
+    public fn char readChar() {
+        string w = "char";
+        if (!this.ready(asked: w)) { return 'a'; }
+        Optional<string> text = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): utf8Of(b: b.view()); case _: Optional::None; };
+        string s = match (give text) { case Some(value: t): give t; case None: ""; };
+        isize count = 0;
+        char last = 'a';
+        foreach (char c in s.chars()) { last = c; count = count + 1; }
+        if (count != 1) {
+            this.mismatch(asked: w);
+            return 'a';
+        }
+        this.at = this.at + 1;
+        return last;
+    }
+
+    public fn string readString() {
+        string w = "string";
+        if (!this.ready(asked: w)) { return ""; }
+        bool text = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): true; case Big(digits: d): true; case _: false; };
+        if (text) {
+            Optional<string> s = match (this.nodes[this.at]) {
+                case Text(bytes: b, shape: k): utf8Of(b: b.view());
+                case Big(digits: d): utf8Of(b: d.view());
+                case _: Optional::None;
+            };
+            bool valid = match (s) { case Some(value: t): true; case None: false; };
+            if (!valid) {
+                string what = this.described(i: this.at);
+                this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is not UTF-8, so it cannot be read as string: read it as DynamicArray<uint8>"));
+                return "";
+            }
+            this.at = this.at + 1;
+            return match (give s) { case Some(value: t): give t; case None: ""; };
+        }
+        bool number = match (this.nodes[this.at]) { case Integer(value: n): true; case Double(value: d): true; case _: false; };
+        if (!number) {
+            this.mismatch(asked: w);
+            return "";
+        }
+        string shown = this.textAt(i: this.at);
+        this.at = this.at + 1;
+        return shown;
+    }
+
+    public fn bool readNull() {
+        if (this.err || this.topIs(h: Hold::Bytes) || this.at >= this.limit()) { return false; }
+        if (!this.isNullAt()) { return false; }
+        this.at = this.at + 1;
+        return true;
+    }
+
+    public fn void skipValue() {
+        if (this.err || this.topIs(h: Hold::Bytes) || this.at >= this.limit()) { return; }
+        this.at = this.ends[this.at];
+    }
+
+    public const fn bool failed() { return this.err; }
+    public fn void fail() { this.failWith(e: DeError::Malformed); }
+
+    // A type refused what it read (a Uuid's text): name the value it read.
+    public fn void failWith(DeError e) {
+        if (this.err) { return; }
+        if (this.at > 0) { this.at = this.at - 1; }
+        string what = this.described(i: this.at);
+        this.refuse(e: e, why: what.concat(other: " is not a value of the type read"));
+    }
+
+    public const fn DeError errorCode() { return this.code; }
+
+    // Whether anything of the reply is left unread.
+    const fn bool unread() { return this.at < this.nodes.length(); }
+}
+
+fn void stacked(ref DynamicArray<Value> work, DynamicArray<Value> items) {
+    DynamicArray<Value> rest = give items;
+    while (rest.length() > 0) {
+        Optional<Value> last = rest.pop();
+        match (give last) { case Some(value: x): { work.add(item: give x); } case None: { } };
+    }
+}
+
+fn string shapeName(Shape s) {
+    return match (s) {
+        case Simple: "a simple string";
+        case Bulk: "a bulk string";
+        case Verbatim: "a verbatim string";
+        case Array: "an array";
+        case Map: "a map";
+        case Set: "a set";
+        case Push: "a push message";
+    };
+}
+
+fn string boolName(bool t) { if (t) { return "a boolean true"; } return "a boolean false"; }
+
+// A float as the server spells one: the shortest decimal, and inf, -inf and nan.
+fn string floatText(float64 v) {
+    if (v != v) { return "nan"; }
+    if (v != 0.0 && v * 0.5 == v) {
+        if (v > 0.0) { return "inf"; }
+        return "-inf";
+    }
+    return f64Str(v: v);
+}
+
+fn Optional<string> utf8Of(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): Optional::Some(value: give s); case Err(error: e): Optional::None; };
+}
+
+// Bytes as text for a message: UTF-8 up to 40 bytes, "…" after; "(not UTF-8)" otherwise.
+fn string shortText(ConstView<uint8> b) {
+    isize n = b.length();
+    if (n > 40) { n = 40; }
+    Optional<string> t = utf8Of(b: b.slice(from: 0, count: n));
+    string s = match (give t) { case Some(value: x): give x; case None: "(not UTF-8)"; };
+    if (b.length() > 40) { s = s.concat(other: "…"); }
+    return s;
+}
+
+// A decimal integer as the server writes one (string2ll): an optional '-', then digits with no leading zero, and
+// nothing else — no '+', no space, no "-0". None when `b` is not one, or does not fit an int64.
+fn Optional<int64> decimal(ConstView<uint8> b) {
+    isize n = b.length();
+    if (n == 0 || n > 20) { return Optional::None; }
+    bool negative = b[0] == 45;
+    isize i = 0;
+    if (negative) { i = 1; }
+    if (i == n) { return Optional::None; }
+    if (b[i] == 48) {
+        if (n == 1) { return Optional::Some(value: 0i64); }
+        return Optional::None;
+    }
+    uint64 limit = 9223372036854775807ui64;
+    if (negative) { limit = 9223372036854775808ui64; }
+    uint64 v = 0ui64;
+    while (i < n) {
+        uint8 c = b[i];
+        if (c < 48 || c > 57) { return Optional::None; }
+        uint64 d = cast<uint64>(c - 48);
+        if (v > (limit - d) / 10ui64) { return Optional::None; }
+        v = v * 10ui64 + d;
+        i = i + 1;
+    }
+    if (!negative) { return Optional::Some(value: cast<int64>(v)); }
+    if (v == 9223372036854775808ui64) { return Optional::Some(value: -9223372036854775807i64 - 1i64); }
+    return Optional::Some(value: 0i64 - cast<int64>(v));
+}
+
+// The same grammar for a uint64: digits only, no leading zero.
+fn Optional<uint64> unsignedDecimal(ConstView<uint8> b) {
+    isize n = b.length();
+    if (n == 0 || n > 20) { return Optional::None; }
+    if (b[0] == 48) {
+        if (n == 1) { return Optional::Some(value: 0ui64); }
+        return Optional::None;
+    }
+    uint64 limit = 18446744073709551615ui64;
+    uint64 v = 0ui64;
+    isize i = 0;
+    while (i < n) {
+        uint8 c = b[i];
+        if (c < 48 || c > 57) { return Optional::None; }
+        uint64 d = cast<uint64>(c - 48);
+        if (v > (limit - d) / 10ui64) { return Optional::None; }
+        v = v * 10ui64 + d;
+        i = i + 1;
+    }
+    return Optional::Some(value: v);
+}
+
+fn Optional<uint64> nonNegative(int64 n) {
+    if (n < 0i64) { return Optional::None; }
+    return Optional::Some(value: cast<uint64>(n));
+}
+
+// A double that is a whole number an int64 holds. The range is checked first: a float cast out of range traps.
+fn Optional<int64> integral(float64 d) {
+    if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) { return Optional::None; }
+    int64 v = cast<int64>(d);
+    if (cast<float64>(v) != d) { return Optional::None; }
+    return Optional::Some(value: v);
+}
+
+fn Optional<uint64> unsignedIntegral(float64 d) {
+    if (!(d >= 0.0 && d < 18446744073709551616.0)) { return Optional::None; }
+    uint64 v = cast<uint64>(d);
+    if (cast<float64>(v) != d) { return Optional::None; }
+    return Optional::Some(value: v);
+}
+
+// Text as a float: the server's spellings (inf, -inf, nan) and decimals. A float32 is parsed as one, so it is
+// rounded once.
+fn Optional<float64> realOf(ConstView<uint8> b, bool narrow) {
+    Optional<string> t = utf8Of(b: b);
+    string text = match (give t) { case Some(value: x): give x; case None: ""; };
+    if (text.length() == 0) { return Optional::None; }
+    if (narrow) {
+        Result<float32, ParseError> p32 = parse::<float32>(s: text);
+        return match (p32) { case Ok(value: x): Optional::Some(value: cast<float64>(x)); case Err(error: e): Optional::None; };
+    }
+    Result<float64, ParseError> p = parse::<float64>(s: text);
+    return match (p) { case Ok(value: x): Optional::Some(value: x); case Err(error: e): Optional::None; };
+}
+
+// ---- the non-generic half: everything that touches the reader's own state ----
+
+fn Result<ReplyReader, RedisError> readerOf(Result<Value, RedisError> result, bool records) {
+    Value v = match (give result) {
+        case Ok(value: x): give x;
+        case Err(error: e): { return Result::Err(error: give e); }
+    };
+    return Result::Ok(value: ReplyReader.over(value: give v, records: records));
+}
+
+fn RedisError readFailure(const ref ReplyReader r, Owned<Error> e) { return r.derived(e: give e); }
+
+// After a type read itself without an error: what is wrong anyway (a failure it did not report, or a reply it did
+// not read to its end).
+fn Optional<RedisError> unfinished(const ref ReplyReader r) {
+    if (r.failed()) { return Optional::Some(value: r.reported()); }
+    if (r.unread()) { return Optional::Some(value: RedisError::Value(detail: "reply: the type read stopped before the end of the reply")); }
+    return Optional::None;
+}
+
+fn Result<T, RedisError> settled<T>(T value, Optional<RedisError> wrong) {
+    return match (give wrong) {
+        case Some(value: e): { T dropped = give value; := Result::Err(error: give e); }
+        case None: Result::Ok(value: give value);
+    };
+}
+
+// ---- the typed reads ----
+
+// The reply as a `T`. A call's own failure is passed through.
+fn Result<T, RedisError> reply<T: Deserializable<T>>(Result<Value, RedisError> result) {
+    Result<ReplyReader, RedisError> made = readerOf(result: give result, records: false);
+    ReplyReader r = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<T, Owned<Error>> v = T.deserialize(r: r);
+    Optional<RedisError> wrong = unfinished(r: r);
+    return match (give v) {
+        case Ok(value: x): settled::<T>(value: give x, wrong: give wrong);
+        case Err(error: e): { Optional<RedisError> dropped = give wrong; := Result::Err(error: readFailure(r: r, e: give e)); }
+    };
+}
+
+// The reply as a `T`, or None for a null (GET of a key that is not there).
+fn Result<Optional<T>, RedisError> replyOpt<T: Deserializable<T>>(Result<Value, RedisError> result) {
+    return optionally::<T>(result: give result, records: false);
+}
+
+// `replyRecord`, or None for a null: BLPOP's `[key, value]`, or its null when it timed out.
+fn Result<Optional<T>, RedisError> replyRecordOpt<T: Deserializable<T>>(Result<Value, RedisError> result) {
+    return optionally::<T>(result: give result, records: true);
+}
+
+fn Result<Optional<T>, RedisError> optionally<T: Deserializable<T>>(Result<Value, RedisError> result, bool records) {
+    Result<ReplyReader, RedisError> made = readerOf(result: give result, records: records);
+    ReplyReader r = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+    if (r.readNull()) {
+        Optional<RedisError> wrongNull = unfinished(r: r);
+        return settled::<Optional<T>>(value: Optional::None, wrong: give wrongNull);
+    }
+    Result<T, Owned<Error>> v = T.deserialize(r: r);
+    Optional<RedisError> wrong = unfinished(r: r);
+    return match (give v) {
+        case Ok(value: x): settled::<Optional<T>>(value: Optional::Some(value: give x), wrong: give wrong);
+        case Err(error: e): { Optional<RedisError> dropped = give wrong; := Result::Err(error: readFailure(r: r, e: give e)); }
+    };
+}
+
+// A list of which any element may be null (MGET, HMGET, SMISMEMBER under some servers): each element a `T`, or None.
+fn Result<DynamicArray<Optional<T>>, RedisError> replyOpts<T: Deserializable<T>>(Result<Value, RedisError> result) {
+    Result<ReplyReader, RedisError> made = readerOf(result: give result, records: false);
+    ReplyReader r = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+    DynamicArray<Optional<T>> items = DynamicArray.empty();
+    r.beginArray();
+    while (r.moreElems()) {
+        if (r.readNull()) {
+            items.add(item: Optional::None);
+            continue;
+        }
+        Result<T, Owned<Error>> v = T.deserialize(r: r);
+        match (give v) {
+            case Ok(value: x): { items.add(item: Optional::Some(value: give x)); }
+            case Err(error: e): { return Result::Err(error: readFailure(r: r, e: give e)); }
+        };
+    }
+    Optional<RedisError> wrong = unfinished(r: r);
+    return settled::<DynamicArray<Optional<T>>>(value: give items, wrong: give wrong);
+}
+
+// The reply as a `T` whose fields are the reply's items in order: a top-level array read by position (BLPOP's
+// `[key, value]`), which `reply` reads by name.
+fn Result<T, RedisError> replyRecord<T: Deserializable<T>>(Result<Value, RedisError> result) {
+    Result<ReplyReader, RedisError> made = readerOf(result: give result, records: true);
+    ReplyReader r = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<T, Owned<Error>> v = T.deserialize(r: r);
+    Optional<RedisError> wrong = unfinished(r: r);
+    return match (give v) {
+        case Ok(value: x): settled::<T>(value: give x, wrong: give wrong);
+        case Err(error: e): { Optional<RedisError> dropped = give wrong; := Result::Err(error: readFailure(r: r, e: give e)); }
+    };
+}

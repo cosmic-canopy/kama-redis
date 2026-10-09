@@ -1,0 +1,114 @@
+// Typed replies (src/reply.kama) from the server itself, under RESP3 and RESP2: what a connection hands over reads
+// the same under both. The unit tests read every server's captured replies; these read them live.
+import { std::collections::DynamicArray, std::collections::Map,
+         redis::Connection, redis::Command, redis::RedisError, redis::reply, redis::replyOpts, redis::replyRecordOpt,
+         redis::resp::Value, redis_integration_tests::check, open, mainUrl, ask, commandOf };
+export { replyTests };
+
+@generate(Deserializable)
+type resource HashPair {
+    @field string f1;
+    @field string f2;
+    public const fn string shown() { return copy this.f1.concat(other: ",").concat(other: this.f2); }
+}
+
+@generate(Deserializable)
+type resource Scored {
+    @field string member;
+    @field float64 score;
+    public const fn string shown() { float64 v = this.score; return copy this.member.concat(other: "=${v}"); }
+}
+
+@generate(Deserializable)
+type resource Entry {
+    @field string id;
+    @field Map<string, string> fields;
+    public const fn string shown() { isize n = this.fields.length(); return copy this.id.concat(other: "/${n}"); }
+}
+
+@generate(Deserializable)
+type resource Popped {
+    @field string key;
+    @field string value;
+    public const fn string shown() { return copy this.key.concat(other: "=").concat(other: this.value); }
+}
+
+unsafe fn Result<Value, RedisError> sent(ref Connection c, const ref string text) {
+    Command command = commandOf(text: text);
+    return c.call(command: command);
+}
+
+fn string failed(const ref RedisError e) { return "(failed) ".concat(other: e.message()); }
+
+unsafe fn int32 readTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "reply: connect under ${protocol}: ${m}"); }
+    };
+    string cleared = ask(c: c, text: "DEL kr:r:h kr:r:a kr:r:b kr:r:z kr:r:x kr:r:l kr:r:f");
+    string h = ask(c: c, text: "HSET kr:r:h f1 v1 f2 v2");
+    Result<HashPair, RedisError> pair = reply::<HashPair>(result: sent(c: c, text: "HGETALL kr:r:h"));
+    string g1 = match (pair) { case Ok(value: p): p.shown(); case Err(error: e): failed(e: e); };
+    f = f + check(ok: g1 == "v1,v2", what: "reply: HGETALL as a struct under ${protocol}: ${g1}");
+
+    string m = ask(c: c, text: "MSET kr:r:a 1 kr:r:b 2");
+    Result<DynamicArray<Optional<int64>>, RedisError> got = replyOpts::<int64>(result: sent(c: c, text: "MGET kr:r:a kr:r:none kr:r:b"));
+    string g2 = match (got) {
+        case Ok(value: xs): {
+            string s = "";
+            isize i = 0;
+            while (i < xs.length()) {
+                string item = match (xs[i]) { case Some(value: v): "${v}"; case None: "none"; };
+                s = s.concat(other: item).concat(other: ";");
+                i = i + 1;
+            }
+            := s;
+        }
+        case Err(error: e): failed(e: e);
+    };
+    f = f + check(ok: g2 == "1;none;2;", what: "reply: MGET as replyOpts<int64> under ${protocol}: ${g2}");
+
+    string z = ask(c: c, text: "ZADD kr:r:z 1.5 a 2 b");
+    Result<DynamicArray<Scored>, RedisError> scored = reply::<DynamicArray<Scored>>(result: sent(c: c, text: "ZRANGE kr:r:z 0 -1 WITHSCORES"));
+    string g3 = match (scored) {
+        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := s; }
+        case Err(error: e): failed(e: e);
+    };
+    f = f + check(ok: g3 == "a=1.5;b=2;", what: "reply: ZRANGE WITHSCORES as records under ${protocol}: ${g3}");
+
+    string x1 = ask(c: c, text: "XADD kr:r:x 1-1 f v");
+    string x2 = ask(c: c, text: "XADD kr:r:x 2-1 g w h u");
+    Result<DynamicArray<Entry>, RedisError> entries = reply::<DynamicArray<Entry>>(result: sent(c: c, text: "XRANGE kr:r:x - +"));
+    string g4 = match (entries) {
+        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := s; }
+        case Err(error: e): failed(e: e);
+    };
+    f = f + check(ok: g4 == "1-1/1;2-1/2;", what: "reply: XRANGE as records under ${protocol}: ${g4}");
+
+    Result<Optional<Popped>, RedisError> none = replyRecordOpt::<Popped>(result: sent(c: c, text: "BLPOP kr:r:l 0.01"));
+    string g5 = match (none) { case Ok(value: o): match (o) { case Some(value: p): p.shown(); case None: "none"; }; case Err(error: e): failed(e: e); };
+    string l = ask(c: c, text: "RPUSH kr:r:l a");
+    Result<Optional<Popped>, RedisError> popped = replyRecordOpt::<Popped>(result: sent(c: c, text: "BLPOP kr:r:l 1"));
+    string g6 = match (popped) { case Ok(value: o): match (o) { case Some(value: p): p.shown(); case None: "none"; }; case Err(error: e): failed(e: e); };
+    f = f + check(ok: g5 == "none" && g6 == "kr:r:l=a", what: "reply: BLPOP's null and its record under ${protocol}: ${g5}, ${g6}");
+
+    Result<float64, RedisError> inc = reply::<float64>(result: sent(c: c, text: "INCRBYFLOAT kr:r:f 0.5"));
+    bool half = match (inc) { case Ok(value: v): v == 0.5; case Err(error: e): false; };
+    Result<int64, RedisError> wrong = reply::<int64>(result: sent(c: c, text: "HGETALL kr:r:h"));
+    string g7 = match (wrong) { case Ok(value: v): "read"; case Err(error: e): e.message(); };
+    string still = ask(c: c, text: "PING");
+    // HGETALL is a map under RESP3 and a flat array under RESP2.
+    f = f + check(ok: half && (g7 == "reply: a map cannot be read as int64" || g7 == "reply: an array cannot be read as int64"),
+                  what: "reply: INCRBYFLOAT as float64, and a reply that does not read is Value: ${g7}");
+    f = f + check(ok: still == "PONG", what: "reply: the connection goes on after a reply that does not read: ${still}");
+    return f;
+}
+
+unsafe fn int32 replyTests() {
+    int32 f = 0;
+    f = f + readTests(tail: "", protocol: "RESP3");
+    f = f + readTests(tail: "?protocol=2", protocol: "RESP2");
+    return f;
+}

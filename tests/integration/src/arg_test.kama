@@ -3,7 +3,7 @@
 // (KAMA_GAPS.md, KPG-38). Every other file builds its commands with Command's `arg` methods.
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::f64Str, std::fmt::parse,
          std::fmt::ParseError, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
-         redis::Connection, redis::Command, redis::cmd, redis::RedisError, redis::resp::Value,
+         redis::Connection, redis::Command, redis::cmd, redis::reply, redis::RedisError, redis::resp::Value,
          redis_integration_tests::check, open, mainUrl, ask, shown };
 export { argTests };
 
@@ -152,6 +152,13 @@ unsafe fn int32 floatTests(const ref string tail, const ref string protocol) {
         bool same = got == want || (x == 0.0 && got == "0");
         f = f + check(ok: ok && back == x && same && (added == "1" || added == "0"),
                       what: "cmd: ${want} through ZADD and ZSCORE under ${protocol}: ${got} (${added})");
+        // And read as a typed reply, from a double (RESP3) or the server's text (RESP2).
+        Command zs = Command.of(name: "ZSCORE");
+        zs.arg(text: "kr:zf");
+        zs.arg(text: "m");
+        Result<float64, RedisError> typed = reply::<float64>(result: c.call(command: zs));
+        bool typedSame = match (typed) { case Ok(value: t): t == x; case Err(error: e): false; };
+        f = f + check(ok: typedSame, what: "reply: ${want} as float64 under ${protocol}");
         i = i + 1;
     }
     return f;
