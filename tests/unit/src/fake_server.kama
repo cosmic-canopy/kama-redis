@@ -33,7 +33,11 @@ type enum Step implements Sendable {
     // sent before it.
     Hangup,
     // The client's next command is answered with `reply`, but only after the client's next wait has come back empty.
-    Late(DynamicArray<uint8> reply);
+    Late(DynamicArray<uint8> reply),
+    // The client's next command is answered with `reply`, but only to a wait that allows at least `atLeastMs`, or one
+    // with no limit; a shorter wait comes back empty, which is how its deadline passing looks to a connection. With
+    // `atLeastMs` -1, only a wait with no limit is answered. It shows how long a connection waits for a command.
+    Patient(DynamicArray<uint8> reply, int32 atLeastMs);
 }
 
 type resource FakeServer implements Transport, Sendable {
@@ -49,6 +53,9 @@ type resource FakeServer implements Transport, Sendable {
     // bytes (a write would block, and the transport is not writable) until the client reads. -1: never.
     isize backlog = -1;
     DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
+    DynamicArray<uint8> patient;   // a patient reply (Step::Patient), given to a wait long enough
+    int32 patience = 0;
+    bool holding = false;
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps;
@@ -58,6 +65,7 @@ type resource FakeServer implements Transport, Sendable {
         this.writeLimit = writeLimit;
         this.backlog = -1;
         this.held = DynamicArray.empty();
+        this.patient = DynamicArray.empty();
         this.advance();
     }
 
@@ -70,6 +78,7 @@ type resource FakeServer implements Transport, Sendable {
         this.writeLimit = writeLimit;
         this.backlog = backlog;
         this.held = DynamicArray.empty();
+        this.patient = DynamicArray.empty();
         this.advance();
     }
 
@@ -102,6 +111,13 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (this.holding) {
+            bool enough = timeoutMs < 0 || (this.patience >= 0 && timeoutMs >= this.patience);
+            if (!enough) { return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked())); }
+            this.toClient.addAll(items: this.patient.view());
+            this.patient = DynamicArray.empty();
+            this.holding = false;
+        }
         if (this.held.length() > 0) {
             // This wait ends without the late reply; it is there for the next.
             this.toClient.addAll(items: this.held.view());
@@ -158,6 +174,11 @@ type resource FakeServer implements Transport, Sendable {
             case Close: { this.hungUp = true; return; }
             case Hangup: { this.hungUp = true; return; }
             case Late(reply: r): { this.held.addAll(items: r.view()); }
+            case Patient(reply: r, atLeastMs: n): {
+                this.patient.addAll(items: r.view());
+                this.patience = n;
+                this.holding = true;
+            }
         };
         this.advance();
     }

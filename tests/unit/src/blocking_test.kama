@@ -1,0 +1,163 @@
+// Blocking commands' deadlines (src/wire/known.kama): `command_timeout` plus the command's own timeout. The scripted
+// server's Patient step answers only a wait that allows a stated time, so each test shows how long the connection
+// waited. The table is checked against every server: each name in its `ACL CAT blocking` must be documented, and
+// for each blocking command a server documents, a command built from COMMAND DOCS with a 1.5 s timeout must wait for
+// it.
+import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::Pipeline, redis::Replies,
+         redis::RedisError, redis::resp::Value,
+         redis_unit_tests::check, Step, welcome, connected, reply as vector, callOutcome, commandOf, splitOn,
+         blockingServers, blockingNames, docsNames, docsArgs };
+export { blockingTests };
+
+// What a call came to, under `url`, against a server that answers only a wait of at least `atLeastMs`.
+unsafe fn string waited(const ref string url, const ref string text, int32 atLeastMs) {
+    string s = "redis-8.10.2";
+    DynamicArray<Step> script = welcome(server: s);
+    script.add(item: Step::Patient(reply: vector(server: s, kase: "blpop-null/3"), atLeastMs: atLeastMs));
+    Connection c = connected(script: give script, url: url, what: "blocking");
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.call(command: command);
+    return callOutcome(r: r);
+}
+
+// A command built from COMMAND DOCS's arguments (name:type:token:flags:children, each), with its timeout 1.5 s: the
+// words, or "" when the docs give it no timeout.
+fn string fromDocs(const ref string name, const ref string args) {
+    string words = copy name;
+    bool timed = false;
+    DynamicArray<string> list = splitOn(text: args, sep: " ");
+    isize i = 0;
+    while (i < list.length()) {
+        DynamicArray<string> a = splitOn(text: list[i], sep: ":");
+        bool optional = a[3].contains(substring: "optional");
+        isize kids = 0;
+        if (a[4] == "1") { kids = 1; }
+        if (a[4] == "2") { kids = 2; }
+        if (a[4] == "3") { kids = 3; }
+        string add = "";
+        if (a[0] == "timeout") {
+            timed = true;
+            if (a[1] == "double") { add = "1.5"; } else { add = "1500"; }
+        } else if (a[2] == "BLOCK") {
+            timed = true;
+            add = "BLOCK 1500";
+        } else if (optional && a[2].length() == 0) {
+            add = "";
+        } else {
+            add = copy a[2];
+            string value = "x";
+            if (a[1] == "key") { value = "kr:b"; }
+            if (a[1] == "integer" || a[1] == "double") { value = "1"; }
+            if (a[1] == "block") {
+                isize k = 0;
+                while (k < kids) { add = add.concat(other: " x"); k = k + 1; }
+            } else if (a[1] != "pure-token") {
+                add = add.concat(other: " ").concat(other: value);
+            }
+        }
+        string trimmed = give add;
+        if (trimmed.startsWith(prefix: " ")) { trimmed = trimmed.substring(start: 1, end: trimmed.length()); }
+        if (trimmed.length() > 0) { words = words.concat(other: " ").concat(other: trimmed); }
+        i = i + 1;
+    }
+    if (!timed) { return ""; }
+    return words;
+}
+
+unsafe fn int32 docsTests() {
+    int32 f = 0;
+    DynamicArray<string> names = docsNames();
+    DynamicArray<string> args = docsArgs();
+    isize i = 0;
+    while (i < names.length()) {
+        DynamicArray<string> who = splitOn(text: names[i], sep: " ");
+        string text = fromDocs(name: who[1], args: args[i]);
+        string row = copy names[i];
+        if (text.length() == 0) {
+            f = f + check(ok: false, what: "blocking: ${row} documents no timeout");
+        } else {
+            // 1500 ms of its own plus 300 of command_timeout: a deadline that counted only command_timeout ends long
+            // before 1750.
+            string got = waited(url: "redis://?command_timeout=0.3", text: text, atLeastMs: 1750);
+            f = f + check(ok: got == "ok", what: "blocking: ${row}: `${text}` waits for its own timeout: ${got}");
+        }
+        i = i + 1;
+    }
+    // Every command a server calls blocking is documented by some server (Redis 6.2 has no COMMAND DOCS, and lists
+    // fewer), so the test above covers it.
+    DynamicArray<string> servers = blockingServers();
+    DynamicArray<string> lists = blockingNames();
+    isize s = 0;
+    while (s < servers.length()) {
+        DynamicArray<string> listed = splitOn(text: lists[s], sep: " ");
+        isize k = 0;
+        while (k < listed.length()) {
+            bool documented = false;
+            isize j = 0;
+            while (j < names.length()) {
+                if (names[j].endsWith(suffix: " ".concat(other: listed[k]))) { documented = true; }
+                j = j + 1;
+            }
+            string server = copy servers[s];
+            string name = copy listed[k];
+            f = f + check(ok: documented, what: "blocking: ${server} lists ${name} as blocking, and no server documents it");
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    return f;
+}
+
+unsafe fn int32 edgeTests() {
+    int32 f = 0;
+    string url = "redis://?command_timeout=0.3";
+    // A command that does not block keeps command_timeout alone: the patient server proves it bites.
+    string get = waited(url: url, text: "GET kr:b", atLeastMs: 1000);
+    f = f + check(ok: get == "timed out", what: "blocking: GET waits command_timeout alone: ${get}");
+    string blpop = waited(url: url, text: "BLPOP kr:b 2", atLeastMs: 2200);
+    f = f + check(ok: blpop == "ok", what: "blocking: BLPOP 2 under 0.3 waits 2.3 s: ${blpop}");
+    string zero = waited(url: url, text: "blpop kr:b 0", atLeastMs: -1);
+    f = f + check(ok: zero == "ok", what: "blocking: BLPOP 0 has no deadline: ${zero}");
+    string tiny = waited(url: url, text: "BLPOP kr:b 0.0001", atLeastMs: -1);
+    f = f + check(ok: tiny == "ok", what: "blocking: less than a millisecond is for ever, as some servers read it: ${tiny}");
+    string bad = waited(url: url, text: "BLPOP kr:b abc", atLeastMs: 1000);
+    string negative = waited(url: url, text: "BLPOP kr:b -1", atLeastMs: 1000);
+    f = f + check(ok: bad == "timed out" && negative == "timed out", what: "blocking: a timeout the server refuses adds nothing: ${bad}, ${negative}");
+    string xread = waited(url: url, text: "XREAD COUNT 1 BLOCK 800 STREAMS kr:x 0", atLeastMs: 1050);
+    f = f + check(ok: xread == "ok", what: "blocking: XREAD BLOCK 800: ${xread}");
+    string lastBlock = waited(url: url, text: "XREAD BLOCK 800 BLOCK 0 STREAMS kr:x 0", atLeastMs: -1);
+    f = f + check(ok: lastBlock == "ok", what: "blocking: XREAD's last BLOCK counts, as the server's: ${lastBlock}");
+    string groupNamedBlock = waited(url: url, text: "XREADGROUP GROUP BLOCK c BLOCK 800 NOACK STREAMS kr:x >", atLeastMs: 1050);
+    f = f + check(ok: groupNamedBlock == "ok", what: "blocking: a group named BLOCK is a name: ${groupNamedBlock}");
+    string noBlock = waited(url: url, text: "XREAD STREAMS kr:x BLOCK", atLeastMs: 1000);
+    f = f + check(ok: noBlock == "timed out", what: "blocking: BLOCK after STREAMS is a stream's name: ${noBlock}");
+    string wait = waited(url: url, text: "WAIT 1 1500", atLeastMs: 1750);
+    string waitaof = waited(url: url, text: "WAITAOF 0 1 1500", atLeastMs: 1750);
+    f = f + check(ok: wait == "ok" && waitaof == "ok", what: "blocking: WAIT and WAITAOF: ${wait}, ${waitaof}");
+    string unlimited = waited(url: "redis://?command_timeout=0", text: "BLPOP kr:b 2", atLeastMs: -1);
+    f = f + check(ok: unlimited == "ok", what: "blocking: command_timeout=0 is no deadline at all: ${unlimited}");
+
+    // A pipeline's blocking commands wait in turn: one deadline for 1 s, 2 s and command_timeout.
+    string s = "redis-8.10.2";
+    DynamicArray<Step> script = welcome(server: s);
+    script.add(item: Step::Patient(reply: vector(server: s, kase: "blpop-null/3"), atLeastMs: 3300));
+    script.add(item: Step::Any(reply: vector(server: s, kase: "blpop-null/3")));
+    Connection c = connected(script: give script, url: "redis://?command_timeout=0.5", what: "blocking pipeline");
+    Pipeline p = Pipeline.make();
+    Command one = commandOf(text: "BLPOP kr:b 1");
+    Command two = commandOf(text: "BLPOP kr:b 2");
+    p.add(command: one);
+    p.add(command: two);
+    Result<Replies, RedisError> r = c.run(pipeline: p);
+    isize count = match (r) { case Ok(value: rs): rs.length(); case Err(error: e): -1; };
+    string got = match (r) { case Ok(value: rs): "${count}"; case Err(error: e): e.message(); };
+    f = f + check(ok: got == "2", what: "blocking: a pipeline of BLPOP 1 and BLPOP 2 under 0.5 waits 3.5 s: ${got}");
+    return f;
+}
+
+unsafe fn int32 blockingTests() {
+    int32 f = 0;
+    f = f + docsTests();
+    f = f + edgeTests();
+    return f;
+}

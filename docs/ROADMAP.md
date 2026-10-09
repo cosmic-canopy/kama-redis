@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 6 is next.
+its session plan, and step 7 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -264,8 +264,7 @@ What the peer clients do was read from their current source, not remembered: go-
   - `command_timeout` is one deadline per call, from the first byte written to the last byte of the reply. When it
     passes, the connection closes: Redis has no way to cancel a command, and a late reply cannot be told from the
     next one. go-redis and redis-py close the connection too.
-  - Blocking commands get deadlines of their own in phase 3 (step 6). Until then a `BLPOP` longer than
-    `command_timeout` needs it raised.
+  - A blocking command's own timeout is added to `command_timeout` (phase 3, "Blocking commands").
 - **Keepalive.** One number, as hiredis takes it: idle N seconds, probes every N/3, and 3 probes before the connection
   is dropped. redis-cli always uses 15, which is the default here. TCP_NODELAY is always on, as in hiredis,
   go-redis and Lettuce.
@@ -480,6 +479,19 @@ confirmed the kama facts underneath, and are listed at the end.
 
     The server's own parser steps the same way, and COMMAND DOCS lists every option on every server, so a new one
     fails the unit test when the vectors are regenerated.
+  - **What building it settled (step 6):**
+    - A timeout in seconds of less than a millisecond is for ever. Some servers read it as 0, which blocks without
+      end, and a deadline must never cut a wait short.
+    - A timeout the server refuses at once (not a number, NaN, negative, out of range, or an unknown XREAD option
+      or no STREAMS) adds nothing. So does a hexadecimal float, which the server's `strtold` accepts and std's
+      `parse` does not; that one gap is known.
+    - A timeout past 10¹² ms (31 years) is for ever, which keeps every sum far from overflowing a `Duration`.
+    - A pipeline adds its blocking commands' timeouts, since they wait in turn.
+    - The unit test builds, from each server's COMMAND DOCS, a command whose timeout is 1.5 s at the documented
+      place, and the scripted server's `Patient` step answers it only if the connection waited that long. All 85
+      rows pass, and every name in every server's `ACL CAT blocking` is documented by one of them.
+    - Live: "a call that outlasts `command_timeout`" is a SET held by `CLIENT PAUSE … WRITE` from another
+      connection, since a blocking command now has its own deadline.
 - **Transactions:** `transact(pipeline:)` writes MULTI, the commands and EXEC in one write. It reads every reply before
   it decides, so the connection stays in step with the server.
   - Its outcome is `TxOutcome { Committed(Replies), WatchConflict }`. EXEC's null is `WatchConflict`, an outcome

@@ -1,6 +1,7 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned, std::fmt::parse,
          std::fmt::ParseError, std::fmt::i64Str, std::fmt::f64Str, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, redis::RedisError, redis::ServerError, redis::resp::Value };
+         std::encoding::utf8::Utf8Error, redis::RedisError, redis::ServerError, redis::resp::Value,
+         redis::wire::decimal, redis::wire::unsignedDecimal };
 export { reply, replyOpt, replyOpts, replyRecord, replyRecordOpt };
 
 // Typed replies: a reply read into a kama type through `Deserializable`, as @kama/postgres reads a column.
@@ -634,57 +635,6 @@ fn string shortText(ConstView<uint8> b) {
     string s = match (give t) { case Some(value: x): give x; case None: "(not UTF-8)"; };
     if (b.length() > 40) { s = s.concat(other: "…"); }
     return s;
-}
-
-// A decimal integer as the server writes one (string2ll): an optional '-', then digits with no leading zero, and
-// nothing else — no '+', no space, no "-0". None when `b` is not one, or does not fit an int64.
-fn Optional<int64> decimal(ConstView<uint8> b) {
-    isize n = b.length();
-    if (n == 0 || n > 20) { return Optional::None; }
-    bool negative = b[0] == 45;
-    isize i = 0;
-    if (negative) { i = 1; }
-    if (i == n) { return Optional::None; }
-    if (b[i] == 48) {
-        if (n == 1) { return Optional::Some(value: 0i64); }
-        return Optional::None;
-    }
-    uint64 limit = 9223372036854775807ui64;
-    if (negative) { limit = 9223372036854775808ui64; }
-    uint64 v = 0ui64;
-    while (i < n) {
-        uint8 c = b[i];
-        if (c < 48 || c > 57) { return Optional::None; }
-        uint64 d = cast<uint64>(c - 48);
-        if (v > (limit - d) / 10ui64) { return Optional::None; }
-        v = v * 10ui64 + d;
-        i = i + 1;
-    }
-    if (!negative) { return Optional::Some(value: cast<int64>(v)); }
-    if (v == 9223372036854775808ui64) { return Optional::Some(value: -9223372036854775807i64 - 1i64); }
-    return Optional::Some(value: 0i64 - cast<int64>(v));
-}
-
-// The same grammar for a uint64: digits only, no leading zero.
-fn Optional<uint64> unsignedDecimal(ConstView<uint8> b) {
-    isize n = b.length();
-    if (n == 0 || n > 20) { return Optional::None; }
-    if (b[0] == 48) {
-        if (n == 1) { return Optional::Some(value: 0ui64); }
-        return Optional::None;
-    }
-    uint64 limit = 18446744073709551615ui64;
-    uint64 v = 0ui64;
-    isize i = 0;
-    while (i < n) {
-        uint8 c = b[i];
-        if (c < 48 || c > 57) { return Optional::None; }
-        uint64 d = cast<uint64>(c - 48);
-        if (v > (limit - d) / 10ui64) { return Optional::None; }
-        v = v * 10ui64 + d;
-        i = i + 1;
-    }
-    return Optional::Some(value: v);
 }
 
 fn Optional<uint64> nonNegative(int64 n) {

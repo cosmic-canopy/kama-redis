@@ -4,7 +4,8 @@ import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
          redis::Pipeline, redis::Replies, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
-         redis::wire::serverError, redis::resp::Writer, redis::resp::Value };
+         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::resp::Writer,
+         redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
 // One connection to a Redis or Valkey server. It belongs to one isolate at a time and moves between them whole.
@@ -124,14 +125,15 @@ type resource Connection implements Sendable {
     }
 
     // Send `command` and return its reply. A command refused while it was built (`Value`), or one a connection cannot
-    // carry (`Usage`), is refused before anything is written. An error reply is `Server`, and the connection is still
+    // carry (`Usage`), is refused before anything is written. The deadline is `command_timeout`, plus the command's
+    // own timeout when it blocks on the server (BLPOP, XREAD BLOCK, WAIT, …); a timeout of 0 blocks with no deadline. An error reply is `Server`, and the connection is still
     // usable; an error inside a reply (one of EXEC's) stays a `Value::Error` there. A push message that comes in place
     // of the reply is set aside, never taken for it.
     public unsafe fn Result<Value, RedisError> call(const ref Command command) {
         Result<Unit, RedisError> admitted = admit(command: command);
         match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         if (!this.live) { return Result::Err(error: RedisError::Closed); }
-        Deadline deadline = Deadline.within(span: this.commandLimit);
+        Deadline deadline = callDeadline(limit: this.commandLimit, extra: blockingWait(command: command));
         this.outbox.clear();
         command.encode(into: this.outbox);
         Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
@@ -150,14 +152,15 @@ type resource Connection implements Sendable {
     // A pipeline refused while it was built (a command `call` would refuse) is refused before anything is written,
     // and an empty one writes nothing. Each reply stands alone, an error reply included (`Replies.take`). A failure
     // of the connection itself (I/O, bytes that are not RESP, the deadline) fails the whole call and closes it, as it
-    // does a `call`. There is one deadline, `command_timeout`, for the write and every reply.
+    // does a `call`. There is one deadline for the write and every reply: `command_timeout`, plus each blocking
+    // command's own timeout, since they wait in turn.
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) {
         Optional<RedisError> problem = pipeline.problem();
         match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
         if (!this.live) { return Result::Err(error: RedisError::Closed); }
         DynamicArray<Value> values = DynamicArray.empty();
         if (pipeline.length() == 0) { return Result::Ok(value: Replies.of(values: give values)); }
-        Deadline deadline = Deadline.within(span: this.commandLimit);
+        Deadline deadline = callDeadline(limit: this.commandLimit, extra: pipeline.waiting());
         Result<Unit, RedisError> sent = this.wire.send(bytes: pipeline.bytes(), deadline: deadline);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
         while (values.length() < pipeline.length()) {

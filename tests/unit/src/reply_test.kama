@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::colle
          redis::resp::Value, redis::resp::Reader, redis::resp::Read,
          redis_unit_tests::check, unhex, serverVersions, replyNames, replyCommands, replyHex, replySetups, respNames,
          respInputs };
-export { replyTests };
+export { replyTests, splitOn };
 
 // ---- the types read ----
 

@@ -1,9 +1,39 @@
 // Deadlines and unreachable servers, live: a refused port, a server that never answers, a name that does not
-// resolve, and a call that outlasts command_timeout.
+// resolve, a call that outlasts command_timeout, and blocking commands, which wait for their own timeouts on top.
 import { std::io::IoError, std::net::TcpListener, std::time::monotonicNow, std::time::Instant, std::time::Duration,
+         std::time::sleep, std::concurrent::Isolate,
          redis::Connection, redis::Command, redis::RedisError, redis::resp::Value,
          redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask };
 export { timeoutTests };
+
+// A connection of its own, opened or the test fails by name.
+unsafe fn Connection reach(const ref string tail, const ref string what) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "timeout_test: ${what}: connect: ${m}"); return reach(tail: tail, what: what); }
+    };
+    return give c;
+}
+
+// Pauses the server's writes from another connection, so a write command is held there: a call the client cannot
+// know will be slow. CLIENT UNPAUSE ends it (6.2 and later have both).
+unsafe fn string pauseWrites(ref Connection other) { return ask(c: other, text: "CLIENT PAUSE 1500 WRITE"); }
+unsafe fn string unpause(ref Connection other) { return ask(c: other, text: "CLIENT UNPAUSE"); }
+
+// Pushes onto a list from another isolate after a pause, over its own connection: what releases a BLPOP with no
+// timeout.
+type resource Pusher implements Sendable {
+    Connection conn;
+    public ctor make(Connection conn) { this.conn = give conn; }
+    public unsafe fn void run() {
+        sleep(d: Duration.fromMillis(ms: 800i64));
+        string pushed = ask(c: this.conn, text: "LPUSH kr:t:zero released");
+        this.conn.close();
+    }
+}
+
+fn void pushLater(Pusher job) { job.run(); }
 
 unsafe fn int32 timeoutTests() {
     int32 f = 0;
@@ -30,38 +60,56 @@ unsafe fn int32 timeoutTests() {
         case Err(error: e): { f = f + check(ok: false, what: "timeout: bind a listener"); }
     };
 
-    // A call that outlasts command_timeout ends in Timeout, and closes the connection.
-    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: "?command_timeout=0.3"));
-    match (give r) {
-        case Ok(value: v): {
-            Connection c = give v;
-            Instant started = monotonicNow();
-            Command blpop = Command.of(name: "BLPOP");
-            blpop.arg(text: "kr:never");
-            blpop.argInt(value: 2i64);
-            Result<Value, RedisError> late = c.call(command: blpop);
-            int64 ms = (monotonicNow() - started).asMillis();
-            bool timedOut = match (late) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: x): false; };
-            string after = ask(c: c, text: "PING");
-            f = f + check(ok: timedOut && ms >= 280i64 && ms < 1500i64 && c.isClosed() && after == "(failed) the connection is closed",
-                          what: "timeout: BLPOP 2 against command_timeout=0.3, after ${ms} ms, then: ${after}");
-        }
-        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "timeout: connect with command_timeout=0.3: ${m}"); }
-    };
+    // A call that outlasts command_timeout ends in Timeout, and closes the connection. The call is a write, held by
+    // the server because another connection paused writes: nothing the client could know.
+    Connection pauser = reach(tail: "", what: "the pausing connection");
+    Connection c = reach(tail: "?command_timeout=0.3", what: "command_timeout=0.3");
+    string paused = pauseWrites(other: pauser);
+    Instant started = monotonicNow();
+    Command held = Command.of(name: "SET");
+    held.arg(text: "kr:t:stall");
+    held.arg(text: "v");
+    Result<Value, RedisError> late = c.call(command: held);
+    int64 ms = (monotonicNow() - started).asMillis();
+    string unpaused = unpause(other: pauser);
+    bool timedOut = match (late) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: x): false; };
+    string after = ask(c: c, text: "PING");
+    f = f + check(ok: paused == "OK" && unpaused == "OK" && timedOut && ms >= 280i64 && ms < 1400i64 && c.isClosed() && after == "(failed) the connection is closed",
+                  what: "timeout: a SET held by the server against command_timeout=0.3, after ${ms} ms, then: ${after}");
+
+    // A blocking command waits for its own timeout, on top of command_timeout: BLPOP 1 under 0.5 returns its null.
+    Connection b = reach(tail: "?command_timeout=0.5", what: "command_timeout=0.5");
+    Instant blocked = monotonicNow();
+    string waitedOut = ask(c: b, text: "BLPOP kr:t:never 1");
+    int64 bms = (monotonicNow() - blocked).asMillis();
+    f = f + check(ok: waitedOut == "(nil)" && bms >= 900i64 && !b.isClosed(), what: "timeout: BLPOP 1 under command_timeout=0.5 returns null after ${bms} ms: ${waitedOut}");
+    // XREAD BLOCK 800 likewise.
+    string cleared = ask(c: b, text: "DEL kr:t:stream");
+    Instant streamed = monotonicNow();
+    string read = ask(c: b, text: "XREAD BLOCK 800 STREAMS kr:t:stream $");
+    int64 xms = (monotonicNow() - streamed).asMillis();
+    f = f + check(ok: read == "(nil)" && xms >= 700i64 && !b.isClosed(), what: "timeout: XREAD BLOCK 800 under command_timeout=0.5 returns null after ${xms} ms: ${read}");
+    // A timeout of 0 blocks with no deadline: another isolate releases it after longer than command_timeout.
+    string empty = ask(c: b, text: "DEL kr:t:zero");
+    Connection releaser = reach(tail: "", what: "the releasing connection");
+    Pusher job = Pusher.make(conn: give releaser);
+    Isolate worker = spawn pushLater(job: give job);
+    Instant zeroStart = monotonicNow();
+    string released = ask(c: b, text: "BLPOP kr:t:zero 0");
+    int64 zms = (monotonicNow() - zeroStart).asMillis();
+    worker.join();
+    f = f + check(ok: released == "[kr:t:zero, released]" && zms >= 600i64 && !b.isClosed(),
+                  what: "timeout: BLPOP 0 under command_timeout=0.5 waits until another connection pushes, after ${zms} ms: ${released}");
 
     // command_timeout=0 is no limit: a blocking call returns when the server answers.
-    Result<Connection, RedisError> r0 = open(url: mainUrl(userinfo: "", tail: "?command_timeout=0"));
-    match (give r0) {
-        case Ok(value: v): {
-            Connection c = give v;
-            string waited = ask(c: c, text: "BLPOP kr:never 1");
-            f = f + check(ok: waited == "(nil)" && !c.isClosed(), what: "timeout: command_timeout=0 waits for BLPOP 1: ${waited}");
-            // And a connection's own timeout replaces the config's.
-            Result<Unit, RedisError> set = c.setCommandTimeout(timeout: Duration.fromMillis(ms: 200i64));
-            string cut = ask(c: c, text: "BLPOP kr:never 2");
-            f = f + check(ok: cut == "(failed) timed out" && c.isClosed(), what: "timeout: setCommandTimeout takes effect: ${cut}");
-        }
-        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "timeout: connect with command_timeout=0: ${m}"); }
-    };
+    Connection unlimited = reach(tail: "?command_timeout=0", what: "command_timeout=0");
+    string waited = ask(c: unlimited, text: "BLPOP kr:t:never 1");
+    f = f + check(ok: waited == "(nil)" && !unlimited.isClosed(), what: "timeout: command_timeout=0 waits for BLPOP 1: ${waited}");
+    // And a connection's own timeout replaces the config's: a write held by the server is cut off at 200 ms.
+    Result<Unit, RedisError> set = unlimited.setCommandTimeout(timeout: Duration.fromMillis(ms: 200i64));
+    string paused2 = pauseWrites(other: pauser);
+    string cut = ask(c: unlimited, text: "SET kr:t:stall v");
+    string unpaused2 = unpause(other: pauser);
+    f = f + check(ok: paused2 == "OK" && unpaused2 == "OK" && cut == "(failed) timed out" && unlimited.isClosed(), what: "timeout: setCommandTimeout takes effect: ${cut}");
     return f;
 }

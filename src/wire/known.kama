@@ -1,5 +1,7 @@
-import { std::collections::ConstView, redis::Command, redis::RedisError, redis::ServerError, redis::resp::Value };
-export { admit, serverError };
+import { std::collections::ConstView, std::time::Duration, std::fmt::parse, std::fmt::ParseError,
+         std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, redis::Command, redis::RedisError,
+         redis::ServerError, redis::resp::Value, Deadline, decimal };
+export { admit, serverError, Wait, blockingWait, later, callDeadline };
 
 // What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
 //
@@ -11,6 +13,10 @@ export { admit, serverError };
 //   - CLIENT REPLY OFF or SKIP stop replies, and SCRIPT DEBUG turns the next EVAL into a debugging session;
 //   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it.
 // WATCH and UNWATCH are allowed.
+//
+// A blocking command waits on the server for as long as its own timeout says, so its deadline is that timeout plus
+// `command_timeout` (blockingWait). The table is checked against every server's `ACL CAT blocking` and COMMAND DOCS
+// (tests/unit/src/blocking_test.kama).
 
 // Whether `command` may be sent: the first reason it was refused while it was built, then the table.
 fn Result<Unit, RedisError> admit(const ref Command command) {
@@ -81,4 +87,129 @@ fn bool sameWord(ConstView<uint8> part, const ref string word) {
         i = i + 1;
     }
     return true;
+}
+
+// ---- blocking commands ----
+
+// How long a command may wait on the server before its reply: no longer than it takes to answer (it does not block,
+// or the server refuses its timeout at once), a span (its own timeout), or for ever (a timeout of 0).
+type enum Wait implements Sendable { Span(Duration span), Forever }
+
+// The longest timeout counted as one: past it a wait is for ever. 10^12 ms is 31 years, and it keeps every sum far
+// from where a Duration (int64 nanoseconds) would overflow.
+comptime int64 LONGEST_MS = 1000000000000;
+
+fn Wait noWait() { return Wait::Span(span: Duration.zero()); }
+
+// How long `command` may block on the server (docs/ROADMAP.md, "Decided, and why", "Phase 3", "Blocking commands").
+fn Wait blockingWait(const ref Command command) {
+    isize n = command.length();
+    if (n < 2) { return noWait(); }
+    if (named(command: command, word: "BLPOP") || named(command: command, word: "BRPOP")
+        || named(command: command, word: "BZPOPMIN") || named(command: command, word: "BZPOPMAX")
+        || named(command: command, word: "BRPOPLPUSH") || named(command: command, word: "BLMOVE")) {
+        return seconds(part: command.part(index: n - 1));
+    }
+    if (named(command: command, word: "BLMOVEM")) {
+        if (n < 6) { return noWait(); }
+        return seconds(part: command.part(index: 5));
+    }
+    if (named(command: command, word: "BLMPOP") || named(command: command, word: "BZMPOP")) {
+        return seconds(part: command.part(index: 1));
+    }
+    if (named(command: command, word: "WAIT")) {
+        if (n < 3) { return noWait(); }
+        return millis(part: command.part(index: 2));
+    }
+    if (named(command: command, word: "WAITAOF")) {
+        if (n < 4) { return noWait(); }
+        return millis(part: command.part(index: 3));
+    }
+    if (named(command: command, word: "XREAD") || named(command: command, word: "XREADGROUP")) {
+        return streamWait(command: command);
+    }
+    return noWait();
+}
+
+// XREAD and XREADGROUP: BLOCK's milliseconds, found by stepping over each option before STREAMS by its arity, as
+// the server's parser steps. The last BLOCK counts, as it does there. An option the server does not know, or no
+// STREAMS, is refused at once.
+fn Wait streamWait(const ref Command command) {
+    isize n = command.length();
+    Wait found = noWait();
+    isize i = 1;
+    while (i < n) {
+        if (wordAt(command: command, at: i, w: "STREAMS")) { return found; }
+        if (wordAt(command: command, at: i, w: "BLOCK")) {
+            if (i + 1 >= n) { return noWait(); }
+            found = millis(part: command.part(index: i + 1));
+            i = i + 2;
+            continue;
+        }
+        if (wordAt(command: command, at: i, w: "COUNT") || wordAt(command: command, at: i, w: "MAXCOUNT")
+            || wordAt(command: command, at: i, w: "MAXSIZE") || wordAt(command: command, at: i, w: "CLAIM")) {
+            i = i + 2;
+            continue;
+        }
+        if (wordAt(command: command, at: i, w: "GROUP")) {
+            i = i + 3;
+            continue;
+        }
+        if (wordAt(command: command, at: i, w: "NOACK")) {
+            i = i + 1;
+            continue;
+        }
+        return noWait();
+    }
+    return noWait();
+}
+
+// A timeout in seconds, as the server reads one (a long double, times 1000). Less than a millisecond is 0 to some
+// servers, which block for ever then, so it is for ever here too: a deadline must never cut a wait short. One the
+// server refuses (not a number, NaN, negative, out of range) does not wait.
+fn Wait seconds(ConstView<uint8> part) {
+    Result<string, Utf8Error> t = decode(bytes: part);
+    string text = match (give t) { case Ok(value: x): give x; case Err(error: e): ""; };
+    Result<float64, ParseError> p = parse::<float64>(s: text);
+    bool number = match (p) { case Ok(value: x): true; case Err(error: e): false; };
+    if (!number) { return noWait(); }
+    float64 secs = match (p) { case Ok(value: x): x; case Err(error: e): 0.0; };
+    if (secs != secs) { return noWait(); }
+    float64 ms = secs * 1000.0;
+    if (ms <= -1.0 || ms >= 9223372036854775807.0) { return noWait(); }
+    if (ms < 1.0) { return Wait::Forever; }
+    if (ms > 1000000000000.0) { return Wait::Forever; }
+    return Wait::Span(span: Duration.fromMillis(ms: cast<int64>(ms) + 1i64));
+}
+
+// A timeout in milliseconds, in the server's integer grammar. 0 is for ever; one the server refuses does not wait.
+fn Wait millis(ConstView<uint8> part) {
+    Optional<int64> v = decimal(b: part);
+    bool number = match (v) { case Some(value: x): true; case None: false; };
+    if (!number) { return noWait(); }
+    int64 ms = match (v) { case Some(value: x): x; case None: 0i64; };
+    if (ms < 0i64) { return noWait(); }
+    if (ms == 0i64 || ms > LONGEST_MS) { return Wait::Forever; }
+    return Wait::Span(span: Duration.fromMillis(ms: ms));
+}
+
+// Two waits one after the other: a pipeline's blocking commands each wait in turn.
+fn Wait later(Wait a, Wait b) {
+    int64 x = match (a) { case Span(span: s): s.asMillis(); case Forever: -1i64; };
+    int64 y = match (b) { case Span(span: s): s.asMillis(); case Forever: -1i64; };
+    if (x < 0i64 || y < 0i64 || x + y > LONGEST_MS) { return Wait::Forever; }
+    return Wait::Span(span: Duration.fromMillis(ms: x + y));
+}
+
+// A call's deadline: `limit` (command_timeout; zero is no limit) plus how long its commands may block on the server.
+unsafe fn Deadline callDeadline(Duration limit, Wait extra) {
+    int64 ms = limit.asMillis();
+    if (ms <= 0i64 && limit.asNanos() <= 0i64) { return Deadline.none(); }
+    int64 more = match (extra) { case Span(span: s): s.asMillis(); case Forever: -1i64; };
+    if (more < 0i64 || ms > LONGEST_MS) { return Deadline.none(); }
+    return Deadline.after(span: limit + Duration.fromMillis(ms: more));
+}
+
+fn bool wordAt(const ref Command command, isize at, const ref string w) {
+    return sameWord(part: command.part(index: at), word: w);
 }
