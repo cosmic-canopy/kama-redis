@@ -1,6 +1,7 @@
 # Roadmap
 
-Where this is, 2026-10-04: phases 0, 1 and 2 are done. Phase 3 is next: see "Phase 3: where to start" below.
+Where this is, 2026-10-08: phases 0, 1 and 2 are done. Phase 3 is next, and "Phase 3: where to start" below is its
+session plan.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -14,9 +15,9 @@ Where this is, 2026-10-04: phases 0, 1 and 2 are done. Phase 3 is next: see "Pha
   - The unit suite's scripted server plays every server's real handshake replies and Envoy's refusals
     (`tools/gen-server-vectors.sh`).
   - `tools/test-integration.sh` is green on all eight servers, debug and release.
-- `tools/test.sh` is green, debug and release, on kama 0.9.530.
-- Open gaps: KRD-5 (HIGH), a type that holds a collection of itself through a resource no longer compiles, which
-  breaks @kama/postgres 0.2.0's build; KRD-6 (LOW). Neither needs a workaround here.
+- `tools/test.sh` is green, debug and release, on kama 0.9.542, and CI is green on every server.
+- Open gaps here: none. KRD-5 and KRD-6 are fixed (0.9.531, 0.9.533). @kama/postgres's KPG-38 is still open on
+  0.9.542 and blocks the `cmd"…"` tag's use in a release build; phase 3's first step cites it.
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -39,35 +40,178 @@ does its discipline:
 ## Phase 3: where to start
 
 The bar stays `@kama/postgres`'s: every form honoured or refused, every failure path against the scripted server, the
-whole matrix live, debug and release.
+whole matrix live, debug and release. The plan below was drawn up on 2026-10-08 from primary sources: redis-rs 1.x,
+go-redis v9, redis-py 8 and Lettuce 7 source; the redis.io and valkey.io command pages; postgres's `src/query.kama`
+(the `PgParam` contract, its adapters, the `pg"…"` tag) and `src/decode.kama` (`column::<T>`, `CellReader`); and
+kama's SPEC, prelude and compiler source.
 
-- **Before writing anything**, read the matching parts of `@kama/postgres`:
-  - `src/query.kama` (`PgParam`) and `src/types/codec.kama`: arguments through a contract with `type adapter`s. Mind
-    KPG-38: two files that use the same adapter fail every release build, so keep each adapter's use in one file
-    and test release.
-  - `src/rows.kama` and `src/decode.kama`: `column::<T>` through `Deserializable`, `@generate` structs included.
-  - `src/pipeline.kama` and `src/batch.kama`: a queue of commands written at once and read in order.
-  - `src/transaction.kama`.
-- **What phase 2 leaves ready:**
-  - `Command` holds a command's arguments as whole bulk strings. `RedisArg` and the `cmd"…"` tag build `Command`s,
-    and `Command.encode` already writes any number of them into one `resp::Writer`.
-  - `Wire.send` reads while a write waits, so a pipeline's replies cannot deadlock its writes.
-    `connection_test`'s jammed server proves it.
-  - `Connection.call` returns a `resp::Value`. Typed replies read from it.
-  - Push messages are set aside (`pendingPushes()`). Phase 4 decides how they are read.
-- **To decide early and write down here,** with what the peers do (redis-rs `ToRedisArgs`/`FromRedisValue`, go-redis
-  `Cmd` types, redis-py, Lettuce):
-  - **Typed replies across protocols.** RESP2 sends a map as a flat array and a double as a bulk string.
-    `reply::<T>` reads both forms into the same T, so a `@generate` struct reads from `HGETALL` either way.
-  - **Pipelines.** How a pipeline is built and read; what one failed command does to the rest (nothing: each reply
-    stands alone); and the deadline, one for the whole pipeline.
-  - **Transactions.** `MULTI`/`EXEC`/`WATCH`, `EXECABORT`, and `EXEC`'s null when a watched key changed.
-  - **Scripts.** `EVALSHA`, falling back to `EVAL` on `NOSCRIPT`; `FCALL`.
-  - **`SCAN` cursors**, as an iterator.
-  - **Blocking commands.** A command's own timeout plus `command_timeout`, so `BLPOP key 30` is not cut off at 5 s;
-    and `0`, which means forever.
-- **Vectors:** typed replies come from the servers' real replies under both protocols (`tools/gen-server-vectors.sh`
-  and `gen-resp-vectors.sh` extended), never typed by hand.
+**KPG-38 blocks the tag's real use.** It is @kama/postgres's gap, still open on 0.9.542, and re-run here as a
+two-file `--release` repro: when two files convert the same primitive to the same contract, a release build fails
+with `redefinition of 'int32__as_…'`. The conversion happens in the caller's file, so an application that writes
+`cmd"GET ${key}"` in two files cannot build release. Cite it in KAMA_GAPS.md first, and flag it to cstar. Until it is
+fixed:
+- each test program converts primitives to `RedisArg` in exactly one file;
+- the package itself never converts: adapter bodies and every helper write through `Command`'s `arg*` methods.
+
+### Proposed decisions (step 0b confirms the kama facts by repro, then writes them under "Decided, and why")
+- **Refusals:**
+  - `RedisError::Value(detail)` is an argument the client refuses, or a reply that does not convert.
+  - A malformed tag literal or a refused command is `Usage`.
+  - Both are refused before anything is written, and the connection stays usable.
+- **Arguments:** `type contract RedisArg for value, resource, enum, intrinsic { const fn void writeRedisArg(ref
+  Command into); }`. A value writes itself with `Command`'s `arg`/`argBytes`/`argInt`/`argFloat`. (Not
+  `ref Serializer`: it has no bulk-bytes write, and it gives an empty byte array and an empty list the same arity.)
+  - **The adapters:**
+
+    | type | becomes |
+    |---|---|
+    | int8 to int64, isize, uint16 to uint64 | decimal |
+    | float32, float64 | shortest round-trip, `inf`/`-inf`; NaN refused (the server rejects it too) |
+    | string | its bytes |
+    | `DynamicArray<uint8>` | exactly one binary argument, even when empty |
+    | `DynamicArray<T: RedisArg>` | one argument per element, so an empty list is none |
+    | Uuid | its text |
+
+  - **No adapter, so each is a compile-time refusal:**
+    - bool and char: redis-py refuses bool; redis-rs and go-redis send 1/0;
+    - Optional: redis-rs drops a None; go-redis sends "";
+    - uint8, Timestamp, Date and Duration: no single meaning (EXPIREAT wants seconds, PEXPIREAT milliseconds).
+  - **Coherence:** `<DynamicArray<uint8>>` beside `<DynamicArray> when [T: RedisArg]` is coherent only because uint8
+    has no adapter. The compiler checks `when` per instance; confirm by repro.
+- **`cmd"…"`** is `fn Command cmd(Template<RedisArg> t)`.
+  - Its literal splits on ASCII whitespace into whole arguments, and each hole is one argument, or several for a list.
+  - It is refused for: text touching a hole (`user:${id}`: a hole is never spliced into text), two holes side by
+    side, a quote in the literal, and an empty command.
+- **Commands a connection cannot carry.** `call` and `run` refuse these before sending, by name, case-insensitively:
+  - SUBSCRIBE, PSUBSCRIBE, SSUBSCRIBE and the three UNSUBSCRIBEs (phase 4);
+  - MONITOR, SYNC, PSYNC, CLIENT REPLY, HELLO, RESET, QUIT;
+  - MULTI, EXEC and DISCARD (`transact` is the one way).
+
+  WATCH and UNWATCH stay allowed.
+- **Typed replies:** `reply::<T>`, `replyOpt::<T>` and `replyOpts::<T>` (MGET; `Optional<T>` is not
+  `Deserializable` on its own), each consuming a `Result<Value, RedisError>`. So `reply::<T>(result:
+  conn.call(command: c))` is the one way, for `call`, pipeline and transaction replies alike. One rule set covers
+  both protocols:
+
+  | asked for | read from |
+  |---|---|
+  | integers | Integer, a strict decimal string, an integral Double that fits, a BigNumber that fits |
+  | floats | Double, Integer, BigNumber, or text (inf and nan included) |
+  | bool | Boolean, or Integer 0 or 1, nothing else |
+  | string | Bulk, Simple, Verbatim (its text), Integer, Double, BigNumber; not UTF-8 is refused, pointing at `DynamicArray<uint8>` |
+  | `DynamicArray<uint8>` | the string kinds |
+  | `DynamicArray<T>` and Set | an Array, a Set, or a Map flattened to key, value, … |
+  | structs | by name, from a Map or an even flat Array |
+  | std Map, or a two-field object inside an array | a positional pair: a 2-element Array element, or element plus the next item |
+
+  - Null reads only into an Optional. Attributes are unwrapped.
+  - An Error element that is read fails as `Server` with its code.
+  - A reader failure is `Value`, naming the path and what was asked.
+  - Peers: redis-rs reads a map from a Map or an even Array, a float from a parsed bulk, and a bool from a non-zero
+    Int. go-redis reads a map from a map or an even array, and a bool from "OK"/"1"/"true".
+- **Pipelines:** `Connection.run(pipeline:) → Replies`, each reply taken once (`take(index:)`).
+  - One write.
+  - One deadline: `command_timeout` plus the blocking commands' own timeouts.
+  - Each reply stands alone.
+  - I/O, protocol errors or a timeout fail the whole call and close the connection.
+  - No size limit, as none of the peers has one.
+- **Blocking commands:** the deadline is the command's own timeout plus `command_timeout`; a timeout of 0 sets no
+  deadline. (go-redis adds 10 s. redis-py and redis-rs cut BLPOP off at their socket timeout.)
+
+  | commands | timeout |
+  |---|---|
+  | BLPOP, BRPOP, BRPOPLPUSH, BLMOVE, BZPOPMIN, BZPOPMAX | last argument, seconds |
+  | BLMPOP, BZMPOP | first argument, seconds |
+  | XREAD, XREADGROUP | `BLOCK`, milliseconds |
+  | WAIT | 2nd argument, milliseconds |
+  | WAITAOF | 3rd argument, milliseconds |
+
+  The table is checked against the servers: `ACL CAT blocking` on all eight (Redis 6.2 has no `blocking` command flag),
+  and each position and unit against `COMMAND DOCS` (an integer is milliseconds, a double seconds).
+- **Transactions:** `transact(pipeline:)` writes MULTI, the commands and EXEC in one write.
+  - Its outcome is `TxOutcome { Committed(Replies), WatchConflict }`. EXEC's null is `WatchConflict`, an outcome
+    rather than an error (go-redis `TxFailedErr`, redis-py `WatchError`, redis-rs `None`).
+  - EXECABORT is `Server`, carrying the first queue-time error.
+  - The deadline is `command_timeout` alone, since nothing blocks inside MULTI.
+  - `watched(keys:, body: TxBody, attempts:)` retries a bounded number of times, which the caller states. Peers retry
+    without bound (redis-rs, redis-py) or leave it to the caller (go-redis).
+- **Scripts:** `Script` computes its SHA-1 client-side (`std::digest::sha1`), and `ScriptCall` carries the call.
+  - `eval` sends EVALSHA, and on NOSCRIPT, EVAL (go-redis's way; redis-py and redis-rs SCRIPT LOAD first). That is
+    safe, because NOSCRIPT means the script never ran.
+  - A read-only script uses the `_RO` forms (7.0+).
+  - Inside pipelines and transactions, EVAL (redis.io: NOSCRIPT cannot be handled there).
+  - FCALL needs nothing special.
+- **SCAN** is a page API, not an Iterator: an iterator cannot borrow a Connection, has no error channel, and would need
+  a hand-back.
+  - `Scan.next(conn:)` returns every page, empty ones included, so no call makes an unbounded number of round trips.
+  - The cursor is opaque bytes (Valkey 9.1's CLUSTERSCAN has string cursors, and Lettuce keeps a String).
+  - Repeats are documented.
+
+### The session's steps
+
+Each step ends with `tools/test.sh` green in debug and release, the live tests on the matrix, and a commit.
+
+0. **0b.** The repros on 0.9.542:
+   - KPG-38 through a tag and through a parameter, for int32, string, float64, `DynamicArray<string>` and Uuid;
+   - the adapter coherence above;
+   - `ref this` passed to a contract method;
+   - `RedisError::Value` beside an imported `resp::Value`;
+   - `reply::<T>(result: conn.call(…))`.
+
+   Then KPG-38's citation in KAMA_GAPS.md, and the decisions above written under "Decided, and why".
+1. **Vectors** (`tools/gen-server-vectors.sh`, one run; the existing cases' bytes must not change):
+   - **Typed RESP2/RESP3 pairs.** For each protocol, a fresh connection, FLUSHALL and the same setup, with the
+     setup's arguments written out so expected values derive from them. Cases: GET (hit, missing, big, binary),
+     MGET, INCRBYFLOAT, HGETALL, HMGET, SMEMBERS, SMISMEMBER, ZRANGE WITHSCORES, ZSCORE, XRANGE, XREAD, LPOS, CONFIG
+     GET, EXISTS, TYPE, EVAL.
+   - **Transactions:** EXEC's null after a broken WATCH, under each protocol, and a queue-time error.
+   - **Scripts:** SCRIPT LOAD SHAs, an EVALSHA hit, an EVAL.
+   - **SCAN pages:** SCAN, SSCAN, HSCAN, ZSCAN.
+   - **BLPOP:** its null and a success, under each protocol.
+   - **Blocking:** `ACL CAT blocking` on every server, and `COMMAND DOCS` of each @blocking command on 7.0 and later.
+
+   The resp vectors' live captures are not true pairs: they are de-duplicated, and the RESP3 run follows the RESP2
+   run on the same data.
+2. **`RedisError::Value` and the refused commands.**
+   - `Command` gets a private `trouble` field and `refuse(detail:)`.
+   - New `src/known.kama` holds the table, and `call` checks it before writing.
+   - `fake_server.kama` gets `Step::ExpectBytes` for binary arguments.
+   - A refused command must leave the script's next `Expect` matching, which proves nothing was sent.
+3. **`RedisArg` and `cmd`** (`src/arg.kama`; `Command.add(value:)` and `argFloat(value:)`). Tests in one conversion
+   file per program: every tag form and refusal, the arity of empty lists, all 256 byte values live, the int64 and
+   uint64 extremes, and floats (0.1, 1e21, 5e-324, -0.0, inf, -inf) round-tripped through ZADD and ZSCORE under both
+   protocols.
+4. **Typed replies** (`src/reply.kama`, on postgres's `decode.kama` model). The reader owns a flat pre-order list of
+   nodes, moved out of the consumed Value. Tests:
+   - every typed pair reads the same under both protocols, equal to the setup;
+   - every resp vector read as each of 7 types is Ok or Err, never a panic;
+   - the edges: odd maps, overflow, non-UTF-8 text, Null, EXEC's error element, a 1024-deep reply.
+
+   It can split into 4a (scalars, arrays, `replyOpt`/`replyOpts`) and 4b (maps, structs, pairs).
+5. **Pipelines** (`src/pipeline.kama`): 1000 commands through the jammed server, an error in the middle, a push in the
+   middle, a late reply, a hangup, a refused command, an empty pipeline; live, 1000 INCRs with a WRONGTYPE mixed in.
+6. **Blocking deadlines.**
+   - Unit: the table covers every `ACL CAT blocking` name and agrees with COMMAND DOCS.
+   - Live, with `command_timeout=0.5`: `BLPOP k 1` returns Null, `BLPOP k 0` is released by a second connection,
+     and `XREAD BLOCK 800`.
+7. **Transactions** (`src/transaction.kama`): commit, a conflict from a second connection, EXECABORT, an error inside
+   EXEC, `watched` retrying. The phase 2 MULTI/EXEC checks move here.
+8. **Scripts** (`src/script.kama`): `sha1()` equals every server's SCRIPT LOAD; NOSCRIPT then EVAL, then a hit;
+   `_RO` from 7.0.
+9. **SCAN** (`src/scan.kama`): captured pages; live, 1000 keys come back whole with MATCH, COUNT and TYPE;
+   SSCAN, HSCAN and ZSCAN; NOVALUES only on Redis 7.4+ and Valkey 8.0+.
+10. **Close phase 3:** ROADMAP, AGENTS.redis.md (the one-conversion-file rule), README examples compiled against a
+    live server, CHANGELOG, the `src/redis.kama` header, and the whole matrix in debug and release.
+
+**If the session runs long:**
+- The minimum is steps 0–5, then 6 (it removes phase 2's written-down BLPOP limitation), then 7.
+- Wherever it stops, end with a "where this is" commit naming the next step.
+
+**Carried past phase 3, by decision:**
+- `Command.addFields(value: Serializable)` for HSET from a struct (no adapter can cover every struct);
+- a `<Map>` adapter;
+- measuring the per-byte typed read of `DynamicArray<uint8>` before asking cstar for a bulk read;
+- lifting the one-conversion-file rule once KPG-38 is fixed.
 
 ## Decided, and why
 

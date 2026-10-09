@@ -5,14 +5,18 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.530`.
+**Current compiler:** `kama 0.9.542` (tag `v0.9.542`).
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-5 (HIGH), KRD-6 (LOW). Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
+
+**Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
+project's gap ids. A fix is found by re-running the entry's repro on the newest compiler, and recorded here with
+the commit that made it pass.
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -23,116 +27,29 @@ filed is cited by its KPG number rather than filed again.
 
 ## OPEN
 
-### KRD-6 · LOW · A branch whose every inner path moves a value and returns still counts as not moving it
-
-**Found:** 2026-10-04, writing `Connection.call`'s read loop (phase 2). **Version:** 0.9.530 (`e01de340`), and the
-same on 0.9.523, so it is not a regression.
-
-The move check refuses a function in which every path moves `v`, when one outer branch holds an inner `if` whose
-two arms both move `v` and `return`. A plain two-arm `if`/`else` that moves in both arms is accepted. So is the same
-logic written as early exits. It looks as if the point after the inner `if`, which no path reaches, is merged as a
-path on which `v` is still live.
-
-Repro (an `else if` chain is the same shape, and fails the same way):
-
-```kama
-import { core::println, std::collections::DynamicArray };
-
-type resource R {
-    int32 n = 0;
-    public ctor make(int32 n) { this.n = n; }
-    public const fn int32 value() { return this.n; }
-}
-
-fn int32 pick(DynamicArray<R> kept, int32 which) {
-    R v = R.make(n: which);
-    if (v.value() == 0) {
-        kept.add(item: give v);
-    } else {
-        if (v.value() == 1) {
-            R dropped = give v;
-            return 1;
-        } else {
-            R last = give v;
-            return last.value();
-        }
-    }
-    return -1;
-}
-
-fn int32 main() {
-    DynamicArray<R> kept = DynamicArray.empty();
-    int32 got = pick(kept: kept, which: 0);
-    println(s: "ok ${got}");
-    return 0;
-}
-```
-
-```
-repro.kama:22:0: error: `v` is moved on some paths but not others and is still live at scope exit — move it on all paths or none, or use Optional<T>
-```
-
-**Expected:** it builds and prints `ok -1`, since `v` is moved on every path that reaches the end of its scope.
-
-**Workaround here:** `Connection.call` (`src/connection.kama`) is written as early exits (`if (push) { …; continue; }`
-then `if (error) { …; return …; }`), which is as clear. Nothing needs undoing when this is fixed.
-
-### KRD-5 · HIGH · A type that holds a collection of itself through a resource no longer compiles — since KRD-4's fix
-
-**Found:** 2026-10-04, writing `src/error.kama` (phase 2). **Version:** fails on 0.9.530 (`e01de340`); the same
-program prints `ok` on the 0.9.523 release (`~/.kama/versions/v0.9.523`). **Suspected:** `fdccadda` (KRD-4,
-0.9.527). Its message says "a recursive mention is assumed to copy while it is being judged"; that provisional
-answer appears to reach the instantiation of `DynamicArray<E>`'s `copy` ctor.
-
-**Why HIGH:** the published **@kama/postgres 0.2.0 does not compile** on 0.9.530. `kama check kama.json` there
-fails on `DynamicArray<postgres::PgError>` (`src/connection.kama:519`) and on `DynamicArray<postgres::BatchResult>`
-(`src/connection.kama:1108`), with the same three errors. Any error type whose aggregate variant keeps the errors
-it gathered has this shape: `PgError::Connect` → `ConnectError` → `ConnectAttempt` → `DynamicArray<PgError>`.
-
-Repro (nothing in it copies anything):
-
-```kama
-import { core::println, std::collections::DynamicArray };
-
-type enum E {
-    A,
-    B(Box box);
-}
-
-type resource Box {
-    DynamicArray<E> items;
-    public ctor make() { this.items = DynamicArray.empty(); }
-}
-
-fn int32 main() {
-    Box b = Box.make();
-    println(s: "ok");
-    return 0;
-}
-```
-
-On 0.9.530:
-
-```
-repro.kama:12:0: error: `std::collections::DynamicArray<E>` has no method `copyAllFrom` — it is declared `when [T: Copyable]`, and `E` (for `T`) does not satisfy `Copyable` (in `DynamicArray<E, GlobalAllocator>`, instantiated here; raised at …/std/collections/dynamic_array.kama:239)
-…/std/collections/view.kama:15:0: error: `E` has no `copy` method — use `give` to move it
-…/std/collections/dynamic_array.kama:23:0: error: `E` has no `copy` method — use `give` to move it
-```
-
-Adding `implements Sendable` to both types changes nothing. `E` is correctly not Copyable: its `B` payload is a
-resource without a copy ctor.
-
-**Expected:** the program builds and prints `ok`, as on 0.9.523. `DynamicArray<E>`'s `copy` ctor is not
-instantiated for an `E` that does not copy.
-
-**Workaround here:** none needed. `@kama/redis` has no such type: a connect attempt holds the `IoError` that ended
-it, not a `RedisError`, because an attempt only ever fails on I/O. That is the design we would choose anyway, so
-nothing will need undoing. @kama/postgres has no workaround, and its next build needs this fixed.
+(none)
 
 ## FIXED — kept for the record
 
-KRD-1 to KRD-4 were verified on 0.9.530 (`e01de340`), each with the repro it was filed with. 0.9.530 is not tagged
-yet; the newest release is 0.9.523.
+KRD-5 and KRD-6 were verified on 0.9.542 (`99ae9a22`), each with the repro it was filed with. KRD-1 to KRD-4 were
+verified on 0.9.530 (`e01de340`) the same way.
+
+### KRD-6 · LOW · A branch whose every inner path moved a value and returned still counted as not moving it — FIXED in 0.9.533
+
+Fixed by `de4de6cf`: a branch's move state is merged at its join only if control can reach the join, judged
+structurally (a block diverges when any statement in it does; an `if` when both arms do; a `match` when every arm
+does). The repro prints `ok -1` (it was refused with "`v` is moved on some paths but not others"). It was the same on
+0.9.523, so not a regression. `Connection.call`'s early exits were never a workaround to undo; they stay, because
+the package's floor is 0.9.529.
+
+### KRD-5 · HIGH · A type that held a collection of itself through a resource did not compile — FIXED in 0.9.531
+
+Fixed by `09ff9968`: whether an enum copies now rests on what each payload type declares, a fact settled before
+generic instances register, so `DynamicArray<E>` no longer keeps a `copy` ctor for an `E` that does not copy. It was
+a regression of 0.9.527 (KRD-4's fix), which judged an enum "owning nothing" before that was known. The repro prints
+`ok` (it failed with "`DynamicArray<E>` has no method `copyAllFrom`"). `kama check` on @kama/postgres, which broke the
+same way on `DynamicArray<PgError>` and `DynamicArray<BatchResult>`, is clean again. Nothing here needed undoing: a
+connect attempt holds an `IoError` by design.
 
 ### KRD-4 · LOW · `copy` did not reach through an `Optional` — FIXED in 0.9.527
 

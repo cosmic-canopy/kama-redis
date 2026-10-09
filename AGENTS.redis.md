@@ -126,8 +126,8 @@ everything this package relies on:
   - A value-producing `match` is not an assignment's right side. Bind it to a local, or move it into a helper.
   - A local moved on one branch must be moved on every branch, a failure branch included:
     `case Err(error: e): { Connection failed = give c; return …; }`.
-  - An inner `if` whose arms all move a value and `return` still reads as not moving it (KRD-6). Write early exits:
-    `if (push) { …; continue; }`, then `if (error) { …; return …; }`.
+  - Before 0.9.533, an inner `if` whose arms all move a value and `return` read as not moving it (KRD-6, fixed). The
+    floor is 0.9.529, so keep writing early exits: `if (push) { …; continue; }`, then `if (error) { …; return …; }`.
   - A `Result`'s error type must implement `Error`: `Result<T, string>` is refused. Return a `RedisError`.
   - A constructor that delegates the whole job is a private ctor (`Connection.establish`), not a static returning
     the type.
