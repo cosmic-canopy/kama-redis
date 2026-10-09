@@ -41,6 +41,9 @@ everything this package relies on:
     - Its Unix-socket test listens on a socket of its own and relays to the server's TCP port, because macOS cannot
       reach the container's socket (as postgres's `socket_test` does).
     - It starts with FLUSHALL, so the debug and release runs share the server cleanly.
+  - The scripted server's steps include `ExpectBytes` (a command's binary arguments, byte for byte) and `Patient`
+    (a reply given only to a wait that allows a stated time, which shows how long a connection waited).
+  - `tools/check-readme.sh` builds every complete program in README.md and runs it against a live server.
   - Vectors come from upstream by script. Each generator pins every upstream file by SHA256 and dies on a
     mismatch. Run it, and `git diff` must be empty unless a server image moved.
   - `tools/gen-resp-vectors.sh` writes `resp_vectors.kama`, with hiredis v1.4.1's reading of every input:
@@ -62,6 +65,10 @@ everything this package relies on:
     - each server's raw reply to every handshake step and to every error a standalone server can be made to send;
     - Envoy's redis proxy's answers to HELLO at 1.32, 1.36 and 1.39, from its pinned source, in the order that
       source checks them. The script verifies that order before it uses it.
+    - typed pairs (phase 3): each case under RESP2 and RESP3 on a fresh connection after FLUSHALL, with its setup
+      written beside it (`replySetups`), so tests derive expected values from the setup; transactions, scripts,
+      SCAN pages and BLPOP; each server's `ACL CAT blocking`, sorted, and COMMAND DOCS's arguments for each
+      blocking command. Every capture must come out the same on every run (intsets, explicit stream IDs).
     A case that needs a server setting Redis lacks (Valkey's `extended-redis-compatibility`) is started by
     product: Redis 8 passes a setting it does not know to its modules and fails only after daemonizing.
   - The live parts run in throwaway `--network none` containers of the matrix's images. They never touch the
@@ -106,6 +113,13 @@ everything this package relies on:
     converts: adapter bodies and helpers write through `Command`'s `arg*` methods.
   - KRD-7: an adapter over a std type cannot name `Command`, so there is no adapter for `DynamicArray<uint8>`,
     `DynamicArray<T>` or `Uuid`. Bytes go through `argBytes`, lists through a loop of `add`.
+  - Each test program's `arg_test.kama` also holds the helpers other files use to convert (the scans' keys and
+    patterns), so a release build stays whole.
+
+- **KRD-8: cstar's newest build (0.9.560) refuses the unit program**, through no change here: std's `deserialize`
+  instantiated with a type of the program's looks its names up in std. Until it is fixed, `tools/test.sh` and the
+  live suite are gated on the CI pin (`v0.9.542`) alone; install it with `KAMA_HOME=<dir> KAMA_VERSION=v0.9.542`
+  and cstar's `install.sh`, and run the gates with `KAMA=<dir>/bin/kama`.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.
@@ -141,7 +155,16 @@ everything this package relies on:
   - A struct with a `string` field owns, so it is a `type resource`, and its fields are private. A typed reply's
     struct gives its caller accessors.
   - A constructor that delegates the whole job is a private ctor (`Connection.establish`), not a static returning
-    the type.
+    the type. A type's fields are assigned in its constructor itself, not in a method it calls, so several public
+    constructors share a private one and return it (`Scan.named`).
+  - A `friend` grant to a free function in the same file is unqualified (`friend readerOf[over];`); across files it
+    is qualified (`friend redis::wire::admit[problem];`).
+  - `try cast` has no float form, and an out-of-range float cast traps: compare the range first, then `cast`
+    (which truncates a fraction).
+  - A string literal cannot contain `${` except as a hole; a hole takes an identifier with accessors only, so bind
+    a call (`isize n = xs.length();`) first.
+  - A local may not share a name with a field, nor with a local of an enclosing scope.
+  - A `Template<C>`'s holes are `const ref`, so a contract method a tag calls on one is a `const fn`.
   - A path dependency's path is relative to its manifest; an absolute one is not found.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when

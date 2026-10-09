@@ -1,7 +1,7 @@
 # Roadmap
 
-Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 10 is next.
+Where this is, 2026-10-09: phases 0 to 3 are done. Phase 4 (server push) is next; its session plan is still to be
+drawn up from primary sources, as phase 3's was ("Phase 3: where to start" below is that plan, as it was run).
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -11,15 +11,23 @@ its session plan, and step 10 is next.
   - `redis::cluster` key slots against the cluster specification and against `CLUSTER KEYSLOT` on all eight servers.
   - `RedisUrl` against redis-cli and valkey-cli, asked live.
 - The connection is in (phase 2): `Config`, `Connection`, `RedisError`, `Command`, `ServerInfo`, the `Transport` and
-  `Dialer` contracts.
-  - The unit suite's scripted server plays every server's real handshake replies and Envoy's refusals
-    (`tools/gen-server-vectors.sh`).
-  - `tools/test-integration.sh` is green on all eight servers, debug and release.
-- `tools/test.sh` is green, debug and release, on kama 0.9.542 (CI's pin) and on cstar's 0.9.558, and CI is green on
-  every server.
-- Open gaps here: KRD-7 (MED), filed in phase 3's step 0b: an adapter over a std type cannot name `Command`. KRD-5
-  and KRD-6 are fixed (0.9.531, 0.9.533). @kama/postgres's KPG-38 is fixed in 0.9.543, but no tagged release has it,
-  and CI stays on `v0.9.542` until one does.
+  `Dialer` contracts. The unit suite's scripted server plays every server's real replies and Envoy's refusals
+  (`tools/gen-server-vectors.sh`).
+- Commands are in (phase 3):
+  - `RedisArg` and the `cmd"…"` tag;
+  - typed replies (`reply::<T>` and its kin);
+  - pipelines, blocking deadlines, transactions (`transact`, `watched`), scripts and `Scan`.
+  The unit suite reads every typed pair from all eight servers under both protocols, and builds each blocking
+  command from every server's COMMAND DOCS. `tools/check-readme.sh` runs the README's programs live.
+- Gates: `tools/test.sh` and `tools/test-integration.sh` are green on all eight servers, debug and release, on
+  kama 0.9.542 (CI's pin). cstar's newest build (0.9.560) refuses the unit program because of a regression there
+  (KRD-8), so it is not a second gate until that is fixed.
+- Open gaps here:
+  - KRD-8 (HIGH): the regression above.
+  - KRD-7 (MED): an adapter over a std type cannot name `Command`. It holds back the bytes, list and Uuid adapters.
+  - @kama/postgres's KPG-38 is fixed in 0.9.543, but no tagged release has it, and CI stays on `v0.9.542` until one
+    does. Until then each test program converts to `RedisArg` in one file.
+  - KRD-5 and KRD-6 are fixed (0.9.531, 0.9.533).
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -32,8 +40,8 @@ does its discipline:
 | 0 | Scaffold: manifest, agent files, unit program (`tools/test.sh`); `tools/redis.sh` + server config + test PKI for Redis 6.2–8.10 and Valkey 7.2–9.1; smoke; CI | **done** |
 | 1 | Pure layers. `redis::resp`: a reader and a writer for every RESP2 and RESP3 type (attributes, push, streamed strings and aggregates, big numbers, verbatim strings), bounded and hostile-input safe, with vectors from the RESP specification and hiredis's reader tests, by script. The `redis://`, `rediss://` and `unix://` URL forms. CRC16 key slots and hash tags, with the cluster specification's vectors | **done** |
 | 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
-| 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | next |
-| 4 | Server push. Pub/sub on RESP3 push messages beside commands on the same connection, and on a dedicated connection under RESP2. Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations) | |
+| 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
+| 4 | Server push. Pub/sub on RESP3 push messages beside commands on the same connection, and on a dedicated connection under RESP2. Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations) | next |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI | |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both | |
 | 7 | Pool (cross-isolate), reconnection, examples, hardening (server restart, failover, bounded memory), docs | |
@@ -65,6 +73,8 @@ When a tag has both fixes: raise the floor and the CI pin, drop the one-file rul
 Each step ends green before its commit:
 - `tools/test.sh`, debug and release, on `v0.9.542` (CI's) and on cstar's newest build;
 - the live tests on the matrix.
+
+Every step below is done (2026-10-09), each in its own commit ("Phase 3, step N").
 
 0. **Done.** KPG-38 is cited, KRD-7 is filed, the repros are run, and the decisions are written under "Decided, and
    why".

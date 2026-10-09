@@ -9,6 +9,29 @@ All notable changes to this package are recorded here. The format follows
 Needs **kama ≥ 0.9.529**.
 
 ### Added
+- Commands (phase 3):
+  - `RedisArg`, a value that writes itself as a command's argument: the integers, `isize`, the floats (shortest
+    round trip, `inf`/`-inf`, NaN refused) and `string`. `Command.add(value:)` and `argFloat(value:)` take them.
+  - The `cmd"…"` tag: literal words and whole-argument holes. Text touching a hole, two holes side by side, a quote
+    and an empty literal are `Usage`, refused before anything is written.
+  - `RedisError::Value`: an argument refused while a command was built (`Command.refuse`), or a reply that does not
+    read as the type asked for.
+  - Commands a connection does not carry are refused before anything is written: pub/sub, `MONITOR`, `SYNC`,
+    `PSYNC`, `CLIENT REPLY`, `SCRIPT DEBUG`, `HELLO`, `RESET`, `QUIT`, `MULTI`, `EXEC`, `DISCARD`.
+  - Typed replies through `Deserializable`: `reply::<T>`, `replyOpt::<T>`, `replyOpts::<T>`, `replyRecord::<T>`
+    and `replyRecordOpt::<T>`, one rule set for RESP2 and RESP3, every failure naming its place in the reply.
+  - Pipelines: `Pipeline` and `Connection.run`, one write and one deadline; `Replies.take` once per reply.
+  - Blocking commands wait for their own timeouts on top of `command_timeout`, from a table checked against every
+    server's `ACL CAT blocking` and `COMMAND DOCS`.
+  - Transactions: `Connection.transact` (MULTI to EXEC in one write) with `TxOutcome { Committed, WatchConflict }`,
+    and `Connection.watched` with a `TxBody`, retrying a stated number of times.
+  - Scripts: `Script` (SHA-1 computed here), `ScriptCall`, `Connection.eval` (EVALSHA, EVAL on NOSCRIPT), the `_RO`
+    forms, and `Pipeline.addScript`.
+  - `Scan`: SCAN, SSCAN, HSCAN and ZSCAN a page at a time, with MATCH, COUNT, TYPE and NOVALUES.
+  - `resp::Writer.raw(bytes:)`.
+  - `tools/gen-server-vectors.sh` captures typed pairs under RESP2 and RESP3 with their setups, transactions,
+    scripts, SCAN pages, BLPOP, and each server's blocking commands and their COMMAND DOCS.
+  - `tools/check-readme.sh` builds the README's programs and runs them against a live server.
 - `redis::Connection`, over TCP or a Unix-domain socket, non-blocking, with `connect_timeout` per address and
   `command_timeout` per call:
   - the handshake is one round trip: `HELLO 3` with `AUTH` and `SETNAME`, then `SELECT` and `CLIENT SETINFO`

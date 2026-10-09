@@ -3,10 +3,13 @@
 //
 // The shape of the package, as it fills in (docs/ROADMAP.md):
 //   redis            Connection (src/connection.kama), Config (src/config.kama), RedisError, ServerError and
-//                    ServerCode (src/error.kama), Command (src/command.kama), ServerInfo (src/server.kama), the
-//                    Transport and Dialer contracts (src/transport.kama), RedisUrl (src/url.kama); to come: the
-//                    `cmd"…"` tag, Reply and `reply::<T>`
-//   redis::wire      internal: a deadline, and RESP over a transport
+//                    ServerCode (src/error.kama), Command (src/command.kama), RedisArg and the `cmd"…"` tag
+//                    (src/arg.kama), `reply::<T>` and its kin (src/reply.kama), Pipeline and Replies
+//                    (src/pipeline.kama), TxOutcome and TxBody (src/transaction.kama), Script and ScriptCall
+//                    (src/script.kama), Scan (src/scan.kama), ServerInfo (src/server.kama), the Transport and Dialer
+//                    contracts (src/transport.kama), RedisUrl (src/url.kama)
+//   redis::wire      internal: a deadline, RESP over a transport, the commands a connection does not carry and the
+//                    blocking commands' timeouts (src/wire/known.kama), the server's integer grammar
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
 //   redis::cluster   key slots (src/cluster/slot.kama); to come: the slot map and redirections
 //   redis::pool      a connection pool shared by isolates

@@ -4,15 +4,16 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS will come from
 [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: connecting works; not yet published.** A connection authenticates, picks its protocol and database, and
-> sends commands with deadlines. It is tested live on Redis 6.2–8.10 and Valkey 7.2–9.1. Typed commands and replies
-> come next; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.529**.
+> **Status: commands work; not yet published.** A connection authenticates, picks its protocol and database, and
+> sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. It is tested live
+> on Redis 6.2–8.10 and Valkey 7.2–9.1. Push messages, TLS and cluster come next; see
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.529**.
 
 ## Connecting
 
 ```kama
-import { core::println, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
-         redis::Config, redis::Connection, redis::Command, redis::RedisError, redis::resp::Value };
+import { core::println, redis::Config, redis::Connection, redis::Command, redis::RedisError, redis::cmd,
+         redis::reply, redis::replyOpt };
 
 fn int32 main() {
     Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379/0?client_name=example");
@@ -26,22 +27,20 @@ fn int32 main() {
         case Err(error: e): { println(s: e.message()); return 1; }
     };
 
-    Command set = Command.of(name: "SET");
-    set.arg(text: "greeting");
-    set.arg(text: "hello");
-    Result<Value, RedisError> stored = conn.call(command: set);
+    // Each hole is one whole argument, spaces and line breaks included: never text spliced into a word.
+    string key = "greeting";
+    string value = "hello, world";
+    int32 ttl = 60;
+    Command set = cmd"SET ${key} ${value} EX ${ttl}";
+    Result<string, RedisError> stored = reply::<string>(result: conn.call(command: set));
 
-    Command get = Command.of(name: "GET");
-    get.arg(text: "greeting");
-    Result<Value, RedisError> got = conn.call(command: get);
-    match (got) {
-        case Ok(value: v): {
-            match (v) {
-                case Bulk(bytes: b): {
-                    Result<string, Utf8Error> text = decode(bytes: b.view());
-                    match (give text) { case Ok(value: t): { println(s: give t); } case Err(error: e): { } };
-                }
-                case _: { }
+    Command get = cmd"GET ${key}";
+    Result<Optional<string>, RedisError> got = replyOpt::<string>(result: conn.call(command: get));
+    match (give got) {
+        case Ok(value: found): {
+            match (give found) {
+                case Some(value: text): { println(s: give text); }
+                case None: { println(s: "(no such key)"); }
             };
         }
         case Err(error: e): { println(s: e.message()); return 1; }
@@ -67,10 +66,165 @@ fn int32 main() {
   `Config.tcp`, `Config.unix` and typed setters do the same without a URL.
 - **Errors are values.** An error reply is `RedisError::Server`. Its code (`WRONGTYPE`, `NOAUTH`, `MOVED`, …) is a
   `ServerCode` to match, beside the server's message, and the connection goes on. A failure of the connection itself
-  (I/O, bytes that are not RESP, a call past `command_timeout`) closes it.
+  (I/O, bytes that are not RESP, a call past its deadline) closes it.
 - **The connection belongs to one isolate at a time,** and moves between them whole.
 
-## What is here now
+## Commands
+
+- **`cmd"…"`** is a `Command`. Its literal text splits on whitespace into arguments, and each hole is a value that
+  writes itself as an argument (`RedisArg`):
+
+  | type | becomes |
+  |---|---|
+  | `int8` to `int64`, `isize`, `uint16` to `uint64` | its decimal |
+  | `float32`, `float64` | the shortest decimal that reads back the same; `inf`, `-inf`; a NaN is refused |
+  | `string` | its bytes |
+
+  Anything else is refused where it is written: a `bool`, a `char` or an `Optional` has no one meaning on the wire.
+  A literal that touches a hole (`user:${id}`), puts two holes side by side, or quotes a word is refused when the
+  command is sent, before anything is written. Bytes go through `Command.argBytes`, and a `Uuid` as its text, until
+  their own adapters come (KAMA_GAPS.md, KRD-7).
+- **`Command`** builds one by hand: `Command.of(name:)`, then `arg(text:)`, `argBytes(bytes:)`, `argInt(value:)`,
+  `argFloat(value:)` and `add(value:)` for any `RedisArg`.
+- **Commands a connection does not carry** are refused, by name, before anything is written: the pub/sub commands,
+  `MONITOR`, `SYNC`, `PSYNC`, `CLIENT REPLY`, `SCRIPT DEBUG`, `HELLO`, `RESET`, `QUIT`, and `MULTI`, `EXEC` and
+  `DISCARD`, since `transact` sends a transaction whole.
+- **Blocking commands wait for their own timeouts.** `BLPOP k 5` waits 5 s plus `command_timeout`, and a timeout of 0
+  has no deadline. The table covers every command each server calls blocking, and is checked against their
+  `COMMAND DOCS`: `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BRPOPLPUSH`, `BLMOVE`, `BLMOVEM`, `BLMPOP`, `BZMPOP`,
+  `XREAD` and `XREADGROUP`'s `BLOCK`, `WAIT` and `WAITAOF`.
+- **On a compiler before 0.9.543,** convert values to `RedisArg` (a `cmd` hole, `Command.add`) in one file of a
+  program only, or a release build fails (KAMA_GAPS.md, KPG-38). Helpers in that one file can serve the rest.
+
+## Replies, pipelines, transactions, scripts and SCAN
+
+```kama
+import { core::println, std::collections::DynamicArray, redis::Config, redis::Connection, redis::Command,
+         redis::Pipeline, redis::Replies, redis::RedisError, redis::TxOutcome, redis::Script, redis::ScriptCall,
+         redis::Scan, redis::cmd, redis::reply, redis::replyRecordOpt };
+
+// A struct reads by its fields' names: HGETALL's map under RESP3, and its flat list under RESP2.
+@generate(Deserializable)
+type resource Account {
+    @field string owner;
+    @field int64 balance;
+    public const fn string describe() { int64 b = this.balance; return copy this.owner.concat(other: ": ${b}"); }
+}
+
+// BLPOP's [key, value] reads by position, as a record.
+@generate(Deserializable)
+type resource Popped {
+    @field string list;
+    @field string item;
+    public const fn string describe() { return copy this.list.concat(other: " gave ").concat(other: this.item); }
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379");
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    string account = "account:42";
+    string owner = "ada";
+    int64 balance = 100;
+
+    // A pipeline: every command in one write, every reply in order.
+    Pipeline setup = Pipeline.make();
+    Command clear = cmd"DEL ${account} jobs";
+    Command fill = cmd"HSET ${account} owner ${owner} balance ${balance}";
+    Command queue = cmd"RPUSH jobs first";
+    setup.add(command: clear);
+    setup.add(command: fill);
+    setup.add(command: queue);
+    Result<Replies, RedisError> ran = conn.run(pipeline: setup);
+    match (ran) { case Ok(value: r): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Typed replies: a struct from a hash.
+    Command all = cmd"HGETALL ${account}";
+    Result<Account, RedisError> read = reply::<Account>(result: conn.call(command: all));
+    match (read) {
+        case Ok(value: a): { println(s: a.describe()); }
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+
+    // A transaction: MULTI, the commands and EXEC in one write. A key changed under WATCH is WatchConflict.
+    int64 debit = -30;
+    Pipeline tx = Pipeline.make();
+    Command take = cmd"HINCRBY ${account} balance ${debit}";
+    Command log = cmd"RPUSH jobs debited";
+    tx.add(command: take);
+    tx.add(command: log);
+    Result<TxOutcome, RedisError> outcome = conn.transact(pipeline: tx);
+    match (give outcome) {
+        case Ok(value: o): {
+            match (give o) {
+                case Committed(replies: r): {
+                    Replies replies = give r;
+                    Result<int64, RedisError> left = reply::<int64>(result: replies.take(index: 0));
+                    match (left) { case Ok(value: n): { println(s: "balance ${n}"); } case Err(error: e): { println(s: e.message()); } };
+                }
+                case WatchConflict: { println(s: "a watched key changed"); }
+            };
+        }
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+
+    // A script: by its SHA-1, and by its source the first time a server lacks it.
+    Script bump = Script.of(source: "return redis.call('HINCRBY', KEYS[1], 'balance', ARGV[1])");
+    ScriptCall call = ScriptCall.of(script: bump);
+    int64 tip = 5;
+    call.addKey(value: account);
+    call.addArg(value: tip);
+    Result<int64, RedisError> bumped = reply::<int64>(result: conn.eval(call: call));
+    match (bumped) { case Ok(value: n): { println(s: "balance ${n}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // A blocking pop: a record, or None when nothing came within its timeout.
+    Command pop = cmd"BLPOP jobs 1";
+    Result<Optional<Popped>, RedisError> popped = replyRecordOpt::<Popped>(result: conn.call(command: pop));
+    match (popped) {
+        case Ok(value: o): { match (o) { case Some(value: p): { println(s: p.describe()); } case None: { println(s: "nothing"); } }; }
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+
+    // SCAN, a page at a time: each `next` is one round trip.
+    Scan scan = Scan.keys();
+    string pattern = "account:*";
+    scan.matching(pattern: pattern);
+    isize found = 0;
+    while (!scan.isDone()) {
+        Result<DynamicArray<string>, RedisError> page = reply::<DynamicArray<string>>(result: scan.next(conn: conn));
+        match (page) { case Ok(value: keys): { found = found + keys.length(); } case Err(error: e): { println(s: e.message()); return 1; } };
+    }
+    println(s: "${found} accounts");
+    conn.close();
+    return 0;
+}
+```
+
+- **Typed replies** read any reply through `Deserializable`, the same way under RESP2 and RESP3:
+  - `reply::<T>`, `replyOpt::<T>` (None for a null), `replyOpts::<T>` (MGET: each element may be null),
+    `replyRecord::<T>` and `replyRecordOpt::<T>` (a top-level array read by position);
+  - integers in the server's own grammar, floats (`inf` and `nan` included), bools, strings (UTF-8, or
+    `DynamicArray<uint8>` for any bytes), lists, sets, std `Map`, and `@generate` structs: by name from a map, by
+    position from an array inside another reply (XRANGE's entries);
+  - an error inside a reply (one of EXEC's) is `RedisError::Server` with its code when it is read; anything that
+    does not read is `RedisError::Value`, naming where: `reply[3].score: a bulk string "x" cannot be read as
+    float64`.
+- **Pipelines** (`Connection.run`): one write, one deadline, and each reply stands alone (`Replies.take`).
+- **Transactions** (`Connection.transact`, and `watched` to run one under WATCH as many times as you say): every
+  reply is read before the outcome is decided. A command refused while queueing aborts it as `Server`; one that fails
+  when EXEC runs it fails alone.
+- **Scripts:** `Connection.eval` sends EVALSHA, and EVAL on NOSCRIPT; `Script.readOnly` uses the `_RO` forms (7.0+);
+  `Pipeline.addScript` sends EVAL.
+- **SCAN, SSCAN, HSCAN and ZSCAN** a page at a time, with `matching`, `countHint`, `ofType` and `noValues`.
+
+## Underneath
 
 - **`redis::resp`**, the protocol as data. A proxy, a fake server or a test harness can use it on its own.
   - `Reader` takes bytes in any pieces and returns each value when it is whole.
@@ -105,7 +259,7 @@ fn int32 main() {
 - **`redis::cluster::keySlot`**, a key's hash slot with hash tags. It is checked against the cluster specification
   and against `CLUSTER KEYSLOT` on every server.
 
-- **`redis::Connection`**, `Config`, `RedisError` and `Command`, as above:
+- **`redis::Connection`**, `Config` and `RedisError`, as above:
   - TCP and Unix-domain sockets, non-blocking, with connect and command deadlines and TCP keepalive;
   - ACL users and passwords, the password alone of a server's default user, the client's name and the database;
   - RESP3 by default, and RESP2 for proxies such as twemproxy and Envoy;
@@ -114,11 +268,6 @@ fn int32 main() {
 ## What it will cover
 
 - **Servers:** Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one.
-- **Commands:**
-  - Typed arguments, and a `cmd"SET ${key} ${value}"` tag whose holes are always whole arguments.
-  - Replies read into kama types through `Deserializable`, `@generate` structs included.
-  - Pipelining, transactions (`MULTI`/`EXEC`/`WATCH`), scripts and functions, `SCAN` cursors, and blocking
-    commands.
 - **Push:** pub/sub (sharded too) and client-side caching.
 - **Security:** TLS (`rediss://`) with verification, client certificates and SNI.
 - **Topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
@@ -134,6 +283,7 @@ tools/redis.sh list                                 # the servers in the matrix
 tools/redis.sh up --server valkey-9.1               # start one (podman or docker); its ports go to out/redistest-valkey-9.1.env
 tools/redis.sh smoke --server valkey-9.1            # one check per authentication case and transport, with the server's own redis-cli
 tools/redis.sh down --server valkey-9.1
+tools/check-readme.sh --server redis-8.10           # build this README's programs and run them against the server
 ```
 
 The unit tests need no server: a scripted server plays real servers' bytes to the connection, a byte at a time.
