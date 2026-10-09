@@ -1,0 +1,101 @@
+import { std::collections::ConstView, std::digest::sha1::sha1 as digestOf, std::encoding::hex::encode as hexOf,
+         redis::Command, redis::RedisArg };
+export { Script, ScriptCall };
+
+// A Lua script, sent by its SHA-1 and, the first time a server lacks it, by its source (docs/ROADMAP.md, "Decided,
+// and why", "Phase 3", "Scripts").
+//
+//   Script bump = Script.of(source: "return redis.call('INCRBY', KEYS[1], ARGV[1])");
+//   ScriptCall call = ScriptCall.of(script: bump);
+//   call.addKey(value: counter);
+//   call.addArg(value: 5);
+//   Result<Value, RedisError> r = conn.eval(call: call);
+//
+// `Connection.eval` sends EVALSHA, and on NOSCRIPT, EVAL, which also loads it: go-redis's way. That is safe because
+// NOSCRIPT means the script never ran. (redis-py and redis-rs send SCRIPT LOAD first.) Inside a pipeline or a
+// transaction a NOSCRIPT could not be answered in time, so `Pipeline.addScript` always sends EVAL.
+//
+// A read-only script (`Script.readOnly`) is sent as EVALSHA_RO and EVAL_RO, which the server runs only if the
+// script writes nothing: Redis 7.0 and Valkey 7.2 and later. An older server answers that it does not know them.
+// Functions (FCALL) are plain commands, and need nothing of this.
+type resource Script implements Sendable {
+    string text;
+    string digest;
+    bool ro = false;
+
+    public ctor of(string source) {
+        this.text = give source;
+        this.digest = hexDigest(text: this.text);
+        this.ro = false;
+    }
+
+    public ctor readOnly(string source) {
+        this.text = give source;
+        this.digest = hexDigest(text: this.text);
+        this.ro = true;
+    }
+
+    // Its SHA-1, as the server names it: forty lowercase hexadecimal digits, as SCRIPT LOAD answers.
+    public const fn string sha() { return copy this.digest; }
+    public const fn string source() { return copy this.text; }
+    public const fn bool isReadOnly() { return this.ro; }
+}
+
+fn string hexDigest(const ref string text) {
+    InlineArray<uint8>#(20) d = digestOf(bytes: text.bytes());
+    return hexOf(bytes: d.view());
+}
+
+// One call of a script: its keys, then its arguments. Each is a whole argument, as a command's are, and one refused
+// while it is added (a NaN) refuses the call, before anything is written.
+type resource ScriptCall implements Sendable {
+    string digest;
+    string text;
+    bool ro = false;
+    Command keys;
+    Command args;
+
+    friend redis::Connection::eval[bySha, bySource];
+    friend redis::Pipeline::addScript[bySource];
+
+    public ctor of(const ref Script script) {
+        this.digest = script.sha();
+        this.text = script.source();
+        this.ro = script.isReadOnly();
+        this.keys = Command.of(name: "KEYS");
+        this.args = Command.of(name: "ARGV");
+    }
+
+    // A key (KEYS[n] in the script), from a value that writes itself (`RedisArg`), or as bytes.
+    public fn void addKey(RedisArg value) { this.keys.add(value: value); }
+    public fn void addKeyBytes(ConstView<uint8> bytes) { this.keys.argBytes(bytes: bytes); }
+    // An argument (ARGV[n]), likewise.
+    public fn void addArg(RedisArg value) { this.args.add(value: value); }
+    public fn void addArgBytes(ConstView<uint8> bytes) { this.args.argBytes(bytes: bytes); }
+
+    // EVALSHA[_RO] sha numkeys keys… args….
+    const fn Command bySha() {
+        string name = "EVALSHA";
+        if (this.ro) { name = "EVALSHA_RO"; }
+        Command c = Command.of(name: name);
+        c.arg(text: this.digest);
+        this.finish(c: c);
+        return c;
+    }
+
+    // EVAL[_RO] source numkeys keys… args….
+    const fn Command bySource() {
+        string name = "EVAL";
+        if (this.ro) { name = "EVAL_RO"; }
+        Command c = Command.of(name: name);
+        c.arg(text: this.text);
+        this.finish(c: c);
+        return c;
+    }
+
+    const fn void finish(ref Command c) {
+        c.argInt(value: cast<int64>(this.keys.length() - 1));
+        c.appendFrom(other: this.keys);
+        c.appendFrom(other: this.args);
+    }
+}

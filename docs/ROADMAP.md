@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 8 is next.
+its session plan, and step 9 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -518,6 +518,13 @@ confirmed the kama facts underneath, and are listed at the end.
   - A read-only script uses the `_RO` forms (7.0+).
   - Inside pipelines and transactions, EVAL (redis.io: NOSCRIPT cannot be handled there).
   - FCALL needs nothing special.
+  - **What building it settled (step 8):**
+    - A script's keys and arguments are added as `addKey`/`addArg` (a `RedisArg`) and `addKeyBytes`/`addArgBytes`,
+      each a whole argument. One refused while it is added (a NaN) refuses the call before anything is written.
+    - Only NOSCRIPT is answered with EVAL; any other answer to EVALSHA, an error included, is EVALSHA's.
+    - A read-only script is never sent as plain EVAL: on a server before 7.0 the `_RO` form is refused, which
+      honours what the caller asked for. Valkey 7.2 has the `_RO` forms, as Redis 7.2 does.
+    - The SHA-1 equals SCRIPT LOAD's on all eight servers (captured), and live under both protocols.
 - **SCAN** is a page API, not an Iterator: an iterator cannot borrow a Connection, has no error channel, and would need
   a hand-back.
   - `Scan.next(conn:)` returns every page, empty ones included, so no call makes an unbounded number of round trips.

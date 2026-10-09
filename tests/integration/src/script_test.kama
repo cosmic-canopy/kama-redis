@@ -1,0 +1,111 @@
+// Scripts against the server, under RESP3 and RESP2: our SHA-1 is the server's, the first call loads the script
+// (NOSCRIPT, then EVAL), the next is a hit, the read-only forms from 7.0, and EVAL in a pipeline and a transaction.
+import { redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Script,
+         redis::ScriptCall, redis::TxOutcome, redis::resp::Value, redis_integration_tests::check,
+         redis_integration_tests::setting, open, mainUrl, ask, shown };
+export { scriptTests };
+
+unsafe fn Connection reach(const ref string tail, const ref string what) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "script_test: ${what}: connect: ${m}"); return reach(tail: tail, what: what); }
+    };
+    return give c;
+}
+
+unsafe fn string sent(ref Connection c, const ref Command command) {
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.message()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+unsafe fn string evaluated(ref Connection c, const ref ScriptCall call) {
+    Result<Value, RedisError> r = c.eval(call: call);
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.message()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+fn ScriptCall reading(const ref Script script) {
+    ScriptCall call = ScriptCall.of(script: script);
+    string key = "kr:s:k";
+    call.addKeyBytes(bytes: key.bytes());
+    return call;
+}
+
+unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Connection c = reach(tail: tail, what: protocol);
+    string flushed = ask(c: c, text: "SCRIPT FLUSH");
+    string set = ask(c: c, text: "SET kr:s:k hello");
+    Script get = Script.of(source: "return redis.call('GET', KEYS[1])");
+
+    // SCRIPT LOAD names it by the same SHA-1.
+    Command load = Command.of(name: "SCRIPT");
+    load.arg(text: "LOAD");
+    load.arg(text: get.source());
+    string loaded = sent(c: c, command: load);
+    string sha = get.sha();
+    f = f + check(ok: loaded == sha, what: "script: SCRIPT LOAD under ${protocol} names it ${loaded}, as we do: ${sha}");
+    string flushedAgain = ask(c: c, text: "SCRIPT FLUSH");
+
+    // The first call loads it: NOSCRIPT, then EVAL. The server has it after, and the next call is EVALSHA's.
+    ScriptCall call = reading(script: get);
+    string first = evaluated(c: c, call: call);
+    Command exists = Command.of(name: "SCRIPT");
+    exists.arg(text: "EXISTS");
+    exists.arg(text: sha);
+    string known = sent(c: c, command: exists);
+    string second = evaluated(c: c, call: call);
+    f = f + check(ok: first == "hello" && known == "[1]" && second == "hello", what: "script: loaded by its first call under ${protocol}: ${first}, ${known}, ${second}");
+
+    // The read-only forms: refused by a server before 7.0, and on later ones a script that writes is refused.
+    Script ro = Script.readOnly(source: "return redis.call('GET', KEYS[1])");
+    ScriptCall roCall = reading(script: ro);
+    string roGot = evaluated(c: c, call: roCall);
+    Script roWrites = Script.readOnly(source: "return redis.call('SET', KEYS[1], 'x')");
+    ScriptCall roWriteCall = reading(script: roWrites);
+    string roWrote = evaluated(c: c, call: roWriteCall);
+    string server = setting(name: "REDISTEST_SERVER");
+    if (server == "redis-6.2") {
+        f = f + check(ok: roGot.startsWith(prefix: "(error) ERR unknown command") && roWrote.startsWith(prefix: "(error) ERR unknown command"),
+                      what: "script: Redis 6.2 has no EVALSHA_RO or EVAL_RO under ${protocol}: ${roGot}");
+    } else {
+        string after = ask(c: c, text: "GET kr:s:k");
+        f = f + check(ok: roGot == "hello" && roWrote.startsWith(prefix: "(error) ") && after == "hello",
+                      what: "script: a read-only script reads, and one that writes is refused under ${protocol}: ${roGot}; ${roWrote}");
+    }
+
+    // EVAL in a pipeline and in a transaction, even with the script flushed.
+    string flushedThird = ask(c: c, text: "SCRIPT FLUSH");
+    Pipeline p = Pipeline.make();
+    ScriptCall inPipeline = reading(script: get);
+    p.addScript(call: inPipeline);
+    Result<Replies, RedisError> rp = c.run(pipeline: p);
+    string piped = match (give rp) {
+        case Ok(value: rs): {
+            Replies all = give rs;
+            Result<Value, RedisError> one = all.take(index: 0);
+            := match (one) { case Ok(value: v): shown(v: v); case Err(error: e): e.message(); };
+        }
+        case Err(error: e): e.message();
+    };
+    Pipeline tx = Pipeline.make();
+    ScriptCall inTx = reading(script: get);
+    tx.addScript(call: inTx);
+    Result<TxOutcome, RedisError> rt = c.transact(pipeline: tx);
+    bool committed = match (rt) { case Ok(value: o): match (o) { case Committed(replies: rs): rs.length() == 1; case WatchConflict: false; }; case Err(error: e): false; };
+    f = f + check(ok: piped == "hello" && committed, what: "script: EVAL in a pipeline and a transaction under ${protocol}: ${piped}");
+    return f;
+}
+
+unsafe fn int32 scriptTests() {
+    int32 f = 0;
+    f = f + runTests(tail: "", protocol: "RESP3");
+    f = f + runTests(tail: "?protocol=2", protocol: "RESP2");
+    return f;
+}

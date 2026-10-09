@@ -2,6 +2,7 @@
 // on a compiler before 0.9.543, a release build fails when two files convert the same primitive (KAMA_GAPS.md,
 // KPG-38). Every other file builds its commands with Command's `arg` methods.
 import { std::collections::DynamicArray, redis::Command, redis::cmd, redis::Connection, redis::RedisError,
+         redis::Script, redis::ScriptCall,
          redis::resp::Value, redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple,
          textOf };
 export { argTests };
@@ -138,9 +139,43 @@ unsafe fn int32 refusalTests() {
     return f;
 }
 
+// A script's keys and arguments, from values that write themselves.
+unsafe fn int32 scriptArgTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    Script script = Script.of(source: "return 1");
+    string sha = script.sha();
+    DynamicArray<Step> steps = welcome(server: s);
+    steps.add(item: expect(command: "EVALSHA ".concat(other: sha).concat(other: " 1 kr:k 5 0.5"), answer: vector(server: s, kase: "ping")));
+    Connection c = connected(script: give steps, url: "redis://", what: "script args");
+    ScriptCall call = ScriptCall.of(script: script);
+    string key = "kr:k";
+    int64 five = 5;
+    float64 half = 0.5;
+    call.addKey(value: key);
+    call.addArg(value: five);
+    call.addArg(value: half);
+    Result<Value, RedisError> r = c.eval(call: call);
+    f = f + check(ok: isSimple(r: r, text: "PONG"), what: "script: keys and arguments from typed values, each a whole argument");
+    float64 zero = 0.0;
+    float64 nan = zero / zero;
+    ScriptCall bad = ScriptCall.of(script: script);
+    bad.addArg(value: nan);
+    f = f + scriptRefused(c: c, bad2: bad, what: "a script's NaN");
+    return f;
+}
+
+unsafe fn int32 scriptRefused(ref Connection c, const ref ScriptCall bad2, const ref string what) {
+    Result<Value, RedisError> r = c.eval(call: bad2);
+    bool value = match (r) { case Err(error: e): match (e) { case Value(detail: d): true; case _: false; }; case Ok(value: v): false; };
+    string m = match (r) { case Err(error: e): e.message(); case Ok(value: v): "sent"; };
+    return check(ok: value && !c.isClosed(), what: "script: ${what} is refused before anything is written: ${m}");
+}
+
 unsafe fn int32 argTests() {
     int32 f = 0;
     f = f + formTests();
     f = f + refusalTests();
+    f = f + scriptArgTests();
     return f;
 }

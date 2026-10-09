@@ -1,0 +1,129 @@
+// Scripts (src/script.kama, Connection.eval, Pipeline.addScript) over the scripted server: the SHA-1 every server
+// computes, EVALSHA then EVAL on NOSCRIPT and never otherwise, the read-only forms, and EVAL inside a pipeline.
+import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::Pipeline, redis::Replies,
+         redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value,
+         redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, callOutcome, isSimple, bytesOf, textOf,
+         serverVersions, replyNames, replyCommands, replyHex, unhex };
+export { scriptTests };
+
+// The server's own source and SHA-1 for case script-load: its command is SCRIPT LOAD '<source>'.
+fn string loadedSource(const ref string server) {
+    string name = server.concat(other: " script-load");
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> commands = replyCommands();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return commands[i].substring(start: 13, end: commands[i].length() - 1); }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn string loadedSha(const ref string server) {
+    string name = server.concat(other: " script-load");
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> hex = replyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) {
+            DynamicArray<uint8> b = unhex(text: hex[i]);
+            // $40\r\n<sha>\r\n
+            if (b.length() != 47) { return ""; }
+            return textOf(b: b.view().slice(from: 5, count: 40));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// A command's parts, as ExpectBytes wants them.
+fn DynamicArray<DynamicArray<uint8>> partsOf(const ref DynamicArray<string> words) {
+    DynamicArray<DynamicArray<uint8>> parts = DynamicArray.empty();
+    isize i = 0;
+    while (i < words.length()) { parts.add(item: bytesOf(text: words[i])); i = i + 1; }
+    return give parts;
+}
+
+fn DynamicArray<string> evalWords(const ref string name, const ref string first) {
+    DynamicArray<string> w = DynamicArray.empty();
+    w.add(item: copy name);
+    w.add(item: copy first);
+    w.add(item: "1");
+    w.add(item: "kr:k");
+    w.add(item: "five");
+    return give w;
+}
+
+fn ScriptCall callOf(const ref Script script) {
+    ScriptCall call = ScriptCall.of(script: script);
+    string key = "kr:k";
+    string arg = "five";
+    call.addKeyBytes(bytes: key.bytes());
+    call.addArgBytes(bytes: arg.bytes());
+    return call;
+}
+
+unsafe fn int32 scriptTests() {
+    int32 f = 0;
+    // The SHA-1 is every server's.
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        string source = loadedSource(server: s);
+        string want = loadedSha(server: s);
+        Script script = Script.of(source: copy source);
+        string got = script.sha();
+        f = f + check(ok: got == want && want.length() == 40, what: "script: ${s} SCRIPT LOAD's SHA-1 is ours: ${got}, ${want}");
+        i = i + 1;
+    }
+
+    string s = "redis-8.10.2";
+    string source = loadedSource(server: s);
+    Script script = Script.of(source: copy source);
+    string sha = script.sha();
+
+    // NOSCRIPT, then EVAL with the source; then a hit, with no EVAL.
+    DynamicArray<Step> load = welcome(server: s);
+    load.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVALSHA", first: sha)), reply: vector(server: s, kase: "noscript")));
+    load.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVAL", first: source)), reply: vector(server: s, kase: "evalsha-hit")));
+    load.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVALSHA", first: sha)), reply: vector(server: s, kase: "evalsha-hit")));
+    // Another error to EVALSHA is EVALSHA's: no EVAL follows. The script's PING is next.
+    load.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVALSHA", first: sha)), reply: vector(server: s, kase: "wrongtype")));
+    load.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection c = connected(script: give load, url: "redis://", what: "script eval");
+    ScriptCall call = callOf(script: script);
+    Result<Value, RedisError> first = c.eval(call: call);
+    string g1 = callOutcome(r: first);
+    Result<Value, RedisError> second = c.eval(call: call);
+    string g2 = callOutcome(r: second);
+    Result<Value, RedisError> third = c.eval(call: call);
+    bool wrongType = match (third) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text() == "WRONGTYPE"; case None: false; }; case Ok(value: v): false; };
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> after = c.call(command: ping);
+    f = f + check(ok: g1 == "ok" && g2 == "ok" && wrongType && isSimple(r: after, text: "PONG"),
+                  what: "script: NOSCRIPT then EVAL, then a hit, and another error is EVALSHA's own: ${g1}, ${g2}");
+
+    // A read-only script: EVALSHA_RO, then EVAL_RO.
+    Script ro = Script.readOnly(source: copy source);
+    DynamicArray<Step> roSteps = welcome(server: s);
+    roSteps.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVALSHA_RO", first: sha)), reply: vector(server: s, kase: "noscript")));
+    roSteps.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVAL_RO", first: source)), reply: vector(server: s, kase: "evalsha-hit")));
+    Connection cr = connected(script: give roSteps, url: "redis://", what: "script ro");
+    ScriptCall roCall = callOf(script: ro);
+    Result<Value, RedisError> roGot = cr.eval(call: roCall);
+    string g3 = callOutcome(r: roGot);
+    f = f + check(ok: g3 == "ok" && ro.isReadOnly() && ro.sha() == sha, what: "script: a read-only script is sent as EVALSHA_RO, then EVAL_RO: ${g3}");
+
+    // In a pipeline, EVAL with the source.
+    DynamicArray<Step> piped = welcome(server: s);
+    piped.add(item: Step::ExpectBytes(args: partsOf(words: evalWords(name: "EVAL", first: source)), reply: vector(server: s, kase: "evalsha-hit")));
+    Connection cp = connected(script: give piped, url: "redis://", what: "script pipeline");
+    Pipeline p = Pipeline.make();
+    ScriptCall pcall = callOf(script: script);
+    p.addScript(call: pcall);
+    Result<Replies, RedisError> rp = cp.run(pipeline: p);
+    isize n = match (rp) { case Ok(value: rs): rs.length(); case Err(error: e): -1; };
+    f = f + check(ok: n == 1, what: "script: in a pipeline, EVAL");
+    return f;
+}

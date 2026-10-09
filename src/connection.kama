@@ -3,7 +3,7 @@ import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
-         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch,
          redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
@@ -171,6 +171,20 @@ type resource Connection implements Sendable {
             };
         }
         return Result::Ok(value: Replies.of(values: give values));
+    }
+
+    // Call a script (src/script.kama): EVALSHA, and if the server lacks the script (NOSCRIPT, so it never ran), EVAL,
+    // which also loads it for the next call. Any other answer, an error included, is EVALSHA's.
+    public unsafe fn Result<Value, RedisError> eval(const ref ScriptCall call) {
+        Command bySha = call.bySha();
+        Result<Value, RedisError> first = this.call(command: bySha);
+        bool missing = match (first) {
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): match (c) { case NoScript: true; case _: false; }; case None: false; };
+            case Ok(value: v): false;
+        };
+        if (!missing) { return give first; }
+        Command bySource = call.bySource();
+        return this.call(command: bySource);
     }
 
     // Send `pipeline` as one transaction: MULTI, its commands and EXEC, in one write. Every reply is read before the

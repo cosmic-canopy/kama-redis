@@ -1,4 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::time::Duration, redis::Command, redis::RedisError,
+         redis::ScriptCall,
          redis::resp::Writer, redis::resp::Value, redis::wire::admit, redis::wire::serverError, redis::wire::Wait,
          redis::wire::blockingWait, redis::wire::later, redis::wire::isWatch };
 export { Pipeline, Replies };
@@ -54,6 +55,13 @@ type resource Pipeline implements Sendable {
             command.encode(into: this.encoded);
             this.waits = later(a: this.waits, b: blockingWait(command: command));
         }
+    }
+
+    // Add a call of a script, as EVAL with its source: inside a pipeline a NOSCRIPT could not be answered in time
+    // (src/script.kama).
+    public fn void addScript(const ref ScriptCall call) {
+        Command c = call.bySource();
+        this.add(command: c);
     }
 
     // How many commands it has.
