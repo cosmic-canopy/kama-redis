@@ -586,6 +586,111 @@ unsafe fn int32 callTests() {
     return f;
 }
 
+// ---- commands a connection does not carry, and commands refused while they were built ----
+
+fn bool isUsage(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: v): false; };
+}
+
+fn bool isValueError(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Value(detail: d): true; case _: false; }; case Ok(value: v): false; };
+}
+
+fn bool isNullReply(const ref Result<Value, RedisError> r) {
+    return match (r) { case Ok(value: v): v.isNull(); case Err(error: e): false; };
+}
+
+fn DynamicArray<uint8> bytesOf(const ref string text) {
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.addAll(items: text.bytes());
+    return give b;
+}
+
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    // Each is refused before anything is written. The script expects PING next, so a command that reached the server
+    // would be answered with an error and a hangup, and the PING after it would fail.
+    DynamicArray<string> refused = DynamicArray.empty();
+    refused.add(item: "subscribe kr:c");
+    refused.add(item: "Psubscribe kr:*");
+    refused.add(item: "SSUBSCRIBE kr:c");
+    refused.add(item: "unsubscribe");
+    refused.add(item: "PUNSUBSCRIBE");
+    refused.add(item: "sunsubscribe kr:c");
+    refused.add(item: "monitor");
+    refused.add(item: "SYNC");
+    refused.add(item: "psync ? -1");
+    refused.add(item: "client reply off");
+    refused.add(item: "CLIENT Reply SKIP");
+    refused.add(item: "script debug yes");
+    refused.add(item: "hello 3");
+    refused.add(item: "HELLO");
+    refused.add(item: "reset");
+    refused.add(item: "quit");
+    DynamicArray<Step> script = welcome(server: s);
+    isize i = 0;
+    while (i < refused.length()) { script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping"))); i = i + 1; }
+    // Another CLIENT subcommand is sent, in the case it was written in.
+    script.add(item: expect(command: "client setname kama-test", answer: reply(server: s, kase: "setname")));
+    // A command refused while it was built, then the PING after it.
+    script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    // A binary argument arrives byte for byte.
+    DynamicArray<uint8> key = DynamicArray.empty();
+    i = 0;
+    while (i < 256) { key.add(item: truncate<uint8>(i)); i = i + 1; }
+    DynamicArray<DynamicArray<uint8>> want = DynamicArray.empty();
+    want.add(item: bytesOf(text: "GET"));
+    want.add(item: copy key);
+    script.add(item: Step::ExpectBytes(args: give want, reply: reply(server: s, kase: "get-missing/3")));
+    // And a byte that differs is caught: the scripted server answers with an error and hangs up.
+    DynamicArray<DynamicArray<uint8>> other = DynamicArray.empty();
+    other.add(item: bytesOf(text: "GET"));
+    other.add(item: copy key);
+    script.add(item: Step::ExpectBytes(args: give other, reply: reply(server: s, kase: "get-missing/3")));
+    Connection c = connected(script: give script, url: "redis://", what: "refusals");
+
+    i = 0;
+    while (i < refused.length()) {
+        Command bad = commandOf(text: refused[i]);
+        Result<Value, RedisError> r = c.call(command: bad);
+        string m = callOutcome(r: r);
+        Command ping = Command.of(name: "PING");
+        Result<Value, RedisError> p = c.call(command: ping);
+        string w = copy refused[i];
+        f = f + check(ok: isUsage(r: r) && m.startsWith(prefix: "a connection does not carry ") && !c.isClosed() && isSimple(r: p, text: "PONG"),
+                      what: "refused before it is written: ${w}: ${m}");
+        i = i + 1;
+    }
+    Command setname = commandOf(text: "client setname kama-test");
+    Result<Value, RedisError> named = c.call(command: setname);
+    f = f + check(ok: isSimple(r: named, text: "OK"), what: "CLIENT SETNAME is sent: only CLIENT REPLY is refused");
+
+    Command nan = Command.of(name: "SET");
+    nan.arg(text: "kr:k");
+    nan.refuse(detail: "NaN has no form the server reads");
+    nan.arg(text: "v");
+    nan.refuse(detail: "a second reason");
+    Result<Value, RedisError> rv = c.call(command: nan);
+    string mv = callOutcome(r: rv);
+    Command ping2 = Command.of(name: "PING");
+    Result<Value, RedisError> p2 = c.call(command: ping2);
+    f = f + check(ok: isValueError(r: rv) && mv == "argument 2: NaN has no form the server reads" && isSimple(r: p2, text: "PONG"),
+                  what: "a command refused while it was built is Value, with the first reason, and nothing is written: ${mv}");
+
+    Command get = Command.of(name: "GET");
+    get.argBytes(bytes: key.view());
+    Result<Value, RedisError> g = c.call(command: get);
+    f = f + check(ok: isNullReply(r: g), what: "a binary argument: all 256 byte values, as they are");
+    key[255] = 0;
+    Command get2 = Command.of(name: "GET");
+    get2.argBytes(bytes: key.view());
+    Result<Value, RedisError> g2 = c.call(command: get2);
+    string m2 = callOutcome(r: g2);
+    f = f + check(ok: m2.startsWith(prefix: "ERR fake server: expected"), what: "ExpectBytes catches one byte that differs: ${m2}");
+    return f;
+}
+
 // ---- a dialer: every address in turn ----
 
 unsafe fn int32 dialerTests() {
@@ -638,6 +743,7 @@ unsafe fn int32 connectionTests() {
     f = f + fallbackTests();
     f = f + hostileHandshakeTests();
     f = f + callTests();
+    f = f + refusalTests();
     f = f + dialerTests();
     return f;
 }

@@ -18,6 +18,8 @@ type enum Step implements Sendable {
     // The client's next command must be exactly `args`; `reply` answers it. Any other command is answered with an
     // error naming both, and the server hangs up.
     Expect(DynamicArray<string> args, DynamicArray<uint8> reply),
+    // `Expect`, for a command whose arguments are bytes: each part must be exactly its bytes.
+    ExpectBytes(DynamicArray<DynamicArray<uint8>> args, DynamicArray<uint8> reply),
     // The client's next command, whatever it is, is answered with `reply`.
     Any(DynamicArray<uint8> reply),
     // Bytes the server sends of its own accord, as soon as the script reaches them: a push message.
@@ -120,27 +122,35 @@ type resource FakeServer implements Transport, Sendable {
             match (give r) {
                 case Incomplete: { return; }
                 case Invalid(error: e): { this.hungUp = true; return; }
-                case Complete(value: v): { this.answer(args: argsOf(v: v)); }
+                case Complete(value: v): { this.answer(command: v); }
             };
         }
     }
 
-    unsafe fn void answer(DynamicArray<string> args) {
+    unsafe fn void answer(const ref Value command) {
         if (this.next >= this.steps.length()) { return; }
         isize at = this.next;
         this.next = this.next + 1;
+        DynamicArray<string> args = argsOf(v: command);
         match (this.steps[at]) {
             case Expect(args: want, reply: r): {
-                if (sameArgs(a: want, b: args)) {
-                    this.toClient.addAll(items: r.view());
-                } else {
+                if (!sameArgs(a: want, b: args)) {
                     string wanted = joined(args: want);
-                    string got = joined(args: args);
-                    string line = "-ERR fake server: expected [".concat(other: wanted).concat(other: "], got [").concat(other: got).concat(other: "]\r\n");
-                    this.toClient.addAll(items: line.bytes());
-                    this.hungUp = true;
+                    this.mismatch(wanted: wanted, args: args);
                     return;
                 }
+                this.toClient.addAll(items: r.view());
+            }
+            case ExpectBytes(args: want, reply: r): {
+                if (!sameBytes(want: want, command: command)) {
+                    DynamicArray<string> shown = DynamicArray.empty();
+                    isize k = 0;
+                    while (k < want.length()) { shown.add(item: utf8OrMark(b: want[k].view())); k = k + 1; }
+                    string wanted = joined(args: shown);
+                    this.mismatch(wanted: wanted, args: args);
+                    return;
+                }
+                this.toClient.addAll(items: r.view());
             }
             case Any(reply: r): { this.toClient.addAll(items: r.view()); }
             case Send(bytes: b): { this.toClient.addAll(items: b.view()); }
@@ -150,6 +160,14 @@ type resource FakeServer implements Transport, Sendable {
             case Late(reply: r): { this.held.addAll(items: r.view()); }
         };
         this.advance();
+    }
+
+    // The command was not the one the script expects: say so, as an error reply, and hang up.
+    fn void mismatch(const ref string wanted, const ref DynamicArray<string> args) {
+        string got = joined(args: args);
+        string line = "-ERR fake server: expected [".concat(other: wanted).concat(other: "], got [").concat(other: got).concat(other: "]\r\n");
+        this.toClient.addAll(items: line.bytes());
+        this.hungUp = true;
     }
 
     // The steps that need no command: bytes sent of the server's own accord, and a hangup.
@@ -196,6 +214,24 @@ fn bool sameArgs(const ref DynamicArray<string> a, const ref DynamicArray<string
     isize i = 0;
     while (i < a.length()) {
         if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool sameBytes(const ref DynamicArray<DynamicArray<uint8>> want, const ref Value command) {
+    return match (command) {
+        case Array(items: parts): sameParts(want: want, parts: parts);
+        case _: false;
+    };
+}
+
+fn bool sameParts(const ref DynamicArray<DynamicArray<uint8>> want, const ref DynamicArray<Value> parts) {
+    if (want.length() != parts.length()) { return false; }
+    isize i = 0;
+    while (i < parts.length()) {
+        bool same = match (parts[i]) { case Bulk(bytes: b): b.equals(other: want[i]); case _: false; };
+        if (!same) { return false; }
         i = i + 1;
     }
     return true;

@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 2 is next.
+its session plan, and step 3 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.

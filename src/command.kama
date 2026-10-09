@@ -1,4 +1,5 @@
-import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, redis::resp::Writer };
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::i64Str, redis::RedisError,
+         redis::resp::Writer };
 export { Command };
 
 // One command: its name and arguments, each a whole RESP bulk string, never text spliced into other text. A
@@ -11,8 +12,17 @@ export { Command };
 //   c.argInt(value: 10i64);
 //
 // Phase 3 builds typed arguments (`RedisArg`) and the `cmd"…"` tag on this.
+//
+// A command can be refused while it is built: an argument that cannot be sent (`refuse`) is `RedisError::Value`, and
+// a malformed `cmd"…"` literal is `Usage`. The first reason is kept, and a connection reports it before writing
+// anything, so the connection is still usable.
 type resource Command implements Sendable {
     DynamicArray<DynamicArray<uint8>> parts;
+    bool refused = false;
+    bool misuse = false;
+    string trouble = "";
+
+    friend redis::wire::admit[problem];
 
     // A command named `name` ("GET", "CLIENT"), with no arguments yet.
     public ctor of(const ref string name) {
@@ -34,6 +44,22 @@ type resource Command implements Sendable {
     public fn void argInt(int64 value) {
         string digits = i64Str(v: value);
         this.argBytes(bytes: digits.bytes());
+    }
+
+    // Refuse to send this command, because the argument being added cannot be sent; `detail` says why. A `RedisArg`
+    // calls it for a value it has no form for (a NaN). Only the first refusal is kept.
+    public fn void refuse(const ref string detail) {
+        if (this.refused) { return; }
+        isize n = this.parts.length();
+        this.refused = true;
+        this.trouble = "argument ${n}: ".concat(other: detail);
+    }
+
+    // Why this command will not be sent, if it will not.
+    const fn Optional<RedisError> problem() {
+        if (!this.refused) { return Optional::None; }
+        if (this.misuse) { return Optional::Some(value: RedisError::Usage(detail: copy this.trouble)); }
+        return Optional::Some(value: RedisError::Value(detail: copy this.trouble));
     }
 
     // How many parts it has, the name included.

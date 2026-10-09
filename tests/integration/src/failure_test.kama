@@ -43,6 +43,13 @@ unsafe fn int32 failureTests() {
     string still = ask(c: c, text: "PING");
     f = f + check(ok: still == "PONG" && !c.isClosed(), what: "failure: the connection goes on after error replies");
 
+    // A command a connection does not carry is refused before it is sent: the server never sees the SUBSCRIBE, so
+    // the connection is not in subscriber mode and answers PING as usual.
+    string sub = ask(c: c, text: "subscribe kr:chan");
+    string unsubscribed = ask(c: c, text: "PING");
+    f = f + check(ok: sub.startsWith(prefix: "(failed) a connection does not carry pub/sub") && unsubscribed == "PONG" && !c.isClosed(),
+                  what: "failure: SUBSCRIBE is refused before it is sent: ${sub}, then ${unsubscribed}");
+
     // An error inside EXEC's reply stays a value there.
     string m2 = ask(c: c, text: "MULTI");
     string q1 = ask(c: c, text: "SET kr:exec v");

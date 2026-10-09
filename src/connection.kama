@@ -3,7 +3,7 @@ import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
-         redis::wire::Wire, redis::wire::Deadline, redis::resp::Writer, redis::resp::Value };
+         redis::wire::Wire, redis::wire::Deadline, redis::wire::admit, redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
 // One connection to a Redis or Valkey server. It belongs to one isolate at a time and moves between them whole.
@@ -17,8 +17,9 @@ export { Connection, libraryName, libraryVersion };
 //      same connection: AUTH, CLIENT SETNAME and SELECT. `protocol=2` goes straight to that path; `protocol=3`
 //      never takes it.
 //
-// After that, `call` sends one command and returns its reply. An error reply is `RedisError::Server`, and the
-// connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) closes
+// After that, `call` sends one command and returns its reply. A command a connection cannot carry (SUBSCRIBE,
+// MONITOR, …) or one refused while it was built is refused before anything is written (`Usage`, `Value`). An error
+// reply is `RedisError::Server`, and the connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) closes
 // it, and every later call answers `Closed`.
 
 // This library's name and version, as CLIENT SETINFO's lib-name and lib-ver tell them to the server.
@@ -120,10 +121,13 @@ type resource Connection implements Sendable {
         return give targets;
     }
 
-    // Send `command` and return its reply. An error reply is `Server`, and the connection is still usable; an error
-    // inside a reply (one of EXEC's) stays a `Value::Error` there. A push message that comes in place of the reply
-    // is set aside, never taken for it.
+    // Send `command` and return its reply. A command refused while it was built (`Value`), or one a connection cannot
+    // carry (`Usage`), is refused before anything is written. An error reply is `Server`, and the connection is still
+    // usable; an error inside a reply (one of EXEC's) stays a `Value::Error` there. A push message that comes in place
+    // of the reply is set aside, never taken for it.
     public unsafe fn Result<Value, RedisError> call(const ref Command command) {
+        Result<Unit, RedisError> admitted = admit(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         if (!this.live) { return Result::Err(error: RedisError::Closed); }
         Deadline deadline = Deadline.within(span: this.commandLimit);
         this.outbox.clear();

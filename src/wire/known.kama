@@ -1,0 +1,76 @@
+import { std::collections::ConstView, redis::Command, redis::RedisError };
+export { admit };
+
+// What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
+//
+// A command whose reply would not be its own is refused, by name and case-insensitively, as the server looks a
+// command up. Each of these changes what the connection's next replies are, and a connection matches every reply to
+// the command it sent:
+//   - SUBSCRIBE and its kin put the connection in subscriber mode, where what comes back is messages;
+//   - MONITOR turns it into a stream of every command the server runs, SYNC and PSYNC into a replication stream;
+//   - CLIENT REPLY OFF or SKIP stop replies, and SCRIPT DEBUG turns the next EVAL into a debugging session;
+//   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it.
+// WATCH and UNWATCH are allowed.
+
+// Whether `command` may be sent: the first reason it was refused while it was built, then the table.
+fn Result<Unit, RedisError> admit(const ref Command command) {
+    Optional<RedisError> problem = command.problem();
+    match (give problem) {
+        case Some(value: e): { return Result::Err(error: give e); }
+        case None: { }
+    };
+    string why = refusal(command: command);
+    if (why.length() > 0) { return Result::Err(error: RedisError::Usage(detail: give why)); }
+    return Result::Ok(value: Unit::Unit);
+}
+
+fn string refusal(const ref Command command) {
+    if (named(command: command, word: "SUBSCRIBE") || named(command: command, word: "PSUBSCRIBE")
+        || named(command: command, word: "SSUBSCRIBE") || named(command: command, word: "UNSUBSCRIBE")
+        || named(command: command, word: "PUNSUBSCRIBE") || named(command: command, word: "SUNSUBSCRIBE")) {
+        return "a connection does not carry pub/sub commands: a subscribed connection's replies are messages, not replies to its commands";
+    }
+    if (named(command: command, word: "MONITOR")) {
+        return "a connection does not carry MONITOR: it turns the connection into a stream of every command the server runs";
+    }
+    if (named(command: command, word: "SYNC") || named(command: command, word: "PSYNC")) {
+        return "a connection does not carry SYNC or PSYNC: they turn the connection into a replication stream";
+    }
+    if (named(command: command, word: "CLIENT") && subNamed(command: command, word: "REPLY")) {
+        return "a connection does not carry CLIENT REPLY: every command it sends is matched to its reply";
+    }
+    if (named(command: command, word: "SCRIPT") && subNamed(command: command, word: "DEBUG")) {
+        return "a connection does not carry SCRIPT DEBUG: it turns the next EVAL into a debugging session";
+    }
+    if (named(command: command, word: "HELLO")) {
+        return "a connection does not carry HELLO: the handshake sends it, from the Config's protocol, user and client name";
+    }
+    if (named(command: command, word: "RESET")) {
+        return "a connection does not carry RESET: it drops the connection's state behind the client's back; open a new connection";
+    }
+    if (named(command: command, word: "QUIT")) {
+        return "a connection does not carry QUIT, which is deprecated since 7.2: close() closes the connection";
+    }
+    return "";
+}
+
+fn bool named(const ref Command command, const ref string word) {
+    return sameWord(part: command.part(index: 0), word: word);
+}
+
+fn bool subNamed(const ref Command command, const ref string word) {
+    return command.length() > 1 && sameWord(part: command.part(index: 1), word: word);
+}
+
+// Whether `part` is `word` (upper case) in any case: ASCII letters fold, as the server's lookup folds them.
+fn bool sameWord(ConstView<uint8> part, const ref string word) {
+    if (part.length() != word.length()) { return false; }
+    isize i = 0;
+    while (i < part.length()) {
+        uint8 b = part[i];
+        if (b >= 97 && b <= 122) { b = b - 32; }
+        if (b != word[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
