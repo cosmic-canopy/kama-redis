@@ -1,0 +1,240 @@
+// Transactions (Connection.transact and watched, src/transaction.kama) over the scripted server: MULTI, the commands
+// and EXEC in one write, every reply read before the outcome is decided, and each way a transaction can end.
+import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::Pipeline, redis::Replies,
+         redis::RedisError, redis::TxOutcome, redis::TxBody, redis::resp::Value,
+         redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple, commandOf };
+export { transactionTests };
+
+// How a transaction ended: "committed: …" with each reply ("simple", an integer, "(error) CODE"), "conflict", or the
+// error ("(error) CODE: message" for the server's, "(failed) message" otherwise).
+fn string ended(Result<TxOutcome, RedisError> r) {
+    TxOutcome o = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): {
+            string m = e.message();
+            Optional<string> code = match (e.serverCode()) { case Some(value: c): Optional::Some(value: c.text()); case None: Optional::None; };
+            return match (give code) { case Some(value: c): "(error) ".concat(other: c).concat(other: ": ").concat(other: m); case None: "(failed) ".concat(other: m); };
+        }
+    };
+    Replies rs = match (give o) {
+        case Committed(replies: x): give x;
+        case WatchConflict: { return "conflict"; }
+    };
+    string shown = "committed: ";
+    isize i = 0;
+    while (i < rs.length()) {
+        Result<Value, RedisError> one = rs.take(index: i);
+        string item = match (one) {
+            case Ok(value: v): match (v) { case Simple(bytes: b): "simple"; case Integer(value: n): "${n}"; case _: "value"; };
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): "(error) ".concat(other: c.text()); case None: "(failed)"; };
+        };
+        if (i > 0) { shown = shown.concat(other: ","); }
+        shown = shown.concat(other: item);
+        i = i + 1;
+    }
+    return shown;
+}
+
+fn Pipeline setThenIncr() {
+    Pipeline p = Pipeline.make();
+    Command set = commandOf(text: "SET kr:t 1");
+    Command incr = commandOf(text: "INCR kr:t");
+    p.add(command: set);
+    p.add(command: incr);
+    return p;
+}
+
+// The steps of one transaction of SET kr:t 1 and INCR kr:t, EXEC answered with `exec`.
+fn void transaction(ref DynamicArray<Step> s, const ref string server, const ref string protocol, DynamicArray<uint8> exec) {
+    s.add(item: expect(command: "MULTI", answer: vector(server: server, kase: "multi/".concat(other: protocol))));
+    s.add(item: expect(command: "SET kr:t 1", answer: vector(server: server, kase: "queued/".concat(other: protocol))));
+    s.add(item: expect(command: "INCR kr:t", answer: vector(server: server, kase: "queued/".concat(other: protocol))));
+    s.add(item: expect(command: "EXEC", answer: give exec));
+}
+
+// A body that adds SET kr:t 1 and INCR kr:t, counting how often it was asked to.
+type resource Bump implements TxBody {
+    int32 builds = 0;
+    public ctor make() { }
+    public fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        this.builds = this.builds + 1;
+        Command set = commandOf(text: "SET kr:t 1");
+        Command incr = commandOf(text: "INCR kr:t");
+        tx.add(command: set);
+        tx.add(command: incr);
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn int32 count() { return this.builds; }
+}
+
+// A body that fails.
+type resource Refuses implements TxBody {
+    public ctor make() { }
+    public fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        return Result::Err(error: RedisError::Value(detail: "the body refused"));
+    }
+}
+
+unsafe fn int32 outcomeTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    // Committed, under RESP3 and RESP2 (which sends no HELLO with nothing to authenticate).
+    DynamicArray<Step> c3 = welcome(server: s);
+    transaction(s: c3, server: s, protocol: "3", exec: vector(server: s, kase: "exec-ok/3"));
+    Connection k3 = connected(script: give c3, url: "redis://", what: "tx commit 3");
+    Pipeline p3 = setThenIncr();
+    string g3 = ended(r: k3.transact(pipeline: p3));
+    f = f + check(ok: g3 == "committed: simple,2", what: "transact: committed under RESP3: ${g3}");
+    DynamicArray<Step> c2 = DynamicArray.empty();
+    transaction(s: c2, server: s, protocol: "2", exec: vector(server: s, kase: "exec-ok/2"));
+    Connection k2 = connected(script: give c2, url: "redis://?protocol=2", what: "tx commit 2");
+    Pipeline p2 = setThenIncr();
+    string g2 = ended(r: k2.transact(pipeline: p2));
+    f = f + check(ok: g2 == "committed: simple,2", what: "transact: committed under RESP2: ${g2}");
+
+    // EXEC's null, under each protocol: a watched key changed, nothing ran.
+    DynamicArray<Step> n3 = welcome(server: s);
+    transaction(s: n3, server: s, protocol: "3", exec: vector(server: s, kase: "exec-null/3"));
+    n3.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection kn3 = connected(script: give n3, url: "redis://", what: "tx null 3");
+    Pipeline pn3 = setThenIncr();
+    string gn3 = ended(r: kn3.transact(pipeline: pn3));
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> after = kn3.call(command: ping);
+    f = f + check(ok: gn3 == "conflict" && isSimple(r: after, text: "PONG"), what: "transact: EXEC's null under RESP3 is a conflict, and the connection goes on: ${gn3}");
+    DynamicArray<Step> n2 = DynamicArray.empty();
+    transaction(s: n2, server: s, protocol: "2", exec: vector(server: s, kase: "exec-null/2"));
+    Connection kn2 = connected(script: give n2, url: "redis://?protocol=2", what: "tx null 2");
+    Pipeline pn2 = setThenIncr();
+    string gn2 = ended(r: kn2.transact(pipeline: pn2));
+    f = f + check(ok: gn2 == "conflict", what: "transact: EXEC's null under RESP2 is a conflict: ${gn2}");
+
+    // A command the server refuses while queueing aborts the transaction, with that first error.
+    DynamicArray<Step> ab = welcome(server: s);
+    ab.add(item: expect(command: "MULTI", answer: vector(server: s, kase: "multi/3")));
+    ab.add(item: expect(command: "NOSUCHCOMMAND", answer: vector(server: s, kase: "queued-error/3")));
+    ab.add(item: expect(command: "SET kr:t 1", answer: vector(server: s, kase: "queued/3")));
+    ab.add(item: expect(command: "EXEC", answer: vector(server: s, kase: "execabort")));
+    ab.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection kab = connected(script: give ab, url: "redis://", what: "tx abort");
+    Pipeline pab = Pipeline.make();
+    Command unknown = commandOf(text: "NOSUCHCOMMAND");
+    Command set = commandOf(text: "SET kr:t 1");
+    pab.add(command: unknown);
+    pab.add(command: set);
+    string gab = ended(r: kab.transact(pipeline: pab));
+    Command ping2 = Command.of(name: "PING");
+    Result<Value, RedisError> after2 = kab.call(command: ping2);
+    f = f + check(ok: gab.startsWith(prefix: "(error) ERR: ERR unknown command") && isSimple(r: after2, text: "PONG"),
+                  what: "transact: an error while queueing aborts it, with that error, and the connection goes on: ${gab}");
+
+    // A command that fails when EXEC runs it fails alone.
+    DynamicArray<Step> er = welcome(server: s);
+    er.add(item: expect(command: "MULTI", answer: vector(server: s, kase: "multi/3")));
+    er.add(item: expect(command: "SET kr:e v", answer: vector(server: s, kase: "queued/3")));
+    er.add(item: expect(command: "LPUSH kr:e x", answer: vector(server: s, kase: "queued/3")));
+    er.add(item: expect(command: "EXEC", answer: vector(server: s, kase: "exec-error")));
+    Connection ker = connected(script: give er, url: "redis://", what: "tx error inside");
+    Pipeline per = Pipeline.make();
+    Command e1 = commandOf(text: "SET kr:e v");
+    Command e2 = commandOf(text: "LPUSH kr:e x");
+    per.add(command: e1);
+    per.add(command: e2);
+    string ger = ended(r: ker.transact(pipeline: per));
+    f = f + check(ok: ger == "committed: simple,(error) WRONGTYPE", what: "transact: an error when EXEC runs a command is that reply's: ${ger}");
+
+    // Something other than QUEUED inside MULTI: the exchange is not one this client knows, and the connection closes.
+    DynamicArray<Step> odd = welcome(server: s);
+    odd.add(item: expect(command: "MULTI", answer: vector(server: s, kase: "multi/3")));
+    odd.add(item: expect(command: "SET kr:t 1", answer: vector(server: s, kase: "multi/3")));
+    odd.add(item: expect(command: "INCR kr:t", answer: vector(server: s, kase: "queued/3")));
+    odd.add(item: expect(command: "EXEC", answer: vector(server: s, kase: "exec-ok/3")));
+    Connection kodd = connected(script: give odd, url: "redis://", what: "tx odd");
+    Pipeline podd = setThenIncr();
+    string godd = ended(r: kodd.transact(pipeline: podd));
+    f = f + check(ok: godd == "(failed) a command inside MULTI was answered with something other than QUEUED" && kodd.isClosed(),
+                  what: "transact: a reply other than QUEUED: ${godd}");
+
+    // A hangup after MULTI's reply.
+    DynamicArray<Step> cut = welcome(server: s);
+    cut.add(item: expect(command: "MULTI", answer: vector(server: s, kase: "multi/3")));
+    cut.add(item: Step::Hangup);
+    Connection kcut = connected(script: give cut, url: "redis://", what: "tx hangup");
+    Pipeline pcut = setThenIncr();
+    string gcut = ended(r: kcut.transact(pipeline: pcut));
+    f = f + check(ok: gcut == "(failed) Server closed the connection" && kcut.isClosed(), what: "transact: a hangup partway: ${gcut}");
+
+    // Refused before anything is written: WATCH inside, MULTI inside. The script's next step is a PING.
+    DynamicArray<Step> quiet = welcome(server: s);
+    quiet.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection kq = connected(script: give quiet, url: "redis://", what: "tx refused");
+    Pipeline pw = Pipeline.make();
+    Command watch = commandOf(text: "WATCH kr:w");
+    pw.add(command: watch);
+    string gw = ended(r: kq.transact(pipeline: pw));
+    Pipeline pm = Pipeline.make();
+    Command multi = commandOf(text: "MULTI");
+    pm.add(command: multi);
+    string gm = ended(r: kq.transact(pipeline: pm));
+    Command ping3 = Command.of(name: "PING");
+    Result<Value, RedisError> after3 = kq.call(command: ping3);
+    f = f + check(ok: gw == "(failed) WATCH and UNWATCH cannot be inside a transaction, where the server refuses them: WATCH first, with call or watched"
+                  && gm == "(failed) command 1: a connection does not carry MULTI, EXEC or DISCARD: transact sends a transaction whole, MULTI to EXEC in one write"
+                  && isSimple(r: after3, text: "PONG"),
+                  what: "transact: WATCH or MULTI inside is refused before anything is written: ${gw}; ${gm}");
+    return f;
+}
+
+unsafe fn int32 watchedTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    // A conflict, then a commit: the body is asked twice.
+    DynamicArray<Step> twice = welcome(server: s);
+    twice.add(item: expect(command: "WATCH kr:w", answer: vector(server: s, kase: "watch/3")));
+    transaction(s: twice, server: s, protocol: "3", exec: vector(server: s, kase: "exec-null/3"));
+    twice.add(item: expect(command: "WATCH kr:w", answer: vector(server: s, kase: "watch/3")));
+    transaction(s: twice, server: s, protocol: "3", exec: vector(server: s, kase: "exec-ok/3"));
+    Connection c = connected(script: give twice, url: "redis://", what: "watched twice");
+    Command watch = commandOf(text: "WATCH kr:w");
+    Bump body = Bump.make();
+    string g1 = ended(r: c.watched(watch: watch, body: body, attempts: 3));
+    int32 builds = body.count();
+    f = f + check(ok: g1 == "committed: simple,2" && builds == 2, what: "watched: a conflict, then a commit, after ${builds} builds: ${g1}");
+
+    // Out of attempts: the conflict is the outcome.
+    DynamicArray<Step> once = welcome(server: s);
+    once.add(item: expect(command: "WATCH kr:w", answer: vector(server: s, kase: "watch/3")));
+    transaction(s: once, server: s, protocol: "3", exec: vector(server: s, kase: "exec-null/3"));
+    Connection c1 = connected(script: give once, url: "redis://", what: "watched once");
+    Bump body1 = Bump.make();
+    string g2 = ended(r: c1.watched(watch: watch, body: body1, attempts: 1));
+    f = f + check(ok: g2 == "conflict", what: "watched: one attempt, and a conflict: ${g2}");
+
+    // A body that fails: UNWATCH, and its error. The script's PING after shows UNWATCH was the last thing sent.
+    DynamicArray<Step> fails = welcome(server: s);
+    fails.add(item: expect(command: "WATCH kr:w", answer: vector(server: s, kase: "watch/3")));
+    fails.add(item: expect(command: "UNWATCH", answer: vector(server: s, kase: "unwatch/3")));
+    fails.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
+    Connection c2 = connected(script: give fails, url: "redis://", what: "watched fails");
+    Refuses refuses = Refuses.make();
+    string g3 = ended(r: c2.watched(watch: watch, body: refuses, attempts: 3));
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> after = c2.call(command: ping);
+    f = f + check(ok: g3 == "(failed) the body refused" && isSimple(r: after, text: "PONG"), what: "watched: a body's error ends it after UNWATCH: ${g3}");
+
+    // Misuse.
+    Bump body2 = Bump.make();
+    string g4 = ended(r: c2.watched(watch: watch, body: body2, attempts: 0));
+    Command notWatch = commandOf(text: "GET kr:w");
+    string g5 = ended(r: c2.watched(watch: notWatch, body: body2, attempts: 1));
+    f = f + check(ok: g4 == "(failed) watched needs at least 1 attempt" && g5 == "(failed) watched takes a WATCH command that names the keys it watches",
+                  what: "watched: no attempts, and a command that is not WATCH: ${g4}; ${g5}");
+    return f;
+}
+
+unsafe fn int32 transactionTests() {
+    int32 f = 0;
+    f = f + outcomeTests();
+    f = f + watchedTests();
+    return f;
+}

@@ -2,7 +2,7 @@
 // server, no network, no clock — these run anywhere `tools/test.sh` runs, debug and release. The cases that
 // need a live server are in tests/integration. A failing case prints its name, so the log says WHICH, not
 // just that.
-import { core::println, respTests, slotTests, urlTests, errorTests, configTests, connectionTests, argTests, replyTests, pipelineTests, blockingTests };
+import { core::println, respTests, slotTests, urlTests, errorTests, configTests, connectionTests, argTests, replyTests, pipelineTests, blockingTests, transactionTests };
 export { check };
 
 fn int32 check(bool ok, string what) {
@@ -22,6 +22,7 @@ fn int32 main() {
     failed = failed + replyTests();
     failed = failed + pipelineTests();
     failed = failed + blockingTests();
+    failed = failed + transactionTests();
     if (failed != 0) { println(s: "redis unit tests: ${failed} failed"); return 1; }
     println(s: "redis unit tests: OK");
     return 0;

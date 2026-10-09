@@ -1,0 +1,133 @@
+// Transactions against the server, under RESP3 and RESP2: a commit, a conflict another connection makes, watched
+// trying again, EXECABORT, an error when EXEC runs a command, and MULTI refused by the server's ACL.
+import { redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::TxOutcome,
+         redis::TxBody, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open,
+         mainUrl, ask, commandOf };
+export { transactionTests };
+
+unsafe fn Connection reach(const ref string userinfo, const ref string tail, const ref string what) {
+    Result<Connection, RedisError> r = open(url: mainUrl(userinfo: userinfo, tail: tail));
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "transaction_test: ${what}: connect: ${m}"); return reach(userinfo: userinfo, tail: tail, what: what); }
+    };
+    return give c;
+}
+
+// How a transaction ended, as the unit tests show it.
+fn string ended(Result<TxOutcome, RedisError> r) {
+    TxOutcome o = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): {
+            string m = e.message();
+            Optional<string> code = match (e.serverCode()) { case Some(value: c): Optional::Some(value: c.text()); case None: Optional::None; };
+            return match (give code) { case Some(value: c): "(error) ".concat(other: c).concat(other: ": ").concat(other: m); case None: "(failed) ".concat(other: m); };
+        }
+    };
+    Replies rs = match (give o) {
+        case Committed(replies: x): give x;
+        case WatchConflict: { return "conflict"; }
+    };
+    string shown = "committed: ";
+    isize i = 0;
+    while (i < rs.length()) {
+        Result<Value, RedisError> one = rs.take(index: i);
+        string item = match (one) {
+            case Ok(value: v): match (v) { case Simple(bytes: b): "simple"; case Integer(value: n): "${n}"; case _: "value"; };
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): "(error) ".concat(other: c.text()); case None: "(failed)"; };
+        };
+        if (i > 0) { shown = shown.concat(other: ","); }
+        shown = shown.concat(other: item);
+        i = i + 1;
+    }
+    return shown;
+}
+
+fn Pipeline pipelineOf(const ref string a, const ref string b) {
+    Pipeline p = Pipeline.make();
+    Command first = commandOf(text: a);
+    Command second = commandOf(text: b);
+    p.add(command: first);
+    p.add(command: second);
+    return p;
+}
+
+// A body that, the first time it is asked, has another connection change the watched key, as a racing client
+// would; each time, it reads the key and sets it from what it read.
+type resource Racer implements TxBody {
+    Connection other;
+    int32 builds = 0;
+    public ctor make(Connection other) { this.other = give other; }
+    public unsafe fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        this.builds = this.builds + 1;
+        if (this.builds == 1) { string raced = ask(c: this.other, text: "SET kr:x:race theirs"); }
+        string seen = ask(c: conn, text: "GET kr:x:race");
+        Command set = Command.of(name: "SET");
+        set.arg(text: "kr:x:race");
+        set.arg(text: "mine-after-".concat(other: seen));
+        tx.add(command: set);
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn int32 count() { return this.builds; }
+}
+
+unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
+    int32 f = 0;
+    Connection c = reach(userinfo: "", tail: tail, what: protocol);
+    Connection other = reach(userinfo: "", tail: "", what: "the other connection");
+    string cleared = ask(c: c, text: "DEL kr:x:t kr:x:w kr:x:a kr:x:e kr:x:race");
+
+    Pipeline p1 = pipelineOf(a: "SET kr:x:t 1", b: "INCR kr:x:t");
+    string g1 = ended(r: c.transact(pipeline: p1));
+    string t = ask(c: c, text: "GET kr:x:t");
+    f = f + check(ok: g1 == "committed: simple,2" && t == "2", what: "transaction: committed under ${protocol}: ${g1}, then ${t}");
+
+    // Another connection writes a key this one watches: EXEC's null, and nothing ran.
+    string w = ask(c: c, text: "WATCH kr:x:w");
+    string theirs = ask(c: other, text: "SET kr:x:w theirs");
+    Pipeline p2 = pipelineOf(a: "SET kr:x:w mine", b: "GET kr:x:w");
+    string g2 = ended(r: c.transact(pipeline: p2));
+    string held = ask(c: c, text: "GET kr:x:w");
+    f = f + check(ok: w == "OK" && g2 == "conflict" && held == "theirs", what: "transaction: a conflict under ${protocol}: ${g2}, the key ${held}");
+
+    // watched: the first attempt meets the race and tries again from what it reads then.
+    Command watch = commandOf(text: "WATCH kr:x:race");
+    Connection racing = reach(userinfo: "", tail: "", what: "the racing connection");
+    Racer body = Racer.make(other: give racing);
+    string g3 = ended(r: c.watched(watch: watch, body: body, attempts: 3));
+    int32 builds = body.count();
+    string race = ask(c: c, text: "GET kr:x:race");
+    f = f + check(ok: g3 == "committed: simple" && builds == 2 && race == "mine-after-theirs",
+                  what: "transaction: watched under ${protocol} tries again after a race: ${g3}, ${builds} builds, the key ${race}");
+
+    // A command the server refuses while queueing aborts it all: nothing ran.
+    Pipeline p4 = pipelineOf(a: "NOSUCHCOMMAND", b: "SET kr:x:a v");
+    string g4 = ended(r: c.transact(pipeline: p4));
+    string a = ask(c: c, text: "GET kr:x:a");
+    f = f + check(ok: g4.startsWith(prefix: "(error) ERR: ERR unknown command") && a == "(nil)", what: "transaction: aborted under ${protocol}: ${g4}, the key ${a}");
+
+    // A command that fails when EXEC runs it fails alone.
+    Pipeline p5 = pipelineOf(a: "SET kr:x:e v", b: "LPUSH kr:x:e y");
+    string g5 = ended(r: c.transact(pipeline: p5));
+    f = f + check(ok: g5 == "committed: simple,(error) WRONGTYPE", what: "transaction: an error inside EXEC under ${protocol}: ${g5}");
+    string still = ask(c: c, text: "PING");
+    f = f + check(ok: still == "PONG" && !c.isClosed(), what: "transaction: the connection goes on under ${protocol}: ${still}");
+    return f;
+}
+
+unsafe fn int32 transactionTests() {
+    int32 f = 0;
+    f = f + runTests(tail: "", protocol: "RESP3");
+    f = f + runTests(tail: "?protocol=2", protocol: "RESP2");
+    // A user who may not run MULTI: the server's NOPERM. (It then ran the command on its own, as MULTI was not in
+    // force; a read here.)
+    string roPw = setting(name: "REDISTEST_RO_PASSWORD");
+    Connection ro = reach(userinfo: "kr_ro:".concat(other: roPw).concat(other: "@"), tail: "", what: "kr_ro");
+    Pipeline p = Pipeline.make();
+    Command get = commandOf(text: "GET kr:x:t");
+    p.add(command: get);
+    string g = ended(r: ro.transact(pipeline: p));
+    string still = ask(c: ro, text: "PING");
+    f = f + check(ok: g.startsWith(prefix: "(error) NOPERM: ") && still == "PONG", what: "transaction: MULTI refused by the ACL is NOPERM, and the connection goes on: ${g}");
+    return f;
+}

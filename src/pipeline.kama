@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::time::Duration, redis::Command, redis::RedisError,
          redis::resp::Writer, redis::resp::Value, redis::wire::admit, redis::wire::serverError, redis::wire::Wait,
-         redis::wire::blockingWait, redis::wire::later };
+         redis::wire::blockingWait, redis::wire::later, redis::wire::isWatch };
 export { Pipeline, Replies };
 
 // Commands sent together: `Connection.run` writes them all in one write and reads their replies in order, one round
@@ -23,8 +23,10 @@ type resource Pipeline implements Sendable {
     bool misuse = false;
     string trouble = "";
     Wait waits;   // how long its blocking commands may wait on the server, in turn
+    bool watching = false;   // it has a WATCH or UNWATCH, which a transaction cannot
 
     friend redis::Connection::run[bytes, problem, waiting];
+    friend redis::Connection::transact[bytes, problem, watches];
 
     public ctor make() {
         this.encoded = Writer.make();
@@ -48,6 +50,7 @@ type resource Pipeline implements Sendable {
             }
         };
         if (!this.refused) {
+            if (isWatch(command: command)) { this.watching = true; }
             command.encode(into: this.encoded);
             this.waits = later(a: this.waits, b: blockingWait(command: command));
         }
@@ -58,6 +61,7 @@ type resource Pipeline implements Sendable {
 
     const fn ConstView<uint8> bytes() { return this.encoded.view(); }
     const fn Wait waiting() { return this.waits; }
+    const fn bool watches() { return this.watching; }
 
     // Why it will not be sent, if it will not: `Value` for an argument, `Usage` otherwise.
     const fn Optional<RedisError> problem() {
@@ -73,6 +77,7 @@ type resource Replies implements Sendable {
     DynamicArray<bool> taken;
 
     friend redis::Connection::run[of];
+    friend redis::Connection::transact[of];
 
     ctor of(DynamicArray<Value> values) {
         this.taken = DynamicArray.empty();

@@ -1,0 +1,31 @@
+import { redis::Connection, redis::Pipeline, redis::Replies, redis::RedisError };
+export { TxOutcome, TxBody };
+
+// Transactions: `Connection.transact` sends MULTI, a pipeline's commands and EXEC in one write, and `watched` runs one
+// under WATCH, again while a watched key changes under it, as many times as the caller says (docs/ROADMAP.md,
+// "Decided, and why", "Phase 3", "Transactions").
+//
+//   Pipeline tx = Pipeline.make();
+//   tx.add(command: cmd"DECRBY ${from} ${amount}");
+//   tx.add(command: cmd"INCRBY ${to} ${amount}");
+//   Result<TxOutcome, RedisError> r = conn.transact(pipeline: tx);
+//
+// A transaction is all or nothing only in the server's sense: a command the server refuses while queueing it (an
+// unknown command, a wrong number of arguments) aborts the transaction (`Server`, with that error), but a command that
+// fails when EXEC runs it (WRONGTYPE) fails alone, and the others still run. Its error is that reply's, through
+// `Replies.take`.
+
+// How a transaction ended, when the server answered EXEC.
+type enum TxOutcome implements Sendable {
+    // EXEC ran it: a reply per command, in order.
+    Committed(Replies replies),
+    // A key under WATCH changed before EXEC, so the server ran nothing (EXEC's null). Not an error: build it again
+    // from what the keys hold now, or let `watched` do so.
+    WatchConflict;
+}
+
+// What `watched` runs on each attempt: read what it needs over `conn` (the keys are watched by then), and add the
+// transaction's commands to `tx`. An error ends `watched` with that error, after UNWATCH.
+type contract TxBody for value, resource {
+    fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx);
+}

@@ -1,7 +1,7 @@
 # Roadmap
 
 Where this is, 2026-10-08: phases 0, 1 and 2 are done, and phase 3 has started. "Phase 3: where to start" below is
-its session plan, and step 7 is next.
+its session plan, and step 8 is next.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -498,8 +498,20 @@ confirmed the kama facts underneath, and are listed at the end.
     rather than an error (go-redis `TxFailedErr`, redis-py `WatchError`, redis-rs `None`).
   - EXECABORT is `Server`, carrying the first queue-time error.
   - The deadline is `command_timeout` alone, since nothing blocks inside MULTI.
-  - `watched(keys:, body: TxBody, attempts:)` retries a bounded number of times, which the caller states. Peers retry
+  - `watched(watch:, body: TxBody, attempts:)` retries a bounded number of times, which the caller states. Peers retry
     without bound (redis-rs, redis-py) or leave it to the caller (go-redis).
+  - **What building it settled (step 7):**
+    - `watched` takes the WATCH command itself (`cmd"WATCH ${a} ${b}"`), not `keys: RedisArg`. A list of keys needs
+      the `DynamicArray` adapter, which KRD-7 blocks, and a command carries binary keys as they are.
+    - A body is a `TxBody`, as postgres's `TransactionBody` is (no closures): `build(ref Connection conn, ref
+      Pipeline tx)` reads over the connection while the keys are watched, and fills the pipeline. A body that fails
+      gets UNWATCH, and its error is returned.
+    - WATCH or UNWATCH inside the pipeline is `Usage` before anything is written, as the server refuses them inside
+      MULTI. MULTI, EXEC and DISCARD joined the refused commands in this step, so a connection is never left inside
+      a transaction.
+    - A reply other than `+OK` to MULTI or `+QUEUED` to a command is `Unexpected`, and closes the connection.
+    - An error to MULTI itself (a user who may not run it) is `Server`, with that error. The server then ran each
+      command on its own, as MULTI was not in force; every client shares this, and the ACL is the fix.
 - **Scripts:** `Script` computes its SHA-1 client-side (`std::digest::sha1`), and `ScriptCall` carries the call.
   - `eval` sends EVALSHA, and on NOSCRIPT, EVAL (go-redis's way; redis-py and redis-rs SCRIPT LOAD first). That is
     safe, because NOSCRIPT means the script never ran.

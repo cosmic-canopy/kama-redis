@@ -1,7 +1,7 @@
 import { std::collections::ConstView, std::time::Duration, std::fmt::parse, std::fmt::ParseError,
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, redis::Command, redis::RedisError,
          redis::ServerError, redis::resp::Value, Deadline, decimal };
-export { admit, serverError, Wait, blockingWait, later, callDeadline };
+export { admit, serverError, isWatch, Wait, blockingWait, later, callDeadline };
 
 // What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
 //
@@ -11,8 +11,10 @@ export { admit, serverError, Wait, blockingWait, later, callDeadline };
 //   - SUBSCRIBE and its kin put the connection in subscriber mode, where what comes back is messages;
 //   - MONITOR turns it into a stream of every command the server runs, SYNC and PSYNC into a replication stream;
 //   - CLIENT REPLY OFF or SKIP stop replies, and SCRIPT DEBUG turns the next EVAL into a debugging session;
-//   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it.
-// WATCH and UNWATCH are allowed.
+//   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it;
+//   - MULTI, EXEC and DISCARD: `Connection.transact` sends a transaction whole, MULTI to EXEC in one write, so the
+//     connection is never left inside one.
+// WATCH and UNWATCH are allowed, outside a transaction (the server refuses them inside one).
 //
 // A blocking command waits on the server for as long as its own timeout says, so its deadline is that timeout plus
 // `command_timeout` (blockingWait). The table is checked against every server's `ACL CAT blocking` and COMMAND DOCS
@@ -54,10 +56,18 @@ fn string refusal(const ref Command command) {
     if (named(command: command, word: "RESET")) {
         return "a connection does not carry RESET: it drops the connection's state behind the client's back; open a new connection";
     }
+    if (named(command: command, word: "MULTI") || named(command: command, word: "EXEC") || named(command: command, word: "DISCARD")) {
+        return "a connection does not carry MULTI, EXEC or DISCARD: transact sends a transaction whole, MULTI to EXEC in one write";
+    }
     if (named(command: command, word: "QUIT")) {
         return "a connection does not carry QUIT, which is deprecated since 7.2: close() closes the connection";
     }
     return "";
+}
+
+// Whether `command` is WATCH or UNWATCH, which the server refuses inside a transaction.
+fn bool isWatch(const ref Command command) {
+    return named(command: command, word: "WATCH") || named(command: command, word: "UNWATCH");
 }
 
 // The error a `Value::Error` holds.

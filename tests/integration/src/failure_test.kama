@@ -1,7 +1,7 @@
 // Failures and sizes, live: a connection the server kills, errors by their codes, an error inside EXEC's reply, and
 // replies large in bytes and in elements.
 import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
-         redis::resp::Value, redis_integration_tests::check, mainUrl, open, ask, codeOf };
+         redis::resp::Value, redis_integration_tests::check, mainUrl, open, ask, codeOf, shown };
 export { failureTests };
 
 unsafe fn Connection connected(const ref string what) {
@@ -34,9 +34,11 @@ unsafe fn int32 failureTests() {
     f = f + check(ok: codeOf(c: c, text: "LPUSH kr:string x") == "WRONGTYPE", what: "failure: WRONGTYPE");
     f = f + check(ok: codeOf(c: c, text: "NOSUCHCOMMAND") == "ERR", what: "failure: ERR for an unknown command");
     f = f + check(ok: codeOf(c: c, text: "EVALSHA ffffffffffffffffffffffffffffffffffffffff 0") == "NOSCRIPT", what: "failure: NOSCRIPT");
+    // MULTI is refused before it is sent (transact sends a transaction whole), so the SET after it runs at once: OK,
+    // not QUEUED. EXECABORT is in transaction_test.kama.
     string multi = ask(c: c, text: "MULTI");
-    string queuedBad = codeOf(c: c, text: "NOSUCHCOMMAND");
-    f = f + check(ok: codeOf(c: c, text: "EXEC") == "EXECABORT", what: "failure: EXECABORT");
+    string direct = ask(c: c, text: "SET kr:direct v");
+    f = f + check(ok: multi.startsWith(prefix: "(failed) a connection does not carry MULTI") && direct == "OK", what: "failure: MULTI is refused before it is sent: ${multi}; then SET: ${direct}");
     string created = ask(c: c, text: "XGROUP CREATE kr:stream g $ MKSTREAM");
     f = f + check(ok: codeOf(c: c, text: "XGROUP CREATE kr:stream g $ MKSTREAM") == "BUSYGROUP", what: "failure: BUSYGROUP");
     f = f + check(ok: codeOf(c: c, text: "XREADGROUP GROUP nog c STREAMS kr:stream >") == "NOGROUP", what: "failure: NOGROUP");
@@ -50,12 +52,15 @@ unsafe fn int32 failureTests() {
     f = f + check(ok: sub.startsWith(prefix: "(failed) a connection does not carry pub/sub") && unsubscribed == "PONG" && !c.isClosed(),
                   what: "failure: SUBSCRIBE is refused before it is sent: ${sub}, then ${unsubscribed}");
 
-    // An error inside EXEC's reply stays a value there.
-    string m2 = ask(c: c, text: "MULTI");
-    string q1 = ask(c: c, text: "SET kr:exec v");
-    string q2 = ask(c: c, text: "LPUSH kr:exec x");
-    string exec = ask(c: c, text: "EXEC");
-    f = f + check(ok: exec.startsWith(prefix: "[OK, (error) WRONGTYPE "), what: "failure: EXEC's error stays inside its array: ${exec}");
+    // An error inside a reply stays a value there: redis.pcall's, inside EVAL's array.
+    string s1 = ask(c: c, text: "SET kr:exec v");
+    Command eval = Command.of(name: "EVAL");
+    eval.arg(text: "return {1, redis.pcall('LPUSH', KEYS[1], 'x')}");
+    eval.arg(text: "1");
+    eval.arg(text: "kr:exec");
+    Result<Value, RedisError> evalled = c.call(command: eval);
+    string inside = match (evalled) { case Ok(value: v): shown(v: v); case Err(error: e): e.message(); };
+    f = f + check(ok: inside.startsWith(prefix: "[1, (error) WRONGTYPE "), what: "failure: an error inside a reply stays inside its array: ${inside}");
 
     // 10 MiB in one bulk string, both ways.
     DynamicArray<uint8> big = DynamicArray.withCapacity(capacity: 10485760);

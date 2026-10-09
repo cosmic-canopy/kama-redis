@@ -262,6 +262,8 @@ my @typed = (
     ['multi', [], ['MULTI']],
     ['queued', [['MULTI']], ['SET', 'kr:q', 'v']],
     ['queued-error', [['MULTI']], ['NOSUCHCOMMAND']],
+    ['watch', [], ['WATCH', 'kr:w']],
+    ['unwatch', [['WATCH', 'kr:w']], ['UNWATCH']],
     ['exec-ok', [['MULTI'], ['SET', 'kr:t', '1'], ['INCR', 'kr:t']], ['EXEC']],
     # SCAN pages: each is the whole collection on one page.
     ['scan', [['SET', 'kr:only', '1']], ['SCAN', '0']],

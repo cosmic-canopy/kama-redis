@@ -3,9 +3,9 @@ import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
-         redis::Pipeline, redis::Replies, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
-         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::resp::Writer,
-         redis::resp::Value };
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
+         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch,
+         redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
 // One connection to a Redis or Valkey server. It belongs to one isolate at a time and moves between them whole.
@@ -19,8 +19,8 @@ export { Connection, libraryName, libraryVersion };
 //      same connection: AUTH, CLIENT SETNAME and SELECT. `protocol=2` goes straight to that path; `protocol=3`
 //      never takes it.
 //
-// After that, `call` sends one command and returns its reply, and `run` sends a pipeline's commands in one write and
-// returns their replies. A command a connection cannot carry (SUBSCRIBE,
+// After that, `call` sends one command and returns its reply, `run` sends a pipeline's commands in one write and
+// returns their replies, and `transact` sends them as one transaction (src/transaction.kama). A command a connection cannot carry (SUBSCRIBE,
 // MONITOR, …) or one refused while it was built is refused before anything is written (`Usage`, `Value`). An error
 // reply is `RedisError::Server`, and the connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) closes
 // it, and every later call answers `Closed`.
@@ -171,6 +171,121 @@ type resource Connection implements Sendable {
             };
         }
         return Result::Ok(value: Replies.of(values: give values));
+    }
+
+    // Send `pipeline` as one transaction: MULTI, its commands and EXEC, in one write. Every reply is read before the
+    // outcome is decided, so the connection stays in step with the server whatever happens:
+    //   - EXEC's array is `Committed`, a reply per command; one that failed when EXEC ran it is its own error;
+    //   - EXEC's null is `WatchConflict`: a watched key changed, and nothing ran;
+    //   - a command the server refused while queueing it aborts the transaction: `Server`, with that first error;
+    //   - an error to EXEC itself (OOM, READONLY, …) is `Server`, with it;
+    //   - an error to MULTI (a user who may not run it) is `Server`, with it. The server then ran each command on its
+    //     own, as MULTI was not in force, and that cannot be undone; every client has this, and the ACL is the fix.
+    // A pipeline with WATCH or UNWATCH is `Usage`, as the server refuses them inside a transaction; WATCH first, with
+    // `call` or `watched`. Nothing blocks inside a transaction, so the deadline is `command_timeout` alone.
+    public unsafe fn Result<TxOutcome, RedisError> transact(const ref Pipeline pipeline) {
+        Optional<RedisError> problem = pipeline.problem();
+        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (pipeline.watches()) {
+            return Result::Err(error: RedisError::Usage(detail: "WATCH and UNWATCH cannot be inside a transaction, where the server refuses them: WATCH first, with call or watched"));
+        }
+        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        Deadline deadline = Deadline.within(span: this.commandLimit);
+        this.outbox.clear();
+        Command multi = Command.of(name: "MULTI");
+        multi.encode(into: this.outbox);
+        this.outbox.raw(bytes: pipeline.bytes());
+        Command exec = Command.of(name: "EXEC");
+        exec.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+
+        // MULTI's reply, then one per command, then EXEC's: all of them, before anything is decided.
+        Result<Value, RedisError> m = this.nextReply(deadline: deadline);
+        Value began = match (give m) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        Optional<RedisError> refused = Optional::None;
+        bool multiFailed = began.isError();
+        if (multiFailed) {
+            refused = Optional::Some(value: RedisError::Server(error: serverError(v: began)));
+        } else if (!isStatus(v: began, text: "OK")) {
+            this.lose();
+            return Result::Err(error: RedisError::Unexpected(detail: "MULTI was answered with something other than OK"));
+        }
+        isize i = 0;
+        while (i < pipeline.length()) {
+            Result<Value, RedisError> q = this.nextReply(deadline: deadline);
+            Value queued = match (give q) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            bool first = match (refused) { case Some(value: e): false; case None: true; };
+            if (queued.isError() && first) {
+                refused = Optional::Some(value: RedisError::Server(error: serverError(v: queued)));
+            } else if (!multiFailed && !queued.isError() && !isStatus(v: queued, text: "QUEUED")) {
+                this.lose();
+                return Result::Err(error: RedisError::Unexpected(detail: "a command inside MULTI was answered with something other than QUEUED"));
+            }
+            i = i + 1;
+        }
+        Result<Value, RedisError> x = this.nextReply(deadline: deadline);
+        Value ended = match (give x) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        bool abandoned = match (refused) { case Some(value: e): true; case None: false; };
+        if (abandoned) {
+            Value dropped = give ended;
+            return match (give refused) {
+                case Some(value: e): Result::Err(error: give e);
+                case None: Result::Err(error: RedisError::Closed);
+            };
+        }
+        if (ended.isError()) {
+            ServerError failed = serverError(v: ended);
+            Value dropped = give ended;
+            return Result::Err(error: RedisError::Server(error: give failed));
+        }
+        if (ended.isNull()) {
+            Value dropped = give ended;
+            return Result::Ok(value: TxOutcome::WatchConflict);
+        }
+        Value ran = unattributed(v: give ended);
+        isize count = match (ran) { case Array(items: xs): xs.length(); case _: -1; };
+        if (count != pipeline.length()) {
+            this.lose();
+            return Result::Err(error: RedisError::Unexpected(detail: "EXEC was answered with something other than a reply per command"));
+        }
+        DynamicArray<Value> replies = match (give ran) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
+        return Result::Ok(value: TxOutcome::Committed(replies: Replies.of(values: give replies)));
+    }
+
+    // Run a transaction under WATCH: send `watch` (a WATCH command naming the keys), let `body` read what it needs and
+    // build the transaction, and send it. When a watched key changed before EXEC, do it all again, up to `attempts`
+    // times in all, then answer `WatchConflict`. A body that fails ends it with that error, after UNWATCH.
+    // (go-redis leaves the retry to the caller; redis-py and redis-rs retry without a bound. The bound is the caller's
+    // to state here.)
+    public unsafe fn Result<TxOutcome, RedisError> watched(const ref Command watch, TxBody body, int32 attempts) {
+        if (attempts < 1) {
+            return Result::Err(error: RedisError::Usage(detail: "watched needs at least 1 attempt"));
+        }
+        if (!isWatch(command: watch) || watch.length() < 2) {
+            return Result::Err(error: RedisError::Usage(detail: "watched takes a WATCH command that names the keys it watches"));
+        }
+        int32 tries = 0;
+        while (tries < attempts) {
+            tries = tries + 1;
+            Result<Value, RedisError> w = this.call(command: watch);
+            bool watching = match (w) { case Ok(value: v): true; case Err(error: e): false; };
+            if (!watching) {
+                return match (give w) { case Err(error: e): Result::Err(error: give e); case Ok(value: v): Result::Err(error: RedisError::Closed); };
+            }
+            Pipeline tx = Pipeline.make();
+            Result<Unit, RedisError> built = body.build(conn: ref this, tx: ref tx);
+            bool ready = match (built) { case Ok(value: u): true; case Err(error: e): false; };
+            if (!ready) {
+                Command unwatch = Command.of(name: "UNWATCH");
+                Result<Value, RedisError> ignored = this.call(command: unwatch);
+                return match (give built) { case Err(error: e): Result::Err(error: give e); case Ok(value: u): Result::Err(error: RedisError::Closed); };
+            }
+            Result<TxOutcome, RedisError> outcome = this.transact(pipeline: tx);
+            bool retry = match (outcome) { case Ok(value: o): match (o) { case WatchConflict: true; case _: false; }; case Err(error: e): false; };
+            if (!retry) { return give outcome; }
+        }
+        return Result::Ok(value: TxOutcome::WatchConflict);
     }
 
     // The next reply, by `deadline`. A push message that comes in place of a reply is set aside, never taken for it.
@@ -383,6 +498,38 @@ type resource Connection implements Sendable {
         this.live = false;
         this.wire.shutdown();
     }
+}
+
+// Whether `v` is the status `text` (+OK, +QUEUED), an attribute around it included.
+fn bool isStatus(const ref Value v, const ref string text) {
+    return match (v) {
+        case Simple(bytes: b): sameText(b: b, text: text);
+        case Attributed(parts: ps): ps.length() > 0 && isStatus(v: ps[ps.length() - 1], text: text);
+        case _: false;
+    };
+}
+
+fn bool sameText(const ref DynamicArray<uint8> b, const ref string text) {
+    if (b.length() != text.length()) { return false; }
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] != text[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A reply without the attributes around it: the value they describe.
+fn Value unattributed(Value v) {
+    Value current = give v;
+    while (true) {
+        bool wrapped = match (current) { case Attributed(parts: ps): ps.length() > 0; case _: false; };
+        if (!wrapped) { return give current; }
+        DynamicArray<Value> parts = match (give current) { case Attributed(parts: ps): give ps; case _: DynamicArray.empty(); };
+        Optional<Value> last = parts.pop();
+        current = match (give last) { case Some(value: x): give x; case None: Value::Null; };
+    }
+    return give current;
 }
 
 // A hangup in answer to HELLO says what it most likely means.

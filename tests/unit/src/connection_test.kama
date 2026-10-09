@@ -476,7 +476,7 @@ unsafe fn int32 callTests() {
     DynamicArray<Step> errs = welcome(server: s);
     errs.add(item: expect(command: "LPUSH kr:s x", answer: reply(server: s, kase: "wrongtype")));
     errs.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
-    errs.add(item: expect(command: "EXEC", answer: reply(server: s, kase: "exec-error")));
+    errs.add(item: Step::Any(reply: reply(server: s, kase: "eval-error-inside/3")));
     Connection c = connected(script: give errs, url: "redis://", what: "calls");
     Command lpush = commandOf(text: "LPUSH kr:s x");
     Result<Value, RedisError> wt = c.call(command: lpush);
@@ -485,14 +485,17 @@ unsafe fn int32 callTests() {
     Command ping = Command.of(name: "PING");
     Result<Value, RedisError> pong = c.call(command: ping);
     f = f + check(ok: isSimple(r: pong, text: "PONG"), what: "call: the next call after an error reply");
-    // An error inside a reply stays a value there.
-    Command exec = Command.of(name: "EXEC");
-    Result<Value, RedisError> ex = c.call(command: exec);
+    // An error inside a reply stays a value there: redis.pcall's, inside EVAL's array.
+    Command eval = Command.of(name: "EVAL");
+    eval.arg(text: "return {1, redis.pcall('LPUSH', KEYS[1], 'x')}");
+    eval.arg(text: "1");
+    eval.arg(text: "kr:s");
+    Result<Value, RedisError> ex = c.call(command: eval);
     bool inside = match (ex) {
         case Ok(value: v): match (v) { case Array(items: it): it.length() == 2 && !it[0].isError() && it[1].isError(); case _: false; };
         case Err(error: e): false;
     };
-    f = f + check(ok: inside, what: "call: EXEC's error stays inside its array");
+    f = f + check(ok: inside, what: "call: an error inside a reply stays inside its array");
 
     // A push message before the reply is set aside.
     DynamicArray<Step> pushed = welcome(server: s);
@@ -629,6 +632,9 @@ unsafe fn int32 refusalTests() {
     refused.add(item: "HELLO");
     refused.add(item: "reset");
     refused.add(item: "quit");
+    refused.add(item: "multi");
+    refused.add(item: "EXEC");
+    refused.add(item: "Discard");
     DynamicArray<Step> script = welcome(server: s);
     isize i = 0;
     while (i < refused.length()) { script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping"))); i = i + 1; }

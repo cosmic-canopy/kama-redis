@@ -91,6 +91,10 @@ type resource Writer implements Sendable {
         return true;
     }
 
+    // Bytes that are RESP already, as they are: values written by another writer (a pipeline's commands, which a
+    // transaction sends between MULTI and EXEC). Nothing checks them.
+    public fn void raw(ConstView<uint8> bytes) { this.putBytes(b: bytes); }
+
     // `$len` and the bytes.
     public fn void bulk(ConstView<uint8> bytes) { this.lengthHeader(tag: 36ui8, n: bytes.length()); this.putBytes(b: bytes); this.crlf(); }
 
