@@ -5,15 +5,14 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.542` (tag `v0.9.542`), which CI pins. Each repro is also run on cstar's newest build
-(`0.9.558+gc28cee24` on 2026-10-08).
+**Current compiler:** `kama 0.9.573` (tag `v0.9.573`), which CI pins and the manifests' floor names. Each repro is
+also run on cstar's newest build (`0.9.577+g135c27c5` on 2026-10-13).
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-8 (HIGH, a regression in cstar's newest build), KRD-7 (MED). KPG-38 (@kama/postgres's) is fixed upstream but not yet in a tagged release, so its
-workaround stays. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -29,120 +28,34 @@ the commit that made it pass.
 
 ## OPEN
 
-### KRD-8 · HIGH · Regression in 0.9.559/0.9.560: std's `deserialize`, instantiated with a type of the program's, resolves its names in std's module
-
-**Found** in phase 3, step 9, when `tools/test.sh`'s unit program stopped compiling on cstar's newest build with no
-change of its own: the tree at `af520b1` checks clean on `0.9.542` and fails on `0.9.560+gb8c3df4a`. The commits
-between are KR-120's (`be22bf4a`, 0.9.559, and `b8c3df4a`, 0.9.560: "a constructor builds its value where it will
-live"), and `deserialize` is a constructor. Reduced, in one file, with std's own JSON reader and nothing else:
-
-```kama
-import { core::println, std::collections::DynamicArray, std::collections::Map, std::memory::Owned,
-         std::serialization::text::json::deserializeJsonBuffer };
-
-@generate(Deserializable)
-type resource Entry {
-    @field string id;
-    public const fn string named() { return copy this.id; }
-}
-
-fn int32 main() {
-    Result<Map<string, DynamicArray<Entry>>, Owned<Error>> r =
-        deserializeJsonBuffer::<Map<string, DynamicArray<Entry>>>(src: "[{\"key\": \"s\", \"value\": [{\"id\": \"1-1\"}]}]");
-    isize n = match (r) { case Ok(value: m): m.length(); case Err(error: e): -1; };
-    println(s: "entries ${n}");
-    return 0;
-}
-```
-
-- `0.9.542`: builds, and prints `entries 1`.
-- `0.9.560`: refused, at the `deserializeJsonBuffer` line:
-  ```
-  src/main.kama:11:0: error: `Entry` is declared in `…/lib/std/collections/map.kama` and this file does not import it — add `import { Entry };` …
-  src/main.kama:11:0: error: `DynamicArray` is declared in `…/lib/std/collections/dynamic_array.kama` and this file does not import it — add `import { DynamicArray };` …
-  ```
-  The file imports `DynamicArray`, and its `Entry` is its own. The first message names std's `Entry` (Map's
-  key-value pair), so the program's `Entry` was looked up in `std::collections`. Two variants:
-  - Renamed `Record`, the same program fails with the `DynamicArray` message alone.
-  - Reading `DynamicArray<Entry>` alone, with no Map, fails with the `Entry` message alone.
-
-**Why HIGH:** reading a list or map of one's own struct is what `Deserializable` is for, and it is how this
-package's typed replies read XREAD and XRANGE. The next tagged release would break this package's tests (and its
-users) the moment CI moves to it.
-
-**Workaround:** none. The tests are correct as written. Until a fix, this package is gated on `0.9.542` (CI's pin)
-alone, and cstar's newest build is not used as a second gate.
-
-### KRD-7 · MED · An adapter over a std type cannot name a type of its own module in a method's signature
-
-**Found** prototyping phase 3's `RedisArg` contract (`const fn void writeRedisArg(ref Command into)`), on `kama
-0.9.542` and `0.9.558+gc28cee24`. Adapters over `int32`, `string`, `float64` and the other primitives build. The
-same method in an adapter over `DynamicArray<uint8>`, `<DynamicArray> when [T: RedisArg]` or `Uuid` is refused,
-naming the same type on both sides. Reduced, in one file:
-
-```kama
-import { core::println, std::collections::DynamicArray };
-type resource Sink {
-    int64 n = 0;
-    public ctor make() { }
-    public fn void bump(int64 by) { this.n = this.n + by; }
-    public const fn int64 total() { return this.n; }
-}
-type contract Arg for value, resource, enum, intrinsic { const fn void put(ref Sink into); }
-type adapter <int32> implements Arg { public const fn void put(ref Sink into) { into.bump(by: cast<int64>(this)); } }
-type adapter <DynamicArray<uint8>> implements Arg { public const fn void put(ref Sink into) { into.bump(by: cast<int64>(this.length())); } }
-fn void feed(ref Sink s, Arg a) { a.put(into: ref s); }
-fn int32 main() {
-    Sink s = Sink.make();
-    DynamicArray<uint8> b = DynamicArray.empty();
-    b.add(item: 1ui8);
-    int32 n = 5;
-    feed(s: ref s, a: n);
-    feed(s: ref s, a: b);
-    int64 t = s.total();
-    println(s: "total ${t}");
-    return 0;
-}
-```
-
-`kama build kama.json --debug` fails on both compilers:
-
-```
-src/main.kama:10:0: error: `std::collections::DynamicArray<uint8>` implements `r2::Arg`, but its `put` takes `Sink` as parameter 1 — the contract declares `Sink`; a conformance must match the signature the contract declares
-```
-
-The same happens with `const ref Sink`, with a generic `<DynamicArray> implements Arg when [T: Arg]` (on its
-`DynamicArray<int32>` instance), and with an adapter over `std::uuid::Uuid`. Without the `DynamicArray<uint8>`
-adapter it prints `total 5`. Spelling the parameter `r2::Sink` is refused ("a module path is written only in an
-`import`"). A contract whose parameter is a prelude type (postgres's `ref Serializer`) does not hit it.
-
-**Where it seems to come from** (read, not run): `CEmitter::implSigOf` (`src/kama.cemit.cpp`, before
-`checkConformanceSignature`) re-renders the implementation's parameter types under the declaring class's scope.
-For an adapter's method injected into `DynamicArray` that is `std::collections`, where `Sink` does not resolve. A
-primitive's synthetic class records no scope, so its adapter keeps the adapter's own, which is why `<int32>` passes.
-
-**Why MED:** a Redis argument is binary, so `cmd"SET ${key} ${payload}"` with a `DynamicArray<uint8>` payload, a
-list hole that becomes one argument per element, and a `Uuid` hole are all part of the design (docs/ROADMAP.md,
-phase 3, "The adapters"). None of them can be written.
-
-**Workaround:** the package ships `RedisArg` adapters for the primitives and `string` only. Bytes, lists and Uuids
-go through `Command.argBytes`, a loop of `add`, and `arg(text: "${id}")`. The three adapters are added (nothing
-is undone) once a tagged compiler has the fix.
-
-### KPG-38 (cited) · HIGH · Two files that convert the same primitive to the same contract fail every release build
-
-Filed by @kama/postgres, and fixed upstream in `0.9.543` by `7872c6b6` (KR-114: a release build's one translation
-unit now emits each adapter vtable and thunk once). No tagged release has it yet, and CI pins `v0.9.542`. Run here as
-a library with `RedisArg` and `cmd`, and two application files that each pass an `int32`, a `string`, a `float64` and
-an `isize`, through the tag and through `Command.add`:
-- `0.9.542`: debug builds and runs; `--release` fails with `redefinition of 'kama_string__as_rlib__RedisArg'`.
-- `0.9.558`: debug and release both build and print the same arguments.
-
-**Workaround, until CI is on a tag that has the fix:** each test program converts primitives to `RedisArg` in exactly
-one file (`arg_test.kama`), and the package never converts: adapter bodies and helpers write through `Command`'s
-`arg*` methods. The README says that an application on a compiler before `0.9.543` must do the same.
+(none)
 
 ## FIXED — kept for the record
+
+KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
+the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
+same change, the first tag with all three.
+
+### KRD-8 · HIGH · std's `deserialize`, instantiated with a type of the program's, resolved its names in std — FIXED in 0.9.565
+
+Fixed by `f29e282c` ("construction: the into decision reads a ctor's return type in the ctor's own context, not the
+caller's"). It was a regression of 0.9.559/0.9.560 (KR-120). The repro prints `entries 1` again, and the unit
+program, which `XREAD`'s typed pair reads as `Map<string, DynamicArray<Entry>>`, builds and passes. Nothing here
+had a workaround to undo.
+
+### KRD-7 · MED · An adapter over a std type could not name a type of its own module in a method's signature — FIXED in 0.9.566
+
+Fixed by `bb3eef09` ("adapter: an adapter method's signature is read in the adapter's module, not the target's").
+The repro prints `total 6`. `RedisArg` now has its `DynamicArray<uint8>` (one binary argument), `<DynamicArray> when
+[T: RedisArg]` (an argument per element) and `Uuid` (its text) adapters, which the workaround (`argBytes`, a loop
+of `add`, a Uuid's text by hand) stood in for. The coherence the design relies on holds: `<DynamicArray<uint8>>`
+beside `<DynamicArray> when [T: RedisArg]` builds, because `uint8` has no adapter.
+
+### KPG-38 (cited) · HIGH · Two files that converted the same primitive to the same contract failed every release build — FIXED in 0.9.543, tagged in v0.9.573
+
+Fixed upstream by `7872c6b6` (KR-114). The two-file repro prints `18 18` in a release build. Each test program's
+"one conversion file" rule is gone: `arg_test.kama` no longer holds the helpers the scan tests converted through, and
+the README no longer warns about it.
 
 KRD-5 and KRD-6 were verified on 0.9.542 (`99ae9a22`), each with the repro it was filed with. KRD-1 to KRD-4 were
 verified on 0.9.530 (`e01de340`) the same way.

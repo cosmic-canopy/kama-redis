@@ -2,8 +2,7 @@
 // back whole across many pages, with MATCH, COUNT and TYPE; NOVALUES where the server has it.
 import { std::collections::DynamicArray, std::collections::Map, std::collections::Set, std::fmt::i64Str,
          redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::Scan, redis::RedisError, redis::reply,
-         redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask,
-         setScan, hashScan, zsetScan, matchingIn };
+         redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask };
 export { scanTests };
 
 unsafe fn Connection reach(const ref string tail, const ref string what) {
@@ -60,7 +59,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
 
     // SCAN with MATCH and COUNT: all 1000 keys, over many pages.
     Scan keys = Scan.keys();
-    matchingIn(scan: keys, pattern: "kr:sc:k:*");
+    keys.matching(pattern: "kr:sc:k:*");
     keys.countHint(count: 100i64);
     isize pages = 0;
     string failed = "";
@@ -71,7 +70,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
 
     // TYPE: the hash, not the strings.
     Scan hashes = Scan.keys();
-    matchingIn(scan: hashes, pattern: "kr:sc:*");
+    hashes.matching(pattern: "kr:sc:*");
     hashes.ofType(typeName: "hash");
     isize hp = 0;
     string hf = "";
@@ -80,7 +79,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
     f = f + check(ok: hf.length() == 0 && tn == 1 && typed.contains(key: "kr:sc:hash"), what: "scan: SCAN TYPE hash under ${protocol}: ${tn} ${hf}");
 
     // SSCAN: 1000 members, a hashtable, so many pages.
-    Scan members = setScan(key: "kr:sc:set");
+    Scan members = Scan.setMembers(key: "kr:sc:set");
     isize sp = 0;
     string sf = "";
     Set<string> got = gathered(c: c, scan: members, pages: sp, failure: sf);
@@ -88,7 +87,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
     f = f + check(ok: sf.length() == 0 && sn == 1000 && sp > 1, what: "scan: SSCAN under ${protocol}: ${sn} in ${sp} pages ${sf}");
 
     // HSCAN: 500 fields and their values, read as maps; then NOVALUES, where the server has it.
-    Scan fields = hashScan(key: "kr:sc:hash");
+    Scan fields = Scan.hashFields(key: "kr:sc:hash");
     Map<string, string> all = Map.empty();
     isize fp = 0;
     while (!fields.isDone() && fp < 100000) {
@@ -101,7 +100,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
     }
     isize fn2 = all.length();
     f = f + check(ok: fn2 == 500 && fp < 100000, what: "scan: HSCAN under ${protocol}: ${fn2} fields in ${fp} pages");
-    Scan names = hashScan(key: "kr:sc:hash");
+    Scan names = Scan.hashFields(key: "kr:sc:hash");
     names.noValues();
     Result<Value, RedisError> first = names.next(conn: c);
     string server = setting(name: "REDISTEST_SERVER");
@@ -110,7 +109,7 @@ unsafe fn int32 runTests(const ref string tail, const ref string protocol) {
     f = f + check(ok: has != refused, what: "scan: HSCAN NOVALUES under ${protocol} on ${server}: refused ${refused}");
 
     // ZSCAN: 300 members and their scores.
-    Scan scored = zsetScan(key: "kr:sc:zset");
+    Scan scored = Scan.sortedSetMembers(key: "kr:sc:zset");
     Map<string, float64> scores = Map.empty();
     isize zp = 0;
     while (!scored.isDone() && zp < 100000) {

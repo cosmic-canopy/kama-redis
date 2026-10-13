@@ -572,7 +572,10 @@ fn int32 edgeTests() {
                   what: "reply: an odd array as a struct: ${odds}");
     Result<HashPair, RedisError> missing = reply::<HashPair>(result: wire(text: "%1\r\n+f1\r\n+a\r\n"));
     string ms = failure::<HashPair>(r: missing);
-    f = f + check(ok: ms == "Value: reply: a field that is neither Optional nor @field(default) is not in the reply", what: "reply: a missing field: ${ms}");
+    f = f + check(ok: ms == "Value: reply.f2: a field that is neither Optional nor @field(default) is not in the reply", what: "reply: a missing field, by its name: ${ms}");
+    Result<DynamicArray<HashPair>, RedisError> missingIn = reply::<DynamicArray<HashPair>>(result: wire(text: "*2\r\n%2\r\n+f1\r\n+a\r\n+f2\r\n+b\r\n%1\r\n+f1\r\n+c\r\n"));
+    string mi = failure::<DynamicArray<HashPair>>(r: missingIn);
+    f = f + check(ok: mi == "Value: reply[1].f2: a field that is neither Optional nor @field(default) is not in the reply", what: "reply: a missing field in an element, by its place: ${mi}");
     Result<Scored, RedisError> named = reply::<Scored>(result: wire(text: "%2\r\n+member\r\n+a\r\n+score\r\n+abc\r\n"));
     string ns = failure::<Scored>(r: named);
     f = f + check(ok: ns == "Value: reply.score: a simple string \"abc\" cannot be read as float64", what: "reply: a field's failure names the field: ${ns}");

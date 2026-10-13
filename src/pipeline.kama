@@ -1,4 +1,5 @@
-import { std::collections::DynamicArray, std::collections::ConstView, std::time::Duration, redis::Command, redis::RedisError,
+import { std::collections::DynamicArray, std::collections::ConstView, std::time::Duration, std::memory::replace,
+         redis::Command, redis::RedisError,
          redis::ScriptCall,
          redis::resp::Writer, redis::resp::Value, redis::wire::admit, redis::wire::serverError, redis::wire::Wait,
          redis::wire::blockingWait, redis::wire::later, redis::wire::isWatch };
@@ -108,10 +109,7 @@ type resource Replies implements Sendable {
             return Result::Err(error: RedisError::Usage(detail: "reply ${index} was taken already: each reply is taken once"));
         }
         this.taken[index] = true;
-        this.values.add(item: Value::Null);
-        this.values.swap(i: index, j: this.values.length() - 1);
-        Optional<Value> removed = this.values.pop();
-        Value v = match (give removed) { case Some(value: x): give x; case None: Value::Null; };
+        Value v = replace::<Value>(place: this.values[index], with: Value::Null);
         if (v.isError()) {
             RedisError e = RedisError::Server(error: serverError(v: v));
             Value dropped = give v;

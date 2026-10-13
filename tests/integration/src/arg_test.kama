@@ -1,18 +1,10 @@
-// RedisArg and the cmd"…" tag, against the server. This is the integration program's one file that converts a value
-// to RedisArg: on a compiler before 0.9.543, a release build fails when two files convert the same primitive
-// (KAMA_GAPS.md, KPG-38). Every other file builds its commands with Command's `arg` methods.
+// RedisArg and the cmd"…" tag, against the server: bytes, lists, Uuids, the integers' extremes and floats come back
+// as they went.
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::f64Str, std::fmt::parse,
          std::fmt::ParseError, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
-         redis::Connection, redis::Command, redis::cmd, redis::reply, redis::RedisError, redis::Scan, redis::resp::Value,
+         std::uuid::Uuid, redis::Connection, redis::Command, redis::cmd, redis::reply, redis::RedisError, redis::resp::Value,
          redis_integration_tests::check, open, mainUrl, ask, shown };
-export { argTests, setScan, hashScan, zsetScan, matchingIn };
-
-// Scans of a key, and a MATCH pattern, from text: the program's other files build theirs here, so this file alone
-// converts a string to RedisArg (KPG-38).
-fn Scan setScan(const ref string key) { return Scan.setMembers(key: key); }
-fn Scan hashScan(const ref string key) { return Scan.hashFields(key: key); }
-fn Scan zsetScan(const ref string key) { return Scan.sortedSetMembers(key: key); }
-fn void matchingIn(ref Scan scan, const ref string pattern) { scan.matching(pattern: pattern); }
+export { argTests };
 
 unsafe fn Connection reach(const ref string tail) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
@@ -86,6 +78,40 @@ unsafe fn int32 bytesTests() {
     getKey.argBytes(bytes: all.view());
     string back = sent(c: c, command: getKey);
     f = f + check(ok: storedKey == "OK" && back == "v", what: "arg: all 256 byte values, as a key: ${back}");
+
+    // The same through the tag: DynamicArray<uint8> is one binary argument.
+    Command tagged = cmd"SET kr:bytes:tag ${all}";
+    string storedTag = sent(c: c, command: tagged);
+    Command getTag = Command.of(name: "GET");
+    getTag.arg(text: "kr:bytes:tag");
+    f = f + check(ok: storedTag == "OK" && bulkIs(c: c, command: getTag, want: all), what: "arg: all 256 byte values through the tag");
+    Result<DynamicArray<uint8>, RedisError> typed = reply::<DynamicArray<uint8>>(result: c.call(command: getTag));
+    bool typedSame = match (typed) { case Ok(value: b): b.equals(other: all); case Err(error: e): false; };
+    f = f + check(ok: typedSame, what: "arg: and back as DynamicArray<uint8>");
+
+    // A list hole: one argument per element, binary ones included; an empty list adds none.
+    DynamicArray<DynamicArray<uint8>> blobs = DynamicArray.empty();
+    blobs.add(item: copy all);
+    DynamicArray<uint8> empty = DynamicArray.empty();
+    blobs.add(item: give empty);
+    DynamicArray<string> nothing = DynamicArray.empty();
+    string cleared = ask(c: c, text: "DEL kr:list");
+    Command push = cmd"RPUSH kr:list ${blobs} ${nothing}";
+    string pushed = sent(c: c, command: push);
+    Command range = cmd"LRANGE kr:list 0 -1";
+    Result<DynamicArray<DynamicArray<uint8>>, RedisError> listed = reply::<DynamicArray<DynamicArray<uint8>>>(result: c.call(command: range));
+    bool listSame = match (listed) { case Ok(value: xs): xs.length() == 2 && xs[0].equals(other: all) && xs[1].length() == 0; case Err(error: e): false; };
+    f = f + check(ok: pushed == "2" && listSame, what: "arg: a list hole is an argument per element: ${pushed}");
+
+    // A Uuid goes as its text, and reads back as a Uuid.
+    Uuid id = Uuid.v4();
+    string want = "${id}";
+    Command setId = cmd"SET kr:uuid ${id}";
+    string storedId = sent(c: c, command: setId);
+    Command getId = cmd"GET kr:uuid";
+    Result<Uuid, RedisError> readId = reply::<Uuid>(result: c.call(command: getId));
+    string gotId = match (readId) { case Ok(value: u): "${u}"; case Err(error: e): e.message(); };
+    f = f + check(ok: storedId == "OK" && gotId == want, what: "arg: a Uuid as its text, and back: ${gotId}");
     return f;
 }
 

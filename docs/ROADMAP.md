@@ -19,15 +19,11 @@ drawn up from primary sources, as phase 3's was ("Phase 3: where to start" below
   - pipelines, blocking deadlines, transactions (`transact`, `watched`), scripts and `Scan`.
   The unit suite reads every typed pair from all eight servers under both protocols, and builds each blocking
   command from every server's COMMAND DOCS. `tools/check-readme.sh` runs the README's programs live.
-- Gates: `tools/test.sh` and `tools/test-integration.sh` are green on all eight servers, debug and release, on
-  kama 0.9.542 (CI's pin). cstar's newest build (0.9.560) refuses the unit program because of a regression there
-  (KRD-8), so it is not a second gate until that is fixed.
-- Open gaps here:
-  - KRD-8 (HIGH): the regression above.
-  - KRD-7 (MED): an adapter over a std type cannot name `Command`. It holds back the bytes, list and Uuid adapters.
-  - @kama/postgres's KPG-38 is fixed in 0.9.543, but no tagged release has it, and CI stays on `v0.9.542` until one
-    does. Until then each test program converts to `RedisArg` in one file.
-  - KRD-5 and KRD-6 are fixed (0.9.531, 0.9.533).
+- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.573 (the floor and CI's pin) and cstar's 0.9.577;
+  `tools/test-integration.sh` on all eight servers on 0.9.573, and on Redis 6.2 and Valkey 9.1 on 0.9.577.
+- Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
+  and CI pin moved there, `RedisArg` gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone,
+  and the reply reader implements 0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -67,6 +63,7 @@ facts they rest on by repro, on 0.9.542 and on cstar's 0.9.558.
   go through `Command.argBytes`, a loop of `add`, and `arg(text: "${id}")`.
 
 When a tag has both fixes: raise the floor and the CI pin, drop the one-file rule, and add the three adapters.
+**Done 2026-10-13**, on v0.9.573 (KAMA_GAPS.md has each verification).
 
 ### The session's steps
 
@@ -154,8 +151,8 @@ Every step below is done (2026-10-09), each in its own commit ("Phase 3, step N"
 - `Command.addFields(value: Serializable)` for HSET from a struct (no adapter can cover every struct);
 - a `<Map>` adapter;
 - measuring the per-byte typed read of `DynamicArray<uint8>` before asking cstar for a bulk read;
-- once a tag has KPG-38's and KRD-7's fixes: the `DynamicArray<uint8>`, `DynamicArray<T>` and `Uuid` adapters, and
-  lifting the one-conversion-file rule.
+- ~~once a tag has KPG-38's and KRD-7's fixes: the `DynamicArray<uint8>`, `DynamicArray<T>` and `Uuid` adapters, and
+  lifting the one-conversion-file rule~~ (done 2026-10-13, v0.9.573).
 
 ## Decided, and why
 
@@ -382,15 +379,15 @@ confirmed the kama facts underneath, and are listed at the end.
     | int8 to int64, isize, uint16 to uint64 | decimal |
     | float32, float64 | shortest round-trip (a float32's own, "0.1"), `inf`/`-inf`; NaN refused (the server rejects it too) |
     | string | its bytes |
-    | `DynamicArray<uint8>` | exactly one binary argument, even when empty (after KRD-7) |
-    | `DynamicArray<T: RedisArg>` | one argument per element, so an empty list is none (after KRD-7) |
-    | Uuid | its text (after KRD-7) |
+    | `DynamicArray<uint8>` | exactly one binary argument, even when empty |
+    | `DynamicArray<T: RedisArg>` | one argument per element, so an empty list is none |
+    | Uuid | its text |
 
     Step 3 found, live: every float in the table comes back from ZADD and ZSCORE as the same value under both
     protocols, except the sign of zero. `-0` is sent as `-0`; Redis 6.2 keeps its sign, and 7.0 and later answer `0`
     for it (ZSCORE, ZRANGE, INCRBYFLOAT), so the sign of a zero is the server's.
 
-    The last three wait for KRD-7's fix in a tagged compiler. Until then a caller writes them through `Command`:
+    The last three waited for KRD-7's fix, and came with v0.9.573 (2026-10-13). Until then a caller writes them through `Command`:
     `argBytes`, a loop of `add`, `arg(text: "${id}")`.
 
   - **No adapter, so each is a compile-time refusal:**
@@ -398,8 +395,8 @@ confirmed the kama facts underneath, and are listed at the end.
     - Optional: redis-rs drops a None; go-redis sends "";
     - uint8, Timestamp, Date and Duration: no single meaning (EXPIREAT wants seconds, PEXPIREAT milliseconds).
   - **Coherence:** `<DynamicArray<uint8>>` beside `<DynamicArray> when [T: RedisArg]` is coherent only because uint8
-    has no adapter, since the compiler checks `when` per instance (SPEC, "Adapters"). This is confirmed by repro
-    when KRD-7 lets either be written.
+    has no adapter, since the compiler checks `when` per instance (SPEC, "Adapters"). Confirmed on v0.9.573: both
+    build, and the unit tests read each as designed.
 - **`cmd"…"`** is `fn Command cmd(Template<RedisArg> t)`.
   - Its literal splits on ASCII whitespace into whole arguments, and each hole is one argument, or several for a list.
   - It is refused for: text touching a hole (`user:${id}`: a hole is never spliced into text), two holes side by
@@ -512,7 +509,8 @@ confirmed the kama facts underneath, and are listed at the end.
     without bound (redis-rs, redis-py) or leave it to the caller (go-redis).
   - **What building it settled (step 7):**
     - `watched` takes the WATCH command itself (`cmd"WATCH ${a} ${b}"`), not `keys: RedisArg`. A list of keys needs
-      the `DynamicArray` adapter, which KRD-7 blocks, and a command carries binary keys as they are.
+      the `DynamicArray` adapter, which KRD-7 blocked then, and a command carries binary keys as they are. A list hole
+      works there now too: `cmd"WATCH ${keys}"`.
     - A body is a `TxBody`, as postgres's `TransactionBody` is (no closures): `build(ref Connection conn, ref
       Pipeline tx)` reads over the connection while the keys are watched, and fills the pipeline. A body that fails
       gets UNWATCH, and its error is returned.
@@ -544,7 +542,7 @@ confirmed the kama facts underneath, and are listed at the end.
     - The shape is `Scan.keys()`, `setMembers(key:)`, `hashFields(key:)` and `sortedSetMembers(key:)`, with the
       options `matching(pattern:)`, `countHint(count:)`, `ofType(typeName:)` and `noValues()`. `next(conn:)`
       returns the page's items as a reply, so they read with `reply::<T>` as any reply does.
-    - Keys and patterns are `RedisArg`s; a key as bytes comes with KRD-7's `DynamicArray<uint8>` adapter.
+    - Keys and patterns are `RedisArg`s, so a key as bytes is a `DynamicArray<uint8>`.
     - An option a scan does not have (TYPE on a key's members, NOVALUES off HSCAN, COUNT below 1) is `Usage`,
       before anything is written. A reply that is not a cursor and a page is `Value`, and the connection goes on.
       `next` after the last page is `Usage`.

@@ -7,7 +7,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 > **Status: commands work; not yet published.** A connection authenticates, picks its protocol and database, and
 > sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. It is tested live
 > on Redis 6.2–8.10 and Valkey 7.2–9.1. Push messages, TLS and cluster come next; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.529**.
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.573**.
 
 ## Connecting
 
@@ -79,11 +79,13 @@ fn int32 main() {
   | `int8` to `int64`, `isize`, `uint16` to `uint64` | its decimal |
   | `float32`, `float64` | the shortest decimal that reads back the same; `inf`, `-inf`; a NaN is refused |
   | `string` | its bytes |
+  | `DynamicArray<uint8>` | one binary argument, even when empty |
+  | `DynamicArray<T>` of any of these | one argument per element, so an empty list is none (`DEL ${keys}`) |
+  | `Uuid` | its text |
 
   Anything else is refused where it is written: a `bool`, a `char` or an `Optional` has no one meaning on the wire.
   A literal that touches a hole (`user:${id}`), puts two holes side by side, or quotes a word is refused when the
-  command is sent, before anything is written. Bytes go through `Command.argBytes`, and a `Uuid` as its text, until
-  their own adapters come (KAMA_GAPS.md, KRD-7).
+  command is sent, before anything is written.
 - **`Command`** builds one by hand: `Command.of(name:)`, then `arg(text:)`, `argBytes(bytes:)`, `argInt(value:)`,
   `argFloat(value:)` and `add(value:)` for any `RedisArg`.
 - **Commands a connection does not carry** are refused, by name, before anything is written: the pub/sub commands,
@@ -93,8 +95,6 @@ fn int32 main() {
   has no deadline. The table covers every command each server calls blocking, and is checked against their
   `COMMAND DOCS`: `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BRPOPLPUSH`, `BLMOVE`, `BLMOVEM`, `BLMPOP`, `BZMPOP`,
   `XREAD` and `XREADGROUP`'s `BLOCK`, `WAIT` and `WAITAOF`.
-- **On a compiler before 0.9.543,** convert values to `RedisArg` (a `cmd` hole, `Command.add`) in one file of a
-  program only, or a release build fails (KAMA_GAPS.md, KPG-38). Helpers in that one file can serve the rest.
 
 ## Replies, pipelines, transactions, scripts and SCAN
 

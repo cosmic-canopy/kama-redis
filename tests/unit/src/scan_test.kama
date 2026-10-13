@@ -3,8 +3,7 @@
 // (A scan of many pages needs a live server: tests/integration's scan_test.)
 import { std::collections::DynamicArray, std::collections::Map, redis::Connection, redis::Command, redis::Scan,
          redis::RedisError, redis::reply, redis::resp::Value,
-         redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, callOutcome, isSimple,
-         setScan, hashScan, zsetScan, matchingIn };
+         redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, callOutcome, isSimple };
 export { scanTests };
 
 fn string listed(const ref Result<DynamicArray<string>, RedisError> r) {
@@ -44,27 +43,27 @@ unsafe fn int32 scanTests() {
                   what: "scan: SCAN's one page, then done: ${g1}; ${g1b}");
 
     // SSCAN, HSCAN (with values and without), ZSCAN: each page read as typed items.
-    Scan members = setScan(key: "kr:ss");
+    Scan members = Scan.setMembers(key: "kr:ss");
     Result<DynamicArray<string>, RedisError> m1 = reply::<DynamicArray<string>>(result: members.next(conn: c));
     string g2 = listed(r: m1);
     f = f + check(ok: g2 == "1,2,3" && members.isDone(), what: "scan: SSCAN's page: ${g2}");
-    Scan fields = hashScan(key: "kr:hs");
+    Scan fields = Scan.hashFields(key: "kr:hs");
     Result<Map<string, string>, RedisError> h1 = reply::<Map<string, string>>(result: fields.next(conn: c));
     bool hashed = match (h1) { case Ok(value: m): m.length() == 2 && m.contains(key: "a") && m.contains(key: "b"); case Err(error: e): false; };
     f = f + check(ok: hashed && fields.isDone(), what: "scan: HSCAN's page as a Map");
-    Scan names = hashScan(key: "kr:hs");
+    Scan names = Scan.hashFields(key: "kr:hs");
     names.noValues();
     Result<DynamicArray<string>, RedisError> h2 = reply::<DynamicArray<string>>(result: names.next(conn: c));
     string g3 = listed(r: h2);
     f = f + check(ok: g3 == "a,b", what: "scan: HSCAN NOVALUES's page: ${g3}");
-    Scan scored = zsetScan(key: "kr:zs");
+    Scan scored = Scan.sortedSetMembers(key: "kr:zs");
     Result<Map<string, float64>, RedisError> z1 = reply::<Map<string, float64>>(result: scored.next(conn: c));
     bool zs = match (z1) { case Ok(value: m): m.length() == 2; case Err(error: e): false; };
     f = f + check(ok: zs, what: "scan: ZSCAN's page as a Map of scores");
 
     // The options, in the order given, after the cursor.
     Scan opts = Scan.keys();
-    matchingIn(scan: opts, pattern: "kr:*");
+    opts.matching(pattern: "kr:*");
     opts.countHint(count: 100i64);
     opts.ofType(typeName: "string");
     Result<DynamicArray<string>, RedisError> o1 = reply::<DynamicArray<string>>(result: opts.next(conn: c));
@@ -75,13 +74,13 @@ unsafe fn int32 scanTests() {
     Scan odd = Scan.keys();
     Result<Value, RedisError> o2 = odd.next(conn: c);
     string g5 = callOutcome(r: o2);
-    Scan wrong = setScan(key: "kr:s");
+    Scan wrong = Scan.setMembers(key: "kr:s");
     Result<Value, RedisError> o3 = wrong.next(conn: c);
     bool wrongType = match (o3) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text() == "WRONGTYPE"; case None: false; }; case Ok(value: v): false; };
     f = f + check(ok: g5 == "SCAN's reply is not a cursor and a page" && wrongType && !c.isClosed(), what: "scan: not a page: ${g5}; an error reply is the server's");
 
     // Options a scan does not have are refused before anything is written: the script's PING is next.
-    Scan typed = setScan(key: "kr:ss");
+    Scan typed = Scan.setMembers(key: "kr:ss");
     typed.ofType(typeName: "string");
     string g6 = callOutcome(r: typed.next(conn: c));
     Scan valueless = Scan.keys();

@@ -48,7 +48,7 @@ for ex in "$work"/ex*.kama; do
     mkdir -p "$project/src"
     sed "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" "$ex" > "$project/src/main.kama"
     cat > "$project/kama.json" <<EOF
-{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.529",
+{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.573",
   "entry": "src/main.kama", "dependencies": { "@kama/redis": { "path": "../../.." } },
   "modules": { ".": { "visibility": "internal" } } }
 EOF

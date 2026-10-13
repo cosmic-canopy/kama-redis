@@ -1,4 +1,4 @@
-import { std::fmt::u64Str, std::fmt::f32Str, redis::Command };
+import { std::collections::DynamicArray, std::fmt::u64Str, std::fmt::f32Str, std::uuid::Uuid, redis::Command };
 export { RedisArg, cmd };
 
 // A value that is a command's argument: it writes itself into a `Command` as one or more whole arguments, through
@@ -7,13 +7,16 @@ export { RedisArg, cmd };
 //   - the integers, `isize` included: their decimal;
 //   - float32 and float64: the shortest decimal that reads back as the same value, `inf` and `-inf`. A NaN is
 //     refused (`RedisError::Value`), as the server refuses one;
-//   - string: its bytes.
+//   - string: its bytes;
+//   - `DynamicArray<uint8>`: its bytes, as exactly one argument, even when it is empty;
+//   - `DynamicArray<T>` of any of these: one argument per element, so an empty list is none (`DEL ${keys}`);
+//   - `Uuid`: its text.
 //
 // Nothing else converts, so each of these is refused where it is written: `bool` and `char` (redis-py refuses a bool;
 // redis-rs and go-redis send 1 or 0); `Optional` (redis-rs drops a None, go-redis sends ""); `uint8`, `Timestamp`,
-// `Date` and `Duration`, which have no one meaning (EXPIREAT wants seconds, PEXPIREAT milliseconds). Bytes, lists and
-// Uuids go through `Command`: `argBytes`, a loop of `add`, `arg(text: "${id}")`. Their own adapters come with a
-// compiler that can write them (KAMA_GAPS.md, KRD-7).
+// `Date` and `Duration`, which have no one meaning (EXPIREAT wants seconds, PEXPIREAT milliseconds). `uint8` having
+// none is also what lets `DynamicArray<uint8>` be bytes while every other `DynamicArray` is a list: the list's adapter
+// applies only to an element type that converts.
 //
 // A type of your own implements it in its declaration, and may `refuse` a value it has no form for.
 type contract RedisArg for value, resource, enum, intrinsic { const fn void writeRedisArg(ref Command into); }
@@ -51,11 +54,33 @@ type adapter <string> implements RedisArg {
     public const fn void writeRedisArg(ref Command into) { into.arg(text: this); }
 }
 
+type adapter <DynamicArray<uint8>> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) { into.argBytes(bytes: this.view()); }
+}
+
+type adapter <DynamicArray> implements RedisArg when [T: RedisArg] {
+    public const fn void writeRedisArg(ref Command into) {
+        isize i = 0;
+        while (i < this.length()) {
+            this[i].writeRedisArg(into: ref into);
+            i = i + 1;
+        }
+    }
+}
+
+type adapter <Uuid> implements RedisArg {
+    public const fn void writeRedisArg(ref Command into) {
+        string text = "${this}";
+        into.arg(text: text);
+    }
+}
+
 // The `cmd` tag: `cmd"SET ${key} ${value} EX 10"` is a Command. Its literal text is split on ASCII whitespace into
 // whole arguments, the first word is the command's name, and each hole is a whole argument of its own, never text
 // spliced into a word. These are refused (`RedisError::Usage`), when the command is sent and before anything is
 // written:
 //   - text touching a hole (`user:${id}`): build the word first, and pass it as the hole;
+//   A hole holding a list is as many arguments as it has elements.
 //   - two holes side by side;
 //   - a quote anywhere in the literal: a hole carries an argument with spaces in it, so nothing needs quoting;
 //   - a name that is a hole, and a literal with no words.

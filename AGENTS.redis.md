@@ -17,12 +17,21 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.529**, declared as `"kama"` in every manifest here. That is the first compiler with
-everything this package relies on:
+**The package needs kama ≥ 0.9.573**, declared as `"kama"` in every manifest here, and CI pins `v0.9.573`. That is the
+first tagged compiler with everything this package relies on (users install tagged releases):
 - the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
 - `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
 - `DynamicArray.addAll`, `View.copyFrom` and `capacity()`, one `memcpy` each (0.9.528, KRD-3);
-- an isolate's stack stated as the main thread's, which `resp::Limits.maxDepth` = 1024 relies on (0.9.529, KRD-2).
+- an isolate's stack stated as the main thread's, which `resp::Limits.maxDepth` = 1024 relies on (0.9.529, KRD-2);
+- one adapter vtable per release build, however many files convert (0.9.543, KPG-38);
+- `std::memory::replace` (0.9.563), which `Replies.take` uses;
+- std's `deserialize` reading a program's types in the program's scope (0.9.565, KRD-8), and an adapter's signature
+  read in the adapter's module (0.9.566, KRD-7), which the bytes, list and Uuid adapters need;
+- `DeErrorKind`, `failWith(kind:)` and `DeError.field()` (0.9.569), which the reply reader implements.
+
+Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+is under active work and has regressed before (KRD-8). Install a tag beside your own with cstar's `install.sh`
+(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.573`), and run the gates with `KAMA=<dir>/bin/kama`.
 
 ## What is true here and nowhere else
 
@@ -105,21 +114,9 @@ everything this package relies on:
   - The first error is final, and `ProtocolError` has scalar payloads so it can be handed back on every call.
   - `spare`/`commit` let a connection read straight into the buffer.
 
-- **Two compiler gaps bound `RedisArg` until CI is on a tag that fixes them** (docs/ROADMAP.md, "Phase 3: where to
-  start"):
-  - KPG-38: a release build fails when two files convert the same primitive to the same contract. So each test
-    program converts primitives to `RedisArg` (a `cmd"…"` hole, `Command.add`) in exactly one file, `arg_test.kama`,
-    and every other test file builds commands with `arg`, `argBytes` and `argInt`. The package itself never
-    converts: adapter bodies and helpers write through `Command`'s `arg*` methods.
-  - KRD-7: an adapter over a std type cannot name `Command`, so there is no adapter for `DynamicArray<uint8>`,
-    `DynamicArray<T>` or `Uuid`. Bytes go through `argBytes`, lists through a loop of `add`.
-  - Each test program's `arg_test.kama` also holds the helpers other files use to convert (the scans' keys and
-    patterns), so a release build stays whole.
-
-- **KRD-8: cstar's newest build (0.9.560) refuses the unit program**, through no change here: std's `deserialize`
-  instantiated with a type of the program's looks its names up in std. Until it is fixed, `tools/test.sh` and the
-  live suite are gated on the CI pin (`v0.9.542`) alone; install it with `KAMA_HOME=<dir> KAMA_VERSION=v0.9.542`
-  and cstar's `install.sh`, and run the gates with `KAMA=<dir>/bin/kama`.
+- **`RedisArg`'s adapters write through `Command`'s `arg*` methods**, and `uint8` has none on purpose: that is what
+  lets `DynamicArray<uint8>` be bytes (one argument) beside `<DynamicArray> when [T: RedisArg]` (an argument per
+  element). An adapter must live in the contract's module (src/arg.kama).
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.
@@ -134,7 +131,8 @@ everything this package relies on:
     with `:= expr;`.
   - A value declared outside a loop may be given inside it only if every path back to the loop's start assigns it
     again (0.9.526). A local moved on only some paths cannot be assigned at all.
-  - A field cannot be moved out (`give this.x`). Drain a `DynamicArray` with `pop()`.
+  - A field cannot be moved out (`give this.x`). Hand out what a place holds with `std::memory::replace(place:,
+    with:)`, stating its type (`replace::<Value>(…)`), or drain a `DynamicArray` with `pop()`.
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
   - No shadowing: a parameter cannot have the name of a function in scope, nor a match binding the name of a local.
   - A `ConstView` local must be rooted: pass the view as a by-value parameter to a helper instead.
@@ -149,8 +147,6 @@ everything this package relies on:
   - A value-producing `match` is not an assignment's right side. Bind it to a local, or move it into a helper.
   - A local moved on one branch must be moved on every branch, a failure branch included:
     `case Err(error: e): { Connection failed = give c; return …; }`.
-  - Before 0.9.533, an inner `if` whose arms all move a value and `return` read as not moving it (KRD-6, fixed). The
-    floor is 0.9.529, so keep writing early exits: `if (push) { …; continue; }`, then `if (error) { …; return …; }`.
   - A `Result`'s error type must implement `Error`: `Result<T, string>` is refused. Return a `RedisError`.
   - A struct with a `string` field owns, so it is a `type resource`, and its fields are private. A typed reply's
     struct gives its caller accessors.
@@ -165,6 +161,8 @@ everything this package relies on:
     a call (`isize n = xs.length();`) first.
   - A local may not share a name with a field, nor with a local of an enclosing scope.
   - A `Template<C>`'s holes are `const ref`, so a contract method a tag calls on one is a `const fn`.
+  - A hand-written `Deserializer` latches a `DeErrorKind` (`failWith(kind:)`, `errorKind()`); the derive adds where
+    on the way out, so a `DeError` recovered with `e.as<DeError>()` names its field (`c.field()`: `f2`, `[1].f2`).
   - A path dependency's path is relative to its manifest; an absolute one is not found.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when

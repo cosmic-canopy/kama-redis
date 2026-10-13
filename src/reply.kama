@@ -79,7 +79,7 @@ type resource ReplyReader implements Deserializer {
     bool err = false;
     bool server = false;
     isize failedAt = -1;
-    DeError code = DeError::Malformed;
+    DeErrorKind code = DeErrorKind::Malformed;
     string where = "";
     string why = "";
 
@@ -195,7 +195,7 @@ type resource ReplyReader implements Deserializer {
 
     // ---- failing ----
 
-    fn void refuse(DeError e, const ref string why) {
+    fn void refuse(DeErrorKind e, const ref string why) {
         if (this.err) { return; }
         this.err = true;
         this.code = e;
@@ -208,27 +208,27 @@ type resource ReplyReader implements Deserializer {
     fn void mismatch(const ref string asked) {
         if (this.err) { return; }
         if (this.at >= this.limit()) {
-            this.refuse(e: DeError::UnexpectedEnd, why: "nothing is left to read as ${asked}");
+            this.refuse(e: DeErrorKind::UnexpectedEnd, why: "nothing is left to read as ${asked}");
             return;
         }
         if (this.isFailureAt()) {
-            this.refuse(e: DeError::TypeMismatch, why: "an error");
+            this.refuse(e: DeErrorKind::TypeMismatch, why: "an error");
             this.server = true;
             return;
         }
         if (this.isNullAt()) {
-            this.refuse(e: DeError::TypeMismatch, why: "null cannot be read as ${asked}: read it with replyOpt or replyOpts, or into an Optional");
+            this.refuse(e: DeErrorKind::TypeMismatch, why: "null cannot be read as ${asked}: read it with replyOpt or replyOpts, or into an Optional");
             return;
         }
         string what = this.described(i: this.at);
-        this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " cannot be read as ").concat(other: asked));
+        this.refuse(e: DeErrorKind::TypeMismatch, why: what.concat(other: " cannot be read as ").concat(other: asked));
     }
 
     // Whether a single value can be read here as `asked`; refused when it cannot.
     fn bool ready(const ref string asked) {
         if (this.err) { return false; }
         if (this.topIs(h: Hold::Bytes)) {
-            this.refuse(e: DeError::TypeMismatch, why: "a string's bytes cannot be read as ${asked}");
+            this.refuse(e: DeErrorKind::TypeMismatch, why: "a string's bytes cannot be read as ${asked}");
             return false;
         }
         if (this.at >= this.limit() || this.isNullAt() || this.isFailureAt()) {
@@ -250,17 +250,18 @@ type resource ReplyReader implements Deserializer {
         return RedisError::Value(detail: give d);
     }
 
-    // The type's own refusal, when the reader saw nothing wrong: the derive's missing field, or a type rejecting
-    // what it read (Uuid's text).
+    // The type's own refusal, when the reader saw nothing wrong: the derive's missing field, named by its path, or
+    // a type rejecting what it read (Uuid's text).
     const fn RedisError derived(Owned<Error> e) {
         if (this.err) { return this.reported(); }
         Optional<DeError> verdict = e.as<DeError>();
-        bool missing = match (verdict) { case Some(value: c): match (c) { case MissingField: true; case _: false; }; case None: false; };
+        bool missing = match (verdict) { case Some(value: c): match (c.kind()) { case MissingField: true; case _: false; }; case None: false; };
+        string place = match (verdict) { case Some(value: c): placed(field: c.field()); case None: "reply"; };
         if (missing) {
-            return RedisError::Value(detail: "reply: a field that is neither Optional nor @field(default) is not in the reply");
+            return RedisError::Value(detail: place.concat(other: ": a field that is neither Optional nor @field(default) is not in the reply"));
         }
-        string m = e.message();
-        return RedisError::Value(detail: "reply: ".concat(other: m));
+        string m = match (verdict) { case Some(value: c): c.kind().message(); case None: e.message(); };
+        return RedisError::Value(detail: place.concat(other: ": ").concat(other: m));
     }
 
     // ---- integers ----
@@ -283,7 +284,7 @@ type resource ReplyReader implements Deserializer {
         int64 v = match (got) { case Some(value: x): x; case None: 0i64; };
         if (v < lo || v > hi) {
             string what = this.described(i: this.at);
-            this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is out of range for ").concat(other: asked));
+            this.refuse(e: DeErrorKind::TypeMismatch, why: what.concat(other: " is out of range for ").concat(other: asked));
             return 0i64;
         }
         this.at = this.at + 1;
@@ -324,7 +325,7 @@ type resource ReplyReader implements Deserializer {
         if (pair) {
             isize second = this.ends[this.at];
             if (second >= this.limit()) {
-                this.refuse(e: DeError::UnexpectedEnd, why: "a key with no value");
+                this.refuse(e: DeErrorKind::UnexpectedEnd, why: "a key with no value");
                 return;
             }
             this.frames.add(item: Frame.of(hold: Hold::Fields, end: this.ends[second]));
@@ -340,7 +341,7 @@ type resource ReplyReader implements Deserializer {
             isize c = this.countAt();
             if (c % 2 != 0) {
                 string what = this.described(i: this.at);
-                this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " of ${c} items cannot be read as a struct by name: its items are not key-value pairs (replyRecord reads it by position)"));
+                this.refuse(e: DeErrorKind::TypeMismatch, why: what.concat(other: " of ${c} items cannot be read as a struct by name: its items are not key-value pairs (replyRecord reads it by position)"));
                 return;
             }
             h = Hold::Named;
@@ -359,7 +360,7 @@ type resource ReplyReader implements Deserializer {
 
     public fn FieldKey field() {
         if (this.err || this.frames.length() == 0) {
-            this.refuse(e: DeError::Malformed, why: "a field read outside a struct");
+            this.refuse(e: DeErrorKind::Malformed, why: "a field read outside a struct");
             return FieldKey::Position(rank: 0ui32);
         }
         isize k = this.frames.length() - 1;
@@ -368,13 +369,13 @@ type resource ReplyReader implements Deserializer {
         if (this.frames[k].hold != Hold::Named) { return FieldKey::Position(rank: truncate<uint32>(rank)); }
         this.frames[k].key = this.at;
         if (this.at + 1 >= this.frames[k].end) {
-            this.refuse(e: DeError::UnexpectedEnd, why: "a key with no value");
+            this.refuse(e: DeErrorKind::UnexpectedEnd, why: "a key with no value");
             return FieldKey::Position(rank: 0ui32);
         }
         bool usable = match (this.nodes[this.at]) { case Text(bytes: b, shape: s): true; case Integer(value: n): true; case _: false; };
         if (!usable) {
             string what = this.described(i: this.at);
-            this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is not a field's name"));
+            this.refuse(e: DeErrorKind::TypeMismatch, why: what.concat(other: " is not a field's name"));
             return FieldKey::Position(rank: 0ui32);
         }
         string name = this.textAt(i: this.at);
@@ -438,7 +439,7 @@ type resource ReplyReader implements Deserializer {
             return false;
         }
         if (this.frames[k].hold != Hold::List && this.frames[k].hold != Hold::Entries) {
-            this.refuse(e: DeError::Malformed, why: "a list's elements read outside a list");
+            this.refuse(e: DeErrorKind::Malformed, why: "a list's elements read outside a list");
             return false;
         }
         if (this.at < this.frames[k].end) {
@@ -460,7 +461,7 @@ type resource ReplyReader implements Deserializer {
             isize k = this.frames.length() - 1;
             isize i = this.frames[k].byteAt;
             if (i >= this.frames[k].seen) {
-                this.refuse(e: DeError::Malformed, why: "a byte read past the string's end");
+                this.refuse(e: DeErrorKind::Malformed, why: "a byte read past the string's end");
                 return 0ui8;
             }
             uint8 b = match (this.nodes[this.frames[k].node]) {
@@ -545,7 +546,7 @@ type resource ReplyReader implements Deserializer {
             bool valid = match (s) { case Some(value: t): true; case None: false; };
             if (!valid) {
                 string what = this.described(i: this.at);
-                this.refuse(e: DeError::TypeMismatch, why: what.concat(other: " is not UTF-8, so it cannot be read as string: read it as DynamicArray<uint8>"));
+                this.refuse(e: DeErrorKind::TypeMismatch, why: what.concat(other: " is not UTF-8, so it cannot be read as string: read it as DynamicArray<uint8>"));
                 return "";
             }
             this.at = this.at + 1;
@@ -574,20 +575,28 @@ type resource ReplyReader implements Deserializer {
     }
 
     public const fn bool failed() { return this.err; }
-    public fn void fail() { this.failWith(e: DeError::Malformed); }
+    public fn void fail() { this.failWith(kind: DeErrorKind::Malformed); }
 
     // A type refused what it read (a Uuid's text): name the value it read.
-    public fn void failWith(DeError e) {
+    public fn void failWith(DeErrorKind kind) {
         if (this.err) { return; }
         if (this.at > 0) { this.at = this.at - 1; }
         string what = this.described(i: this.at);
-        this.refuse(e: e, why: what.concat(other: " is not a value of the type read"));
+        this.refuse(e: kind, why: what.concat(other: " is not a value of the type read"));
     }
 
-    public const fn DeError errorCode() { return this.code; }
+    public const fn DeErrorKind errorKind() { return this.code; }
 
     // Whether anything of the reply is left unread.
     const fn bool unread() { return this.at < this.nodes.length(); }
+}
+
+// A derive's path (`f2`, `[1].f2`) as a place in the reply: `reply.f2`, `reply[1].f2`; `reply` for the whole.
+fn string placed(Optional<string> field) {
+    string path = match (give field) { case Some(value: f): give f; case None: ""; };
+    if (path.length() == 0) { return "reply"; }
+    if (path[0] == 91) { return "reply".concat(other: path); }
+    return "reply.".concat(other: path);
 }
 
 fn void stacked(ref DynamicArray<Value> work, DynamicArray<Value> items) {

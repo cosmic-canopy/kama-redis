@@ -1,18 +1,9 @@
-// RedisArg and the cmd"…" tag (src/arg.kama). This is the unit program's one file that converts a value to RedisArg:
-// on a compiler before 0.9.543, a release build fails when two files convert the same primitive (KAMA_GAPS.md,
-// KPG-38). Every other file builds its commands with Command's `arg` methods.
-import { std::collections::DynamicArray, redis::Command, redis::cmd, redis::Connection, redis::RedisError,
-         redis::Script, redis::ScriptCall, redis::Scan,
+// RedisArg and the cmd"…" tag (src/arg.kama): every form a hole takes, and every literal the tag refuses.
+import { std::collections::DynamicArray, std::uuid::Uuid, redis::Command, redis::cmd, redis::Connection,
+         redis::RedisError, redis::Script, redis::ScriptCall,
          redis::resp::Value, redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple,
          textOf };
-export { argTests, setScan, hashScan, zsetScan, matchingIn };
-
-// Scans of a key, and a MATCH pattern, from text: the program's other files build theirs here, so this file alone
-// converts a string to RedisArg (KPG-38).
-fn Scan setScan(const ref string key) { return Scan.setMembers(key: key); }
-fn Scan hashScan(const ref string key) { return Scan.hashFields(key: key); }
-fn Scan zsetScan(const ref string key) { return Scan.sortedSetMembers(key: key); }
-fn void matchingIn(ref Scan scan, const ref string pattern) { scan.matching(pattern: pattern); }
+export { argTests };
 
 // A command's parts, each in brackets: "[SET][kr:k][v]".
 fn string partsOf(const ref Command c) {
@@ -83,6 +74,39 @@ fn int32 formTests() {
     Command floats = cmd"X ${tenth} ${big} ${tiny} ${negZero} ${inf} ${ninf} ${t32} ${inf32}";
     string g7 = partsOf(c: floats);
     f = f + check(ok: g7 == "[X][0.1][1e+21][5e-324][-0][inf][-inf][0.1][inf]", what: "cmd: floats, shortest and exact: ${g7}");
+
+    // Bytes are one argument, even empty; a list is one argument per element, so an empty one is none.
+    DynamicArray<uint8> all = DynamicArray.empty();
+    isize b = 0;
+    while (b < 256) { all.add(item: truncate<uint8>(b)); b = b + 1; }
+    DynamicArray<uint8> noBytes = DynamicArray.empty();
+    Command bytes = cmd"SET ${k} ${all} ${noBytes}";
+    bool sameBytes = bytes.length() == 4 && bytes.part(index: 2).length() == 256 && bytes.part(index: 3).length() == 0
+                     && bytes.part(index: 2)[255] == 255ui8 && bytes.part(index: 2)[0] == 0ui8;
+    f = f + check(ok: sameBytes, what: "cmd: DynamicArray<uint8> is one binary argument, and an empty one is still one");
+    DynamicArray<string> keys = DynamicArray.empty();
+    keys.add(item: "a");
+    keys.add(item: "b c");
+    keys.add(item: "");
+    DynamicArray<string> none = DynamicArray.empty();
+    DynamicArray<int64> numbers = DynamicArray.empty();
+    numbers.add(item: 1i64);
+    numbers.add(item: -2i64);
+    Command lists = cmd"DEL ${keys} ${none} ${numbers}";
+    string g8 = partsOf(c: lists);
+    f = f + check(ok: g8 == "[DEL][a][b c][][1][-2]", what: "cmd: a list is an argument per element, and an empty one is none: ${g8}");
+    DynamicArray<DynamicArray<uint8>> blobs = DynamicArray.empty();
+    blobs.add(item: copy all);
+    blobs.add(item: DynamicArray.empty());
+    Command many = Command.of(name: "RPUSH");
+    many.arg(text: "kr:l");
+    many.add(value: blobs);
+    f = f + check(ok: many.length() == 4 && many.part(index: 2).length() == 256 && many.part(index: 3).length() == 0,
+                  what: "add: a list of byte strings is an argument per element, each binary");
+    Uuid nil = Uuid.nil();
+    Command id = cmd"SET ${k} ${nil}";
+    string g9 = partsOf(c: id);
+    f = f + check(ok: g9 == "[SET][kr:k][00000000-0000-0000-0000-000000000000]", what: "cmd: a Uuid is its text: ${g9}");
     return f;
 }
 
