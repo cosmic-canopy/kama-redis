@@ -1,7 +1,8 @@
 # Roadmap
 
-Where this is, 2026-10-09: phases 0 to 3 are done. Phase 4 (server push) is next; its session plan is still to be
-drawn up from primary sources, as phase 3's was ("Phase 3: where to start" below is that plan, as it was run).
+Where this is, 2026-10-13: phases 0 to 3 are done, and the compiler fixes they waited on are in (v0.9.573). Phase 4
+(server push) is next: "Phase 4: where to start" below is its session plan, drawn up from primary sources as phase 3's
+was. "Before 0.1.0" lists everything between here and a publish.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -37,11 +38,224 @@ does its discipline:
 | 1 | Pure layers. `redis::resp`: a reader and a writer for every RESP2 and RESP3 type (attributes, push, streamed strings and aggregates, big numbers, verbatim strings), bounded and hostile-input safe, with vectors from the RESP specification and hiredis's reader tests, by script. The `redis://`, `rediss://` and `unix://` URL forms. CRC16 key slots and hash tags, with the cluster specification's vectors | **done** |
 | 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
-| 4 | Server push. Pub/sub on RESP3 push messages beside commands on the same connection, and on a dedicated connection under RESP2. Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations) | next |
+| 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection). See "Phase 4: where to start" | next |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI | |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both | |
 | 7 | Pool (cross-isolate), reconnection, examples, hardening (server restart, failover, bounded memory), docs | |
 | — | Publish `@kama/redis` 0.1.0 — only on the maintainer's word | |
+
+### Before 0.1.0
+
+What stands between this and a publish, as of 2026-10-13:
+1. **Phase 4, server push** ("Phase 4: where to start" is its session plan).
+   - Pub/sub on a `Subscriber`, under both protocols.
+   - Sharded pub/sub.
+   - Client-side caching.
+   - Today the pub/sub commands are refused, and a push is only set aside, unbounded (`pendingPushes`).
+2. **Phase 5, TLS** through `@kama/tls`: `rediss://` (refused today), the chain and the host name verified, client
+   certificates, SNI. The test servers already listen on TLS, and the PKI is generated (`tools/gen-test-certs.sh`).
+3. **Phase 6, topologies.**
+   - Cluster: the slot map, MOVED and ASK, one slot per multi-key command, reads from replicas.
+   - Sentinel.
+   - A multi-node `tools/redis.sh` for both. Only `redis::cluster::keySlot` exists so far.
+4. **Phase 7.** A pool shared across isolates, reconnection, examples, hardening (a server restart, a failover,
+   bounded memory under load), and the docs.
+5. **Carried past phase 3:**
+   - `Command.addFields(value: Serializable)` (HSET from a struct);
+   - a `<Map>` adapter;
+   - measuring the typed read of `DynamicArray<uint8>`, byte by byte, before asking cstar for a bulk read.
+6. **The release itself** (AGENTS.package.md, "Publishing"):
+   - the CHANGELOG's Unreleased section becomes `[0.1.0]`, and the version stays in step with `libraryVersion()`;
+   - CI green on the pinned tag;
+   - `kama publish kama.json --dry-run` lists no certificates and no agent files;
+   - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word.
+
+   A version is permanent, and `@kama/postgres` shipped only after its whole roadmap (0.2.0).
+
+## Phase 4: where to start
+
+The plan for the next session, drawn up on 2026-10-13 from primary sources:
+- **The peers' source:** go-redis v9.23.0 (`pubsub.go`, `csc_*.go`), redis-py 8.1.0 (`client.py`'s `PubSub`,
+  `cache.py`), redis-rs 1.7.1 (`connection.rs`, `aio/pubsub.rs`, `caching/`), Lettuce 7.9.0 (`PubSubEndpoint`,
+  `ClientSideCaching`), and rueidis (`pipe.go`, `lru.go`), the most complete client-side cache.
+- **The servers:** Redis 8.10.2's and Valkey 9.1.2's own source (`pubsub.c`, `tracking.c`, `server.c`), and the
+  redis.io and valkey.io pub/sub and client-side caching pages.
+- **Probes:** every probe below, run live on all eight servers, in throwaway containers.
+- **The model:** @kama/postgres's `waitForNotification`.
+
+The bar is phase 3's: every form honoured or refused, every failure path against the scripted server, the whole matrix
+live, debug and release.
+
+**A gap in today's code, fixed first.** `CLIENT TRACKING` and `CLIENT CACHING` are not refused. Under RESP3, a caller
+can turn tracking on through `call`, and the invalidations then pile up in the connection's set-aside pushes, unread
+and unbounded.
+
+### What the servers do (probed on all eight; the generator will capture each as vectors)
+- **Confirmations.** SUBSCRIBE, PSUBSCRIBE and SSUBSCRIBE get one confirmation per name, and no other reply:
+  `[subscribe, name, count]`.
+  - Under RESP3 a confirmation is a push (`>3`); under RESP2 it is an array.
+  - A name subscribed twice is confirmed twice, with the count unchanged.
+- **Unsubscribing.**
+  - UNSUBSCRIBE with names: one confirmation per name, a name never subscribed included.
+  - With no names: one confirmation per subscribed name, **in hash order, which differs by server**, so they are
+    matched by name, never by position.
+  - With nothing subscribed: one confirmation with a null name (`$-1`, or `_` under RESP3).
+- **Counts.** A SUBSCRIBE or PSUBSCRIBE count covers channels and patterns; an SSUBSCRIBE count covers shard channels
+  alone. A connection leaves RESP2's subscribed mode only when both reach 0.
+- **Messages:** `[message, channel, payload]`, `[pmessage, pattern, channel, payload]` and `[smessage, channel,
+  payload]`. A message that both a channel and a pattern match arrives twice.
+- **RESP2's subscribed mode.**
+  - Only `(P|S)SUBSCRIBE`, `(P|S)UNSUBSCRIBE`, PING, QUIT and RESET are allowed. Anything else, HELLO included, is
+    refused with the server's own text (6.2's names `(P)SUBSCRIBE`). EXEC is refused as EXECABORT.
+  - PING answers `["pong", ""]`, in lower case.
+  - Under RESP3, any command runs while subscribed, PING answers `+PONG`, and pushes interleave with replies (a
+    message arrived during a `BLPOP`).
+- **Ordering.**
+  - **A RESP3 client that PUBLISHes to a channel it is subscribed to** gets the reply first and then the message on
+    7.2 and later; on 6.2, the pushes come first.
+  - **SUBSCRIBE inside MULTI** is QUEUED. Under RESP3, EXEC's array then holds the push (`*1 >3 subscribe …`).
+- **Sharded pub/sub** (7.0 and later; 6.2 answers `unknown command`).
+  - A standalone server accepts SSUBSCRIBE across slots. A cluster answers CROSSSLOT, or MOVED for a slot elsewhere.
+  - When a slot moves away, the server sends a `sunsubscribe` of its own, and a RESP2 connection whose counts reach
+    0 leaves subscribed mode.
+  - A plain PUBLISH does not reach a shard subscriber.
+- **RESET** drops every subscription and tracking silently, with no unsubscribe pushes, and reverts to RESP2.
+  `HELLO 2` on a RESP3 subscriber keeps the subscriptions, now in RESP2's subscribed mode.
+- **Invalidations.**
+  - **Shape.** RESP3 sends `>2 invalidate [keys]`. Default mode sends one key per push, and an MSET or EXEC sends a
+    push per key. A FLUSHALL or FLUSHDB sends `>2 invalidate _` to every tracking client.
+  - **Order.** A connection's own write gets its reply first, then the push, on all eight. A push can arrive before
+    an unrelated reply.
+  - **Options.** NOLOOP drops the push for the connection's own writes, and still forgets the key. OPTIN tracks only
+    a read after `CLIENT CACHING yes`, and inside MULTI that covers the whole transaction. A key is forgotten once
+    invalidated, so it must be read again to be tracked.
+  - **Under RESP2,** `CLIENT TRACKING on` without REDIRECT answers `+OK`, and **nothing is ever delivered**. With
+    REDIRECT, the target must be subscribed to `__redis__:invalidate`.
+  - The server's errors for each misuse (BCAST switching, overlapping prefixes, CACHING outside OPTIN/OPTOUT, a
+    REDIRECT to a missing client) are exact strings; the generator captures them.
+- **The server's limits.**
+  - `client-output-buffer-limit pubsub 32mb 8mb 60` disconnects a subscriber that falls behind.
+  - `tracking-table-max-keys` (1,000,000) evicts keys as invalidations.
+  - Delivery is at most once.
+
+### What the peers do
+- **Pub/sub.**
+  - **All four give pub/sub a connection of its own, under RESP3 as under RESP2,** although RESP3 would allow
+    sharing. redis-rs alone subscribes on a command connection, and only under RESP3.
+  - On a command connection, a pub/sub push is logged and dropped (redis-py) or goes to a generic push callback
+    (Lettuce, redis-rs).
+  - **Waiting.** go-redis's `ReceiveTimeout` and redis-py's `get_message(timeout)` block, up to a time. A background
+    reader (go-redis `Channel()`, redis-py `run_in_thread`) is offered beside them.
+  - **Confirmations are typed results with their counts.** Several peers take the first confirmation as the
+    command's reply and pair the rest wrongly.
+  - **Resubscribing.** go-redis, redis-py and Lettuce resubscribe from client-side sets on a reconnect.
+  - **Health checks.** go-redis pings every 3 s and redis-py on an interval. redis-rs and Lettuce never ping.
+  - **Bounds.** go-redis alone has one: 100 messages, then a drop after 60 s. redis-py is pull-based, and redis-rs and
+    Lettuce's default are unbounded.
+  - **Sharded pub/sub:** redis-py is the most complete, with a connection per node and reconciliation when a slot
+    moves. The others route by the first channel.
+- **Client-side caching.**
+  - **Maturity.** Lettuce's is deprecated, and go-redis's and redis-rs's are experimental. redis-py's refuses RESP2,
+    and refuses Valkey too.
+  - **Under RESP2,** every peer refuses caching or leaves it out.
+  - **rueidis is the model:**
+    - a cache per connection, so values and invalidations come down one ordered stream;
+    - OPTIN, with `CLIENT CACHING YES, MULTI, PTTL key, command, EXEC`, so a value comes back with its server TTL;
+    - a pending entry before sending;
+    - an allow-list of about 70 cacheable commands;
+    - an LRU bounded in bytes.
+  - **Commonly missed:** the null flush (redis-rs), the server TTL (redis-py, go-redis, Lettuce), a pending marker
+    (Lettuce, redis-rs), a flush on disconnect (Lettuce), and reading one's own writes.
+
+### Proposed decisions (step 0 confirms the kama facts by repro, then writes them under "Decided, and why")
+- **Pub/sub runs on a `Subscriber`, which owns its connection, under both protocols,** as every peer does. The
+  ROADMAP's earlier "beside commands on the same connection under RESP3" is dropped, for three reasons:
+  - a connection belongs to one isolate, and waiting for messages blocks it;
+  - under RESP2 a subscribed connection takes no other commands;
+  - it is one way for both protocols.
+
+  `Connection.call` keeps refusing the (un)subscribe commands, which get no reply of their own.
+  - **Making one.** `Subscriber.over(connection:)` takes a connection whole. `Subscriber.connect(config:)` opens one.
+    `release()` unsubscribes everything, waits until every count reaches 0, and hands the connection back.
+  - **(Un)subscribing.** `subscribe`, `psubscribe`, `ssubscribe`, `unsubscribe`, `punsubscribe` and `sunsubscribe`
+    each take the names as a `RedisArg` (a list, or none for "all").
+    - Each writes one command and reads until every confirmation it causes has come, matched by name.
+    - The three subscription sets follow the server's confirmations, as redis-py's and Lettuce's do.
+    - A message read on the way is queued.
+  - **Waiting.** `next(timeout: Optional<Duration>) -> Result<Optional<Delivery>, RedisError>` gives the oldest
+    queued delivery, else the next to arrive. None means the time passed. The connection stays open: nothing was
+    asked of the server, and a message half-read stays in the reader for the next call (postgres's
+    `waitForNotification`).
+  - **`Delivery`:**
+    - `Message(Message)`, for message, pmessage and smessage alike. A `Message` has its kind, channel, pattern and
+      payload; the payload is bytes, with a `text()` that refuses non-UTF-8.
+    - `Unsubscribed(kind, channel)`, for a `sunsubscribe` the server sent of its own accord (a slot moved).
+    - Confirmations are not deliveries: the call that caused them consumes them.
+  - **`ping()`** reads both shapes, RESP2's `["pong", ""]` and RESP3's `+PONG`. RESET and HELLO are refused on a
+    subscriber, since they would silently drop the subscriptions or change the protocol.
+  - **Bounds.** Delivery is pull-based: unread messages wait in the socket and the server's buffer, where the server
+    disconnects a subscriber that falls behind. The one queue on this side holds what arrives while a call waits for
+    its confirmations. It is bounded in bytes (`resp::Limits.maxReplyBytes`, 1 GiB), and past that the subscriber
+    fails and closes rather than drop anything silently.
+  - **Out of scope here.** Cluster routing of shard channels is phase 6. Resubscribing after a reconnect, and a
+    health check, are phase 7, which the kept sets make possible. Delivery is at most once, and the docs say so.
+  - **PUBLISH, SPUBLISH and PUBSUB** are ordinary commands (`reply::<int64>`). The count PUBLISH returns covers the
+    node it was sent to.
+- **A connection's other pushes:**
+  - `takePushes()` hands over the set-aside pushes, oldest first.
+  - The set-aside list is bounded (1024). Past that the oldest is dropped and counted (`droppedPushes()`), never
+    silently.
+  - `call` refuses `CLIENT TRACKING` and `CLIENT CACHING` with `Usage`: caching is `enableCache`'s alone.
+- **Client-side caching follows rueidis:**
+  - **Scope.** RESP3 only. Under RESP2 `enableCache` is `Usage`, since the server would answer `+OK` and then drop
+    every invalidation.
+  - **One cache per connection.** `Connection.enableCache(config: CacheConfig)` sends `CLIENT TRACKING ON OPTIN`.
+  - **`cached(command:, ttl:)`** serves a command on the allow-list from the cache, or sends `CLIENT CACHING YES`,
+    `MULTI`, `PTTL` for each key, the command and `EXEC` in one write.
+    - An entry lives as long as the shorter of the server's TTL and `ttl`, which is required.
+    - The cache is keyed by the command's bytes, with a reverse index from each Redis key.
+  - **The allow-list** is generated by script from every server's COMMAND INFO: read-only, keyed, not blocking, not
+    random, and not a script runner, on all eight servers. XREAD, XPENDING and SORT_RO are left out, as go-redis does.
+  - **Every frame is applied in wire order.** A pending entry is made before sending, and a reply is stored only if
+    its entry is still pending; an invalidation removes pending entries too.
+    - Before a hit is served, every frame already buffered is applied without blocking.
+    - After any other command on a caching connection, the next hit first makes a round trip (PING). That
+      guarantees the invalidation of the connection's own write has arrived, since the server sends it right after
+      the write's reply.
+  - **Everything is flushed** on close, I/O failure, timeout, protocol error, a null invalidation, and
+    `tracking-redir-broken`.
+  - **Refused on a caching connection:** SELECT, AUTH, HELLO, RESET, and `CLIENT TRACKING` or `CLIENT CACHING`.
+  - **Bounds:** entries and bytes, LRU, and a pending entry is never evicted.
+  - **Left out:** BCAST and REDIRECT. Only rueidis offers BCAST, and it is safe only when every cached key falls under
+    a prefix. Both stay refused.
+
+### The session's steps
+Each step ends green before its commit:
+- `tools/test.sh`, debug and release, on CI's tag and on cstar's newest build;
+- the live matrix.
+
+0. **Repros.** A `Subscriber` that takes a `Connection` by value and hands it back. A `Delivery` enum with resource
+   payloads. A non-blocking read of what is buffered (`Wire`'s `drain`, made reachable). The cache's LRU over
+   `std::collections::Map`. Then the decisions, under "Decided, and why".
+1. **Vectors** (`tools/gen-server-vectors.sh`).
+   - Captures read by count, and second-connection setups (PUBLISH, SET, FLUSHALL), for every probe above under both
+     protocols. The confirmation order is recorded per server.
+   - Each server's COMMAND INFO flags, for the allow-list.
+   - A two-node cluster for MOVED, CROSSSLOT and the server's own `sunsubscribe` (bytes only; routing is phase 6).
+2. **A connection's pushes:** `takePushes`, the bound, `droppedPushes`, and `CLIENT TRACKING`/`CACHING` refused.
+3. **`Subscriber`, under RESP2 and RESP3.**
+   - Unit: every captured confirmation order; messages queued during a subscribe; a timeout that keeps the
+     connection; a hangup; the RESP2 refusals; ping's two shapes; `release`.
+   - Live: a publisher from a second connection, patterns, a message matched twice, and `release` back to `call`.
+4. **Sharded pub/sub, and the server's own `sunsubscribe`.** Unit tests from the cluster captures; live on a
+   standalone server; refused on 6.2.
+5. **Client-side caching.** `CacheConfig`, `enableCache`, `cached`, the generated allow-list, the race (pending
+   entries, through the scripted server), and every flush rule. Live: another connection's write, FLUSHALL, a key's
+   TTL, reading one's own write, and the bounds.
+6. **Close phase 4:** ROADMAP, AGENTS.redis.md, README (programs checked by `tools/check-readme.sh`), CHANGELOG, the
+   module header.
+
+**If the session runs long:** steps 0–3, then 4, then 5. Client-side caching can be its own session.
 
 ## Phase 3: where to start
 
