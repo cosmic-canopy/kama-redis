@@ -649,6 +649,131 @@ unsafe fn int32 releaseTests(const ref string s, int32 p) {
     return f;
 }
 
+// ---- sharded pub/sub (7.0 and later), and the server's own sunsubscribe ----
+
+unsafe fn int32 shardTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+    if (!has(server: s, kase: "smessage/${p}")) {
+        // Redis 6.2 has no SSUBSCRIBE: the server's error, and the subscriber goes on.
+        DynamicArray<Step> old = opening(server: s, proto: p);
+        old.add(item: expect(command: "SSUBSCRIBE kr:s1 kr:s2", answer: pub(server: s, kase: "ssub-two", proto: p)));
+        old.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+        Subscriber a = subscriberOf(script: give old, proto: p, what: "6.2 ssubscribe");
+        Result<Unit, RedisError> r = a.ssubscribe(names: listOf(text: "kr:s1 kr:s2"));
+        string after = outcome(r: a.subscribe(names: "kr:c1"));
+        f = f + check(ok: isKind(r: r, kind: "ERR") && a.shardCount() == 0 && after == "ok",
+                      what: "${at}: SSUBSCRIBE on a server without it is Server, and the subscriber goes on (${after})");
+        return f;
+    }
+
+    // On a standalone server, shard channels in different slots together; a shard message; PING among them.
+    DynamicArray<Step> one = opening(server: s, proto: p);
+    one.add(item: expect(command: "SSUBSCRIBE kr:s1 kr:s2", answer: pub(server: s, kase: "ssub-two", proto: p)));
+    Subscriber a = subscriberOf(script: give one, proto: p, what: "ssubscribe two");
+    string a1 = outcome(r: a.ssubscribe(names: listOf(text: "kr:s1 kr:s2")));
+    f = f + check(ok: a1 == "ok" && a.shardCount() == 2 && a.channelCount() == 0, what: "${at}: shard channels in different slots, on a standalone server (${a1})");
+    DynamicArray<Step> two = opening(server: s, proto: p);
+    two.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(server: s, kase: "ssub-one", proto: p)));
+    two.add(item: Step::Send(bytes: pub(server: s, kase: "smessage", proto: p)));
+    two.add(item: expect(command: "PING", answer: pub(server: s, kase: "shard-ping", proto: p)));
+    Subscriber b = subscriberOf(script: give two, proto: p, what: "smessage");
+    string b1 = outcome(r: b.ssubscribe(names: "kr:s1"));
+    string b2 = shown(r: b.next(timeout: soon()));
+    string b3 = outcome(r: b.ping());
+    f = f + check(ok: b1 == "ok" && b2 == "smessage kr:s1 hello" && b3 == "ok", what: "${at}: a shard channel's message, and PING (${b2}; ${b3})");
+
+    // From every shard channel, in every order; and with none held.
+    DynamicArray<DynamicArray<uint8>> all = framesOf(b: pub(server: s, kase: "sunsub-all", proto: p));
+    DynamicArray<DynamicArray<isize>> each = orders(n: all.length());
+    isize k = 0;
+    while (k < each.length()) {
+        DynamicArray<Step> script = opening(server: s, proto: p);
+        script.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+        script.add(item: expect(command: "SSUBSCRIBE kr:s1 kr:s2", answer: pub(server: s, kase: "ssub-two-after-one", proto: p)));
+        script.add(item: expect(command: "SUNSUBSCRIBE", answer: joined(frames: all, order: each[k])));
+        script.add(item: expect(command: "SUNSUBSCRIBE", answer: pub(server: s, kase: "sunsub-none", proto: p)));
+        Subscriber c = subscriberOf(script: give script, proto: p, what: "sunsubscribe all");
+        string c1 = outcome(r: c.subscribe(names: "kr:c1"));
+        string c2 = outcome(r: c.ssubscribe(names: listOf(text: "kr:s1 kr:s2")));
+        DynamicArray<string> none = DynamicArray.empty();
+        string c3 = outcome(r: c.sunsubscribe(names: none));
+        DynamicArray<string> none2 = DynamicArray.empty();
+        string c4 = outcome(r: c.sunsubscribe(names: none2));
+        f = f + check(ok: c1 == "ok" && c2 == "ok" && c3 == "ok" && c4 == "ok" && c.shardCount() == 0 && c.channelCount() == 1,
+                      what: "${at}: sunsubscribe from all, in order ${k}, then with none held (${c3} ${c4})");
+        k = k + 1;
+    }
+
+    // In a cluster: names in two slots (CROSSSLOT) and a slot another node serves (MOVED) are refused whole.
+    string crossCommand = commandFor(server: s, kase: "cluster-crossslot", proto: p);
+    string movedCommand = commandFor(server: s, kase: "cluster-moved", proto: p);
+    DynamicArray<Step> cluster = opening(server: s, proto: p);
+    cluster.add(item: expect(command: crossCommand, answer: pub(server: s, kase: "cluster-crossslot", proto: p)));
+    cluster.add(item: expect(command: movedCommand, answer: pub(server: s, kase: "cluster-moved", proto: p)));
+    Subscriber d = subscriberOf(script: give cluster, proto: p, what: "cluster");
+    Result<Unit, RedisError> d1 = d.ssubscribe(names: namesIn(text: crossCommand));
+    Result<Unit, RedisError> d2 = d.ssubscribe(names: namesIn(text: movedCommand));
+    f = f + check(ok: isKind(r: d1, kind: "CROSSSLOT") && isKind(r: d2, kind: "MOVED") && d.shardCount() == 0 && !d.isClosed(),
+                  what: "${at}: CROSSSLOT and MOVED in place of confirmations, and the subscriber goes on");
+
+    // The server's own sunsubscribe, when a slot leaves the node: a delivery, and the name is no longer kept. With a
+    // channel still subscribed, RESP2 stays in subscribed mode; with none left, it leaves it (PING's +PONG).
+    string oneCommand = commandFor(server: s, kase: "cluster-ssub-one", proto: p);
+    DynamicArray<string> oneName = namesIn(text: oneCommand);
+    DynamicArray<Step> moved = opening(server: s, proto: p);
+    moved.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    moved.add(item: expect(command: oneCommand, answer: pub(server: s, kase: "cluster-ssub-one", proto: p)));
+    moved.add(item: Step::Send(bytes: pub(server: s, kase: "cluster-sunsubscribe", proto: p)));
+    moved.add(item: expect(command: "PING", answer: pub(server: s, kase: "cluster-sunsubscribe-ping", proto: p)));
+    Subscriber e = subscriberOf(script: give moved, proto: p, what: "own sunsubscribe");
+    string e1 = outcome(r: e.subscribe(names: "kr:c1"));
+    string e2 = outcome(r: e.ssubscribe(names: oneName));
+    string e3 = shown(r: e.next(timeout: soon()));
+    string e4 = outcome(r: e.ping());
+    string want = "unsubscribed smessage ".concat(other: oneName[0]);
+    f = f + check(ok: e1 == "ok" && e2 == "ok" && e3 == want && e.shardCount() == 0 && e.channelCount() == 1 && e4 == "ok",
+                  what: "${at}: the server's own sunsubscribe is a delivery (${e3}; ${e4})");
+
+    string lastCommand = commandFor(server: s, kase: "cluster-ssub-last", proto: p);
+    DynamicArray<Step> last = opening(server: s, proto: p);
+    last.add(item: expect(command: lastCommand, answer: pub(server: s, kase: "cluster-ssub-last", proto: p)));
+    last.add(item: Step::Send(bytes: pub(server: s, kase: "cluster-sunsubscribe-last", proto: p)));
+    last.add(item: expect(command: "PING", answer: pub(server: s, kase: "cluster-sunsubscribe-last-ping", proto: p)));
+    Subscriber g = subscriberOf(script: give last, proto: p, what: "own sunsubscribe, the last");
+    string g1 = outcome(r: g.ssubscribe(names: namesIn(text: lastCommand)));
+    string g2 = shown(r: g.next(timeout: soon()));
+    string g3 = shown(r: g.next(timeout: soon()));
+    string g4 = outcome(r: g.ping());
+    f = f + check(ok: g1 == "ok" && g2.startsWith(prefix: "unsubscribed smessage ") && g3.startsWith(prefix: "(error) nothing is subscribed") && g4 == "ok",
+                  what: "${at}: the last subscription ended by the server: then nothing can come, and PING (${g2}; ${g3}; ${g4})");
+
+    // During a call: the server's own sunsubscribe waits for next, beside the confirmation the call wanted.
+    DynamicArray<DynamicArray<uint8>> subTwo = framesOf(b: pub(server: s, kase: "sub-two", proto: p));
+    DynamicArray<Step> during = opening(server: s, proto: p);
+    during.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    during.add(item: expect(command: oneCommand, answer: pub(server: s, kase: "cluster-ssub-one", proto: p)));
+    during.add(item: expect(command: "SUBSCRIBE kr:c2", answer: plus(a: pub(server: s, kase: "cluster-sunsubscribe", proto: p), b: subTwo[1])));
+    Subscriber h = subscriberOf(script: give during, proto: p, what: "own sunsubscribe during a call");
+    string h1 = outcome(r: h.subscribe(names: "kr:c1"));
+    string h2 = outcome(r: h.ssubscribe(names: oneName));
+    string h3 = outcome(r: h.subscribe(names: "kr:c2"));
+    string h4 = shown(r: h.next(timeout: soon()));
+    f = f + check(ok: h1 == "ok" && h2 == "ok" && h3 == "ok" && h4 == want && h.shardCount() == 0 && h.channelCount() == 2,
+                  what: "${at}: the server's own sunsubscribe during a call waits for next (${h4})");
+
+    // One for a shard channel not kept here means nothing: the message after it is the next delivery.
+    DynamicArray<Step> stray = opening(server: s, proto: p);
+    stray.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    stray.add(item: Step::Send(bytes: pub(server: s, kase: "cluster-sunsubscribe", proto: p)));
+    stray.add(item: Step::Send(bytes: pub(server: s, kase: "message", proto: p)));
+    Subscriber k2 = subscriberOf(script: give stray, proto: p, what: "stray sunsubscribe");
+    string k1 = outcome(r: k2.subscribe(names: "kr:c1"));
+    string k3 = shown(r: k2.next(timeout: soon()));
+    f = f + check(ok: k1 == "ok" && k3 == "message kr:c1 hello", what: "${at}: a sunsubscribe for a channel not kept is dropped (${k3})");
+    return f;
+}
+
 unsafe fn int32 subscriberTests() {
     int32 f = 0;
     DynamicArray<string> servers = serverVersions();
@@ -663,6 +788,7 @@ unsafe fn int32 subscriberTests() {
             f = f + refusalTests(s: s, p: p);
             f = f + failureTests(s: s, p: p);
             f = f + releaseTests(s: s, p: p);
+            f = f + shardTests(s: s, p: p);
             p = p + 1;
         }
         i = i + 1;

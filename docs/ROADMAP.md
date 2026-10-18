@@ -271,7 +271,7 @@ Each step ends green before its commit:
    - Unit: every captured confirmation order; messages queued during a subscribe; a timeout that keeps the
      connection; a hangup; the RESP2 refusals; ping's two shapes; `release`.
    - Live: a publisher from a second connection, patterns, a message matched twice, and `release` back to `call`.
-4. **Sharded pub/sub, and the server's own `sunsubscribe`.** Unit tests from the cluster captures; live on a
+4. **Done (2026-10-18).** **Sharded pub/sub, and the server's own `sunsubscribe`.** Unit tests from the cluster captures; live on a
    standalone server; refused on 6.2.
 5. **(0.3.0) Client-side caching.** Not in this phase's run for 0.1.0. `CacheConfig`, `enableCache`, `cached`, the
    generated allow-list, the race (pending entries, through the scripted server), and every flush rule. Live: another
@@ -926,3 +926,13 @@ facts underneath; they are listed at the end.
   - Live, under both protocols, on all eight servers: a second connection's messages, a pattern, a message matched
     twice, a binary channel with all 256 byte values, a 200 ms wait that ends with None, a publish from another
     isolate while `next` has no limit, NOPERM for `kr_ro`, and `release` back to `call`.
+- **What building it settled (step 4):**
+  - Sharded pub/sub needed no code of its own beyond step 3's: shard channels are the third kind of kept name, and
+    the server's own `sunsubscribe` is the one confirmation no call may be waiting for. One for a name still kept is
+    a delivery (`Unsubscribed`), during `next` or queued during a call; one for a name not kept means nothing.
+  - From the cluster captures: CROSSSLOT and MOVED are `Server` and the subscriber goes on; the server's own
+    sunsubscribe of the last subscription leaves RESP2's subscribed mode, after which PING reads `+PONG` and `next` is
+    `Usage`.
+  - Live on a standalone server: shard channels in two slots together, SPUBLISH reaching them, a plain PUBLISH not,
+    and SUNSUBSCRIBE by name; Redis 6.2 answers SSUBSCRIBE with `ERR unknown command`, and the subscriber goes on.
+    Routing a shard channel to the node that serves its slot is phase 6's.

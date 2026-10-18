@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::concu
          std::encoding::utf8::Utf8Error,
          redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Message, redis::ChannelKind,
          redis::Command, redis::RedisError, redis::reply, redis::resp::Value,
-         redis_integration_tests::check, open, mainUrl, ask, commandOf };
+         redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask, commandOf };
 export { subscriberTests };
 
 // Publishes from another isolate after a pause, over its own connection.
@@ -206,9 +206,56 @@ unsafe fn int32 liveTests(const ref string tail, const ref string protocol, cons
     return f;
 }
 
+// Sharded pub/sub (Redis 7.0 and later; Valkey 7.2 has it): on a standalone server, shard channels in any slots, a
+// message by SPUBLISH, and none by a plain PUBLISH. Redis 6.2 answers SSUBSCRIBE with an error.
+unsafe fn int32 shardTests(const ref string tail, const ref string protocol, const ref string pre) {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: tail);
+    Result<Subscriber, RedisError> made = subscriberFor(url: url);
+    Subscriber sub = match (give made) {
+        case Ok(value: s): give s;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "shard: connect under ${protocol}: ${m}"); }
+    };
+    string s1 = pre.concat(other: "s1");
+    string s2 = pre.concat(other: "s2");
+    DynamicArray<string> names = DynamicArray.empty();
+    names.add(item: copy s1);
+    names.add(item: copy s2);
+    Result<Unit, RedisError> r = sub.ssubscribe(names: names);
+    string server = setting(name: "REDISTEST_SERVER");
+    if (server == "redis-6.2") {
+        string code = match (r) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text(); case None: e.message(); }; case Ok(value: u): "ok"; };
+        string still = outcome(r: sub.ping());
+        return check(ok: code == "ERR" && still == "ok" && sub.shardCount() == 0, what: "shard under ${protocol}: 6.2 has no SSUBSCRIBE: ${code}, then PING ${still}");
+    }
+    string first = outcome(r: give r);
+    Result<Connection, RedisError> pr = open(url: url);
+    Connection pubc = match (give pr) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "shard: connect the publisher under ${protocol}: ${m}"); }
+    };
+    string n1 = ask(c: pubc, text: "SPUBLISH ${s1} hello");
+    string m1 = shown(r: sub.next(timeout: within(ms: 5000i64)));
+    f = f + check(ok: first == "ok" && sub.shardCount() == 2 && n1 == "1" && m1 == "smessage ${s1} hello",
+                  what: "shard under ${protocol}: SSUBSCRIBE in two slots, and SPUBLISH (${first} ${n1}: ${m1})");
+    string n2 = ask(c: pubc, text: "PUBLISH ${s1} plain");
+    string m2 = shown(r: sub.next(timeout: within(ms: 200i64)));
+    f = f + check(ok: n2 == "0" && m2 == "none", what: "shard under ${protocol}: a plain PUBLISH does not reach a shard subscriber (${n2}: ${m2})");
+    string u1 = outcome(r: sub.sunsubscribe(names: s1));
+    isize left = sub.shardCount();
+    Result<Connection, RedisError> back = sub.release();
+    bool released = match (back) { case Ok(value: c): !c.isClosed(); case Err(error: e): false; };
+    string none = ask(c: pubc, text: "SPUBLISH ${s2} after");
+    f = f + check(ok: u1 == "ok" && left == 1 && released && none == "0",
+                  what: "shard under ${protocol}: SUNSUBSCRIBE one, then release (${u1} ${left} ${none})");
+    return f;
+}
+
 unsafe fn int32 subscriberTests() {
     int32 f = 0;
     f = f + liveTests(tail: "", protocol: "RESP3", pre: "kr:ps3:");
     f = f + liveTests(tail: "?protocol=2", protocol: "RESP2", pre: "kr:ps2:");
+    f = f + shardTests(tail: "", protocol: "RESP3", pre: "kr:sh3:");
+    f = f + shardTests(tail: "?protocol=2", protocol: "RESP2", pre: "kr:sh2:");
     return f;
 }
