@@ -103,6 +103,9 @@ can turn tracking on through `call`, and the invalidations then pile up in the c
 and unbounded.
 
 ### What the servers do (probed on all eight; the generator will capture each as vectors)
+
+The probe scripts lived in a session's scratch directory and are gone. What they found is below, server by server
+where servers differ, and step 1 writes each capture into `tools/gen-server-vectors.sh` from it.
 - **Confirmations.** SUBSCRIBE, PSUBSCRIBE and SSUBSCRIBE get one confirmation per name, and no other reply:
   `[subscribe, name, count]`.
   - Under RESP3 a confirmation is a push (`>3`); under RESP2 it is an array.
