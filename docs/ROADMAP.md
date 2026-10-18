@@ -182,7 +182,7 @@ where servers differ, and step 1 writes each capture into `tools/gen-server-vect
   - **Commonly missed:** the null flush (redis-rs), the server TTL (redis-py, go-redis, Lettuce), a pending marker
     (Lettuce, redis-rs), a flush on disconnect (Lettuce), and reading one's own writes.
 
-### Proposed decisions (step 0 confirms the kama facts by repro, then writes them under "Decided, and why")
+### Proposed decisions (step 0 confirmed the kama facts by repro; "Decided, and why", "Phase 4", holds them as decided)
 - **Pub/sub runs on a `Subscriber`, which owns its connection, under both protocols,** as every peer does. The
   ROADMAP's earlier "beside commands on the same connection under RESP3" is dropped, for three reasons:
   - a connection belongs to one isolate, and waiting for messages blocks it;
@@ -250,14 +250,18 @@ Each step ends green before its commit:
 - `tools/test.sh`, debug and release, on CI's tag and on cstar's newest build;
 - the live matrix.
 
-0. **Repros.** A `Subscriber` that takes a `Connection` by value and hands it back. A `Delivery` enum with resource
-   payloads. A non-blocking read of what is buffered (`Wire`'s `drain`, made reachable). The cache's LRU over
-   `std::collections::Map`. Then the decisions, under "Decided, and why".
+0. **Done (2026-10-18).** Repros: a `Subscriber` that takes a `Connection` by value and hands it back, a `Delivery`
+   enum with resource payloads, and per-method `friend` grants from `Connection`. The decisions are under "Decided,
+   and why", "Phase 4". The cache's LRU and a reachable `drain` wait for 0.3.0, with the cache.
 1. **Vectors** (`tools/gen-server-vectors.sh`).
    - Captures read by count, and second-connection setups (PUBLISH, SET, FLUSHALL), for every probe above under both
-     protocols. The confirmation order is recorded per server.
-   - Each server's COMMAND INFO flags, for the allow-list.
+     protocols.
+   - An unsubscribe-all's confirmations are recorded sorted. Their order follows the server's hash seed, which is
+     random per process, so a recorded order would differ on the next run. The unit test plays every permutation.
    - A two-node cluster for MOVED, CROSSSLOT and the server's own `sunsubscribe` (bytes only; routing is phase 6).
+     `redis-cli --cluster create` needs three primaries, so the two nodes are joined by hand (ADDSLOTSRANGE, CLUSTER
+     MEET), on 7.0 and later only.
+   - (0.3.0) Each server's COMMAND INFO flags, for the allow-list: captured in step 5, which uses them.
 2. **A connection's pushes:** `takePushes`, the bound, `droppedPushes`, and `CLIENT TRACKING`/`CACHING` refused.
 3. **`Subscriber`, under RESP2 and RESP3.**
    - Unit: every captured confirmation order; messages queued during a subscribe; a timeout that keeps the
@@ -842,3 +846,50 @@ confirmed the kama facts underneath, and are listed at the end.
   - A `type value` element mutates in place through `frames[k].x = …`.
   - add, swap and pop take an element out of a `DynamicArray`.
 
+
+### Phase 4
+
+Drawn up 2026-10-13 (see "Phase 4: where to start" for the sources and the proposals, which hold unless this section
+says otherwise). Step 0's repros, run 2026-10-18 on v0.9.667 and cstar's 0.9.668, debug and release, confirmed the kama
+facts underneath; they are listed at the end.
+
+- **A `Subscriber` holds its `Connection` in a `DynamicArray` of zero or one,** as `Opener` holds its dialer. A
+  field cannot be given out, so `release()` pops it. A second `release()` is `Usage`, and every later call is
+  `Closed`. A subscriber dropped while it holds a connection closes it, through the connection's destructor.
+- **Channel and pattern names are bytes, as payloads are.** `Message` has `channel()`, `pattern()` and `payload()` as
+  bytes, and `channelText()`, `patternText()` and `text()`, which refuse bytes that are not UTF-8 (`Value`).
+  Subscribing takes a `RedisArg`, a `DynamicArray<uint8>` included, so a channel can be any bytes, and a reply must
+  give them back whole.
+  - redis-py gives bytes (unless `decode_responses`), and go-redis's Go strings hold any bytes.
+  - redis-rs 1.7.1's `get_channel_name()` turns a name that is not UTF-8 into `"?"` (connection.rs:2302). That
+    silent replacement is what this decision avoids.
+- **`release()` drops what was not read.** It unsubscribes from everything, reads until every count is 0, and hands
+  the connection back. Messages queued or arriving meanwhile are dropped. The caller chose to stop listening, and a
+  caller who wants everything reads `next` until it gives None first. go-redis's `Close` and redis-py's `close`
+  drop them too.
+- **`next` with nothing subscribed and nothing queued is `Usage`,** never a wait with no end. A server's own
+  `sunsubscribe` of the last shard channel would otherwise leave `next(timeout: None)` waiting for ever. The
+  `Unsubscribed` delivery comes first, so the caller learns why.
+- **Two kinds of waiting, two outcomes.**
+  - `next`'s time passing is an answer: None. The connection stays open, and a message half-read stays in the
+    reader for the next call (postgres's `waitForNotification`).
+  - A (un)subscribe's confirmations, or a PING's answer, that do not come by `command_timeout` close the
+    subscriber, as `call` closes on a timeout: the server's state is no longer known.
+  - `next(timeout: Some(zero))` polls: it reads what has arrived, and waits for nothing more.
+- **An error reply in place of confirmations is `Server`, and the subscriber goes on.** The server refused the whole
+  command (NOPERM, CROSSSLOT, MOVED, `unknown command` for SSUBSCRIBE on 6.2), so no confirmation will come, and the
+  kept sets are unchanged.
+- **A RESP3 push that is not pub/sub** goes to the connection's set-aside pushes (bounded), and comes back with it
+  from `release()`. On a subscriber that can be a module's push, or an `invalidate` that another connection's
+  `CLIENT TRACKING … REDIRECT` sends here.
+
+- **What step 0's repros showed** (in the session's scratchpad; each on v0.9.667 and 0.9.668, debug and release):
+  - A resource taken by value into a `DynamicArray` of one, used in place through `held[0]`, and handed back by
+    `pop()`; a second pop is None.
+  - A `friend` grant from one type to another type's private and public methods, across files, reaches private
+    fields and methods (`friend r0::Holder::exchange[secret, shut, setAside];`).
+  - A `Delivery` enum with a resource payload and a bytes payload, matched with `give`, and handed out of a queue
+    with `remove(index: 0)`.
+  - `next(timeout: Optional<Duration>)` returning `Result<Optional<Delivery>, E>`.
+  - A ctor returning `Result<Holder, E>` that refuses a value it was given hands it to a local first.
+  - A type cannot be named `Err` (a language name).
