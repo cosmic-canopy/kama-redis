@@ -11,7 +11,7 @@ import { core::println, std::collections::DynamicArray, std::collections::ConstV
          redis::RedisError, redis::Command, redis::resp::Value, redis::resp::Reader, redis::resp::Read,
          redis::resp::Limits, redis_unit_tests::check, FakeServer, Step, welcome, expect, reply, configOf, connected,
          textOf, bytesOf, resp, isSimple, serverVersions, replyNames, replyCommands };
-export { subscriberTests };
+export { subscriberTests, shown, soon };
 
 // ---- the scripts ----
 

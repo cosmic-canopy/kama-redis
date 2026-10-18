@@ -1,0 +1,92 @@
+import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion as EngineVersion,
+         redis::Config, redis::TlsVerify, redis::TlsVersion, redis::RedisError };
+export { prepareTls, setupFailure, hasIdentity };
+
+// redis::secure — TLS for a connection, from `@kama/tls`. Internal: `Connection` is the only user.
+//
+// A `TlsConfig` is built for each connection attempt, from the Config's settings, as libpq builds one for each: the
+// files are read then, never when the Config is made, so a renewed certificate is read by the next connection. The
+// order is libpq's: the versions, the roots, the client's identity, then what is verified.
+
+// The TlsConfig for one attempt. A failure is redis-cli's "Could not negotiate a TLS connection: …", naming the file
+// that would not load.
+unsafe fn Result<TlsConfig, RedisError> prepareTls(const ref Config config) {
+    Result<TlsConfig, TlsError> made = TlsConfig.client();
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: setupFailure(what: "", e: give e)); } };
+    Result<Unit, TlsError> bounds = c.versions(min: engineVersion(v: config.tlsMinVersion()), max: engineVersion(v: config.tlsMaxVersion()));
+    match (give bounds) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "", e: give e)); } };
+
+    // The roots: the CA given, or the system's bundle. Under TlsVerify::None nothing is checked, so none are loaded.
+    if (config.tlsVerify() != TlsVerify::None) {
+        Optional<string> file = config.tlsTrustFile();
+        match (give file) {
+            case Some(value: path): {
+                Result<Unit, TlsError> t = c.trustFile(path: path);
+                match (give t) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "invalid CA file \"".concat(other: path).concat(other: "\": "), e: give e)); } };
+            }
+            case None: {
+                bool pem = match (config.tlsTrustPem()) { case Some(value: b): true; case None: false; };
+                if (pem) {
+                    Result<Unit, TlsError> t = match (config.tlsTrustPem()) {
+                        case Some(value: b): c.trustPem(pem: b.view());
+                        case None: Result::Ok(value: Unit::Unit);
+                    };
+                    match (give t) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "invalid CA PEM: ", e: give e)); } };
+                } else {
+                    Result<isize, TlsError> t = c.trustSystem();
+                    match (give t) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "", e: give e)); } };
+                }
+            }
+        };
+    }
+
+    // The client's certificate and key, from files or PEM.
+    Optional<string> certFile = config.tlsCertificateFile();
+    match (give certFile) {
+        case Some(value: cert): {
+            Optional<string> keyFile = config.tlsKeyFile();
+            string key = match (give keyFile) { case Some(value: k): give k; case None: ""; };
+            Result<string, Utf8Error> pw = decode(bytes: config.tlsKeyPassword().view());
+            string password = match (give pw) { case Ok(value: p): give p; case Err(error: e): ""; };
+            Result<Unit, TlsError> id = c.identityFiles(certificate: cert, key: key, password: password);
+            string what = "invalid client certificate \"".concat(other: cert).concat(other: "\" or key \"").concat(other: key).concat(other: "\": ");
+            match (give id) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: what, e: give e)); } };
+        }
+        case None: {
+            bool pem = match (config.tlsCertificatePem()) { case Some(value: b): true; case None: false; };
+            if (pem) {
+                DynamicArray<uint8> none = DynamicArray.empty();
+                Result<Unit, TlsError> id = match (config.tlsCertificatePem()) {
+                    case Some(value: cert): match (config.tlsKeyPem()) {
+                        case Some(value: key): c.identityPem(certificate: cert.view(), key: key.view(), password: config.tlsKeyPassword().view());
+                        case None: c.identityPem(certificate: cert.view(), key: none.view(), password: config.tlsKeyPassword().view());
+                    };
+                    case None: Result::Ok(value: Unit::Unit);
+                };
+                match (give id) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "invalid client certificate or key PEM: ", e: give e)); } };
+            }
+        }
+    };
+
+    Result<Unit, TlsError> v = c.verify(mode: engineVerify(v: config.tlsVerify()));
+    match (give v) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setupFailure(what: "", e: give e)); } };
+    return Result::Ok(value: give c);
+}
+
+// redis-cli's words for TLS that would not set up: "Could not negotiate a TLS connection: ", what failed, and why.
+fn RedisError setupFailure(const ref string what, TlsError e) {
+    string detail = "Could not negotiate a TLS connection: ".concat(other: what).concat(other: e.reason());
+    return RedisError::Tls(detail: give detail, cause: give e);
+}
+
+// Whether `config` gives a client certificate to send.
+fn bool hasIdentity(const ref Config config) {
+    bool files = match (config.tlsCertificateFile()) { case Some(value: p): true; case None: false; };
+    bool pem = match (config.tlsCertificatePem()) { case Some(value: b): true; case None: false; };
+    return files || pem;
+}
+
+fn EngineVersion engineVersion(TlsVersion v) { return match (v) { case Tls12: EngineVersion::Tls12; case Tls13: EngineVersion::Tls13; }; }
+
+fn Verify engineVerify(TlsVerify v) { return match (v) { case Full: Verify::Full; case Chain: Verify::Chain; case None: Verify::None; }; }

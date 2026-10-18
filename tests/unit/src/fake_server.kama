@@ -8,11 +8,18 @@
 // Its `wait` never blocks: a wait with nothing to read comes back at once without the side asked for, which is how
 // a deadline passing looks to a connection. So a script that falls silent ends in `Timeout` at once, whatever the
 // timeout, and no test waits on a clock.
-import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::io::IoError,
-         std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::memory::Owned, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, redis::Transport, redis::Dialer, redis::DialTarget, redis::RedisError,
+//
+// A secure server (`secure`) runs Mbed TLS as the server (@kama/tls, over the in-memory `ServerSide`) from the
+// client's first byte, and the script sees the plaintext, as postgres's scripted server does. It checks the SNI the
+// client sent, and its hangups send close_notify. A client that sends it anything but TLS breaks its handshake, and it
+// hangs up.
+import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::collections::FixedArray,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::ReliableStream,
+         std::memory::Owned, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
+         redis::Transport, redis::Dialer, redis::DialTarget, redis::RedisError,
          redis::resp::Reader, redis::resp::Read, redis::resp::Value };
-export { FakeServer, Step, ScriptDialer, Dial };
+export { FakeServer, Step, ScriptDialer, Dial, ServerSide };
 
 type enum Step implements Sendable {
     // The client's next command must be exactly `args`; `reply` answers it. Any other command is answered with an
@@ -40,13 +47,52 @@ type enum Step implements Sendable {
     Patient(DynamicArray<uint8> reply, int32 atLeastMs),
     // The server sends nothing more of its own accord until the client's next wait has come back empty: the steps
     // after this one are reached only then. It shows what a client does with a message split across its timeout.
-    Pause;
+    Pause,
+    // The client's next command is answered with `reply`, of whose bytes as sent (over TLS, its records) only the
+    // first `keep` reach the client before the server hangs up, with no close_notify: a truncated stream.
+    Truncate(DynamicArray<uint8> reply, isize keep);
+}
+
+// The server's side of a TLS session: what the client sent waits in `inbound` for the engine, and what the engine
+// writes collects in `outbound` until the fake hands it to the client. Always non-blocking.
+type resource ServerSide implements ReliableStream, Sendable {
+    DynamicArray<uint8> inbound;
+    isize inAt = 0;
+    DynamicArray<uint8> outbound;
+
+    public ctor make() { this.inbound = DynamicArray.empty(); this.inAt = 0; this.outbound = DynamicArray.empty(); }
+
+    public fn void feed(ConstView<uint8> bytes) { this.inbound.addAll(items: bytes); }
+    // Hand what the engine wrote to `into`.
+    public fn void drain(ref DynamicArray<uint8> into) { into.addAll(items: this.outbound.view()); this.outbound = DynamicArray.empty(); }
+
+    public fn Result<isize, IoError> read(View<uint8> into) {
+        isize available = this.inbound.length() - this.inAt;
+        if (available == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        isize n = available;
+        if (n > into.length()) { n = into.length(); }
+        isize i = 0;
+        while (i < n) { into[i] = this.inbound[this.inAt + i]; i = i + 1; }
+        this.inAt = this.inAt + n;
+        if (this.inAt == this.inbound.length()) { this.inbound = DynamicArray.empty(); this.inAt = 0; }
+        return Result::Ok(value: n);
+    }
+    public fn Result<isize, IoError> write(ConstView<uint8> bytes) { this.outbound.addAll(items: bytes); return Result::Ok(value: bytes.length()); }
+    public fn Result<Unit, IoError> flush() { return Result::Ok(value: Unit::Unit); }
+    public fn Result<Unit, IoError> setNonBlocking(bool on) { return Result::Ok(value: Unit::Unit); }
 }
 
 type resource FakeServer implements Transport, Sendable {
     DynamicArray<Step> steps;
     isize next = 0;
     DynamicArray<uint8> toClient;
+    // What the script sends, in plaintext, until it is handed on: to the client at once, or over TLS once the
+    // handshake is done.
+    DynamicArray<uint8> outbox;
+    DynamicArray<TlsStream<ServerSide>> engine;   // zero or one: a secure server's session
+    bool established = false;
+    bool abrupt = false;   // a hangup with no close_notify (Step::Truncate)
+    string sniWanted;   // the SNI the client must send: "" checks nothing, "-" none at all
     isize readAt = 0;
     Reader fromClient;
     bool hungUp = false;
@@ -70,6 +116,32 @@ type resource FakeServer implements Transport, Sendable {
         this.backlog = -1;
         this.held = DynamicArray.empty();
         this.patient = DynamicArray.empty();
+        this.outbox = DynamicArray.empty();
+        this.engine = DynamicArray.empty();
+        this.sniWanted = "";
+        this.advance();
+    }
+
+    // `make`, over TLS: Mbed TLS as the server, with `config`, from the client's first byte. `sni` is the name the
+    // client must send ("-" for none, "" to check nothing); a client that sends another is answered with an error,
+    // and the server hangs up.
+    public unsafe ctor secure(DynamicArray<Step> steps, isize chunk, isize writeLimit, const ref TlsConfig config, string sni) {
+        this.steps = give steps;
+        this.toClient = DynamicArray.empty();
+        this.fromClient = Reader.make();
+        this.chunk = chunk;
+        this.writeLimit = writeLimit;
+        this.backlog = -1;
+        this.held = DynamicArray.empty();
+        this.patient = DynamicArray.empty();
+        this.outbox = DynamicArray.empty();
+        this.engine = DynamicArray.empty();
+        this.sniWanted = give sni;
+        Result<TlsStream<ServerSide>, TlsError> opened = TlsStream::<ServerSide>.server(inner: ServerSide.make(), config: config);
+        match (give opened) {
+            case Ok(value: t): { this.engine.add(item: give t); }
+            case Err(error: e): { this.hungUp = true; }
+        };
         this.advance();
     }
 
@@ -83,10 +155,35 @@ type resource FakeServer implements Transport, Sendable {
         this.backlog = backlog;
         this.held = DynamicArray.empty();
         this.patient = DynamicArray.empty();
+        this.outbox = DynamicArray.empty();
+        this.engine = DynamicArray.empty();
+        this.sniWanted = "";
+        this.advance();
+    }
+
+    // `jammed`, over TLS.
+    public unsafe ctor secureJammed(DynamicArray<Step> steps, isize chunk, isize writeLimit, isize backlog, const ref TlsConfig config, string sni) {
+        this.steps = give steps;
+        this.toClient = DynamicArray.empty();
+        this.fromClient = Reader.make();
+        this.chunk = chunk;
+        this.writeLimit = writeLimit;
+        this.backlog = backlog;
+        this.held = DynamicArray.empty();
+        this.patient = DynamicArray.empty();
+        this.outbox = DynamicArray.empty();
+        this.engine = DynamicArray.empty();
+        this.sniWanted = give sni;
+        Result<TlsStream<ServerSide>, TlsError> opened = TlsStream::<ServerSide>.server(inner: ServerSide.make(), config: config);
+        match (give opened) {
+            case Ok(value: t): { this.engine.add(item: give t); }
+            case Err(error: e): { this.hungUp = true; }
+        };
         this.advance();
     }
 
     public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        this.handOn();
         isize available = this.toClient.length() - this.readAt;
         if (available == 0) {
             if (this.hungUp) { return Result::Ok(value: 0); }
@@ -105,33 +202,44 @@ type resource FakeServer implements Transport, Sendable {
 
     // After a hangup, what the client still sends is lost, as it is on a socket whose peer has gone.
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        this.handOn();
         if (this.hungUp) { return Result::Ok(value: bytes.length()); }
         if (this.blocked()) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
         isize n = bytes.length();
         if (n > this.writeLimit) { n = this.writeLimit; }
+        if (this.engine.length() > 0) {
+            this.engine[0].innerRefMut().feed(bytes: bytes.slice(from: 0, count: n));
+            this.pump();
+            return Result::Ok(value: n);
+        }
         this.fromClient.feed(bytes: bytes.slice(from: 0, count: n));
         this.serve();
+        this.handOn();
         return Result::Ok(value: n);
     }
 
-    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        this.handOn();
         if (this.holding) {
             bool enough = timeoutMs < 0 || (this.patience >= 0 && timeoutMs >= this.patience);
             if (!enough) { return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked())); }
-            this.toClient.addAll(items: this.patient.view());
+            this.outbox.addAll(items: this.patient.view());
             this.patient = DynamicArray.empty();
             this.holding = false;
+            this.handOn();
         }
         if (this.pausing && this.readAt == this.toClient.length() && !this.hungUp) {
             // This wait ends empty; what the script sends next is there for the one after.
             this.pausing = false;
             this.advance();
+            this.handOn();
             return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
         }
         if (this.held.length() > 0) {
             // This wait ends without the late reply; it is there for the next.
-            this.toClient.addAll(items: this.held.view());
+            this.outbox.addAll(items: this.held.view());
             this.held = DynamicArray.empty();
+            this.handOn();
             return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
         }
         bool readable = this.readAt < this.toClient.length() || this.hungUp;
@@ -140,6 +248,72 @@ type resource FakeServer implements Transport, Sendable {
 
     public fn void shutdown() { }
     public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+
+    // What the script has sent goes on to the client: as it is, or over TLS once the handshake is done (until then
+    // it waits). A hangup the script asked for comes after it, with close_notify over TLS.
+    unsafe fn void handOn() {
+        if (this.engine.length() == 0) {
+            this.toClient.addAll(items: this.outbox.view());
+            this.outbox = DynamicArray.empty();
+            return;
+        }
+        if (!this.established) { return; }
+        isize sent = 0;
+        while (sent < this.outbox.length()) {
+            Result<isize, IoError> w = this.engine[0].write(bytes: this.outbox.view().slice(from: sent, count: this.outbox.length() - sent));
+            match (w) { case Ok(value: n): { sent = sent + n; } case Err(error: e): { sent = this.outbox.length(); } };
+        }
+        this.outbox = DynamicArray.empty();
+        if (this.hungUp && !this.abrupt) { Result<Unit, TlsError> closed = this.engine[0].close(); }
+        this.engine[0].innerRefMut().drain(into: this.toClient);
+    }
+
+    // Run the engine on what the client sent: the handshake, then the plaintext through the script, then the
+    // ciphertext out to the client. A handshake that fails sends the engine's alert, and the server hangs up.
+    unsafe fn void pump() {
+        if (!this.established && !this.hungUp) {
+            Result<Progress, TlsError> step = this.engine[0].handshake();
+            match (give step) {
+                case Ok(value: p): {
+                    Progress at = p;
+                    bool done = match (at) { case Done: true; case _: false; };
+                    if (done) { this.established = true; this.checkSni(); }
+                }
+                case Err(error: e): { this.engine[0].innerRefMut().drain(into: this.toClient); this.hungUp = true; return; }
+            };
+        }
+        if (this.established && !this.hungUp) {
+            FixedArray<uint8> buf = FixedArray.make(size: 4096);
+            bool more = true;
+            while (more) {
+                Result<isize, IoError> r = this.engine[0].read(into: buf.viewMut());
+                match (r) {
+                    case Ok(value: n): { if (n == 0) { more = false; } this.fromClient.feed(bytes: buf.view().slice(from: 0, count: n)); }
+                    case Err(error: e): {
+                        more = false;
+                        // Anything but "nothing more yet" ends the session: the client's records did not hold.
+                        bool waiting = match (e.kind()) { case WouldBlock: true; case _: false; };
+                        if (!waiting) { this.hungUp = true; }
+                    }
+                };
+            }
+            this.serve();
+        }
+        this.handOn();
+        this.engine[0].innerRefMut().drain(into: this.toClient);
+    }
+
+    // The client must have sent the SNI the test names.
+    unsafe fn void checkSni() {
+        if (this.sniWanted.length() == 0) { return; }
+        Optional<string> seen = this.engine[0].requestedServerName();
+        string got = match (give seen) { case Some(value: v): give v; case None: "-"; };
+        if (!got.equals(other: this.sniWanted)) {
+            string line = "-ERR fake server: SNI ".concat(other: got).concat(other: ", wanted ").concat(other: this.sniWanted).concat(other: "\r\n");
+            this.outbox.addAll(items: line.bytes());
+            this.hungUp = true;
+        }
+    }
 
     // Answer every whole command the client has sent with the next step.
     unsafe fn void serve() {
@@ -165,7 +339,7 @@ type resource FakeServer implements Transport, Sendable {
                     this.mismatch(wanted: wanted, args: args);
                     return;
                 }
-                this.toClient.addAll(items: r.view());
+                this.outbox.addAll(items: r.view());
             }
             case ExpectBytes(args: want, reply: r): {
                 if (!sameBytes(want: want, command: command)) {
@@ -176,21 +350,38 @@ type resource FakeServer implements Transport, Sendable {
                     this.mismatch(wanted: wanted, args: args);
                     return;
                 }
-                this.toClient.addAll(items: r.view());
+                this.outbox.addAll(items: r.view());
             }
-            case Any(reply: r): { this.toClient.addAll(items: r.view()); }
-            case Send(bytes: b): { this.toClient.addAll(items: b.view()); }
+            case Any(reply: r): { this.outbox.addAll(items: r.view()); }
+            case Send(bytes: b): { this.outbox.addAll(items: b.view()); }
             case Silent: { }
             case Close: { this.hungUp = true; return; }
             case Hangup: { this.hungUp = true; return; }
             case Late(reply: r): { this.held.addAll(items: r.view()); }
             case Pause: { }
+            case Truncate(reply: r, keep: k): {
+                isize before = this.toClient.length();
+                this.outbox.addAll(items: r.view());
+                this.handOn();
+                isize end = before + k;
+                if (end < this.toClient.length()) {
+                    DynamicArray<uint8> kept = DynamicArray.empty();
+                    kept.addAll(items: this.toClient.view().slice(from: 0, count: end));
+                    this.toClient = give kept;
+                }
+                this.abrupt = true;
+                this.hungUp = true;
+                return;
+            }
             case Patient(reply: r, atLeastMs: n): {
                 this.patient.addAll(items: r.view());
                 this.patience = n;
                 this.holding = true;
             }
         };
+        // Each step's bytes leave as they are made: over TLS, a reply and what the server sends after it are records
+        // of their own, as a server's are.
+        this.handOn();
         this.advance();
     }
 
@@ -198,21 +389,22 @@ type resource FakeServer implements Transport, Sendable {
     fn void mismatch(const ref string wanted, const ref DynamicArray<string> args) {
         string got = joined(args: args);
         string line = "-ERR fake server: expected [".concat(other: wanted).concat(other: "], got [").concat(other: got).concat(other: "]\r\n");
-        this.toClient.addAll(items: line.bytes());
+        this.outbox.addAll(items: line.bytes());
         this.hungUp = true;
     }
 
     // The steps that need no command: bytes sent of the server's own accord, a hangup, and a pause.
-    fn void advance() {
+    unsafe fn void advance() {
         while (this.next < this.steps.length() && !this.hungUp && !this.pausing) {
             bool own = match (this.steps[this.next]) { case Send(bytes: b): true; case Hangup: true; case Pause: true; case _: false; };
             if (!own) { return; }
             match (this.steps[this.next]) {
-                case Send(bytes: b): { this.toClient.addAll(items: b.view()); }
+                case Send(bytes: b): { this.outbox.addAll(items: b.view()); }
                 case Pause: { this.pausing = true; }
                 case _: { this.hungUp = true; }
             };
             this.next = this.next + 1;
+            this.handOn();
         }
     }
 }
@@ -281,11 +473,12 @@ fn string joined(const ref DynamicArray<string> args) {
     return text;
 }
 
-// What one dial does: refuse, give up on its deadline, or connect to a scripted server.
+// What one dial does: refuse, give up on its deadline, or connect to a scripted server, over TLS or not.
 type enum Dial implements Sendable {
     Refuse,
     TimeOut,
-    Serve(DynamicArray<Step> steps);
+    Serve(DynamicArray<Step> steps),
+    ServeTls(DynamicArray<Step> steps, TlsConfig config, string sni);
 }
 
 // A `Dialer` that answers each dial with the next entry; with none left, it refuses as a closed port would.
@@ -302,6 +495,10 @@ type resource ScriptDialer implements Dialer, Sendable {
             case TimeOut: { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
             case Serve(steps: s): {
                 Owned<Transport> fake = new FakeServer.make(steps: give s, chunk: 1, writeLimit: 3);
+                return Result::Ok(value: give fake);
+            }
+            case ServeTls(steps: s, config: c, sni: n): {
+                Owned<Transport> fake = new FakeServer.secure(steps: give s, chunk: 1, writeLimit: 3, config: c, sni: give n);
                 return Result::Ok(value: give fake);
             }
         };

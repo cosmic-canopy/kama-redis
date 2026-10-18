@@ -1,0 +1,542 @@
+// TLS (src/secure/, docs/ROADMAP.md "Phase 5") over the scripted server: Mbed TLS runs as the server
+// (fake_server.kama's `secure`), with the test PKI tools/gen-test-certs.sh writes, found through REDISTEST_CERTDIR
+// (tools/test.sh sets it). Every case reads one byte at a time and writes three at a time, so every TLS record is
+// split everywhere it can be.
+import { core::println, core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::SocketAddr, std::net::resolve,
+         std::memory::Owned, std::time::Duration,
+         tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion as EngineVersion,
+         redis::Connection, redis::Config, redis::RedisError, redis::Transport, redis::Dialer, redis::TlsVerify, redis::TlsVersion,
+         redis::TlsSession, redis::Subscriber, redis::Pipeline, redis::Command, redis::Replies, redis::resp::Value,
+         redis_unit_tests::check, FakeServer, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, callOutcome, isSimple,
+         commandOf, serverVersions, ended, setThenIncr, transaction, shown, soon };
+export { tlsTests };
+
+comptime uint32 BADCERT_CN_MISMATCH = 4ui32;
+comptime uint32 BADCERT_NOT_TRUSTED = 8ui32;
+// The server whose bytes the scripts play.
+fn string vectorServer() { return "redis-8.10.2"; }
+
+fn string certPath(const ref string name) {
+    Optional<string> dir = env(name: "REDISTEST_CERTDIR");
+    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "tls_test: REDISTEST_CERTDIR is not set: run tools/test.sh"); := ""; } };
+    return d.concat(other: "/").concat(other: name);
+}
+
+// A server presenting `cert` (cert.crt and cert.key). `policy`: 0 asks for no client certificate, 1 asks for one and
+// takes any answer, 2 requires one the test CA signed. `only`: 12 or 13 pins that version, 0 takes either.
+unsafe fn TlsConfig serverTls(const ref string cert, int32 policy, int32 only) {
+    Result<TlsConfig, TlsError> made = TlsConfig.server();
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "tls_test: server config"); := serverTls(cert: cert, policy: policy, only: only); } };
+    string crt = certPath(name: cert.concat(other: ".crt"));
+    string key = certPath(name: cert.concat(other: ".key"));
+    string none = "";
+    Result<Unit, TlsError> id = c.identityFiles(certificate: crt, key: key, password: none);
+    match (give id) { case Ok(value: u): { } case Err(error: e): { string m = e.message(); panic(msg: "tls_test: server identity: ${m}"); } };
+    if (policy == 1) { Result<Unit, TlsError> r = c.requestClientCertificate(); }
+    if (policy == 2) {
+        Result<Unit, TlsError> v = c.verify(mode: Verify::Chain);
+        Result<Unit, TlsError> t = c.trustFile(path: certPath(name: "ca.crt"));
+    }
+    if (only == 12) { Result<Unit, TlsError> p = c.versions(min: EngineVersion::Tls12, max: EngineVersion::Tls12); }
+    if (only == 13) { Result<Unit, TlsError> p = c.versions(min: EngineVersion::Tls13, max: EngineVersion::Tls13); }
+    return give c;
+}
+
+// A rediss:// URL to `host` that trusts the test CA, with more query after it.
+fn string trusting(const ref string host, const ref string more) {
+    return "rediss://".concat(other: host).concat(other: "?tls_ca=").concat(other: certPath(name: "ca.crt")).concat(other: more);
+}
+
+// A connection over a secure scripted server.
+unsafe fn Result<Connection, RedisError> overTls(DynamicArray<Step> script, const ref Config config, const ref TlsConfig server, const ref string sni) {
+    Owned<Transport> fake = new FakeServer.secure(steps: give script, chunk: 1, writeLimit: 3, config: server, sni: copy sni);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// `welcome` and one PING, answered.
+fn DynamicArray<Step> greeting() {
+    DynamicArray<Step> s = welcome(server: vectorServer());
+    s.add(item: expect(command: "PING", answer: reply(server: vectorServer(), kase: "ping")));
+    return give s;
+}
+
+fn string outcome(const ref Result<Connection, RedisError> r) { return match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); }; }
+
+fn bool isTls(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Tls(detail: d, cause: c): true; case _: false; }; case Ok(value: c): false; };
+}
+
+fn bool isTimeout(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: c): false; };
+}
+
+// The connect failed on the server's certificate, with every bit of `want` set.
+fn bool certificateRefused(const ref Result<Connection, RedisError> r, uint32 want) {
+    return match (r) {
+        case Err(error: e): match (e) {
+            case Tls(detail: d, cause: c): match (c) { case Certificate(flags: f, reasons: x): (f & want) == want; case _: false; };
+            case _: false;
+        };
+        case Ok(value: c): false;
+    };
+}
+
+// The session a connect gave, as "<version> requested=<b> sent=<b>"; or the failure.
+fn string sessionOf(const ref Result<Connection, RedisError> r) {
+    return match (r) {
+        case Err(error: e): e.message();
+        case Ok(value: c): match (c.tlsSession()) {
+            case None: "no session";
+            case Some(value: s): {
+                string v = "1.3";
+                if (s.version() == TlsVersion::Tls12) { v = "1.2"; }
+                string q = "false"; if (s.certificateRequested()) { q = "true"; }
+                string t = "false"; if (s.certificateSent()) { t = "true"; }
+                bool cert = s.serverCertificate().length() > 0 && s.cipherSuite().length() > 0;
+                string extra = "";
+                if (!cert) { extra = " (no certificate or cipher)"; }
+                := v.concat(other: " requested=").concat(other: q).concat(other: " sent=").concat(other: t).concat(other: extra);
+            }
+        };
+    };
+}
+
+// PING, on a connection a script must have given.
+unsafe fn string pinged(Result<Connection, RedisError> r) {
+    Connection c = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+    Result<Value, RedisError> p = c.call(command: commandOf(text: "PING"));
+    if (isSimple(r: p, text: "PONG")) { return "PONG"; }
+    return callOutcome(r: p);
+}
+
+// ---- transports for the hostile cases ----
+
+// A server that says nothing and never closes: what a server's plaintext port does with a ClientHello
+// (tls-at-plaintext in server_vectors.kama).
+type resource Silence implements Transport, Sendable {
+    public ctor make() { }
+    public fn Result<isize, IoError> read(View<uint8> into) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+    public fn Result<isize, IoError> write(ConstView<uint8> bytes) { return Result::Ok(value: bytes.length()); }
+    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) { return Result::Ok(value: Ready.of(readable: false, writable: true)); }
+    public fn void shutdown() { }
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+}
+
+// A server that answers anything with `bytes`, then closes.
+type resource Canned implements Transport, Sendable {
+    DynamicArray<uint8> bytes;
+    isize at = 0;
+    public ctor make(DynamicArray<uint8> bytes) { this.bytes = give bytes; this.at = 0; }
+    public fn Result<isize, IoError> read(View<uint8> into) {
+        if (this.at >= this.bytes.length()) { return Result::Ok(value: 0); }
+        into[0] = this.bytes[this.at];
+        this.at = this.at + 1;
+        return Result::Ok(value: 1);
+    }
+    public fn Result<isize, IoError> write(ConstView<uint8> bytes) { return Result::Ok(value: bytes.length()); }
+    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) { return Result::Ok(value: Ready.of(readable: true, writable: true)); }
+    public fn void shutdown() { }
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+}
+
+// Another transport, of which only the first `limit` bytes the server sends reach the client: then the connection
+// ends, mid-record (a hangup at any point of the handshake). Or, `stalling`, the rest arrives only after the client's
+// next wait has come back empty (a record split across a timeout).
+type resource Cut implements Transport, Sendable {
+    Owned<Transport> inner;
+    isize limit = 0;
+    isize given = 0;
+    bool stalling = false;
+
+    public ctor make(Owned<Transport> inner, isize limit, bool stalling) { this.inner = give inner; this.limit = limit; this.given = 0; this.stalling = stalling; }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        if (this.given >= this.limit) {
+            if (this.stalling) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+            return Result::Ok(value: 0);
+        }
+        isize room = this.limit - this.given;
+        View<uint8> part = into;
+        if (into.length() > room) { part = into.slice(from: 0, count: room); }
+        Result<isize, IoError> r = this.inner.read(into: part);
+        match (r) { case Ok(value: n): { this.given = this.given + n; } case Err(error: e): { } };
+        return r;
+    }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.inner.write(bytes: bytes); }
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (this.given >= this.limit) {
+            if (!this.stalling) { return Result::Ok(value: Ready.of(readable: true, writable: true)); }
+            // This wait ends empty; what is held back is there for the next.
+            this.stalling = false;
+            this.limit = 9223372036854775807;
+            return Result::Ok(value: Ready.of(readable: false, writable: true));
+        }
+        return this.inner.wait(interest: interest, timeoutMs: timeoutMs);
+    }
+    public unsafe fn void shutdown() { this.inner.shutdown(); }
+    public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
+}
+
+// A subscriber over a secure server that subscribes and is sent a message, the server's bytes held back from `at`
+// until one wait has come back empty: "message …" when the first next had it whole, "none, then message …" when it
+// came after next's timeout, or what failed.
+unsafe fn string splitRun(const ref TlsConfig server, const ref Config config, isize at) {
+    DynamicArray<Step> sub = welcome(server: vectorServer());
+    sub.add(item: expect(command: "SUBSCRIBE kr:c1", answer: reply(server: vectorServer(), kase: "sub-one/3")));
+    sub.add(item: Step::Send(bytes: reply(server: vectorServer(), kase: "message/3")));
+    string none = "";
+    Owned<Transport> fake = new FakeServer.secure(steps: give sub, chunk: 1, writeLimit: 3, config: server, sni: "");
+    Owned<Transport> stall = new Cut.make(inner: give fake, limit: at, stalling: true);
+    Result<Connection, RedisError> rc = Connection.connectOver(transport: give stall, config: config);
+    Connection c = match (give rc) { case Ok(value: x): give x; case Err(error: e): { return "connect: ".concat(other: e.message()); } };
+    Result<Subscriber, RedisError> so = Subscriber.over(connection: give c);
+    Subscriber s = match (give so) { case Ok(value: x): give x; case Err(error: e): { return "over: ".concat(other: e.message()); } };
+    Result<Unit, RedisError> subscribed = s.subscribe(names: "kr:c1");
+    match (subscribed) { case Ok(value: u): { } case Err(error: e): { return "subscribe: ".concat(other: e.message()); } };
+    string first = shown(r: s.next(timeout: soon()));
+    if (first != "none") { return first; }
+    if (s.isClosed()) { return "closed after none"; }
+    string second = shown(r: s.next(timeout: soon()));
+    return "none, then ".concat(other: second);
+}
+
+// ---- the cases ----
+
+// Verification: by name, by address, by tls_server_name; another name, another CA, each mode.
+unsafe fn int32 verificationTests() {
+    int32 f = 0;
+    string none = "";
+    TlsConfig server = serverTls(cert: "server", policy: 0, only: 0);
+
+    Config byName = configOf(url: trusting(host: "localhost", more: none));
+    Result<Connection, RedisError> r1 = overTls(script: greeting(), config: byName, server: server, sni: "localhost");
+    string s1 = sessionOf(r: r1);
+    string p1 = pinged(r: give r1);
+    f = f + check(ok: s1 == "1.3 requested=false sent=false" && p1 == "PONG", what: "tls: full, by name, SNI localhost, TLS 1.3 (${s1}; ${p1})");
+
+    Config byAddress = configOf(url: trusting(host: "127.0.0.1", more: none));
+    Result<Connection, RedisError> r2 = overTls(script: greeting(), config: byAddress, server: server, sni: "-");
+    string p2 = pinged(r: give r2);
+    f = f + check(ok: p2 == "PONG", what: "tls: full, by IP address against an IP SAN, no SNI sent (${p2})");
+    Config byV6 = configOf(url: trusting(host: "[::1]", more: none));
+    Result<Connection, RedisError> r2b = overTls(script: greeting(), config: byV6, server: server, sni: "-");
+    string p2b = pinged(r: give r2b);
+    f = f + check(ok: p2b == "PONG", what: "tls: full, by IPv6 address, no SNI sent (${p2b})");
+
+    Config named = configOf(url: trusting(host: "127.0.0.1", more: "&tls_server_name=localhost"));
+    Result<Connection, RedisError> r3 = overTls(script: greeting(), config: named, server: server, sni: "localhost");
+    string p3 = pinged(r: give r3);
+    f = f + check(ok: p3 == "PONG", what: "tls: tls_server_name is what is verified and sent as SNI (${p3})");
+
+    TlsConfig wrong = serverTls(cert: "wronghost", policy: 0, only: 0);
+    Result<Connection, RedisError> r4 = overTls(script: greeting(), config: byName, server: wrong, sni: none);
+    string g4 = outcome(r: r4);
+    f = f + check(ok: certificateRefused(r: r4, want: BADCERT_CN_MISMATCH) && g4.startsWith(prefix: "Could not connect to localhost:6379: certificate verify failed: "),
+                  what: "tls: full refuses a certificate for another name: ${g4}");
+    Result<Connection, RedisError> r4b = overTls(script: greeting(), config: byAddress, server: wrong, sni: none);
+    f = f + check(ok: certificateRefused(r: r4b, want: BADCERT_CN_MISMATCH), what: "tls: full by address refuses a certificate without that address");
+    Config chain = configOf(url: trusting(host: "localhost", more: "&tls_verify=chain"));
+    Result<Connection, RedisError> r5 = overTls(script: greeting(), config: chain, server: wrong, sni: "localhost");
+    string p5 = pinged(r: give r5);
+    f = f + check(ok: p5 == "PONG", what: "tls: chain takes another name that chains to the CA (${p5})");
+
+    Config other = configOf(url: "rediss://localhost?tls_ca=".concat(other: certPath(name: "other-ca.crt")));
+    Result<Connection, RedisError> r6 = overTls(script: greeting(), config: other, server: server, sni: none);
+    f = f + check(ok: certificateRefused(r: r6, want: BADCERT_NOT_TRUSTED), what: "tls: a server the CA did not sign is refused");
+    Config otherChain = configOf(url: "rediss://localhost?tls_verify=chain&tls_ca=".concat(other: certPath(name: "other-ca.crt")));
+    Result<Connection, RedisError> r6b = overTls(script: greeting(), config: otherChain, server: server, sni: none);
+    f = f + check(ok: certificateRefused(r: r6b, want: BADCERT_NOT_TRUSTED), what: "tls: chain refuses it too");
+    Config nothing = configOf(url: "rediss://localhost?tls_verify=none");
+    Result<Connection, RedisError> r7 = overTls(script: greeting(), config: nothing, server: wrong, sni: "localhost");
+    string p7 = pinged(r: give r7);
+    f = f + check(ok: p7 == "PONG", what: "tls: none takes any certificate, by name (${p7})");
+
+    // No CA given: the system's roots, which do not hold the test CA. A host with no bundle at all says so.
+    Config system = configOf(url: "rediss://localhost");
+    Result<Connection, RedisError> r8 = overTls(script: greeting(), config: system, server: server, sni: none);
+    string g8 = outcome(r: r8);
+    bool noBundle = g8.contains(substring: "SSL_CERT_FILE");
+    f = f + check(ok: certificateRefused(r: r8, want: BADCERT_NOT_TRUSTED) || (isTls(r: r8) && noBundle),
+                  what: "tls: by default the system's roots, which refuse the test CA: ${g8}");
+    return f;
+}
+
+// Versions: either by default, one pinned at either end, none in common.
+unsafe fn int32 versionTests() {
+    int32 f = 0;
+    string none = "";
+    Config any = configOf(url: trusting(host: "localhost", more: none));
+    TlsConfig only12 = serverTls(cert: "server", policy: 0, only: 12);
+    Result<Connection, RedisError> r1 = overTls(script: welcome(server: vectorServer()), config: any, server: only12, sni: "localhost");
+    string s1 = sessionOf(r: r1);
+    f = f + check(ok: s1 == "1.2 requested=false sent=false", what: "tls: a TLS 1.2 server (${s1})");
+    Config capped = configOf(url: trusting(host: "localhost", more: none));
+    Result<Unit, RedisError> cap = capped.setTlsVersions(min: TlsVersion::Tls12, max: TlsVersion::Tls12);
+    TlsConfig any13 = serverTls(cert: "server", policy: 0, only: 0);
+    Result<Connection, RedisError> r2 = overTls(script: welcome(server: vectorServer()), config: capped, server: any13, sni: "localhost");
+    string s2 = sessionOf(r: r2);
+    f = f + check(ok: s2 == "1.2 requested=false sent=false", what: "tls: a client capped at TLS 1.2 (${s2})");
+    TlsConfig only13 = serverTls(cert: "server", policy: 0, only: 13);
+    Result<Connection, RedisError> r3 = overTls(script: welcome(server: vectorServer()), config: capped, server: only13, sni: none);
+    string g3 = outcome(r: r3);
+    f = f + check(ok: isTls(r: r3) && g3.startsWith(prefix: "Could not connect to localhost:6379: "), what: "tls: no version in common: ${g3}");
+    return f;
+}
+
+// Client certificates: asked for and given, required and missing, refused, an encrypted key, files that will not load.
+unsafe fn int32 certificateTests() {
+    int32 f = 0;
+    string none = "";
+    string cert = certPath(name: "client.crt");
+    string key = certPath(name: "client.key");
+    string withCert = "&tls_cert=".concat(other: cert).concat(other: "&tls_key=").concat(other: key);
+    Config given = configOf(url: trusting(host: "localhost", more: withCert));
+    Config bare = configOf(url: trusting(host: "localhost", more: none));
+
+    TlsConfig asks = serverTls(cert: "server", policy: 1, only: 0);
+    Result<Connection, RedisError> r1 = overTls(script: welcome(server: vectorServer()), config: given, server: asks, sni: "localhost");
+    string s1 = sessionOf(r: r1);
+    f = f + check(ok: s1 == "1.3 requested=true sent=true", what: "tls: a certificate asked for and sent (${s1})");
+    Result<Connection, RedisError> r2 = overTls(script: welcome(server: vectorServer()), config: bare, server: asks, sni: "localhost");
+    string s2 = sessionOf(r: r2);
+    f = f + check(ok: s2 == "1.3 requested=true sent=false", what: "tls: a certificate asked for and none to send (${s2})");
+
+    TlsConfig requires = serverTls(cert: "server", policy: 2, only: 0);
+    Result<Connection, RedisError> r3 = overTls(script: greeting(), config: given, server: requires, sni: "localhost");
+    string p3 = pinged(r: give r3);
+    f = f + check(ok: p3 == "PONG", what: "tls: a required certificate, given (${p3})");
+    // Under TLS 1.3 the server refuses after the client's handshake is done, at HELLO; under 1.2, in the handshake.
+    Result<Connection, RedisError> r4 = overTls(script: greeting(), config: bare, server: requires, sni: "localhost");
+    string g4 = outcome(r: r4);
+    f = f + check(ok: isTls(r: r4) && g4.contains(substring: "The server asked for a client certificate, and none was given: set tls_cert and tls_key"),
+                  what: "tls: a required certificate, missing (TLS 1.3): ${g4}");
+    TlsConfig requires12 = serverTls(cert: "server", policy: 2, only: 12);
+    Result<Connection, RedisError> r5 = overTls(script: greeting(), config: bare, server: requires12, sni: "localhost");
+    string g5 = outcome(r: r5);
+    f = f + check(ok: isTls(r: r5) && g5.startsWith(prefix: "Could not connect to localhost:6379: ") && g5.contains(substring: "none was given"),
+                  what: "tls: a required certificate, missing (TLS 1.2): ${g5}");
+    string otherCert = "&tls_cert=".concat(other: certPath(name: "other-client.crt")).concat(other: "&tls_key=").concat(other: certPath(name: "other-client.key"));
+    Config stranger = configOf(url: trusting(host: "localhost", more: otherCert));
+    Result<Connection, RedisError> r6 = overTls(script: greeting(), config: stranger, server: requires12, sni: "localhost");
+    string g6 = outcome(r: r6);
+    f = f + check(ok: isTls(r: r6) && g6.contains(substring: "The server did not accept the client certificate"), what: "tls: a certificate the server's CA did not sign: ${g6}");
+
+    // An encrypted key, with its password and with another.
+    Config encrypted = configOf(url: trusting(host: "localhost", more: none));
+    Result<Unit, RedisError> id = encrypted.setTlsIdentityFiles(certificate: copy cert, key: certPath(name: "client-enc.key"), password: "kr_client_key_pw");
+    Result<Connection, RedisError> r7 = overTls(script: greeting(), config: encrypted, server: requires, sni: "localhost");
+    string p7 = pinged(r: give r7);
+    f = f + check(ok: p7 == "PONG", what: "tls: an encrypted key and its password (${p7})");
+    Config badPassword = configOf(url: trusting(host: "localhost", more: none));
+    Result<Unit, RedisError> id2 = badPassword.setTlsIdentityFiles(certificate: copy cert, key: certPath(name: "client-enc.key"), password: "wrong");
+    Result<Connection, RedisError> r8 = overTls(script: greeting(), config: badPassword, server: requires, sni: none);
+    string g8 = outcome(r: r8);
+    f = f + check(ok: isTls(r: r8) && g8.startsWith(prefix: "Could not negotiate a TLS connection: invalid client certificate \""), what: "tls: an encrypted key, the wrong password: ${g8}");
+
+    // Files that are not there: refused at connect, in redis-cli's frame, naming the file.
+    Config noCa = configOf(url: "rediss://localhost?tls_ca=/nonexistent/ca.pem");
+    Result<Connection, RedisError> r9 = overTls(script: greeting(), config: noCa, server: requires, sni: none);
+    string g9 = outcome(r: r9);
+    f = f + check(ok: isTls(r: r9) && g9.startsWith(prefix: "Could not negotiate a TLS connection: invalid CA file \"/nonexistent/ca.pem\": "), what: "tls: a CA file that is not there: ${g9}");
+    Config noKey = configOf(url: trusting(host: "localhost", more: "&tls_cert=/nonexistent/c.pem&tls_key=/nonexistent/k.pem"));
+    Result<Connection, RedisError> r10 = overTls(script: greeting(), config: noKey, server: requires, sni: none);
+    string g10 = outcome(r: r10);
+    f = f + check(ok: isTls(r: r10) && g10.startsWith(prefix: "Could not negotiate a TLS connection: invalid client certificate \"/nonexistent/c.pem\" or key \"/nonexistent/k.pem\": "),
+                  what: "tls: a certificate file that is not there: ${g10}");
+    return f;
+}
+
+// Everything over TLS: a pipeline through a jammed server, a transaction, a subscriber, a record split across a
+// subscriber's timeout.
+unsafe fn int32 sessionTests() {
+    int32 f = 0;
+    string none = "";
+    TlsConfig server = serverTls(cert: "server", policy: 0, only: 0);
+    Config config = configOf(url: trusting(host: "localhost", more: none));
+
+    DynamicArray<Step> jam = welcome(server: vectorServer());
+    isize i = 0;
+    while (i < 1000) { jam.add(item: expect(command: "PING", answer: reply(server: vectorServer(), kase: "ping"))); i = i + 1; }
+    Owned<Transport> jammed = new FakeServer.secureJammed(steps: give jam, chunk: 1, writeLimit: 3, backlog: 4, config: server, sni: "localhost");
+    Result<Connection, RedisError> rj = Connection.connectOver(transport: give jammed, config: config);
+    Connection cj = match (give rj) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: a jammed server's handshake: ${m}"); } };
+    Pipeline p = Pipeline.make();
+    i = 0;
+    while (i < 1000) { Command ping = commandOf(text: "PING"); p.add(command: ping); i = i + 1; }
+    Result<Replies, RedisError> rr = cj.run(pipeline: p);
+    isize pongs = 0;
+    match (give rr) {
+        case Ok(value: rs): {
+            Replies all = give rs;
+            isize k = 0;
+            while (k < all.length()) { Result<Value, RedisError> one = all.take(index: k); if (isSimple(r: one, text: "PONG")) { pongs = pongs + 1; } k = k + 1; }
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "tls: 1000 commands through a jammed server: ${m}"); }
+    };
+    f = f + check(ok: pongs == 1000, what: "tls: 1000 commands through a jammed server, ${pongs} PONGs");
+
+    DynamicArray<Step> tx = welcome(server: vectorServer());
+    transaction(s: tx, server: vectorServer(), protocol: "3", exec: reply(server: vectorServer(), kase: "exec-ok/3"));
+    Result<Connection, RedisError> rt = overTls(script: give tx, config: config, server: server, sni: "localhost");
+    Connection ct = match (give rt) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: transaction: ${m}"); } };
+    Pipeline body = setThenIncr();
+    string committed = ended(r: ct.transact(pipeline: body));
+    f = f + check(ok: committed == "committed: simple,2", what: "tls: a transaction (${committed})");
+
+    // A subscriber over TLS, its message's record split across next's timeout: the engine holds half a record, next
+    // gives None with the connection open, and the next call reads the message. Where the record ends is found by
+    // search: a stall at or past its end leaves the message whole for the first next.
+    isize lo = 0;
+    isize hi = 65536;
+    string last = splitRun(server: server, config: config, at: hi);
+    f = f + check(ok: last == "message kr:c1 hello", what: "tls: a subscriber's message over TLS (${last})");
+    while (lo + 1 < hi) {
+        isize mid = (lo + hi) / 2;
+        string got = splitRun(server: server, config: config, at: mid);
+        if (got == "message kr:c1 hello") { hi = mid; } else { lo = mid; }
+    }
+    string split = splitRun(server: server, config: config, at: hi - 10);
+    f = f + check(ok: split == "none, then message kr:c1 hello", what: "tls: a message's record split across a timeout, 10 bytes short of its end at ${hi} (${split})");
+    return f;
+}
+
+// What the server sends that is not a server's TLS: silence, a hangup at any point, bytes that are not TLS, the end of
+// the stream with close_notify and without.
+unsafe fn int32 hostileTests() {
+    int32 f = 0;
+    string none = "";
+    TlsConfig server = serverTls(cert: "server", policy: 0, only: 0);
+    Config config = configOf(url: trusting(host: "localhost", more: none));
+
+    // A plaintext port says nothing to a ClientHello, on every server (the vectors): the handshake times out.
+    DynamicArray<string> versions = serverVersions();
+    bool silent = true;
+    isize v = 0;
+    while (v < versions.length()) {
+        DynamicArray<uint8> answer = reply(server: versions[v], kase: "tls-at-plaintext");
+        if (answer.length() != 0) { silent = false; }
+        v = v + 1;
+    }
+    Owned<Transport> mute = new Silence.make();
+    Result<Connection, RedisError> r1 = Connection.connectOver(transport: give mute, config: config);
+    f = f + check(ok: silent && isTimeout(r: r1), what: "tls: a plaintext port's silence to a ClientHello is a Timeout");
+
+    // A hangup at every point of the handshake: each a TLS failure in hiredis's words, never a panic.
+    isize cut = 0;
+    isize closedWords = 0;
+    isize tried = 0;
+    while (cut < 3000) {
+        Owned<Transport> fake = new FakeServer.secure(steps: greeting(), chunk: 1, writeLimit: 3, config: server, sni: "");
+        Owned<Transport> part = new Cut.make(inner: give fake, limit: cut, stalling: false);
+        Result<Connection, RedisError> r = Connection.connectOver(transport: give part, config: config);
+        string g = outcome(r: r);
+        bool ok = match (r) { case Ok(value: c): true; case Err(error: e): false; };
+        if (!ok) {
+            tried = tried + 1;
+            if (isTls(r: r) && g == "Could not connect to localhost:6379: Server closed the connection during the TLS handshake") { closedWords = closedWords + 1; }
+            else { if (!g.contains(substring: "closed")) { f = f + check(ok: false, what: "tls: a hangup after ${cut} bytes: ${g}"); } }
+        }
+        if (cut < 64) { cut = cut + 1; } else { cut = cut + 97; }
+    }
+    f = f + check(ok: closedWords > 60 && tried > 60, what: "tls: a hangup at every point of the handshake (${closedWords} of ${tried} in the handshake)");
+
+    // Bytes that are not TLS in place of the server's.
+    Owned<Transport> resp = new Canned.make(bytes: reply(server: vectorServer(), kase: "unknown"));
+    Result<Connection, RedisError> r2 = Connection.connectOver(transport: give resp, config: config);
+    string g2 = outcome(r: r2);
+    f = f + check(ok: isTls(r: r2) && g2.startsWith(prefix: "Could not connect to localhost:6379: "), what: "tls: a RESP error in place of a ServerHello: ${g2}");
+    DynamicArray<uint8> junk = DynamicArray.empty();
+    isize j = 0;
+    while (j < 200) { junk.add(item: truncate<uint8>(j * 37 + 22)); j = j + 1; }
+    Owned<Transport> garbage = new Canned.make(bytes: give junk);
+    Result<Connection, RedisError> r3 = Connection.connectOver(transport: give garbage, config: config);
+    f = f + check(ok: isTls(r: r3), what: "tls: garbage in place of a ServerHello");
+
+    // close_notify in place of a reply: the server closed the connection, in the words it has over plaintext.
+    DynamicArray<Step> closing = welcome(server: vectorServer());
+    closing.add(item: Step::Close);
+    Result<Connection, RedisError> r4 = overTls(script: give closing, config: config, server: server, sni: none);
+    Connection c4 = match (give r4) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: close_notify: ${m}"); } };
+    string g4 = callOutcome(r: c4.call(command: commandOf(text: "PING")));
+    f = f + check(ok: g4 == "Server closed the connection", what: "tls: close_notify in place of a reply (${g4})");
+    // A record cut short, with no close_notify: the same.
+    DynamicArray<Step> truncated = welcome(server: vectorServer());
+    truncated.add(item: Step::Truncate(reply: reply(server: vectorServer(), kase: "get-big/3"), keep: 100));
+    Result<Connection, RedisError> r5 = overTls(script: give truncated, config: config, server: server, sni: none);
+    Connection c5 = match (give r5) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: truncated: ${m}"); } };
+    string g5 = callOutcome(r: c5.call(command: commandOf(text: "GET kr:big")));
+    f = f + check(ok: g5 == "Server closed the connection", what: "tls: a record cut short without close_notify (${g5})");
+    return f;
+}
+
+// A TLS configuration never carries plaintext, through any entry point; and the other way about, a plaintext client
+// at a TLS port is told so.
+unsafe fn int32 entryTests() {
+    int32 f = 0;
+    string none = "";
+    Config config = configOf(url: trusting(host: "127.0.0.1", more: none));
+
+    // A server that reads RESP meets the ClientHello and hangs up: the client sent TLS, not HELLO.
+    Owned<Transport> plain = new FakeServer.make(steps: greeting(), chunk: 1, writeLimit: 3);
+    Result<Connection, RedisError> r1 = Connection.connectOver(transport: give plain, config: config);
+    string g1 = outcome(r: r1);
+    f = f + check(ok: isTls(r: r1), what: "tls: connectOver sends TLS, never plaintext: ${g1}");
+    DynamicArray<Dial> plainDial = DynamicArray.empty();
+    plainDial.add(item: Dial::Serve(steps: greeting()));
+    Owned<Dialer> d1 = new ScriptDialer.make(dials: give plainDial);
+    Result<Connection, RedisError> r2 = Connection.connectWith(dialer: give d1, config: config);
+    string g2 = outcome(r: r2);
+    f = f + check(ok: isTls(r: r2), what: "tls: connectWith sends TLS, never plaintext: ${g2}");
+    // A dialer's transport, secured.
+    DynamicArray<Dial> tlsDial = DynamicArray.empty();
+    tlsDial.add(item: Dial::ServeTls(steps: greeting(), config: serverTls(cert: "server", policy: 0, only: 0), sni: "-"));
+    Owned<Dialer> d2 = new ScriptDialer.make(dials: give tlsDial);
+    Result<Connection, RedisError> r3 = Connection.connectWith(dialer: give d2, config: config);
+    string p3 = pinged(r: give r3);
+    f = f + check(ok: p3 == "PONG", what: "tls: TLS over a dialer's transport (${p3})");
+
+    // A TLS failure is final: the next address is not tried (localhost, when it resolves to more than one).
+    Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: "localhost", port: 6379ui16);
+    isize n = match (found) { case Ok(value: all): all.length(); case Err(error: e): 0; };
+    if (n > 1) {
+        DynamicArray<Dial> two = DynamicArray.empty();
+        two.add(item: Dial::ServeTls(steps: greeting(), config: serverTls(cert: "wronghost", policy: 0, only: 0), sni: ""));
+        isize k = 1;
+        while (k < n) { two.add(item: Dial::ServeTls(steps: greeting(), config: serverTls(cert: "server", policy: 0, only: 0), sni: "")); k = k + 1; }
+        Owned<Dialer> d3 = new ScriptDialer.make(dials: give two);
+        Config local = configOf(url: trusting(host: "localhost", more: none));
+        Result<Connection, RedisError> r4 = Connection.connectWith(dialer: give d3, config: local);
+        f = f + check(ok: certificateRefused(r: r4, want: BADCERT_CN_MISMATCH), what: "tls: a certificate refused at the first address is final");
+    }
+
+    // A plaintext HELLO at a TLS port: every server closes without a byte (the vectors), and the client says so.
+    DynamicArray<string> versions = serverVersions();
+    bool closes = true;
+    isize v = 0;
+    while (v < versions.length()) {
+        DynamicArray<uint8> answer = reply(server: versions[v], kase: "plaintext-at-tls");
+        if (answer.length() != 0) { closes = false; }
+        v = v + 1;
+    }
+    DynamicArray<Step> shut = DynamicArray.empty();
+    shut.add(item: Step::Close);
+    Owned<Transport> tlsPort = new FakeServer.make(steps: give shut, chunk: 1, writeLimit: 3);
+    Config plainConfig = configOf(url: "redis://127.0.0.1:6380");
+    Result<Connection, RedisError> r5 = Connection.connectOver(transport: give tlsPort, config: plainConfig);
+    string g5 = outcome(r: r5);
+    f = f + check(ok: closes && g5.contains(substring: "A server's TLS port closes a plaintext connection: connect to one with rediss://"),
+                  what: "tls: redis:// at a TLS port is told to use rediss://: ${g5}");
+    return f;
+}
+
+unsafe fn int32 tlsTests() {
+    int32 f = 0;
+    f = f + verificationTests();
+    f = f + versionTests();
+    f = f + certificateTests();
+    f = f + sessionTests();
+    f = f + hostileTests();
+    f = f + entryTests();
+    return f;
+}

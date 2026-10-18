@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::io::IoError, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, redis::resp::ProtocolError };
+         std::encoding::utf8::Utf8Error, tls::TlsError, redis::resp::ProtocolError };
 export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt };
 
 // What can go wrong talking to Redis or Valkey. A data error is one of these; a contract violation (an index out of
@@ -9,7 +9,7 @@ export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt };
 // "Could not connect to …"), so a log line from this client reads the same as one from the server's own tools.
 type enum RedisError implements Error, Sendable {
     // A setting that cannot be used: a URL that does not parse, an option this client does not know, a value out
-    // of range, TLS before it is supported.
+    // of range.
     Config(string detail),
     // The socket failed. A server that closed the connection is `UnexpectedEof`.
     Io(IoError error),
@@ -28,6 +28,12 @@ type enum RedisError implements Error, Sendable {
     Connect(ConnectError error),
     // The connection is closed: by `close()`, or by an earlier failure that left it unusable.
     Closed,
+    // TLS failed: its settings would not load ("Could not negotiate a TLS connection: …", redis-cli's words), the
+    // handshake failed ("Could not connect to <address>: certificate verify failed: …"), or the session did after
+    // it (a server's alert refusing the client's certificate). `cause` is @kama/tls's account, whose
+    // `Certificate(flags, reasons)` names each check that failed. A TLS failure while connecting is final: the next
+    // address is not tried.
+    Tls(string detail, TlsError cause),
     // An argument this client will not send (a NaN), or a reply that does not read as the type asked for. Nothing was
     // sent for a refused argument, a reply that does not read was read whole, and the connection is still usable.
     Value(string detail),
@@ -45,6 +51,7 @@ type enum RedisError implements Error, Sendable {
             case Server(error: e): e.message();
             case Connect(error: e): e.message();
             case Closed: "the connection is closed";
+            case Tls(detail: d, cause: c): copy d;
             case Value(detail: d): copy d;
             case Usage(detail: d): copy d;
         };

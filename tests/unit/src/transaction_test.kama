@@ -3,7 +3,7 @@
 import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::Pipeline, redis::Replies,
          redis::RedisError, redis::TxOutcome, redis::TxBody, redis::resp::Value,
          redis_unit_tests::check, Step, welcome, connected, expect, reply as vector, isSimple, commandOf };
-export { transactionTests };
+export { transactionTests, ended, setThenIncr, transaction };
 
 // How a transaction ended: "committed: …" with each reply ("simple", an integer, "(error) CODE"), "conflict", or the
 // error ("(error) CODE: message" for the server's, "(failed) message" otherwise).

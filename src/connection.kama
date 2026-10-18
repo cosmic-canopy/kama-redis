@@ -2,7 +2,8 @@ import { std::collections::DynamicArray, std::collections::Deque, std::io::IoErr
          std::net::SocketAddr, std::net::resolve, std::time::Duration,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
-         redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
+         redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo, redis::TlsSession,
+         redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
          redis::resp::Writer, redis::resp::Value };
@@ -14,7 +15,9 @@ export { Connection, libraryName, libraryVersion };
 //   1. The config's host resolves to its addresses, tried in the resolver's order; a unix:// config has its one
 //      socket. Each address gets `connect_timeout` for its connect and, once connected, the handshake. A failed
 //      connect moves on to the next address; once one connects, the handshake's outcome is the connect's.
-//   2. The handshake is one write and, normally, one round trip: HELLO 3 with AUTH and SETNAME, then SELECT and the
+//   2. Over TLS (rediss://, valkeys://), the TLS handshake comes first, within the same `connect_timeout`; its
+//      failure is the connect's, and the next address is not tried (src/secure/).
+//   3. The handshake is one write and, normally, one round trip: HELLO 3 with AUTH and SETNAME, then SELECT and the
 //      two CLIENT SETINFOs that name this library. A server that refuses HELLO (a proxy) gets the RESP2 path on the
 //      same connection: AUTH, CLIENT SETNAME and SELECT. `protocol=2` goes straight to that path; `protocol=3`
 //      never takes it.
@@ -40,6 +43,8 @@ type resource Connection implements Sendable {
     Protocol speaking;
     // The server's HELLO, when the handshake sent one: zero or one.
     DynamicArray<ServerInfo> identified;
+    // What the TLS handshake settled, on a TLS connection: zero or one.
+    DynamicArray<TlsSession> secured;
     // Push messages that arrived in place of a reply, oldest first: at most MAX_PUSHES, holding at most the reader's
     // `maxReplyBytes`. Past either bound the oldest goes, and is counted.
     Deque<Value> pushes;
@@ -61,6 +66,7 @@ type resource Connection implements Sendable {
         this.live = true;
         this.speaking = Protocol::Resp3;
         this.identified = DynamicArray.empty();
+        this.secured = DynamicArray.empty();
         this.pushes = Deque.empty();
         this.pushBudget = config.limits().maxReplyBytes;
         this.commandLimit = config.commandTimeout();
@@ -78,12 +84,12 @@ type resource Connection implements Sendable {
         return Connection.establish(config: config, opener: opener);
     }
 
-    // The handshake over a transport the caller opened. `config` supplies everything but where to connect;
-    // `connect_timeout` bounds the handshake.
+    // The handshake over a transport the caller opened: TLS first, when `config` is a TLS one. `config` supplies
+    // everything but where to connect; `connect_timeout` bounds the handshake.
     public unsafe ctor Result<Connection, RedisError> connectOver(Owned<Transport> transport, const ref Config config) {
-        if (config.transport() == UrlTransport::Tls) { return Result::Err(error: tlsNotYet()); }
         Deadline deadline = Deadline.within(span: config.connectTimeout());
-        Connection c = Connection.over(transport: give transport, config: config);
+        Result<Connection, RedisError> opened = Connection.opened(link: give transport, config: config, place: hostAndPort(config: config), deadline: deadline);
+        Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
         Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
         return match (give done) {
             case Ok(value: u): Result::Ok(value: give c);
@@ -92,7 +98,6 @@ type resource Connection implements Sendable {
     }
 
     unsafe ctor Result<Connection, RedisError> establish(const ref Config config, ref Opener opener) {
-        if (config.transport() == UrlTransport::Tls) { return Result::Err(error: tlsNotYet()); }
         ConnectError failures = ConnectError.make();
         DynamicArray<DialTarget> targets = Connection::targetsOf(config: config, failures: failures);
         isize i = 0;
@@ -102,7 +107,8 @@ type resource Connection implements Sendable {
             match (give opened) {
                 case Err(error: e): { failures.add(attempt: ConnectAttempt.make(place: targets[i].place(), failure: e)); }
                 case Ok(value: t): {
-                    Connection c = Connection.over(transport: give t, config: config);
+                    Result<Connection, RedisError> secured = Connection.opened(link: give t, config: config, place: targets[i].place(), deadline: deadline);
+                    Connection c = match (give secured) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
                     Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
                     match (give done) {
                         case Ok(value: u): { return Result::Ok(value: give c); }
@@ -113,6 +119,27 @@ type resource Connection implements Sendable {
             i = i + 1;
         }
         return Result::Err(error: RedisError::Connect(error: give failures));
+    }
+
+    // A connection over `link`, secured first when `config` is a TLS one: the TLS handshake runs within `deadline`,
+    // and its failure names the server at `place`. A TLS configuration is never carried in plaintext.
+    unsafe ctor Result<Connection, RedisError> opened(Owned<Transport> link, const ref Config config, string place, Deadline deadline) {
+        if (config.transport() != UrlTransport::Tls) { return Result::Ok(value: Connection.over(transport: give link, config: config)); }
+        Result<TlsConfig, RedisError> prepared = prepareTls(config: config);
+        TlsConfig tls = match (give prepared) {
+            case Ok(value: x): give x;
+            case Err(error: e): { Owned<Transport> unused = give link; unused.shutdown(); return Result::Err(error: give e); }
+        };
+        string name = config.tlsServerName();
+        Result<Owned<TlsTransport>, RedisError> started = new TlsTransport.start(link: give link, config: tls, name: name, certificateLoaded: hasIdentity(config: config));
+        Owned<TlsTransport> secure = match (give started) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> shaken = secure.handshake(deadline: deadline, place: place);
+        match (give shaken) { case Ok(value: u): { } case Err(error: e): { secure.shutdown(); return Result::Err(error: give e); } };
+        TlsSession session = secure.session();
+        Owned<Transport> up = give secure;
+        Connection c = Connection.over(transport: give up, config: config);
+        c.secured.add(item: give session);
+        return Result::Ok(value: give c);
     }
 
     // Where `config` can be reached: its socket, or every address its host resolves to. A name that does not resolve
@@ -353,6 +380,13 @@ type resource Connection implements Sendable {
         return Optional::Some(value: copy this.identified[0]);
     }
 
+    // What the TLS handshake settled: the version, the cipher suite, the server's certificate. None on a connection
+    // that is not TLS.
+    public const fn Optional<TlsSession> tlsSession() {
+        if (this.secured.length() == 0) { return Optional::None; }
+        return Optional::Some(value: copy this.secured[0]);
+    }
+
     // How many push messages are set aside, waiting for `takePushes`.
     public const fn isize pendingPushes() { return this.pushes.length(); }
 
@@ -446,7 +480,7 @@ type resource Connection implements Sendable {
         Result<Value, RedisError> first = this.wire.receive(deadline: deadline);
         Value reply = match (give first) {
             case Ok(value: v): give v;
-            case Err(error: e): { this.lose(); return Result::Err(error: helloFailure(e: give e)); }
+            case Err(error: e): { this.lose(); return Result::Err(error: helloFailure(e: give e, tls: config.transport() == UrlTransport::Tls)); }
         };
         if (reply.isError()) {
             ServerError refused = serverError(v: reply);
@@ -603,10 +637,14 @@ fn bool sameText(const ref DynamicArray<uint8> b, const ref string text) {
 }
 
 // A hangup in answer to HELLO says what it most likely means.
-fn RedisError helloFailure(RedisError e) {
+fn RedisError helloFailure(RedisError e, bool tls) {
     bool eof = match (e) { case Io(error: x): match (x.kind()) { case UnexpectedEof: true; case _: false; }; case _: false; };
     if (!eof) { return give e; }
-    return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. A proxy that does not know HELLO, such as twemproxy, closes the connection: connect to one with protocol=2");
+    string proxy = "A proxy that does not know HELLO, such as twemproxy, closes the connection: connect to one with protocol=2";
+    if (tls) { return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. ".concat(other: proxy)); }
+    // Every server in the matrix closes its TLS port on a plaintext HELLO without a byte (tools/gen-server-vectors.sh,
+    // plaintext-at-tls).
+    return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. A server's TLS port closes a plaintext connection: connect to one with rediss://. ".concat(other: proxy));
 }
 
 // "host:port", the host in brackets when it is an IPv6 address.
@@ -648,9 +686,4 @@ type resource Opener implements Sendable {
         Owned<Transport> transport = give tcp;
         return Result::Ok(value: give transport);
     }
-}
-
-// A TLS configuration is refused until this connection secures its link, and never dialled in plaintext.
-fn RedisError tlsNotYet() {
-    return RedisError::Config(detail: "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://");
 }

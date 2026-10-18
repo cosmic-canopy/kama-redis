@@ -1,0 +1,38 @@
+import { std::collections::DynamicArray, redis::TlsVersion };
+export { TlsSession };
+
+// What a connection's TLS session settled (`Connection.tlsSession()`): the version agreed, the cipher suite, the
+// server's certificate, and whether the server asked for a client certificate and one was sent.
+type resource TlsSession implements Sendable, Copyable<This>(bare: give) {
+    TlsVersion agreed;
+    string cipherName;
+    DynamicArray<uint8> certificateDer;
+    bool requested = false;
+    bool sent = false;
+
+    ctor make(TlsVersion version, string cipher, DynamicArray<uint8> certificate, bool requested, bool sent) {
+        this.agreed = version;
+        this.cipherName = give cipher;
+        this.certificateDer = give certificate;
+        this.requested = requested;
+        this.sent = sent;
+    }
+    friend redis::secure::TlsTransport::session[make];
+
+    public ctor copy(ref TlsSession source) {
+        this.agreed = source.agreed;
+        this.cipherName = copy source.cipherName;
+        this.certificateDer = copy source.certificateDer;
+        this.requested = source.requested;
+        this.sent = source.sent;
+    }
+
+    public const fn TlsVersion version() { return this.agreed; }
+    // Mbed TLS's name for the cipher suite ("TLS1-3-AES-256-GCM-SHA384").
+    public const fn const ref string cipherSuite() { return this.cipherName; }
+    // The server's certificate, in DER.
+    public const fn const ref DynamicArray<uint8> serverCertificate() { return this.certificateDer; }
+    // Whether the server asked for a client certificate, and whether one was sent.
+    public const fn bool certificateRequested() { return this.requested; }
+    public const fn bool certificateSent() { return this.sent; }
+}

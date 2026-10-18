@@ -1,0 +1,198 @@
+import { std::collections::View, std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
+         std::net::ReliableStream, std::net::Interest, std::net::Ready, std::memory::Owned, std::time::Duration,
+         tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress, tls::TlsVersion as EngineVersion,
+         redis::Transport, redis::RedisError, redis::TlsVersion, redis::TlsSession, redis::wire::Deadline,
+         redis::secure::setupFailure };
+export { TransportStream, TlsTransport };
+
+// TLS over any transport, as @kama/postgres runs it (src/secure/transport.kama there). @kama/tls runs a session over
+// a `ReliableStream`; `TransportStream` makes a `Transport` one, so the same TlsTransport serves TCP, a caller's
+// dialer and the unit tests' scripted server.
+//
+// The transport stays non-blocking end to end. A write may leave ciphertext queued in the engine, and a read may
+// leave plaintext there; neither must strand a connection waiting on its socket, so:
+//   - `write` sends what is queued first, and answers WouldBlock while it cannot (backpressure);
+//   - `read` sends what is queued, then reads;
+//   - `wait` is readable at once while plaintext is buffered, and while ciphertext is queued it waits to write too,
+//     sending as soon as it can, so a request is never left unsent while the connection waits for its answer.
+
+// A Transport as a ReliableStream: reads and writes pass through; it is always non-blocking.
+type resource TransportStream implements ReliableStream, Sendable {
+    Owned<Transport> link;
+
+    public ctor over(Owned<Transport> link) { this.link = give link; }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.link.read(into: into); }
+
+    // A write that takes nothing is a full transport: WouldBlock, so the engine waits rather than spins.
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        Result<isize, IoError> w = this.link.write(bytes: bytes);
+        bool none = match (w) { case Ok(value: n): n == 0 && bytes.length() > 0; case Err(error: e): false; };
+        if (none) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        return w;
+    }
+
+    public fn Result<Unit, IoError> flush() { return Result::Ok(value: Unit::Unit); }
+    public fn Result<Unit, IoError> setNonBlocking(bool on) { return Result::Ok(value: Unit::Unit); }
+
+    public unsafe fn Result<Ready, IoError> waitFor(Interest interest, int32 timeoutMs) { return this.link.wait(interest: interest, timeoutMs: timeoutMs); }
+    public unsafe fn void stop() { this.link.shutdown(); }
+}
+
+fn bool isWouldBlock(const ref IoError e) { return match (e.kind()) { case WouldBlock: true; case _: false; }; }
+
+type resource TlsTransport implements Transport, Sendable {
+    TlsStream<TransportStream> engine;
+    // This side has a client certificate to send, for the words of a refusal.
+    bool certificateLoaded = false;
+
+    ctor make(TlsStream<TransportStream> engine, bool certificateLoaded) {
+        this.engine = give engine;
+        this.certificateLoaded = certificateLoaded;
+    }
+
+    // A client session over `link` with `config`, for the server `name` (sent as SNI unless it is an IP address,
+    // and the name the certificate must carry under TlsVerify::Full). The handshake is `handshake`.
+    public unsafe ctor Result<TlsTransport, RedisError> start(Owned<Transport> link, const ref TlsConfig config, const ref string name, bool certificateLoaded) {
+        TransportStream stream = TransportStream.over(link: give link);
+        Result<TlsStream<TransportStream>, TlsError> opened = TlsStream::<TransportStream>.client(inner: give stream, config: config, serverName: name);
+        return match (give opened) {
+            case Ok(value: s): Result::Ok(value: TlsTransport.make(engine: give s, certificateLoaded: certificateLoaded));
+            case Err(error: e): Result::Err(error: setupFailure(what: "", e: give e));
+        };
+    }
+
+    // The handshake, waiting on the transport as it asks, until `deadline`, which passing is `Timeout`. A failure is
+    // final, in the words of a connect that failed: "Could not connect to <place>: " and what went wrong.
+    public unsafe fn Result<Unit, RedisError> handshake(Deadline deadline, const ref string place) {
+        while (true) {
+            Result<Progress, TlsError> step = this.engine.handshake();
+            Interest want = Interest::Read;
+            match (give step) {
+                case Ok(value: p): {
+                    Progress at = p;
+                    bool done = match (at) { case Done: true; case _: false; };
+                    if (done) { return Result::Ok(value: Unit::Unit); }
+                    bool writing = match (at) { case WantWrite: true; case _: false; };
+                    if (writing) { want = Interest::Write; }
+                }
+                case Err(error: e): { return Result::Err(error: this.handshakeFailure(e: give e, place: place)); }
+            };
+            Result<Ready, IoError> waited = this.engine.innerRefMut().waitFor(interest: want, timeoutMs: deadline.remainingMs());
+            Ready r = match (waited) {
+                case Ok(value: x): x;
+                case Err(error: e): { return Result::Err(error: this.handshakeFailure(e: TlsError::Io(error: e), place: place)); }
+            };
+            // Only the side asked for counts: a transport that is writable while the server says nothing has timed out.
+            bool ready = r.readable;
+            if (want == Interest::Write) { ready = r.writable; }
+            if (!ready) { return Result::Err(error: RedisError::Timeout); }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // What the handshake settled, once it is done.
+    public unsafe fn TlsSession session() {
+        Optional<EngineVersion> v = this.engine.protocolVersion();
+        TlsVersion version = TlsVersion::Tls13;
+        match (v) {
+            case Some(value: x): { EngineVersion e = x; bool twelve = match (e) { case Tls12: true; case _: false; }; if (twelve) { version = TlsVersion::Tls12; } }
+            case None: { }
+        };
+        bool requested = this.engine.certificateRequested();
+        return TlsSession.make(version: version, cipher: this.engine.cipherSuite(), certificate: this.engine.peerCertificate(),
+                               requested: requested, sent: requested && this.certificateLoaded);
+    }
+
+    // ---- Transport ----
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        if (this.engine.hasPendingOutput()) { Result<Unit, IoError> sent = this.engine.flush(); }
+        return this.engine.read(into: into);
+    }
+
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        if (this.engine.hasPendingOutput()) {
+            Result<Unit, IoError> sent = this.engine.flush();
+            match (sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        Result<isize, IoError> w = this.engine.write(bytes: bytes);
+        match (w) {
+            // Send the record at once if the transport takes it; what it does not take waits for `wait`.
+            case Ok(value: n): { Result<Unit, IoError> sent = this.engine.flush(); }
+            case Err(error: e): { }
+        };
+        return w;
+    }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        bool wantRead = match (interest) { case Read: true; case ReadWrite: true; case Write: false; case _: true; };
+        bool wantWrite = match (interest) { case Write: true; case ReadWrite: true; case Read: false; case _: true; };
+        if (wantRead && this.engine.hasBufferedInput()) { return Result::Ok(value: Ready.of(readable: true, writable: false)); }
+        Deadline deadline = Deadline.none();
+        if (timeoutMs >= 0) { deadline = Deadline.after(span: Duration.fromMillis(ms: cast<int64>(timeoutMs))); }
+        while (this.engine.hasPendingOutput()) {
+            Result<Unit, IoError> sent = this.engine.flush();
+            bool blocked = match (sent) { case Ok(value: u): false; case Err(error: e): isWouldBlock(e: e); };
+            bool failed = match (sent) { case Ok(value: u): false; case Err(error: e): !isWouldBlock(e: e); };
+            if (failed) { return Result::Ok(value: Ready.of(readable: true, writable: true)); }   // the read or write that follows reports it
+            if (blocked) {
+                Interest both = Interest::ReadWrite;
+                if (!wantRead) { both = Interest::Write; }
+                Result<Ready, IoError> w = this.engine.innerRefMut().waitFor(interest: both, timeoutMs: deadline.remainingMs());
+                Ready r = match (w) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: e); } };
+                if (!r.readable && !r.writable) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+                if (wantRead && r.readable) { return Result::Ok(value: Ready.of(readable: true, writable: r.writable)); }
+            }
+        }
+        if (wantWrite && !wantRead) { return Result::Ok(value: Ready.of(readable: false, writable: true)); }
+        return this.engine.innerRefMut().waitFor(interest: interest, timeoutMs: deadline.remainingMs());
+    }
+
+    // close_notify, as far as the transport takes it now, then the transport itself.
+    public unsafe fn void shutdown() {
+        Result<Unit, TlsError> closed = this.engine.close();
+        this.engine.innerRefMut().stop();
+    }
+
+    // A failure after the handshake, in TLS's words when TLS failed (a server's alert, a record that did not
+    // authenticate). An end of the stream, with close_notify or without, is the server closing the connection, in
+    // the words it has over plaintext; so is a socket that failed.
+    public unsafe fn Optional<RedisError> explain(IoError error) {
+        bool other = match (error.kind()) { case Other: true; case _: false; };
+        if (!other) { return Optional::None; }
+        Optional<TlsError> why = this.engine.tlsError();
+        return match (give why) {
+            case Some(value: t): {
+                string detail = "the TLS session failed: ".concat(other: t.reason()).concat(other: this.certificateHint(e: t));
+                := Optional::Some(value: RedisError::Tls(detail: give detail, cause: give t));
+            }
+            case None: Optional::None;
+        };
+    }
+
+    // A failed handshake: "Could not connect to <place>: " and why, as a connect that failed is worded. The
+    // transport closing is hiredis's "Server closed the connection".
+    unsafe fn RedisError handshakeFailure(TlsError e, const ref string place) {
+        string why = match (e) {
+            case Closed: "Server closed the connection during the TLS handshake";
+            case Io(error: x): RedisError::Io(error: x).message();
+            case _: e.reason();
+        };
+        string detail = "Could not connect to ".concat(other: place).concat(other: ": ").concat(other: why).concat(other: this.certificateHint(e: e));
+        return RedisError::Tls(detail: give detail, cause: give e);
+    }
+
+    // When the server asked for a client certificate, what a refusal most likely means: that none was given, or that
+    // the server did not accept the one sent (its alert names the certificate: RFC 8446, section 6.2).
+    unsafe fn string certificateHint(const ref TlsError e) {
+        if (!this.engine.certificateRequested()) { return ""; }
+        if (!this.certificateLoaded) { return ". The server asked for a client certificate, and none was given: set tls_cert and tls_key"; }
+        bool refused = match (e) {
+            case Alert(description: d, name: n, established: x): d == 42ui8 || d == 43ui8 || d == 44ui8 || d == 45ui8 || d == 46ui8 || d == 48ui8;
+            case _: false;
+        };
+        if (refused) { return ". The server did not accept the client certificate"; }
+        return "";
+    }
+}
