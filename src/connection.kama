@@ -4,7 +4,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::io::IoErr
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
-         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint,
+         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
          redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
@@ -47,6 +47,13 @@ type resource Connection implements Sendable {
     int64 pushBudget = 0;
     int64 pushesDropped = 0;
     Duration commandLimit;
+
+    // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
+    friend redis::Subscriber::write[transmit];
+    friend redis::Subscriber::read[receiveFrame];
+    friend redis::Subscriber::breakOff[lose];
+    friend redis::Subscriber::keepAside[setAside];
+    friend redis::Subscriber::over[budget];
 
     ctor over(Owned<Transport> transport, const ref Config config) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -544,6 +551,28 @@ type resource Connection implements Sendable {
         return Result::Ok(value: Unit::Unit);
     }
 
+    // ---- for a Subscriber (src/subscriber.kama), which reads what comes back itself ----
+
+    // Write `command`, a subscriber's (un)subscribe or PING. A failure closes the connection.
+    unsafe fn Result<Unit, RedisError> transmit(const ref Command command, Deadline deadline) {
+        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        this.outbox.clear();
+        command.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The next value from the server, whatever it is. A failure is handed back, not acted on: a subscriber's wait
+    // whose time passed leaves the connection open, and what was half read stays in the reader.
+    unsafe fn Result<Value, RedisError> receiveFrame(Deadline deadline) {
+        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        return this.wire.receive(deadline: deadline);
+    }
+
+    // How much a subscriber may keep queued: the reader's `maxReplyBytes`, as for the set-aside pushes.
+    const fn int64 budget() { return this.pushBudget; }
+
     // The connection is unusable: stop the transport, and answer `Closed` from now on.
     unsafe fn void lose() {
         if (!this.live) { return; }
@@ -569,19 +598,6 @@ fn bool sameText(const ref DynamicArray<uint8> b, const ref string text) {
         i = i + 1;
     }
     return true;
-}
-
-// A reply without the attributes around it: the value they describe.
-fn Value unattributed(Value v) {
-    Value current = give v;
-    while (true) {
-        bool wrapped = match (current) { case Attributed(parts: ps): ps.length() > 0; case _: false; };
-        if (!wrapped) { return give current; }
-        DynamicArray<Value> parts = match (give current) { case Attributed(parts: ps): give ps; case _: DynamicArray.empty(); };
-        Optional<Value> last = parts.pop();
-        current = match (give last) { case Some(value: x): give x; case None: Value::Null; };
-    }
-    return give current;
 }
 
 // A hangup in answer to HELLO says what it most likely means.

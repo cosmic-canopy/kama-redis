@@ -440,15 +440,15 @@ sub scene {
         scene($proto, 7000, ['a', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*'], ['rec', 'punsub-one', 1, 'PUNSUBSCRIBE', 'kr:q*']);
         # Unsubscribing from all: one confirmation per name, the other kinds' counts included; with none, one with
         # a null name.
-        scene($proto, 7000, ['a', 3, 'SUBSCRIBE', 'kr:c1', 'kr:c2', 'kr:c3'], ['a', 1, 'PSUBSCRIBE', 'kr:p*'],
+        scene($proto, 7000, ['rec', 'sub-three', 3, 'SUBSCRIBE', 'kr:c1', 'kr:c2', 'kr:c3'], ['rec', 'psub-after-three', 1, 'PSUBSCRIBE', 'kr:p*'],
               $all->('unsub-all', ['kr:c1', 'kr:c2', 'kr:c3'], 'UNSUBSCRIBE'));
-        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*'],
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'psub-two-after-one', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*'],
               $all->('punsub-all', ['kr:p*', 'kr:q*'], 'PUNSUBSCRIBE'));
         scene($proto, 7000, ['rec', 'unsub-none', 1, 'UNSUBSCRIBE']);
         scene($proto, 7000, ['rec', 'punsub-none', 1, 'PUNSUBSCRIBE']);
-        scene($proto, 7000, ['a', 1, 'PSUBSCRIBE', 'kr:p*'], ['rec', 'unsub-none-pattern', 1, 'UNSUBSCRIBE']);
+        scene($proto, 7000, ['rec', 'psub-one', 1, 'PSUBSCRIBE', 'kr:p*'], ['rec', 'unsub-none-pattern', 1, 'UNSUBSCRIBE']);
         if ($sharded) {
-            scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 2, 'SSUBSCRIBE', 'kr:s1', 'kr:s2'],
+            scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'ssub-two-after-one', 2, 'SSUBSCRIBE', 'kr:s1', 'kr:s2'],
                   $all->('sunsub-all', ['kr:s1', 'kr:s2'], 'SUNSUBSCRIBE'));
             scene($proto, 7000, ['rec', 'sunsub-none', 1, 'SUNSUBSCRIBE']);
         }
@@ -456,14 +456,14 @@ sub scene {
         # a channel and a pattern match, which comes twice.
         scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['recb', 'publish-one', 1, 'PUBLISH', 'kr:c1', 'hello'],
               ['rec', 'message', 1]);
-        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', "kr:\x00\xff"], ['b', 1, 'PUBLISH', "kr:\x00\xff", $bin],
+        scene($proto, 7000, ['rec', 'sub-binary', 1, 'SUBSCRIBE', "kr:\x00\xff"], ['b', 1, 'PUBLISH', "kr:\x00\xff", $bin],
               ['rec', 'message-binary', 1]);
         scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['b', 1, 'PUBLISH', 'kr:c1', ''], ['rec', 'message-empty', 1]);
         scene($proto, 7000, ['a', 1, 'PSUBSCRIBE', 'kr:p*'], ['b', 1, 'PUBLISH', 'kr:p1', 'hello'], ['rec', 'pmessage', 1]);
-        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'PSUBSCRIBE', 'kr:c*'],
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'psub-after-one', 1, 'PSUBSCRIBE', 'kr:c*'],
               ['recb', 'publish-two', 1, 'PUBLISH', 'kr:c1', 'hello'], ['rec', 'message-twice', 2]);
         if ($sharded) {
-            scene($proto, 7000, ['a', 1, 'SSUBSCRIBE', 'kr:s1'], ['recb', 'spublish-one', 1, 'SPUBLISH', 'kr:s1', 'hello'],
+            scene($proto, 7000, ['rec', 'ssub-one', 1, 'SSUBSCRIBE', 'kr:s1'], ['recb', 'spublish-one', 1, 'SPUBLISH', 'kr:s1', 'hello'],
                   ['rec', 'smessage', 1]);
             # A plain PUBLISH does not reach a shard subscriber: the PING's answer is the next thing to come.
             scene($proto, 7000, ['a', 1, 'SSUBSCRIBE', 'kr:s1'], ['recb', 'publish-shard', 1, 'PUBLISH', 'kr:s1', 'hello'],
@@ -472,7 +472,7 @@ sub scene {
         # PING while subscribed (RESP2's ["pong", ""], RESP3's +PONG), and once every count is back to 0.
         scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'ping-subscribed', 1, 'PING']);
         scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'ping-subscribed-text', 1, 'PING', 'hello']);
-        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'UNSUBSCRIBE', 'kr:c1'], ['rec', 'ping-left', 1, 'PING']);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'unsub-last', 1, 'UNSUBSCRIBE', 'kr:c1'], ['rec', 'ping-left', 1, 'PING']);
         # What else a subscribed connection is told: RESP2 refuses other commands; RESP3 runs them.
         scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'subscribed-get', 1, 'GET', 'kr:k']);
         # A user who may not subscribe (kr_ro has no @pubsub): one error, and no confirmation.
@@ -512,9 +512,9 @@ sub scene {
             my ($one, $other) = $proto == 2 ? @mine[0, 1] : @mine[2, 3];
             scene($proto, 7100, ['rec', 'cluster-crossslot', 2, 'SSUBSCRIBE', $one->[0], $other->[0]]);
             scene($proto, 7100, ['rec', 'cluster-moved', 1, 'SSUBSCRIBE', $theirs]);
-            scene($proto, 7100, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'SSUBSCRIBE', $one->[0]],
+            scene($proto, 7100, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'cluster-ssub-one', 1, 'SSUBSCRIBE', $one->[0]],
                   ['b', 1, 'CLUSTER', 'DELSLOTS', $one->[1]], ['rec', 'cluster-sunsubscribe', 1], ['rec', 'cluster-sunsubscribe-ping', 1, 'PING']);
-            scene($proto, 7100, ['a', 1, 'SSUBSCRIBE', $other->[0]], ['b', 1, 'CLUSTER', 'DELSLOTS', $other->[1]],
+            scene($proto, 7100, ['rec', 'cluster-ssub-last', 1, 'SSUBSCRIBE', $other->[0]], ['b', 1, 'CLUSTER', 'DELSLOTS', $other->[1]],
                   ['rec', 'cluster-sunsubscribe-last', 1], ['rec', 'cluster-sunsubscribe-last-ping', 1, 'PING']);
         }
     }

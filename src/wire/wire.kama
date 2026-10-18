@@ -2,7 +2,7 @@ import { std::collections::ConstView, std::collections::DynamicArray, std::io::I
          std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
          redis::Transport, redis::RedisError, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
          redis::resp::Limits };
-export { Wire, Deadline, footprint };
+export { Wire, Deadline, footprint, unattributed };
 
 // redis::wire — RESP over a `Transport`: replies read as they arrive, straight into the reader's buffer
 // (`resp::Reader.spare`/`commit`), and requests written out, each step bounded by a deadline. Internal: a
@@ -174,4 +174,17 @@ fn int64 footprintAll(const ref DynamicArray<Value> xs) {
     isize i = 0;
     while (i < xs.length()) { total = total + footprint(v: xs[i]); i = i + 1; }
     return total;
+}
+
+// A value without the RESP3 attributes around it: the value they describe.
+fn Value unattributed(Value v) {
+    Value current = give v;
+    while (true) {
+        bool wrapped = match (current) { case Attributed(parts: ps): ps.length() > 0; case _: false; };
+        if (!wrapped) { return give current; }
+        DynamicArray<Value> parts = match (give current) { case Attributed(parts: ps): give ps; case _: DynamicArray.empty(); };
+        Optional<Value> last = parts.pop();
+        current = match (give last) { case Some(value: x): give x; case None: Value::Null; };
+    }
+    return give current;
 }

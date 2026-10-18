@@ -1,0 +1,640 @@
+import { std::collections::DynamicArray, std::collections::Deque, std::collections::Set, std::collections::ConstView,
+         std::memory::Owned, std::memory::replace, std::time::Duration, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error,
+         redis::Config, redis::Connection, redis::Dialer, redis::Protocol, redis::RedisError, redis::ServerError,
+         redis::RedisArg, redis::Command, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
+         redis::wire::serverError, redis::resp::Value };
+export { Subscriber, Delivery, Message, ChannelKind };
+
+// Pub/sub on a connection of its own, under RESP3 and RESP2 alike (docs/ROADMAP.md, "Decided, and why", "Phase 4").
+//
+// A subscriber owns its connection while it is subscribed: waiting for messages blocks it, and under RESP2 a
+// subscribed connection takes no other command. `release()` unsubscribes from everything and hands the connection
+// back. PUBLISH, SPUBLISH and PUBSUB are ordinary commands, sent on any connection with `call`.
+//
+//   - Each (un)subscribe writes one command and reads until every confirmation it causes has come, matched by kind
+//     and name: the server confirms each name it was given, and an unsubscribe from all confirms each name it held,
+//     in an order that follows its hash table. The names kept here change only with the server's confirmations.
+//   - `next` hands over the messages: the ones that arrived while a call waited for its confirmations first, then
+//     the next to arrive, waiting up to the time it is given. That time passing is an answer (None), and the
+//     connection stays open, a message half read included. Unread messages wait in the socket and the server's
+//     buffer, and the server disconnects a subscriber that falls too far behind (client-output-buffer-limit pubsub).
+//     Delivery is at most once, as the server's own is.
+//   - A shard channel the server unsubscribes of its own accord (its slot left the node) is a delivery too,
+//     `Unsubscribed`, so a caller learns it is no longer listening there.
+//   - An error in place of confirmations (NOPERM, CROSSSLOT, MOVED, a server before 7.0 asked to SSUBSCRIBE) means the
+//     server refused the whole command: it is `Server`, and the subscriber goes on, its names unchanged. A
+//     confirmation or a PING's answer that does not come by `command_timeout` closes it, as a call's reply does.
+//   - Invalidations another connection's CLIENT TRACKING … REDIRECT sends here are not deliveries: they are set aside
+//     on the connection (`Connection.takePushes`), RESP2's form (a message on __redis__:invalidate whose payload is
+//     an array of keys, or a null) as RESP3's push is.
+
+// What a subscription is to: a channel, a pattern of channels (PSUBSCRIBE's glob), or a shard channel (SSUBSCRIBE,
+// Redis 7.0 and later), which a cluster serves from the node that owns its slot.
+type enum ChannelKind implements Sendable { Channel, Pattern, Shard }
+
+// A message published to something this subscriber is subscribed to. Names and payload are bytes, as the server
+// keeps them; the text accessors refuse bytes that are not UTF-8.
+type resource Message implements Sendable {
+    ChannelKind which;
+    DynamicArray<uint8> channelBytes;
+    DynamicArray<uint8> patternBytes;
+    DynamicArray<uint8> payloadBytes;
+
+    friend classify[of];
+
+    ctor of(ChannelKind kind, DynamicArray<uint8> channel, DynamicArray<uint8> pattern, DynamicArray<uint8> payload) {
+        this.which = kind;
+        this.channelBytes = give channel;
+        this.patternBytes = give pattern;
+        this.payloadBytes = give payload;
+    }
+
+    // `Channel` for a message to a channel subscribed by name, `Pattern` for one a pattern matched, `Shard` for a
+    // shard channel's.
+    public const fn ChannelKind kind() { return this.which; }
+    // The channel it was published to.
+    public const fn ConstView<uint8> channel() { return this.channelBytes.view(); }
+    // The pattern that matched it, for a `Pattern` message; empty otherwise.
+    public const fn ConstView<uint8> pattern() { return this.patternBytes.view(); }
+    public const fn ConstView<uint8> payload() { return this.payloadBytes.view(); }
+
+    public const fn Result<string, RedisError> channelText() { return textOf(b: this.channelBytes.view(), what: "the channel"); }
+    public const fn Result<string, RedisError> patternText() { return textOf(b: this.patternBytes.view(), what: "the pattern"); }
+    public const fn Result<string, RedisError> text() { return textOf(b: this.payloadBytes.view(), what: "the payload"); }
+}
+
+fn Result<string, RedisError> textOf(ConstView<uint8> b, const ref string what) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) {
+        case Ok(value: s): Result::Ok(value: give s);
+        case Err(error: e): Result::Err(error: RedisError::Value(detail: what.concat(other: " is not UTF-8: read its bytes")));
+    };
+}
+
+// What `next` hands over.
+type enum Delivery implements Sendable {
+    // A message to a channel, pattern or shard channel this subscriber is subscribed to.
+    Message(Message message),
+    // A subscription the server ended of its own accord: a shard channel whose slot left the node (a cluster
+    // resharding). It is no longer kept here; subscribe again where the slot went.
+    Unsubscribed(ChannelKind kind, DynamicArray<uint8> channel);
+}
+
+type resource Subscriber implements Sendable {
+    // The connection, until `release` hands it back: zero or one.
+    DynamicArray<Connection> held;
+    // Deliveries read while a call waited for its confirmations, oldest first, and what each holds in memory.
+    Deque<Delivery> pending;
+    Deque<int64> costs;
+    int64 pendingBytes = 0;
+    int64 pendingLimit = 0;
+    // The names subscribed, as the server confirmed them, each once.
+    Set<Name> channels;
+    Set<Name> patterns;
+    Set<Name> shards;
+
+    ctor fresh(int64 limit) {
+        this.held = DynamicArray.empty();
+        this.pending = Deque.empty();
+        this.costs = Deque.empty();
+        this.pendingLimit = limit;
+        this.channels = Set.empty();
+        this.patterns = Set.empty();
+        this.shards = Set.empty();
+    }
+
+    // A subscriber over `connection`, whole. `release` hands it back.
+    public ctor Result<Subscriber, RedisError> over(Connection connection) {
+        if (connection.isClosed()) {
+            Connection gone = give connection;
+            return Result::Err(error: RedisError::Closed);
+        }
+        Subscriber s = Subscriber.fresh(limit: connection.budget());
+        s.held.add(item: give connection);
+        return Result::Ok(value: give s);
+    }
+
+    // A subscriber over a new connection to the server `config` names (`Connection.connect`).
+    public unsafe ctor Result<Subscriber, RedisError> connect(const ref Config config) {
+        Result<Connection, RedisError> made = Connection.connect(config: config);
+        return match (give made) {
+            case Ok(value: c): Subscriber.over(connection: give c);
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+
+    // The same, with the connection's transport opened by `dialer` (`Connection.connectWith`).
+    public unsafe ctor Result<Subscriber, RedisError> connectWith(Owned<Dialer> dialer, const ref Config config) {
+        Result<Connection, RedisError> made = Connection.connectWith(dialer: give dialer, config: config);
+        return match (give made) {
+            case Ok(value: c): Subscriber.over(connection: give c);
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+
+    // Subscribe to channels, patterns or shard channels: `names` is one name or a list (strings, or bytes as
+    // `DynamicArray<uint8>`). It returns once the server has confirmed each one; messages that arrive meanwhile wait
+    // for `next`. Shard channels need Redis 7.0 or later, and in a cluster, names that all hash to one slot of the
+    // node this connection is to.
+    public unsafe fn Result<Unit, RedisError> subscribe(RedisArg names) { return this.change(op: Op::Subscribe, names: names); }
+    public unsafe fn Result<Unit, RedisError> psubscribe(RedisArg names) { return this.change(op: Op::Psubscribe, names: names); }
+    public unsafe fn Result<Unit, RedisError> ssubscribe(RedisArg names) { return this.change(op: Op::Ssubscribe, names: names); }
+
+    // Unsubscribe from the names given, or, given an empty list, from every one of that kind, as the server reads an
+    // UNSUBSCRIBE with no names. A name not subscribed is confirmed all the same.
+    public unsafe fn Result<Unit, RedisError> unsubscribe(RedisArg names) { return this.change(op: Op::Unsubscribe, names: names); }
+    public unsafe fn Result<Unit, RedisError> punsubscribe(RedisArg names) { return this.change(op: Op::Punsubscribe, names: names); }
+    public unsafe fn Result<Unit, RedisError> sunsubscribe(RedisArg names) { return this.change(op: Op::Sunsubscribe, names: names); }
+
+    // The next delivery: the oldest one already read, else the next to arrive within `timeout` (None waits as long
+    // as it takes; zero takes only what has already arrived). None when the time passes first; the subscriber goes
+    // on. With nothing subscribed and nothing waiting, nothing can come: `Usage`.
+    public unsafe fn Result<Optional<Delivery>, RedisError> next(Optional<Duration> timeout) {
+        if (this.held.length() == 0) { return Result::Err(error: released()); }
+        if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.dequeue())); }
+        if (this.held[0].isClosed()) { return Result::Err(error: RedisError::Closed); }
+        if (this.subscriptions() == 0) {
+            return Result::Err(error: RedisError::Usage(detail: "nothing is subscribed, so no message can come: subscribe first"));
+        }
+        bool negative = match (timeout) { case Some(value: t): t.isNegative(); case None: false; };
+        if (negative) { return Result::Err(error: RedisError::Usage(detail: "a timeout cannot be negative: None waits as long as it takes")); }
+        Deadline until = match (timeout) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
+        while (true) {
+            Result<Value, RedisError> got = this.read(deadline: until);
+            Value v = match (give got) {
+                case Ok(value: x): give x;
+                case Err(error: e): {
+                    bool late = match (e) { case Timeout: true; case _: false; };
+                    if (late) { return Result::Ok(value: Optional::None); }
+                    this.breakOff();
+                    return Result::Err(error: give e);
+                }
+            };
+            Incoming frame = classify(v: give v, resp2: this.resp2());
+            match (give frame) {
+                case Delivered(message: m, cost: c): { return Result::Ok(value: Optional::Some(value: Delivery::Message(message: give m))); }
+                case Confirmed(op: o, name: n, named: has): {
+                    bool own = o == Op::Sunsubscribe && has;
+                    if (!own) { return this.unexpected(detail: "the server confirmed a subscription no call was waiting for"); }
+                    if (this.forget(kind: ChannelKind::Shard, name: n.view())) {
+                        return Result::Ok(value: Optional::Some(value: Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: give n)));
+                    }
+                }
+                case Aside(push: p): { this.keepAside(push: give p); }
+                case Refused(error: e): { return this.unexpected(detail: "the server sent an error no call was waiting for"); }
+                case Pong: { return this.unexpected(detail: "the server answered a PING no call sent"); }
+                case Other(value: x): { return this.unexpected(detail: "the server sent a reply no call was waiting for"); }
+            };
+        }
+        return Result::Ok(value: Optional::None);
+    }
+
+    // PING the server, which answers between messages: a check that the connection is alive. Messages read on the
+    // way wait for `next`.
+    public unsafe fn Result<Unit, RedisError> ping() {
+        if (this.held.length() == 0) { return Result::Err(error: released()); }
+        Command command = Command.of(name: "PING");
+        Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
+        Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        while (true) {
+            Result<Incoming, RedisError> got = this.arrival(deadline: deadline);
+            Incoming frame = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            match (give frame) {
+                case Pong: { return Result::Ok(value: Unit::Unit); }
+                case Other(value: x): {
+                    if (isPong(v: x)) { return Result::Ok(value: Unit::Unit); }
+                    return this.fail(detail: "PING was answered with something other than PONG");
+                }
+                case Refused(error: e): { return Result::Err(error: RedisError::Server(error: give e)); }
+                case Confirmed(op: o, name: n, named: has): {
+                    Result<Unit, RedisError> kept = this.ownConfirmation(op: o, name: give n, named: has);
+                    match (give kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Delivered(message: m, cost: c): {
+                    Result<Unit, RedisError> queued = this.enqueue(d: Delivery::Message(message: give m), cost: c);
+                    match (give queued) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Aside(push: p): { this.keepAside(push: give p); }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Unsubscribe from everything, wait until the server has confirmed it, and hand the connection back, ready for
+    // `call`. Deliveries not yet read are dropped: read `next` until None first to have them. A connection that
+    // failed is `Closed`; a second release is `Usage`.
+    public unsafe fn Result<Connection, RedisError> release() {
+        if (this.held.length() == 0) { return Result::Err(error: released()); }
+        bool closed = this.held[0].isClosed();
+        if (!closed && this.channels.length() > 0) {
+            Result<Unit, RedisError> done = this.changeAll(op: Op::Unsubscribe);
+            match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        closed = this.held[0].isClosed();
+        if (!closed && this.patterns.length() > 0) {
+            Result<Unit, RedisError> done = this.changeAll(op: Op::Punsubscribe);
+            match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        closed = this.held[0].isClosed();
+        if (!closed && this.shards.length() > 0) {
+            Result<Unit, RedisError> done = this.changeAll(op: Op::Sunsubscribe);
+            match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        this.pending = Deque.empty();
+        this.costs = Deque.empty();
+        this.pendingBytes = 0;
+        Optional<Connection> last = this.held.pop();
+        Connection c = match (give last) { case Some(value: x): give x; case None: { return Result::Err(error: released()); } };
+        if (c.isClosed()) {
+            Connection gone = give c;
+            return Result::Err(error: RedisError::Closed);
+        }
+        return Result::Ok(value: give c);
+    }
+
+    // Close the connection. Every later call answers `Closed`.
+    public unsafe fn void close() {
+        if (this.held.length() > 0) { this.breakOff(); }
+    }
+
+    public const fn bool isClosed() { return this.held.length() == 0 || this.held[0].isClosed(); }
+
+    // The protocol the connection's handshake settled on.
+    public const fn Protocol protocol() {
+        if (this.held.length() == 0) { return Protocol::Resp3; }
+        return this.held[0].protocol();
+    }
+
+    // How many channels, patterns and shard channels are subscribed, as the server confirmed them.
+    public const fn isize channelCount() { return this.channels.length(); }
+    public const fn isize patternCount() { return this.patterns.length(); }
+    public const fn isize shardCount() { return this.shards.length(); }
+
+    // ---- inside ----
+
+    const fn bool resp2() { return this.held[0].protocol() == Protocol::Resp2; }
+    const fn isize subscriptions() { return this.channels.length() + this.patterns.length() + this.shards.length(); }
+
+    // One (un)subscribe: one command, then every confirmation it causes.
+    unsafe fn Result<Unit, RedisError> change(Op op, RedisArg names) {
+        if (this.held.length() == 0) { return Result::Err(error: released()); }
+        Command command = Command.of(name: opCommand(op: op));
+        command.add(value: names);
+        Optional<RedisError> problem = command.problem();
+        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (command.length() == 1 && opAdds(op: op)) {
+            string word = opCommand(op: op);
+            return Result::Err(error: RedisError::Usage(detail: word.concat(other: " needs at least one name")));
+        }
+        DynamicArray<DynamicArray<uint8>> named = DynamicArray.empty();
+        isize i = 1;
+        while (i < command.length()) {
+            DynamicArray<uint8> part = DynamicArray.empty();
+            part.addAll(items: command.part(index: i));
+            named.add(item: give part);
+            i = i + 1;
+        }
+        Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
+        Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.settle(op: op, expected: named, deadline: deadline);
+    }
+
+    // An unsubscribe from every name of a kind, as `release` sends it.
+    unsafe fn Result<Unit, RedisError> changeAll(Op op) {
+        Command command = Command.of(name: opCommand(op: op));
+        DynamicArray<DynamicArray<uint8>> none = DynamicArray.empty();
+        Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
+        Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.settle(op: op, expected: none, deadline: deadline);
+    }
+
+    // Read until every confirmation `op` causes has come: one for each name in `expected`, matched by name (the
+    // server confirms them in the order given, which is tried first); with none given, one for each name of that kind
+    // kept here, in whatever order the server sends them, or a single one with no name when none is kept. What else
+    // comes on the way is kept: messages queue for `next`, as does the server's own sunsubscribe, and other pushes
+    // are set aside on the connection.
+    unsafe fn Result<Unit, RedisError> settle(Op op, const ref DynamicArray<DynamicArray<uint8>> expected, Deadline deadline) {
+        ChannelKind kind = opKind(op: op);
+        bool all = expected.length() == 0;
+        bool noneKept = all && this.keptCount(kind: kind) == 0;
+        DynamicArray<bool> matched = DynamicArray.empty();
+        isize k = 0;
+        while (k < expected.length()) { matched.add(item: false); k = k + 1; }
+        isize cursor = 0;
+        isize left = expected.length();
+        while (true) {
+            if (!all && left == 0) { return Result::Ok(value: Unit::Unit); }
+            if (all && !noneKept && this.keptCount(kind: kind) == 0) { return Result::Ok(value: Unit::Unit); }
+            Result<Incoming, RedisError> got = this.arrival(deadline: deadline);
+            Incoming frame = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            match (give frame) {
+                case Confirmed(op: o, name: n, named: has): {
+                    bool ours = false;
+                    if (o == op && all && noneKept) {
+                        if (has) { return this.fail(detail: "an unsubscribe from all, with nothing subscribed, was confirmed with a name"); }
+                        return Result::Ok(value: Unit::Unit);
+                    }
+                    if (o == op && all && has) {
+                        ours = this.forget(kind: kind, name: n.view());
+                    }
+                    if (o == op && !all && has) {
+                        isize at = -1;
+                        if (cursor < expected.length() && !matched[cursor] && expected[cursor].equals(other: n)) { at = cursor; }
+                        isize j = 0;
+                        while (at < 0 && j < expected.length()) {
+                            if (!matched[j] && expected[j].equals(other: n)) { at = j; }
+                            j = j + 1;
+                        }
+                        if (at >= 0) {
+                            matched[at] = true;
+                            left = left - 1;
+                            cursor = at + 1;
+                            if (opAdds(op: op)) { this.keep(kind: kind, name: n.view()); } else { bool gone = this.forget(kind: kind, name: n.view()); }
+                            ours = true;
+                        }
+                    }
+                    if (!ours) {
+                        Result<Unit, RedisError> kept = this.ownConfirmation(op: o, name: give n, named: has);
+                        match (give kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                    } else {
+                        DynamicArray<uint8> confirmed = give n;
+                    }
+                }
+                case Delivered(message: m, cost: c): {
+                    Result<Unit, RedisError> queued = this.enqueue(d: Delivery::Message(message: give m), cost: c);
+                    match (give queued) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Aside(push: p): { this.keepAside(push: give p); }
+                // The server refused the whole command: nothing it names is confirmed, and the subscriber goes on.
+                case Refused(error: e): { return Result::Err(error: RedisError::Server(error: give e)); }
+                case Pong: { return this.fail(detail: "the server answered a PING no call sent"); }
+                case Other(value: x): { return this.fail(detail: "a subscription was answered with something other than its confirmations"); }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A confirmation no call is waiting for. The server sends a sunsubscribe of its own when a shard channel's slot
+    // leaves the node: one still kept is queued as `Unsubscribed`, and one already gone means nothing more. Any other
+    // means this client and the server no longer agree, and the connection closes.
+    unsafe fn Result<Unit, RedisError> ownConfirmation(Op op, DynamicArray<uint8> name, bool named) {
+        if (op != Op::Sunsubscribe || !named) {
+            return this.fail(detail: "the server confirmed a subscription no call was waiting for");
+        }
+        if (!this.forget(kind: ChannelKind::Shard, name: name.view())) { return Result::Ok(value: Unit::Unit); }
+        int64 cost = cast<int64>(name.length());
+        return this.enqueue(d: Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: give name), cost: cost);
+    }
+
+    // The next value, classified. A failure of the connection closes it, a deadline passing included: a call that
+    // waits for an answer must have it.
+    unsafe fn Result<Incoming, RedisError> arrival(Deadline deadline) {
+        Result<Value, RedisError> got = this.read(deadline: deadline);
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { this.breakOff(); return Result::Err(error: give e); } };
+        return Result::Ok(value: classify(v: give v, resp2: this.resp2()));
+    }
+
+    // Queue `d` for `next`, within `resp::Limits.maxReplyBytes` in all; past it the subscriber fails rather than drop
+    // a message.
+    unsafe fn Result<Unit, RedisError> enqueue(Delivery d, int64 cost) {
+        if (this.pendingBytes + cost > this.pendingLimit) {
+            Delivery dropped = give d;
+            return this.fail(detail: "messages arrived faster than a call could read its confirmations, past maxReplyBytes: the subscriber is closed");
+        }
+        this.pendingBytes = this.pendingBytes + cost;
+        this.pending.pushBack(item: give d);
+        this.costs.pushBack(item: cost);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    fn Delivery dequeue() {
+        Optional<int64> c = this.costs.popFront();
+        match (c) { case Some(value: n): { this.pendingBytes = this.pendingBytes - n; } case None: { } };
+        Optional<Delivery> d = this.pending.popFront();
+        return match (give d) {
+            case Some(value: x): give x;
+            case None: Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: DynamicArray.empty());
+        };
+    }
+
+    // The exchange broke: close the connection, and say why.
+    unsafe fn Result<Unit, RedisError> fail(const ref string detail) {
+        this.breakOff();
+        return Result::Err(error: RedisError::Unexpected(detail: copy detail));
+    }
+
+    unsafe fn Result<Optional<Delivery>, RedisError> unexpected(const ref string detail) {
+        this.breakOff();
+        return Result::Err(error: RedisError::Unexpected(detail: copy detail));
+    }
+
+    // ---- the kept names ----
+
+    fn void keep(ChannelKind kind, ConstView<uint8> name) {
+        match (kind) {
+            case Channel: { this.channels.add(key: Name.of(bytes: name)); }
+            case Pattern: { this.patterns.add(key: Name.of(bytes: name)); }
+            case Shard: { this.shards.add(key: Name.of(bytes: name)); }
+        };
+    }
+
+    // Whether `name` was kept, which it no longer is.
+    fn bool forget(ChannelKind kind, ConstView<uint8> name) {
+        Name key = Name.of(bytes: name);
+        return match (kind) {
+            case Channel: this.channels.remove(key: key);
+            case Pattern: this.patterns.remove(key: key);
+            case Shard: this.shards.remove(key: key);
+        };
+    }
+
+    const fn isize keptCount(ChannelKind kind) {
+        return match (kind) {
+            case Channel: this.channels.length();
+            case Pattern: this.patterns.length();
+            case Shard: this.shards.length();
+        };
+    }
+
+    // ---- the connection (each the one way to reach its private side) ----
+
+    unsafe fn Result<Unit, RedisError> write(const ref Command command, Deadline deadline) {
+        return this.held[0].transmit(command: command, deadline: deadline);
+    }
+    unsafe fn Result<Value, RedisError> read(Deadline deadline) { return this.held[0].receiveFrame(deadline: deadline); }
+    unsafe fn void breakOff() { this.held[0].lose(); }
+    unsafe fn void keepAside(Value push) { this.held[0].setAside(push: give push); }
+}
+
+fn RedisError released() { return RedisError::Usage(detail: "the subscriber released its connection already"); }
+
+// Whether `v` is +PONG: PING's answer under RESP3, and under RESP2 with nothing subscribed.
+fn bool isPong(const ref Value v) {
+    return match (v) { case Simple(bytes: b): sameWord(b: b.view(), word: "PONG"); case _: false; };
+}
+
+// ---- the six commands that (un)subscribe ----
+
+type enum Op implements Sendable { Subscribe, Psubscribe, Ssubscribe, Unsubscribe, Punsubscribe, Sunsubscribe }
+
+fn string opCommand(Op op) {
+    return match (op) {
+        case Subscribe: "SUBSCRIBE";
+        case Psubscribe: "PSUBSCRIBE";
+        case Ssubscribe: "SSUBSCRIBE";
+        case Unsubscribe: "UNSUBSCRIBE";
+        case Punsubscribe: "PUNSUBSCRIBE";
+        case Sunsubscribe: "SUNSUBSCRIBE";
+    };
+}
+
+fn ChannelKind opKind(Op op) {
+    return match (op) {
+        case Subscribe: ChannelKind::Channel;
+        case Unsubscribe: ChannelKind::Channel;
+        case Psubscribe: ChannelKind::Pattern;
+        case Punsubscribe: ChannelKind::Pattern;
+        case Ssubscribe: ChannelKind::Shard;
+        case Sunsubscribe: ChannelKind::Shard;
+    };
+}
+
+fn bool opAdds(Op op) {
+    return match (op) { case Subscribe: true; case Psubscribe: true; case Ssubscribe: true; case _: false; };
+}
+
+// The command a confirmation names, in the server's lower case.
+fn Optional<Op> opNamed(ConstView<uint8> word) {
+    if (sameWord(b: word, word: "subscribe")) { return Optional::Some(value: Op::Subscribe); }
+    if (sameWord(b: word, word: "psubscribe")) { return Optional::Some(value: Op::Psubscribe); }
+    if (sameWord(b: word, word: "ssubscribe")) { return Optional::Some(value: Op::Ssubscribe); }
+    if (sameWord(b: word, word: "unsubscribe")) { return Optional::Some(value: Op::Unsubscribe); }
+    if (sameWord(b: word, word: "punsubscribe")) { return Optional::Some(value: Op::Punsubscribe); }
+    if (sameWord(b: word, word: "sunsubscribe")) { return Optional::Some(value: Op::Sunsubscribe); }
+    return Optional::None;
+}
+
+fn bool sameWord(ConstView<uint8> b, const ref string word) {
+    if (b.length() != word.length()) { return false; }
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] != word[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- what comes from a subscribed connection ----
+
+type enum Incoming implements Sendable {
+    // A (un)subscribe's confirmation: the command it confirms and the name, or no name (`named` false) for an
+    // unsubscribe from all with nothing subscribed.
+    Confirmed(Op op, DynamicArray<uint8> name, bool named),
+    // A message, and what it holds in memory.
+    Delivered(Message message, int64 cost),
+    // RESP2's answer to a PING while subscribed: ["pong", text].
+    Pong,
+    // A push that is not pub/sub's, or RESP2's form of an invalidation: kept aside on the connection.
+    Aside(Value push),
+    // An error reply.
+    Refused(ServerError error),
+    // Anything else: a reply, which only a PING's +PONG may be.
+    Other(Value value);
+}
+
+// What `v` is. Pub/sub arrives as RESP3 push messages, or as RESP2 arrays, which are told from a reply by their
+// first element; a message whose payload is not a string is RESP2's invalidation, set aside as RESP3's push is.
+fn Incoming classify(Value v, bool resp2) {
+    int64 cost = footprint(v: v);
+    Value bare = unattributed(v: give v);
+    if (bare.isError()) {
+        ServerError e = serverError(v: bare);
+        Value gone = give bare;
+        return Incoming::Refused(error: give e);
+    }
+    bool pushed = match (bare) { case Push(items: xs): true; case _: false; };
+    bool listed = match (bare) { case Array(items: xs): resp2; case _: false; };
+    if (!pushed && !listed) { return Incoming::Other(value: give bare); }
+    DynamicArray<Value> items = match (give bare) { case Push(items: xs): give xs; case Array(items: xs): give xs; case _: DynamicArray.empty(); };
+    isize n = items.length();
+    bool worded = n > 0 && isBulk(v: items[0]);
+    if (!worded) { return setAsideOrOther(items: give items, pushed: pushed); }
+    DynamicArray<uint8> word = takeBytes(items: items, at: 0);
+    Optional<Op> op = opNamed(word: word.view());
+    bool confirmation = match (op) { case Some(value: o): true; case None: false; };
+    if (confirmation && n == 3 && (isBulk(v: items[1]) || items[1].isNull()) && isInteger(v: items[2])) {
+        bool named = isBulk(v: items[1]);
+        DynamicArray<uint8> name = takeBytes(items: items, at: 1);
+        Op o = match (op) { case Some(value: x): x; case None: Op::Subscribe; };
+        return Incoming::Confirmed(op: o, name: give name, named: named);
+    }
+    bool message = sameWord(b: word.view(), word: "message");
+    bool smessage = sameWord(b: word.view(), word: "smessage");
+    bool pmessage = sameWord(b: word.view(), word: "pmessage");
+    if ((message || smessage) && n == 3 && isBulk(v: items[1]) && isBulk(v: items[2])) {
+        ChannelKind kind = ChannelKind::Channel;
+        if (smessage) { kind = ChannelKind::Shard; }
+        DynamicArray<uint8> channel = takeBytes(items: items, at: 1);
+        DynamicArray<uint8> payload = takeBytes(items: items, at: 2);
+        return Incoming::Delivered(message: Message.of(kind: kind, channel: give channel, pattern: DynamicArray.empty(), payload: give payload), cost: cost);
+    }
+    if (pmessage && n == 4 && isBulk(v: items[1]) && isBulk(v: items[2]) && isBulk(v: items[3])) {
+        DynamicArray<uint8> pattern = takeBytes(items: items, at: 1);
+        DynamicArray<uint8> channel = takeBytes(items: items, at: 2);
+        DynamicArray<uint8> payload = takeBytes(items: items, at: 3);
+        return Incoming::Delivered(message: Message.of(kind: ChannelKind::Pattern, channel: give channel, pattern: give pattern, payload: give payload), cost: cost);
+    }
+    if (!pushed && sameWord(b: word.view(), word: "pong") && n == 2 && isBulk(v: items[1])) { return Incoming::Pong; }
+    // Put the word back: what is set aside, or refused, is the value as it came.
+    items[0] = Value::Bulk(bytes: give word);
+    bool messageForm = message || smessage || pmessage;
+    if (messageForm) { return Incoming::Aside(push: rebuilt(items: give items, pushed: pushed)); }
+    return setAsideOrOther(items: give items, pushed: pushed);
+}
+
+// A push this subscriber does not read goes aside on the connection; under RESP2, an array that is not pub/sub's is
+// a reply no call asked for.
+fn Incoming setAsideOrOther(DynamicArray<Value> items, bool pushed) {
+    if (pushed) { return Incoming::Aside(push: Value::Push(items: give items)); }
+    return Incoming::Other(value: Value::Array(items: give items));
+}
+
+fn Value rebuilt(DynamicArray<Value> items, bool pushed) {
+    if (pushed) { return Value::Push(items: give items); }
+    return Value::Array(items: give items);
+}
+
+fn bool isBulk(const ref Value v) { return match (v) { case Bulk(bytes: b): true; case _: false; }; }
+fn bool isInteger(const ref Value v) { return match (v) { case Integer(value: x): true; case _: false; }; }
+
+// The bytes of the string at `at`, taken out (empty for anything else).
+fn DynamicArray<uint8> takeBytes(ref DynamicArray<Value> items, isize at) {
+    Value v = replace::<Value>(place: items[at], with: Value::Null);
+    return match (give v) { case Bulk(bytes: b): give b; case _: DynamicArray.empty(); };
+}
+
+// A channel or pattern name as a set's key: its bytes, hashed with FNV-1a, as std hashes a string.
+type resource Name implements Hashable, Equatable<This>, Sendable {
+    DynamicArray<uint8> bytes;
+
+    public ctor of(ConstView<uint8> bytes) {
+        this.bytes = DynamicArray.empty();
+        this.bytes.addAll(items: bytes);
+    }
+
+    public const fn uint64 hash() {
+        uint64 h = 14695981039346656037ui64;
+        isize i = 0;
+        while (i < this.bytes.length()) {
+            h = (h ^ cast<uint64>(this.bytes[i])) * 1099511628211ui64;
+            i = i + 1;
+        }
+        return h;
+    }
+
+    public const fn bool equals(const ref Name other) { return this.bytes.equals(other: other.bytes); }
+}

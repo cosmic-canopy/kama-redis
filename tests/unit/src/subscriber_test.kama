@@ -1,0 +1,671 @@
+// redis::Subscriber over the scripted server (fake_server.kama), under RESP2 and RESP3, on every server's own bytes
+// (server_vectors.kama, the pub/sub cases). What the client must send is written here as the commands a script
+// expects; what the server answers is always a capture.
+//
+// A capture whose setup ran on the same connection is replayed with that setup's own capture before it, so each scene
+// is what a server sent in that order. Where a scene joins captures from different connections (a message arriving
+// before a later confirmation, say), each frame is still a server's; the counts they carry are the server's at its
+// capture, and the client reads names, never counts.
+import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::time::Duration,
+         std::memory::Owned, redis::Transport, redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Message, redis::ChannelKind,
+         redis::RedisError, redis::Command, redis::resp::Value, redis::resp::Reader, redis::resp::Read,
+         redis::resp::Limits, redis_unit_tests::check, FakeServer, Step, welcome, expect, reply, configOf, connected,
+         textOf, bytesOf, resp, isSimple, serverVersions, replyNames, replyCommands };
+export { subscriberTests };
+
+// ---- the scripts ----
+
+fn string urlOf(int32 proto) {
+    if (proto == 2) { return "redis://?protocol=2"; }
+    return "redis://";
+}
+
+// The handshake's steps: RESP3's HELLO and SETINFOs, or nothing at all for protocol=2 with no password, name or
+// database.
+fn DynamicArray<Step> opening(const ref string server, int32 proto) {
+    if (proto == 2) { return DynamicArray.empty(); }
+    return welcome(server: server);
+}
+
+// The capture `server` sent for pub/sub case `kase` under `proto` ("sub-two" -> "sub-two/3").
+fn DynamicArray<uint8> pub(const ref string server, const ref string kase, int32 proto) {
+    string name = kase.concat(other: "/${proto}");
+    return reply(server: server, kase: name);
+}
+
+fn bool has(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = replyNames();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The command a pub/sub case sent, as the generator wrote it (the cluster's shard channels are chosen there).
+fn string commandFor(const ref string server, const ref string kase, int32 proto) {
+    string name = server.concat(other: " ").concat(other: kase).concat(other: "/${proto}");
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> commands = replyCommands();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return copy commands[i]; }
+        i = i + 1;
+    }
+    panic(msg: "subscriber_test: no server vector ${name}");
+    return "";
+}
+
+// `text`'s words after the first: the names a command gives.
+fn DynamicArray<string> namesIn(const ref string text) {
+    DynamicArray<string> list = DynamicArray.empty();
+    isize start = -1;
+    isize i = 0;
+    while (i <= text.length()) {
+        bool space = i == text.length() || text.bytes()[i] == 32ui8;
+        if (space) {
+            if (start >= 0) { list.add(item: text.substring(start: start, end: i)); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return give list;
+}
+
+// Space-separated names as a list ("" is none).
+fn DynamicArray<string> listOf(const ref string text) {
+    if (text.length() == 0) { return DynamicArray.empty(); }
+    string padded = "X ".concat(other: text);
+    return namesIn(text: padded);
+}
+
+// The whole RESP values in `b`, each as its bytes.
+fn DynamicArray<DynamicArray<uint8>> framesOf(const ref DynamicArray<uint8> b) {
+    DynamicArray<DynamicArray<uint8>> frames = DynamicArray.empty();
+    Reader r = Reader.make();
+    r.feed(bytes: b.view());
+    isize start = 0;
+    while (start < b.length()) {
+        Read got = r.next();
+        bool whole = match (got) { case Complete(value: v): true; case _: false; };
+        if (!whole) { panic(msg: "subscriber_test: a capture that is not whole values"); }
+        isize end = b.length() - r.buffered();
+        DynamicArray<uint8> one = DynamicArray.empty();
+        one.addAll(items: b.view().slice(from: start, count: end - start));
+        frames.add(item: give one);
+        start = end;
+    }
+    return give frames;
+}
+
+fn DynamicArray<uint8> joined(const ref DynamicArray<DynamicArray<uint8>> frames, const ref DynamicArray<isize> order) {
+    DynamicArray<uint8> all = DynamicArray.empty();
+    isize i = 0;
+    while (i < order.length()) { all.addAll(items: frames[order[i]].view()); i = i + 1; }
+    return give all;
+}
+
+fn DynamicArray<uint8> plus(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b) {
+    DynamicArray<uint8> all = DynamicArray.empty();
+    all.addAll(items: a.view());
+    all.addAll(items: b.view());
+    return give all;
+}
+
+// Every order of 0 … n-1.
+fn DynamicArray<DynamicArray<isize>> orders(isize n) {
+    DynamicArray<DynamicArray<isize>> all = DynamicArray.empty();
+    DynamicArray<isize> current = DynamicArray.empty();
+    DynamicArray<bool> used = DynamicArray.empty();
+    isize i = 0;
+    while (i < n) { used.add(item: false); i = i + 1; }
+    permute(current: ref current, used: ref used, n: n, all: ref all);
+    return give all;
+}
+
+fn void permute(ref DynamicArray<isize> current, ref DynamicArray<bool> used, isize n, ref DynamicArray<DynamicArray<isize>> all) {
+    if (current.length() == n) { all.add(item: copy current); return; }
+    isize i = 0;
+    while (i < n) {
+        if (!used[i]) {
+            used[i] = true;
+            current.add(item: i);
+            permute(current: ref current, used: ref used, n: n, all: ref all);
+            Optional<isize> back = current.pop();
+            used[i] = false;
+        }
+        i = i + 1;
+    }
+}
+
+unsafe fn Subscriber subscriberOf(DynamicArray<Step> script, int32 proto, const ref string what) {
+    string url = urlOf(proto: proto);
+    Connection c = connected(script: give script, url: url, what: what);
+    Result<Subscriber, RedisError> r = Subscriber.over(connection: give c);
+    return match (give r) {
+        case Ok(value: s): give s;
+        case Err(error: e): { string m = e.message(); panic(msg: "subscriber_test: ${what}: ${m}"); := subscriberOf(script: DynamicArray.empty(), proto: proto, what: what); }
+    };
+}
+
+// ---- what the subscriber answered ----
+
+fn string kindWord(ChannelKind k) {
+    return match (k) { case Channel: "message"; case Pattern: "pmessage"; case Shard: "smessage"; };
+}
+
+fn string shownMessage(const ref Message m) {
+    string kind = kindWord(k: m.kind());
+    string channel = textOf(b: m.channel());
+    string payload = textOf(b: m.payload());
+    bool patterned = match (m.kind()) { case Pattern: true; case _: false; };
+    if (patterned) {
+        string pattern = textOf(b: m.pattern());
+        return "${kind} ${pattern} ${channel} ${payload}";
+    }
+    return "${kind} ${channel} ${payload}";
+}
+
+fn string shownDelivery(Delivery d) {
+    return match (give d) {
+        case Message(message: m): shownMessage(m: m);
+        case Unsubscribed(kind: k, channel: c): { string name = textOf(b: c.view()); string word = kindWord(k: k); := "unsubscribed ${word} ${name}"; }
+    };
+}
+
+// "none", "(error) <message>", or the delivery: "message kr:c1 hello", "pmessage kr:p* kr:p1 hello", "unsubscribed
+// smessage kr:s2".
+fn string shown(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Err(error: e): { string m = e.message(); := "(error) ${m}"; }
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): shownDelivery(d: give d);
+        };
+    };
+}
+
+fn string outcome(Result<Unit, RedisError> r) {
+    return match (give r) { case Ok(value: u): "ok"; case Err(error: e): { string m = e.message(); := "(error) ${m}"; } };
+}
+
+fn bool isKind(const ref Result<Unit, RedisError> r, const ref string kind) {
+    string got = match (r) {
+        case Ok(value: u): "ok";
+        case Err(error: e): match (e) {
+            case Server(error: s): s.codeText();
+            case Usage(detail: d): "Usage";
+            case Unexpected(detail: d): "Unexpected";
+            case Timeout: "Timeout";
+            case Protocol(error: p): "Protocol";
+            case Io(error: x): "Io";
+            case Closed: "Closed";
+            case _: "other";
+        };
+    };
+    return got == kind;
+}
+
+unsafe fn Optional<Duration> soon() { return Optional::Some(value: Duration.fromMillis(ms: 10i64)); }
+
+// ---- confirmations ----
+
+unsafe fn int32 confirmationTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+
+    // By name: each confirmed, a name subscribed twice kept once, an unsubscribe of a name never subscribed confirmed.
+    DynamicArray<Step> one = opening(server: s, proto: p);
+    one.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2", answer: pub(server: s, kase: "sub-two", proto: p)));
+    one.add(item: expect(command: "UNSUBSCRIBE kr:c1", answer: pub(server: s, kase: "unsub-one", proto: p)));
+    one.add(item: expect(command: "UNSUBSCRIBE kr:nope", answer: pub(server: s, kase: "unsub-never", proto: p)));
+    Subscriber a = subscriberOf(script: give one, proto: p, what: "by name");
+    string r1 = outcome(r: a.subscribe(names: listOf(text: "kr:c1 kr:c2")));
+    isize n1 = a.channelCount();
+    string r2 = outcome(r: a.unsubscribe(names: "kr:c1"));
+    isize n2 = a.channelCount();
+    string r3 = outcome(r: a.unsubscribe(names: "kr:nope"));
+    isize n3 = a.channelCount();
+    f = f + check(ok: r1 == "ok" && n1 == 2 && r2 == "ok" && n2 == 1 && r3 == "ok" && n3 == 1 && !a.isClosed(),
+                  what: "${at}: subscribe two, unsubscribe one, and one never subscribed (${r1} ${n1}, ${r2} ${n2}, ${r3} ${n3})");
+
+    DynamicArray<Step> twice = opening(server: s, proto: p);
+    twice.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c1", answer: pub(server: s, kase: "sub-twice", proto: p)));
+    twice.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-again", proto: p)));
+    twice.add(item: expect(command: "PSUBSCRIBE kr:p* kr:q*", answer: pub(server: s, kase: "psub-two", proto: p)));
+    twice.add(item: expect(command: "PUNSUBSCRIBE kr:q*", answer: pub(server: s, kase: "punsub-one", proto: p)));
+    Subscriber b = subscriberOf(script: give twice, proto: p, what: "twice");
+    string t1 = outcome(r: b.subscribe(names: listOf(text: "kr:c1 kr:c1")));
+    string t2 = outcome(r: b.subscribe(names: "kr:c1"));
+    string t3 = outcome(r: b.psubscribe(names: listOf(text: "kr:p* kr:q*")));
+    isize patterns = b.patternCount();
+    string t4 = outcome(r: b.punsubscribe(names: "kr:q*"));
+    f = f + check(ok: t1 == "ok" && t2 == "ok" && b.channelCount() == 1 && t3 == "ok" && patterns == 2 && t4 == "ok" && b.patternCount() == 1,
+                  what: "${at}: a name subscribed twice is kept once; patterns (${t1} ${t2} ${t3} ${t4})");
+
+    // From all: the server confirms each name it held, in its hash table's order, so every order is played.
+    DynamicArray<DynamicArray<uint8>> all = framesOf(b: pub(server: s, kase: "unsub-all", proto: p));
+    DynamicArray<DynamicArray<isize>> each = orders(n: all.length());
+    isize k = 0;
+    while (k < each.length()) {
+        DynamicArray<Step> script = opening(server: s, proto: p);
+        script.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2 kr:c3", answer: pub(server: s, kase: "sub-three", proto: p)));
+        script.add(item: expect(command: "PSUBSCRIBE kr:p*", answer: pub(server: s, kase: "psub-after-three", proto: p)));
+        script.add(item: expect(command: "UNSUBSCRIBE", answer: joined(frames: all, order: each[k])));
+        script.add(item: expect(command: "PING", answer: pub(server: s, kase: "ping-subscribed", proto: p)));
+        Subscriber c = subscriberOf(script: give script, proto: p, what: "unsubscribe all");
+        string u1 = outcome(r: c.subscribe(names: listOf(text: "kr:c1 kr:c2 kr:c3")));
+        string u2 = outcome(r: c.psubscribe(names: "kr:p*"));
+        DynamicArray<string> none = DynamicArray.empty();
+        string u3 = outcome(r: c.unsubscribe(names: none));
+        string u4 = outcome(r: c.ping());
+        f = f + check(ok: u1 == "ok" && u2 == "ok" && u3 == "ok" && c.channelCount() == 0 && c.patternCount() == 1 && u4 == "ok",
+                      what: "${at}: unsubscribe from all, the confirmations in order ${k} (${u1} ${u2} ${u3} ${u4})");
+        k = k + 1;
+    }
+    DynamicArray<DynamicArray<uint8>> pall = framesOf(b: pub(server: s, kase: "punsub-all", proto: p));
+    DynamicArray<DynamicArray<isize>> peach = orders(n: pall.length());
+    k = 0;
+    while (k < peach.length()) {
+        DynamicArray<Step> script = opening(server: s, proto: p);
+        script.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+        script.add(item: expect(command: "PSUBSCRIBE kr:p* kr:q*", answer: pub(server: s, kase: "psub-two-after-one", proto: p)));
+        script.add(item: expect(command: "PUNSUBSCRIBE", answer: joined(frames: pall, order: peach[k])));
+        Subscriber c = subscriberOf(script: give script, proto: p, what: "punsubscribe all");
+        string u1 = outcome(r: c.subscribe(names: "kr:c1"));
+        string u2 = outcome(r: c.psubscribe(names: listOf(text: "kr:p* kr:q*")));
+        DynamicArray<string> none = DynamicArray.empty();
+        string u3 = outcome(r: c.punsubscribe(names: none));
+        f = f + check(ok: u1 == "ok" && u2 == "ok" && u3 == "ok" && c.channelCount() == 1 && c.patternCount() == 0,
+                      what: "${at}: punsubscribe from all, in order ${k} (${u1} ${u2} ${u3})");
+        k = k + 1;
+    }
+
+    // From all, with none held: one confirmation with no name.
+    DynamicArray<Step> empty = opening(server: s, proto: p);
+    empty.add(item: expect(command: "UNSUBSCRIBE", answer: pub(server: s, kase: "unsub-none", proto: p)));
+    empty.add(item: expect(command: "PUNSUBSCRIBE", answer: pub(server: s, kase: "punsub-none", proto: p)));
+    empty.add(item: expect(command: "PSUBSCRIBE kr:p*", answer: pub(server: s, kase: "psub-one", proto: p)));
+    empty.add(item: expect(command: "UNSUBSCRIBE", answer: pub(server: s, kase: "unsub-none-pattern", proto: p)));
+    Subscriber d = subscriberOf(script: give empty, proto: p, what: "none held");
+    DynamicArray<string> none1 = DynamicArray.empty();
+    string e1 = outcome(r: d.unsubscribe(names: none1));
+    DynamicArray<string> none2 = DynamicArray.empty();
+    string e2 = outcome(r: d.punsubscribe(names: none2));
+    string e3 = outcome(r: d.psubscribe(names: "kr:p*"));
+    DynamicArray<string> none3 = DynamicArray.empty();
+    string e4 = outcome(r: d.unsubscribe(names: none3));
+    f = f + check(ok: e1 == "ok" && e2 == "ok" && e3 == "ok" && e4 == "ok" && d.patternCount() == 1 && !d.isClosed(),
+                  what: "${at}: unsubscribe from all with none held: one confirmation, no name (${e1} ${e2} ${e3} ${e4})");
+
+    // A subscribe with no names is refused before anything is written: the script's next step still matches.
+    DynamicArray<Step> usage = opening(server: s, proto: p);
+    usage.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    Subscriber g = subscriberOf(script: give usage, proto: p, what: "usage");
+    DynamicArray<string> nothing = DynamicArray.empty();
+    Result<Unit, RedisError> refused = g.subscribe(names: nothing);
+    bool isUsage = isKind(r: refused, kind: "Usage");
+    string after = outcome(r: g.subscribe(names: "kr:c1"));
+    f = f + check(ok: isUsage && after == "ok", what: "${at}: a subscribe with no names is Usage, and nothing is written (${after})");
+    return f;
+}
+
+// ---- messages ----
+
+unsafe fn int32 messageTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+
+    // A message from another connection; then nothing more, and the subscriber goes on.
+    DynamicArray<Step> one = opening(server: s, proto: p);
+    one.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    one.add(item: Step::Send(bytes: pub(server: s, kase: "message", proto: p)));
+    one.add(item: Step::Send(bytes: pub(server: s, kase: "message-empty", proto: p)));
+    Subscriber a = subscriberOf(script: give one, proto: p, what: "message");
+    string sub = outcome(r: a.subscribe(names: "kr:c1"));
+    string m1 = shown(r: a.next(timeout: soon()));
+    Result<Optional<Delivery>, RedisError> second = a.next(timeout: soon());
+    string emptyText = match (give second) {
+        case Ok(value: o): match (give o) {
+            case Some(value: d): match (give d) {
+                case Message(message: m): match (m.text()) { case Ok(value: t): "[".concat(other: t).concat(other: "]"); case Err(error: e): "not text"; };
+                case _: "not a message";
+            };
+            case None: "none";
+        };
+        case Err(error: e): e.message();
+    };
+    string m3 = shown(r: a.next(timeout: soon()));
+    f = f + check(ok: sub == "ok" && m1 == "message kr:c1 hello" && emptyText == "[]" && m3 == "none" && !a.isClosed(),
+                  what: "${at}: a message, an empty one, then none within the time (${m1}; ${emptyText}; ${m3})");
+
+    // Binary: the channel and the payload come back as their bytes, and their text is refused.
+    DynamicArray<uint8> name = bytesOf(text: "kr:");
+    name.add(item: 0ui8);
+    name.add(item: 255ui8);
+    DynamicArray<DynamicArray<uint8>> args = DynamicArray.empty();
+    args.add(item: bytesOf(text: "SUBSCRIBE"));
+    args.add(item: copy name);
+    DynamicArray<Step> bin = opening(server: s, proto: p);
+    bin.add(item: Step::ExpectBytes(args: give args, reply: pub(server: s, kase: "sub-binary", proto: p)));
+    bin.add(item: Step::Send(bytes: pub(server: s, kase: "message-binary", proto: p)));
+    Subscriber b = subscriberOf(script: give bin, proto: p, what: "binary");
+    string bs = outcome(r: b.subscribe(names: name));
+    Result<Optional<Delivery>, RedisError> got = b.next(timeout: soon());
+    bool exact = match (give got) {
+        case Ok(value: o): match (give o) {
+            case Some(value: d): match (give d) {
+                case Message(message: m): exactBinary(m: m, name: name);
+                case _: false;
+            };
+            case None: false;
+        };
+        case Err(error: e): false;
+    };
+    f = f + check(ok: bs == "ok" && exact && b.channelCount() == 1, what: "${at}: a binary channel and all 256 byte values, as bytes (${bs})");
+
+    // A pattern's message; one both a channel and a pattern match comes twice.
+    DynamicArray<Step> pat = opening(server: s, proto: p);
+    pat.add(item: expect(command: "PSUBSCRIBE kr:p*", answer: pub(server: s, kase: "psub-one", proto: p)));
+    pat.add(item: Step::Send(bytes: pub(server: s, kase: "pmessage", proto: p)));
+    Subscriber c = subscriberOf(script: give pat, proto: p, what: "pmessage");
+    string ps = outcome(r: c.psubscribe(names: "kr:p*"));
+    string pm = shown(r: c.next(timeout: soon()));
+    f = f + check(ok: ps == "ok" && pm == "pmessage kr:p* kr:p1 hello", what: "${at}: a pattern's message (${pm})");
+
+    DynamicArray<Step> both = opening(server: s, proto: p);
+    both.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    both.add(item: expect(command: "PSUBSCRIBE kr:c*", answer: pub(server: s, kase: "psub-after-one", proto: p)));
+    both.add(item: Step::Send(bytes: pub(server: s, kase: "message-twice", proto: p)));
+    Subscriber d = subscriberOf(script: give both, proto: p, what: "twice");
+    string d1 = outcome(r: d.subscribe(names: "kr:c1"));
+    string d2 = outcome(r: d.psubscribe(names: "kr:c*"));
+    string w1 = shown(r: d.next(timeout: soon()));
+    string w2 = shown(r: d.next(timeout: soon()));
+    f = f + check(ok: d1 == "ok" && d2 == "ok" && w1 == "message kr:c1 hello" && w2 == "pmessage kr:c* kr:c1 hello",
+                  what: "${at}: a message a channel and a pattern both match comes twice (${w1}; ${w2})");
+
+    // Messages that arrive while a subscribe waits for its confirmations wait for next, in order.
+    DynamicArray<DynamicArray<uint8>> two = framesOf(b: pub(server: s, kase: "sub-two", proto: p));
+    DynamicArray<uint8> message = pub(server: s, kase: "message", proto: p);
+    DynamicArray<uint8> early = plus(a: message, b: pub(server: s, kase: "message-empty", proto: p));
+    DynamicArray<Step> during = opening(server: s, proto: p);
+    during.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    during.add(item: expect(command: "SUBSCRIBE kr:c2", answer: plus(a: early, b: two[1])));
+    Subscriber e = subscriberOf(script: give during, proto: p, what: "during");
+    string e1 = outcome(r: e.subscribe(names: "kr:c1"));
+    string e2 = outcome(r: e.subscribe(names: "kr:c2"));
+    string q1 = shown(r: e.next(timeout: soon()));
+    string q2 = shown(r: e.next(timeout: soon()));
+    string q3 = shown(r: e.next(timeout: soon()));
+    f = f + check(ok: e1 == "ok" && e2 == "ok" && e.channelCount() == 2 && q1 == "message kr:c1 hello" && q2 == "message kr:c1 " && q3 == "none",
+                  what: "${at}: messages during a subscribe wait for next, in order (${q1}; ${q2}; ${q3})");
+
+    // A message split across a wait whose time passed: None, the connection open, and the rest read next time.
+    isize half = message.length() / 2;
+    DynamicArray<uint8> front = DynamicArray.empty();
+    front.addAll(items: message.view().slice(from: 0, count: half));
+    DynamicArray<uint8> back = DynamicArray.empty();
+    back.addAll(items: message.view().slice(from: half, count: message.length() - half));
+    DynamicArray<Step> split = opening(server: s, proto: p);
+    split.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    split.add(item: Step::Send(bytes: give front));
+    split.add(item: Step::Pause);
+    split.add(item: Step::Send(bytes: give back));
+    Subscriber g = subscriberOf(script: give split, proto: p, what: "split");
+    string g1 = outcome(r: g.subscribe(names: "kr:c1"));
+    string h1 = shown(r: g.next(timeout: soon()));
+    bool open = !g.isClosed();
+    string h2 = shown(r: g.next(timeout: soon()));
+    f = f + check(ok: g1 == "ok" && h1 == "none" && open && h2 == "message kr:c1 hello",
+                  what: "${at}: a message split across a timeout: none, then the message (${h1}; ${h2})");
+
+    // Zero polls: what has arrived, and nothing more. A negative time is Usage.
+    DynamicArray<Step> poll = opening(server: s, proto: p);
+    poll.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    poll.add(item: Step::Send(bytes: pub(server: s, kase: "message", proto: p)));
+    Subscriber h = subscriberOf(script: give poll, proto: p, what: "poll");
+    string pollSub = outcome(r: h.subscribe(names: "kr:c1"));
+    Optional<Duration> zero = Optional::Some(value: Duration.zero());
+    string z1 = shown(r: h.next(timeout: zero));
+    Optional<Duration> zero2 = Optional::Some(value: Duration.zero());
+    string z2 = shown(r: h.next(timeout: zero2));
+    Optional<Duration> negative = Optional::Some(value: Duration.fromMillis(ms: -1i64));
+    string z3 = shown(r: h.next(timeout: negative));
+    f = f + check(ok: pollSub == "ok" && z1 == "message kr:c1 hello" && z2 == "none" && z3.startsWith(prefix: "(error) a timeout cannot be negative"),
+                  what: "${at}: zero polls; a negative time is Usage (${z1}; ${z2}; ${z3})");
+
+    // Nothing subscribed and nothing waiting: nothing can come, so next refuses rather than wait for ever.
+    DynamicArray<Step> idle = opening(server: s, proto: p);
+    Subscriber k = subscriberOf(script: give idle, proto: p, what: "idle");
+    string nothing = shown(r: k.next(timeout: Optional::None));
+    f = f + check(ok: nothing.startsWith(prefix: "(error) nothing is subscribed") && !k.isClosed(), what: "${at}: next with nothing subscribed is Usage (${nothing})");
+    return f;
+}
+
+// Whether `payload` is the 256 byte values, in order.
+fn bool everyByte(ConstView<uint8> payload) {
+    if (payload.length() != 256) { return false; }
+    isize i = 0;
+    while (i < 256) {
+        if (payload[i] != truncate<uint8>(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool sameAs(ConstView<uint8> channel, const ref DynamicArray<uint8> name) {
+    if (channel.length() != name.length()) { return false; }
+    isize i = 0;
+    while (i < channel.length()) {
+        if (channel[i] != name[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool exactBinary(const ref Message m, const ref DynamicArray<uint8> name) {
+    if (!everyByte(payload: m.payload()) || !sameAs(channel: m.channel(), name: name)) { return false; }
+    bool textRefused = match (m.text()) { case Ok(value: t): false; case Err(error: e): true; };
+    bool channelRefused = match (m.channelText()) { case Ok(value: t): false; case Err(error: e): true; };
+    return textRefused && channelRefused;
+}
+
+// ---- PING, refusals, failures ----
+
+unsafe fn int32 pingTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+    // Subscribed (RESP2's ["pong", ""], RESP3's +PONG), with a message read on the way; and once nothing is left,
+    // when RESP2 has left subscribed mode (+PONG).
+    DynamicArray<Step> script = opening(server: s, proto: p);
+    script.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    script.add(item: expect(command: "PING", answer: plus(a: pub(server: s, kase: "message", proto: p), b: pub(server: s, kase: "ping-subscribed", proto: p))));
+    script.add(item: expect(command: "UNSUBSCRIBE kr:c1", answer: pub(server: s, kase: "unsub-last", proto: p)));
+    script.add(item: expect(command: "PING", answer: pub(server: s, kase: "ping-left", proto: p)));
+    Subscriber a = subscriberOf(script: give script, proto: p, what: "ping");
+    string r1 = outcome(r: a.subscribe(names: "kr:c1"));
+    string r2 = outcome(r: a.ping());
+    string m = shown(r: a.next(timeout: soon()));
+    string r3 = outcome(r: a.unsubscribe(names: "kr:c1"));
+    string r4 = outcome(r: a.ping());
+    f = f + check(ok: r1 == "ok" && r2 == "ok" && m == "message kr:c1 hello" && r3 == "ok" && r4 == "ok" && a.channelCount() == 0,
+                  what: "${at}: PING subscribed and not, a message read on the way (${r2}; ${m}; ${r4})");
+    return f;
+}
+
+unsafe fn int32 refusalTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+    // A user who may not subscribe: one error for the whole command, nothing kept, and the subscriber goes on.
+    DynamicArray<Step> script = opening(server: s, proto: p);
+    script.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2", answer: pub(server: s, kase: "sub-noperm", proto: p)));
+    script.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    Subscriber a = subscriberOf(script: give script, proto: p, what: "noperm");
+    Result<Unit, RedisError> denied = a.subscribe(names: listOf(text: "kr:c1 kr:c2"));
+    bool noperm = isKind(r: denied, kind: "NOPERM");
+    isize n = a.channelCount();
+    string again = outcome(r: a.subscribe(names: "kr:c1"));
+    f = f + check(ok: noperm && n == 0 && !a.isClosed() && again == "ok" && a.channelCount() == 1,
+                  what: "${at}: NOPERM in place of confirmations is Server, and the subscriber goes on (${again})");
+    return f;
+}
+
+unsafe fn int32 failureTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+    // A server that hangs up while next waits: Io, then Closed.
+    DynamicArray<Step> gone = opening(server: s, proto: p);
+    gone.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    gone.add(item: Step::Hangup);
+    Subscriber a = subscriberOf(script: give gone, proto: p, what: "hangup");
+    string a1 = outcome(r: a.subscribe(names: "kr:c1"));
+    string a2 = shown(r: a.next(timeout: Optional::None));
+    bool closed = a.isClosed();
+    string a3 = shown(r: a.next(timeout: soon()));
+    f = f + check(ok: a1 == "ok" && a2 == "(error) Server closed the connection" && closed && a3 == "(error) the connection is closed",
+                  what: "${at}: a hangup while next waits (${a2}; ${a3})");
+
+    // A hangup, silence and garbage in place of confirmations: each closes the subscriber.
+    DynamicArray<Step> hung = opening(server: s, proto: p);
+    hung.add(item: Step::Close);
+    Subscriber b = subscriberOf(script: give hung, proto: p, what: "close");
+    Result<Unit, RedisError> b1 = b.subscribe(names: "kr:c1");
+    f = f + check(ok: isKind(r: b1, kind: "Io") && b.isClosed(), what: "${at}: a hangup in place of confirmations");
+    DynamicArray<Step> quiet = opening(server: s, proto: p);
+    quiet.add(item: Step::Silent);
+    Subscriber c = subscriberOf(script: give quiet, proto: p, what: "silent");
+    Result<Unit, RedisError> c1 = c.subscribe(names: "kr:c1");
+    f = f + check(ok: isKind(r: c1, kind: "Timeout") && c.isClosed(), what: "${at}: confirmations that do not come time out, and close it");
+    DynamicArray<Step> junk = opening(server: s, proto: p);
+    junk.add(item: expect(command: "SUBSCRIBE kr:c1", answer: resp(name: "hostile: type byte 0x00")));
+    Subscriber d = subscriberOf(script: give junk, proto: p, what: "garbage");
+    Result<Unit, RedisError> d1 = d.subscribe(names: "kr:c1");
+    f = f + check(ok: isKind(r: d1, kind: "Protocol") && d.isClosed(), what: "${at}: bytes that are not RESP close it");
+
+    // A reply in place of confirmations (a PING's answer no call sent): the two no longer agree, and it closes.
+    DynamicArray<Step> stray = opening(server: s, proto: p);
+    stray.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "ping-left", proto: p)));
+    Subscriber e = subscriberOf(script: give stray, proto: p, what: "stray");
+    Result<Unit, RedisError> e1 = e.subscribe(names: "kr:c1");
+    f = f + check(ok: isKind(r: e1, kind: "Unexpected") && e.isClosed(), what: "${at}: a reply in place of confirmations is Unexpected");
+
+    // Messages that come faster than a call can read its confirmations, past maxReplyBytes: it fails, and drops none.
+    Config tight = configOf(url: urlOf(proto: p));
+    Limits small = Limits.defaults();
+    small.maxReplyBytes = 2048i64;
+    tight.setLimits(limits: small);
+    DynamicArray<uint8> flood = DynamicArray.empty();
+    DynamicArray<uint8> message = pub(server: s, kase: "message", proto: p);
+    isize i = 0;
+    while (i < 40) { flood.addAll(items: message.view()); i = i + 1; }
+    DynamicArray<DynamicArray<uint8>> two = framesOf(b: pub(server: s, kase: "sub-two", proto: p));
+    DynamicArray<Step> heavy = opening(server: s, proto: p);
+    heavy.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    heavy.add(item: expect(command: "SUBSCRIBE kr:c2", answer: plus(a: flood, b: two[1])));
+    Owned<Transport> fake = new FakeServer.make(steps: give heavy, chunk: 1, writeLimit: 3);
+    Result<Connection, RedisError> made = Connection.connectOver(transport: give fake, config: tight);
+    match (give made) {
+        case Ok(value: conn): {
+            Result<Subscriber, RedisError> over = Subscriber.over(connection: give conn);
+            match (give over) {
+                case Ok(value: g): {
+                    Subscriber sub = give g;
+                    string g1 = outcome(r: sub.subscribe(names: "kr:c1"));
+                    Result<Unit, RedisError> g2 = sub.subscribe(names: "kr:c2");
+                    f = f + check(ok: g1 == "ok" && isKind(r: g2, kind: "Unexpected") && sub.isClosed(),
+                                  what: "${at}: messages past maxReplyBytes during a call: it fails, and closes");
+                }
+                case Err(error: e2): { f = f + check(ok: false, what: "${at}: a subscriber over a connection with small limits"); }
+            };
+        }
+        case Err(error: e3): { string m = e3.message(); f = f + check(ok: false, what: "${at}: connect with small limits (${m})"); }
+    };
+    return f;
+}
+
+// ---- pushes that are not pub/sub, and the hand-back ----
+
+unsafe fn int32 releaseTests(const ref string s, int32 p) {
+    int32 f = 0;
+    string at = "${s} RESP${p}";
+    // Invalidations another connection's tracking redirects here are set aside on the connection, under RESP2 (a
+    // message whose payload is not a string) as under RESP3 (a push); the message after them is delivered. release
+    // unsubscribes from everything, drops the message no one read, and hands back the connection with them.
+    DynamicArray<DynamicArray<uint8>> one = framesOf(b: pub(server: s, kase: "unsub-one", proto: p));
+    DynamicArray<Step> script = opening(server: s, proto: p);
+    script.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(server: s, kase: "sub-one", proto: p)));
+    script.add(item: expect(command: "PSUBSCRIBE kr:p* kr:q*", answer: pub(server: s, kase: "psub-two-after-one", proto: p)));
+    script.add(item: Step::Send(bytes: pub(server: s, kase: "tracking-redirect", proto: p)));
+    script.add(item: Step::Send(bytes: pub(server: s, kase: "tracking-flush", proto: p)));
+    script.add(item: Step::Send(bytes: pub(server: s, kase: "message", proto: p)));
+    script.add(item: expect(command: "UNSUBSCRIBE", answer: plus(a: pub(server: s, kase: "message", proto: p), b: one[0])));
+    script.add(item: expect(command: "PUNSUBSCRIBE", answer: pub(server: s, kase: "punsub-all", proto: p)));
+    script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Subscriber a = subscriberOf(script: give script, proto: p, what: "release");
+    string a1 = outcome(r: a.subscribe(names: "kr:c1"));
+    string a2 = outcome(r: a.psubscribe(names: listOf(text: "kr:p* kr:q*")));
+    string m = shown(r: a.next(timeout: soon()));
+    Result<Connection, RedisError> back = a.release();
+    match (give back) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            isize aside = conn.pendingPushes();
+            Command ping = Command.of(name: "PING");
+            Result<Value, RedisError> pong = conn.call(command: ping);
+            f = f + check(ok: a1 == "ok" && a2 == "ok" && m == "message kr:c1 hello" && aside == 2 && isSimple(r: pong, text: "PONG"),
+                          what: "${at}: invalidations set aside, a message delivered, release, then call (${m}; ${aside} aside)");
+        }
+        case Err(error: e): { string why = e.message(); f = f + check(ok: false, what: "${at}: release (${why})"); }
+    };
+    string twice = match (a.release()) { case Ok(value: c): "a second connection"; case Err(error: e): e.message(); };
+    string later = shown(r: a.next(timeout: soon()));
+    f = f + check(ok: twice == "the subscriber released its connection already" && later == "(error) the subscriber released its connection already",
+                  what: "${at}: after release, every call is Usage (${twice})");
+
+    // Nothing subscribed: release sends nothing. A closed one hands nothing back. A closed connection is refused.
+    DynamicArray<Step> idle = opening(server: s, proto: p);
+    idle.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Subscriber b = subscriberOf(script: give idle, proto: p, what: "idle release");
+    Result<Connection, RedisError> idleBack = b.release();
+    bool handed = match (give idleBack) {
+        case Ok(value: c): { Connection conn = give c; Command ping = Command.of(name: "PING"); Result<Value, RedisError> pong = conn.call(command: ping); := isSimple(r: pong, text: "PONG"); }
+        case Err(error: e): false;
+    };
+    f = f + check(ok: handed, what: "${at}: release with nothing subscribed writes nothing");
+    DynamicArray<Step> closing = opening(server: s, proto: p);
+    Subscriber c = subscriberOf(script: give closing, proto: p, what: "closed release");
+    c.close();
+    string closedBack = match (c.release()) { case Ok(value: x): "a connection"; case Err(error: e): e.message(); };
+    f = f + check(ok: closedBack == "the connection is closed", what: "${at}: release of a closed subscriber is Closed (${closedBack})");
+    DynamicArray<Step> shut = opening(server: s, proto: p);
+    string url = urlOf(proto: p);
+    Connection dead = connected(script: give shut, url: url, what: "closed connection");
+    dead.close();
+    string refused = match (Subscriber.over(connection: give dead)) { case Ok(value: x): "a subscriber"; case Err(error: e): e.message(); };
+    f = f + check(ok: refused == "the connection is closed", what: "${at}: a subscriber over a closed connection is Closed (${refused})");
+    return f;
+}
+
+unsafe fn int32 subscriberTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        int32 p = 2;
+        while (p <= 3) {
+            f = f + confirmationTests(s: s, p: p);
+            f = f + messageTests(s: s, p: p);
+            f = f + pingTests(s: s, p: p);
+            f = f + refusalTests(s: s, p: p);
+            f = f + failureTests(s: s, p: p);
+            f = f + releaseTests(s: s, p: p);
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    return f;
+}

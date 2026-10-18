@@ -267,7 +267,7 @@ Each step ends green before its commit:
      MEET), on 7.0 and later only.
    - (0.3.0) Each server's COMMAND INFO flags, for the allow-list: captured in step 5, which uses them.
 2. **Done (2026-10-18).** **A connection's pushes:** `takePushes`, the bound, `droppedPushes`, and `CLIENT TRACKING`/`CACHING` refused.
-3. **`Subscriber`, under RESP2 and RESP3.**
+3. **Done (2026-10-18).** **`Subscriber`, under RESP2 and RESP3.**
    - Unit: every captured confirmation order; messages queued during a subscribe; a timeout that keeps the
      connection; a hangup; the RESP2 refusals; ping's two shapes; `release`.
    - Live: a publisher from a second connection, patterns, a message matched twice, and `release` back to `call`.
@@ -858,8 +858,8 @@ says otherwise). Step 0's repros, run 2026-10-18 on v0.9.667 and cstar's 0.9.668
 facts underneath; they are listed at the end.
 
 - **A `Subscriber` holds its `Connection` in a `DynamicArray` of zero or one,** as `Opener` holds its dialer. A
-  field cannot be given out, so `release()` pops it. A second `release()` is `Usage`, and every later call is
-  `Closed`. A subscriber dropped while it holds a connection closes it, through the connection's destructor.
+  field cannot be given out, so `release()` pops it. After that every call, a second `release()` included, is
+  `Usage`, naming the release. A subscriber dropped while it holds a connection closes it, through the connection's destructor.
 - **Channel and pattern names are bytes, as payloads are.** `Message` has `channel()`, `pattern()` and `payload()` as
   bytes, and `channelText()`, `patternText()` and `text()`, which refuse bytes that are not UTF-8 (`Value`).
   Subscribing takes a `RedisArg`, a `DynamicArray<uint8>` included, so a channel can be any bytes, and a reply must
@@ -904,3 +904,25 @@ facts underneath; they are listed at the end.
   - `next(timeout: Optional<Duration>)` returning `Result<Optional<Delivery>, E>`.
   - A ctor returning `Result<Holder, E>` that refuses a value it was given hands it to a local first.
   - A type cannot be named `Err` (a language name).
+- **What building it settled (step 3):**
+  - `Subscriber` reaches its connection through five private members `Connection` grants it, method by method:
+    `transmit` (write a command), `receiveFrame` (the next value, a failure handed back rather than acted on, so
+    `next`'s time passing leaves the connection open), `lose`, `setAside` and `budget`. It sends no command but its
+    own (un)subscribes and PING, and builds them with `Command`, whose `problem()` it reads by grant.
+  - One classifier reads every frame under both protocols: a RESP3 push, or a RESP2 array told from a reply by its
+    first element. It yields a confirmation, a message, RESP2's `["pong", text]`, something to set aside, an error, or
+    anything else, which closes the subscriber as `Unexpected`.
+  - Confirmations for names given are matched in the order given first (the server confirms them in that order),
+    then by search, so a reordering costs nothing but time. An unsubscribe from all ends when its kind's kept names
+    are gone.
+  - The kept names are three std `Set`s over a small `Name` (bytes, FNV-1a as std hashes a string), since a
+    `DynamicArray<uint8>` is `Equatable` but not `Hashable`.
+  - The queue is a `Deque` of deliveries with their cost (the frame's footprint, as the reader counts it), bounded by
+    `maxReplyBytes`; past it the call fails as `Unexpected` and the subscriber closes, dropping nothing silently.
+  - The scripted server gained `Step::Pause`: nothing more of its own accord until the client's next wait comes back
+    empty, which splits a message across a `next` timeout.
+  - The generator records each scene's setup confirmations as cases too (`sub-three`, `psub-two-after-one`, …), so
+    the unit tests replay each scene in the order a server sent it.
+  - Live, under both protocols, on all eight servers: a second connection's messages, a pattern, a message matched
+    twice, a binary channel with all 256 byte values, a 200 ms wait that ends with None, a publish from another
+    isolate while `next` has no limit, NOPERM for `kr_ro`, and `release` back to `call`.

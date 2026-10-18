@@ -1,0 +1,214 @@
+// Pub/sub on a real server, under RESP3 and RESP2: a publisher on a second connection, a pattern, a message a channel
+// and a pattern both match, a binary channel and payload, a wait that ends with nothing, a publish from another
+// isolate while a wait has no limit, a user who may not subscribe, and the connection handed back.
+import { std::collections::DynamicArray, std::collections::ConstView, std::concurrent::Isolate, std::time::Duration,
+         std::time::sleep, std::time::monotonicNow, std::time::Instant, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error,
+         redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Message, redis::ChannelKind,
+         redis::Command, redis::RedisError, redis::reply, redis::resp::Value,
+         redis_integration_tests::check, open, mainUrl, ask, commandOf };
+export { subscriberTests };
+
+// Publishes from another isolate after a pause, over its own connection.
+type resource Publisher implements Sendable {
+    Connection conn;
+    string channel;
+    public ctor make(Connection conn, string channel) { this.conn = give conn; this.channel = give channel; }
+    public unsafe fn void run() {
+        sleep(d: Duration.fromMillis(ms: 300i64));
+        Command publish = Command.of(name: "PUBLISH");
+        publish.arg(text: this.channel);
+        publish.arg(text: "from afar");
+        Result<Value, RedisError> done = this.conn.call(command: publish);
+        this.conn.close();
+    }
+}
+
+fn void publishLater(Publisher job) { job.run(); }
+
+fn string text(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): "(not UTF-8)"; };
+}
+
+fn string kindWord(ChannelKind k) {
+    return match (k) { case Channel: "message"; case Pattern: "pmessage"; case Shard: "smessage"; };
+}
+
+fn string shownMessage(const ref Message m) {
+    string kind = kindWord(k: m.kind());
+    string channel = text(b: m.channel());
+    string payload = text(b: m.payload());
+    bool patterned = match (m.kind()) { case Pattern: true; case _: false; };
+    if (patterned) {
+        string pattern = text(b: m.pattern());
+        return "${kind} ${pattern} ${channel} ${payload}";
+    }
+    return "${kind} ${channel} ${payload}";
+}
+
+fn string shown(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Err(error: e): { string m = e.message(); := "(error) ${m}"; }
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): match (give d) {
+                case Message(message: m): shownMessage(m: m);
+                case Unsubscribed(kind: k, channel: c): { string name = text(b: c.view()); := "unsubscribed ${name}"; }
+            };
+        };
+    };
+}
+
+fn string outcome(Result<Unit, RedisError> r) {
+    return match (give r) { case Ok(value: u): "ok"; case Err(error: e): { string m = e.message(); := "(error) ${m}"; } };
+}
+
+unsafe fn Result<Subscriber, RedisError> subscriberFor(const ref string url) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Subscriber.connect(config: config);
+}
+
+unsafe fn Optional<Duration> within(int64 ms) { return Optional::Some(value: Duration.fromMillis(ms: ms)); }
+
+fn bool everyByte(ConstView<uint8> b) {
+    if (b.length() != 256) { return false; }
+    isize i = 0;
+    while (i < 256) {
+        if (b[i] != truncate<uint8>(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bool binaryArrived(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Ok(value: o): match (give o) {
+            case Some(value: d): match (give d) { case Message(message: m): everyByte(b: m.payload()) && m.channel().length() == 9; case _: false; };
+            case None: false;
+        };
+        case Err(error: e): false;
+    };
+}
+
+unsafe fn int32 liveTests(const ref string tail, const ref string protocol, const ref string pre) {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: tail);
+    Result<Subscriber, RedisError> made = subscriberFor(url: url);
+    Subscriber sub = match (give made) {
+        case Ok(value: s): give s;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "subscriber: connect under ${protocol}: ${m}"); }
+    };
+    Result<Connection, RedisError> r = open(url: url);
+    Connection pubc = match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); return check(ok: false, what: "subscriber: connect the publisher under ${protocol}: ${m}"); }
+    };
+    string a = pre.concat(other: "a");
+    string b = pre.concat(other: "b");
+    string pz = pre.concat(other: "pz");
+    string pattern = pre.concat(other: "p*");
+    DynamicArray<string> channels = DynamicArray.empty();
+    channels.add(item: copy a);
+    channels.add(item: copy b);
+    channels.add(item: copy pz);
+    string s1 = outcome(r: sub.subscribe(names: channels));
+    string s2 = outcome(r: sub.psubscribe(names: pattern));
+    string numsub = ask(c: pubc, text: "PUBSUB NUMSUB ${a} ${b}");
+    bool counted = numsub.contains(substring: a.concat(other: ", 1")) && numsub.contains(substring: b.concat(other: ", 1"));
+    f = f + check(ok: s1 == "ok" && s2 == "ok" && sub.channelCount() == 3 && sub.patternCount() == 1 && counted,
+                  what: "subscriber under ${protocol}: subscribed, as PUBSUB NUMSUB counts it (${s1} ${s2} ${numsub})");
+
+    string n1 = ask(c: pubc, text: "PUBLISH ${a} hello");
+    string m1 = shown(r: sub.next(timeout: within(ms: 5000i64)));
+    f = f + check(ok: n1 == "1" && m1 == "message ${a} hello", what: "subscriber under ${protocol}: a message from another connection (${n1}: ${m1})");
+    string p1 = pre.concat(other: "p1");
+    string n2 = ask(c: pubc, text: "PUBLISH ${p1} x");
+    string m2 = shown(r: sub.next(timeout: within(ms: 5000i64)));
+    f = f + check(ok: n2 == "1" && m2 == "pmessage ${pattern} ${p1} x", what: "subscriber under ${protocol}: a pattern's message (${m2})");
+    string n3 = ask(c: pubc, text: "PUBLISH ${pz} both");
+    string m3 = shown(r: sub.next(timeout: within(ms: 5000i64)));
+    string m4 = shown(r: sub.next(timeout: within(ms: 5000i64)));
+    f = f + check(ok: n3 == "2" && m3 == "message ${pz} both" && m4 == "pmessage ${pattern} ${pz} both",
+                  what: "subscriber under ${protocol}: a channel and a pattern both match: twice (${m3}; ${m4})");
+
+    // A channel whose name is not UTF-8, and all 256 byte values as the payload.
+    DynamicArray<uint8> binName = DynamicArray.empty();
+    binName.addAll(items: pre.bytes());
+    binName.add(item: 0ui8);
+    binName.add(item: 255ui8);
+    DynamicArray<uint8> payload = DynamicArray.empty();
+    isize i = 0;
+    while (i < 256) { payload.add(item: truncate<uint8>(i)); i = i + 1; }
+    string s3 = outcome(r: sub.subscribe(names: binName));
+    Command publishBin = Command.of(name: "PUBLISH");
+    publishBin.argBytes(bytes: binName.view());
+    publishBin.argBytes(bytes: payload.view());
+    Result<int64, RedisError> nb = reply::<int64>(result: pubc.call(command: publishBin));
+    bool one = match (nb) { case Ok(value: n): n == 1i64; case Err(error: e): false; };
+    bool exact = binaryArrived(r: sub.next(timeout: within(ms: 5000i64)));
+    f = f + check(ok: s3 == "ok" && one && exact, what: "subscriber under ${protocol}: a binary channel and payload, as bytes");
+
+    // Nothing comes: None after the time, and the subscriber goes on.
+    Instant quietStart = monotonicNow();
+    string quiet = shown(r: sub.next(timeout: within(ms: 200i64)));
+    int64 quietMs = (monotonicNow() - quietStart).asMillis();
+    string pinged = outcome(r: sub.ping());
+    f = f + check(ok: quiet == "none" && quietMs >= 150i64 && quietMs < 3000i64 && !sub.isClosed() && pinged == "ok",
+                  what: "subscriber under ${protocol}: nothing within 200 ms, after ${quietMs} ms, then PING (${quiet} ${pinged})");
+
+    // Published from another isolate while next waits with no limit.
+    Result<Connection, RedisError> r2 = open(url: url);
+    match (give r2) {
+        case Ok(value: other): {
+            Publisher job = Publisher.make(conn: give other, channel: copy a);
+            Isolate worker = spawn publishLater(job: give job);
+            Instant start = monotonicNow();
+            string afar = shown(r: sub.next(timeout: Optional::None));
+            int64 ms = (monotonicNow() - start).asMillis();
+            worker.join();
+            f = f + check(ok: afar == "message ${a} from afar" && ms >= 200i64 && ms < 9000i64,
+                          what: "subscriber under ${protocol}: a message from another isolate, after ${ms} ms, waiting with no limit (${afar})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "subscriber under ${protocol}: connect another publisher: ${m}"); }
+    };
+
+    // Unsubscribe by name, then hand the connection back: unsubscribed from everything, and ready for call.
+    string u1 = outcome(r: sub.unsubscribe(names: b));
+    Result<Connection, RedisError> back = sub.release();
+    match (give back) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            string pong = ask(c: conn, text: "PING");
+            string none = ask(c: pubc, text: "PUBLISH ${a} after");
+            string patterns = ask(c: pubc, text: "PUBSUB NUMPAT");
+            f = f + check(ok: u1 == "ok" && pong == "PONG" && none == "0" && patterns == "0",
+                          what: "subscriber under ${protocol}: release, then call; nothing is subscribed (${pong} ${none} ${patterns})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "subscriber under ${protocol}: release: ${m}"); }
+    };
+
+    // A user who may not subscribe (kr_ro has no @pubsub): NOPERM, and the subscriber goes on.
+    string roUrl = mainUrl(userinfo: "kr_ro:kr_ro_pw@", tail: tail);
+    Result<Subscriber, RedisError> ro = subscriberFor(url: roUrl);
+    match (give ro) {
+        case Ok(value: x): {
+            Subscriber limited = give x;
+            Result<Unit, RedisError> denied = limited.subscribe(names: a);
+            string code = match (denied) { case Err(error: e): match (e.serverCode()) { case Some(value: k): k.text(); case None: e.message(); }; case Ok(value: u): "ok"; };
+            string still = outcome(r: limited.ping());
+            f = f + check(ok: code == "NOPERM" && still == "ok" && limited.channelCount() == 0,
+                          what: "subscriber under ${protocol}: a user who may not subscribe: ${code}, then PING ${still}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "subscriber under ${protocol}: connect as kr_ro: ${m}"); }
+    };
+    return f;
+}
+
+unsafe fn int32 subscriberTests() {
+    int32 f = 0;
+    f = f + liveTests(tail: "", protocol: "RESP3", pre: "kr:ps3:");
+    f = f + liveTests(tail: "?protocol=2", protocol: "RESP2", pre: "kr:ps2:");
+    return f;
+}
