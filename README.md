@@ -6,7 +6,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 
 > **Status: commands work; not yet published.** A connection authenticates, picks its protocol and database, and
 > sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. It is tested live
-> on Redis 6.2–8.10 and Valkey 7.2–9.1. Push messages, TLS and cluster come next; see
+> on Redis 6.2–8.10 and Valkey 7.2–9.1. The first release, 0.1.0, adds pub/sub, TLS and reconnection; see
 > [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
@@ -267,11 +267,11 @@ fn int32 main() {
 
 ## What it will cover
 
-- **Servers:** Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one.
-- **Push:** pub/sub (sharded too) and client-side caching.
-- **Security:** TLS (`rediss://`) with verification, client certificates and SNI.
-- **Topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
-- **A connection pool** shared across isolates.
+On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
+- **0.1.0, one server, complete:** what is here now, plus pub/sub (sharded too), TLS (`rediss://`) with verification,
+  client certificates and SNI, reconnection, and examples.
+- **0.2.0, topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
+- **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
 
 ## Tests
 

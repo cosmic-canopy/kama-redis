@@ -1,8 +1,9 @@
 # Roadmap
 
-Where this is, 2026-10-13: phases 0 to 3 are done, and the compiler fixes they waited on are in (v0.9.573). Phase 4
-(server push) is next: "Phase 4: where to start" below is its session plan, drawn up from primary sources as phase 3's
-was. "Before 0.1.0" lists everything between here and a publish.
+Where this is, 2026-10-18: phases 0 to 3 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
+client for one server. "The release plan" below says what each release holds. Phase 4 (pub/sub) is next, and "Phase 4:
+where to start" is its session plan. Phases 5 (TLS) and 7a (reconnection, examples, hardening, docs) follow, each with
+an outline, and then 0.1.0.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -38,39 +39,50 @@ does its discipline:
 | 1 | Pure layers. `redis::resp`: a reader and a writer for every RESP2 and RESP3 type (attributes, push, streamed strings and aggregates, big numbers, verbatim strings), bounded and hostile-input safe, with vectors from the RESP specification and hiredis's reader tests, by script. The `redis://`, `rediss://` and `unix://` URL forms. CRC16 key slots and hash tags, with the cluster specification's vectors | **done** |
 | 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
-| 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection). See "Phase 4: where to start" | next |
-| 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI | |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both | |
-| 7 | Pool (cross-isolate), reconnection, examples, hardening (server restart, failover, bounded memory), docs | |
-| — | Publish `@kama/redis` 0.1.0 — only on the maintainer's word | |
+| 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | next |
+| 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0** | |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0** | |
+| 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
+| — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
-### Before 0.1.0
+### The release plan (decided by the maintainer, 2026-10-18)
 
-What stands between this and a publish, as of 2026-10-13:
-1. **Phase 4, server push** ("Phase 4: where to start" is its session plan).
-   - Pub/sub on a `Subscriber`, under both protocols.
-   - Sharded pub/sub.
-   - Client-side caching.
-   - Today the pub/sub commands are refused, and a push is only set aside, unbounded (`pendingPushes`).
-2. **Phase 5, TLS** through `@kama/tls`: `rediss://` (refused today), the chain and the host name verified, client
-   certificates, SNI. The test servers already listen on TLS, and the PKI is generated (`tools/gen-test-certs.sh`).
-3. **Phase 6, topologies.**
-   - Cluster: the slot map, MOVED and ASK, one slot per multi-key command, reads from replicas.
-   - Sentinel.
-   - A multi-node `tools/redis.sh` for both. Only `redis::cluster::keySlot` exists so far.
-4. **Phase 7.** A pool shared across isolates, reconnection, examples, hardening (a server restart, a failover,
-   bounded memory under load), and the docs.
-5. **Carried past phase 3:**
-   - `Command.addFields(value: Serializable)` (HSET from a struct);
-   - a `<Map>` adapter;
-   - measuring the typed read of `DynamicArray<uint8>`, byte by byte, before asking cstar for a bulk read.
-6. **The release itself** (AGENTS.package.md, "Publishing"):
-   - the CHANGELOG's Unreleased section becomes `[0.1.0]`, and the version stays in step with `libraryVersion()`;
-   - CI green on the pinned tag;
-   - `kama publish kama.json --dry-run` lists no certificates and no agent files;
-   - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word.
+The roadmap is unchanged; its releases are phased. Each release is held to the same bar as the rest:
+- every form it covers is honoured or refused;
+- every failure path is tested against the scripted server;
+- the whole matrix passes live, debug and release.
 
-   A version is permanent, and `@kama/postgres` shipped only after its whole roadmap (0.2.0).
+Anything not in a release yet is refused clearly rather than half there. Today `rediss://` is refused by name, a
+cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` will be refused (phase 4, step 2).
+
+- **0.1.0, a complete client for one server:**
+  - what phases 0–3 built;
+  - pub/sub and sharded pub/sub (phase 4, without client-side caching);
+  - TLS (phase 5);
+  - reconnection, examples, hardening and docs (phase 7a).
+
+  The order: phase 4 (its session plan is below), then 5, then 7a, then the release.
+- **0.2.0, topologies:** Cluster and Sentinel (phase 6).
+- **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), and client-side caching
+  (phase 4's research and decisions, kept below).
+- **Carried, to be placed in a release:**
+  - `Command.addFields(value: Serializable)` (HSET from a struct);
+  - a `<Map>` adapter;
+  - measuring the typed read of `DynamicArray<uint8>`, byte by byte, before asking cstar for a bulk read.
+- **Each release** (AGENTS.package.md, "Publishing"):
+  - the CHANGELOG's Unreleased section becomes the version, kept in step with `kama.json` and `libraryVersion()`
+    (`tools/test.sh` checks the two);
+  - CI green on the pinned tag;
+  - `kama publish kama.json --dry-run` lists no certificates and no agent files;
+  - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word, since a version is
+    permanent.
+- **Neighbours, as of 2026-10-18:**
+  - `@kama/tls` 0.1.2 is on the registry, and checks clean on v0.9.667. It is phase 5's.
+  - `@kama/postgres` 0.2.0, the model, no longer builds on v0.9.667 (`DeError`'s kinds, a non-exhaustive
+    `Interest`). That is its repository's to fix, but it means postgres's code is a model to read, not one to build
+    against.
+  - `@kama/http` is seeded, with nothing usable yet. The UI packages (`ui`, `rmlui`, `freetype`) do not touch this one.
 
 ## Phase 4: where to start
 
@@ -206,7 +218,8 @@ and unbounded.
   - The set-aside list is bounded (1024). Past that the oldest is dropped and counted (`droppedPushes()`), never
     silently.
   - `call` refuses `CLIENT TRACKING` and `CLIENT CACHING` with `Usage`: caching is `enableCache`'s alone.
-- **Client-side caching follows rueidis:**
+- **Client-side caching follows rueidis.** (**0.3.0**, by the release plan. The research and the decisions stay here,
+  so that release starts from them.)
   - **Scope.** RESP3 only. Under RESP2 `enableCache` is `Usage`, since the server would answer `+OK` and then drop
     every invalidation.
   - **One cache per connection.** `Connection.enableCache(config: CacheConfig)` sends `CLIENT TRACKING ON OPTIN`.
@@ -249,13 +262,58 @@ Each step ends green before its commit:
    - Live: a publisher from a second connection, patterns, a message matched twice, and `release` back to `call`.
 4. **Sharded pub/sub, and the server's own `sunsubscribe`.** Unit tests from the cluster captures; live on a
    standalone server; refused on 6.2.
-5. **Client-side caching.** `CacheConfig`, `enableCache`, `cached`, the generated allow-list, the race (pending
-   entries, through the scripted server), and every flush rule. Live: another connection's write, FLUSHALL, a key's
-   TTL, reading one's own write, and the bounds.
+5. **(0.3.0) Client-side caching.** Not in this phase's run for 0.1.0. `CacheConfig`, `enableCache`, `cached`, the
+   generated allow-list, the race (pending entries, through the scripted server), and every flush rule. Live: another
+   connection's write, FLUSHALL, a key's TTL, reading one's own write, and the bounds. Step 1's COMMAND INFO capture
+   serves it then.
 6. **Close phase 4:** ROADMAP, AGENTS.redis.md, README (programs checked by `tools/check-readme.sh`), CHANGELOG, the
    module header.
 
-**If the session runs long:** steps 0–3, then 4, then 5. Client-side caching can be its own session.
+**For 0.1.0:** steps 0–4 and 6. If the session runs long, do 0–3, then 4.
+
+## Phase 5: an outline (draw up its session plan from primary sources at its start, as phases 3 and 4 were)
+
+- **What is known.**
+  - `@kama/tls` 0.1.2 gives a client `TlsConfig`: `Verify::Full` (chain and name) by default, trust from the system,
+    a file or PEM, a client identity (`identityFiles`/`identityPem`), revocation, ALPN and version bounds.
+  - `TlsStream::<S>.client(inner:, config:, serverName:)` sends SNI and checks the name. A stepwise `handshake()`
+    fits a deadline. `TlsError::Certificate` names each check that failed.
+  - The model is @kama/postgres's `src/secure/`. Its `transport.kama` makes any `Transport` a `ReliableStream`, so
+    TLS runs over TCP, a caller's tunnel and the scripted server alike, non-blocking end to end. `setup.kama` builds
+    a configuration per attempt.
+  - Redis starts TLS at once, with no in-protocol request, so postgres's `negotiate.kama` has no counterpart.
+  - The test servers listen on TLS (base + 100, `tls-auth-clients optional`), with the PKI from
+    `tools/gen-test-certs.sh`.
+  - `rediss://` and `valkeys://` are parsed today and refused in `Config` (`tlsRefused`).
+- **To research at its start:**
+  - redis-cli 8.10's and valkey-cli 9.1's TLS flags (`--tls`, `--cacert`, `--cacertdir`, `--cert`, `--key`, `--sni`,
+    `--insecure`, `--tls-ciphers`);
+  - the peers' URL options and defaults (redis-py's `ssl_*`, go-redis's `rediss` with `ServerName`, redis-rs's
+    `rediss` and `#insecure`, Lettuce's `verifyPeer`);
+  - which option names to honour and which to refuse;
+  - whether `insecure` (no verification) exists at all, or only `Verify` modes named for what they check.
+- **Tests:**
+  - unit: a TLS session over the scripted server;
+  - live, on every server's TLS port: the chain and the name verified, a wrong CA, a wrong name, a client
+    certificate required and offered, SNI, and a handshake past `connect_timeout`.
+
+## Phase 7a: an outline (likewise, drawn up at its start)
+
+- **Reconnection.**
+  - Research the peers first:
+    - go-redis redials through its pool;
+    - redis-py retries on the next command;
+    - redis-rs's `ConnectionManager` reconnects and resubscribes;
+    - Lettuce reconnects on its own and replays.
+  - Decide what is retried. Nothing is resent silently: a command that may have run is the caller's to retry.
+  - A `Subscriber` resubscribes from its kept sets.
+- **Examples:** an `examples/` program per area, built and run against a live server by a script, as
+  `tools/check-readme.sh` does the README's.
+- **Hardening:** a server restart in the middle of a call, a pipeline and a subscription; `CLIENT KILL`; memory
+  bounded under a flood of pushes and replies.
+- **Docs and the release:** the README, the CHANGELOG as `[0.1.0]`, and the checklist in "The release plan".
+
+
 
 ## Phase 3: where to start
 
