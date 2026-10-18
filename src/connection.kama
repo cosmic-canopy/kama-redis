@@ -1,10 +1,10 @@
-import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
+import { std::collections::DynamicArray, std::collections::Deque, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
          std::net::SocketAddr, std::net::resolve, std::time::Duration,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
-         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch,
+         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint,
          redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
@@ -30,6 +30,9 @@ export { Connection, libraryName, libraryVersion };
 fn string libraryName() { return "kama-redis"; }
 fn string libraryVersion() { return "0.1.0"; }
 
+// The most push messages a connection sets aside for `takePushes`; past it the oldest is dropped, and counted.
+comptime isize MAX_PUSHES = 1024;
+
 type resource Connection implements Sendable {
     Wire wire;
     Writer outbox;
@@ -37,8 +40,12 @@ type resource Connection implements Sendable {
     Protocol speaking;
     // The server's HELLO, when the handshake sent one: zero or one.
     DynamicArray<ServerInfo> identified;
-    // Push messages that arrived in place of a reply, oldest first. Phase 4 decides how they are read.
-    DynamicArray<Value> pushes;
+    // Push messages that arrived in place of a reply, oldest first: at most MAX_PUSHES, holding at most the reader's
+    // `maxReplyBytes`. Past either bound the oldest goes, and is counted.
+    Deque<Value> pushes;
+    int64 pushBytes = 0;
+    int64 pushBudget = 0;
+    int64 pushesDropped = 0;
     Duration commandLimit;
 
     ctor over(Owned<Transport> transport, const ref Config config) {
@@ -47,7 +54,8 @@ type resource Connection implements Sendable {
         this.live = true;
         this.speaking = Protocol::Resp3;
         this.identified = DynamicArray.empty();
-        this.pushes = DynamicArray.empty();
+        this.pushes = Deque.empty();
+        this.pushBudget = config.limits().maxReplyBytes;
         this.commandLimit = config.commandTimeout();
     }
 
@@ -313,7 +321,7 @@ type resource Connection implements Sendable {
             };
             bool push = match (v) { case Push(items: p): true; case _: false; };
             if (push) {
-                this.pushes.add(item: give v);
+                this.setAside(push: give v);
                 continue;
             }
             return Result::Ok(value: give v);
@@ -336,8 +344,38 @@ type resource Connection implements Sendable {
         return Optional::Some(value: copy this.identified[0]);
     }
 
-    // How many push messages have been set aside. (Phase 4 decides how they are read.)
+    // How many push messages are set aside, waiting for `takePushes`.
     public const fn isize pendingPushes() { return this.pushes.length(); }
+
+    // The push messages set aside, oldest first, handed over: a push that came in place of a reply (a module's, or an
+    // invalidation another connection's CLIENT TRACKING … REDIRECT sends here). Pub/sub messages go to a `Subscriber`.
+    public fn DynamicArray<Value> takePushes() {
+        DynamicArray<Value> taken = DynamicArray.empty();
+        bool more = true;
+        while (more) {
+            Optional<Value> next = this.pushes.popFront();
+            match (give next) { case Some(value: v): { taken.add(item: give v); } case None: { more = false; } };
+        }
+        this.pushBytes = 0;
+        return give taken;
+    }
+
+    // How many push messages were dropped, unread, to keep the set-aside ones within their bounds: at most
+    // MAX_PUSHES of them, holding at most `resp::Limits.maxReplyBytes`. It only grows.
+    public const fn int64 droppedPushes() { return this.pushesDropped; }
+
+    // Keep `push` for `takePushes`, dropping the oldest while the set-aside ones are past a bound.
+    unsafe fn void setAside(Value push) {
+        this.pushBytes = this.pushBytes + footprint(v: push);
+        this.pushes.pushBack(item: give push);
+        while (this.pushes.length() > MAX_PUSHES || (this.pushBytes > this.pushBudget && this.pushes.length() > 1)) {
+            Optional<Value> oldest = this.pushes.popFront();
+            match (give oldest) {
+                case Some(value: v): { this.pushBytes = this.pushBytes - footprint(v: v); this.pushesDropped = this.pushesDropped + 1i64; }
+                case None: { }
+            };
+        }
+    }
 
     // How long each later call may take; zero is no limit. It starts as the config's `command_timeout`.
     public fn Result<Unit, RedisError> setCommandTimeout(Duration timeout) {

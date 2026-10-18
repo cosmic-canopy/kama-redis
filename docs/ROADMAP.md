@@ -219,7 +219,8 @@ where servers differ, and step 1 writes each capture into `tools/gen-server-vect
 - **A connection's other pushes:**
   - `takePushes()` hands over the set-aside pushes, oldest first.
   - The set-aside list is bounded (1024). Past that the oldest is dropped and counted (`droppedPushes()`), never
-    silently.
+    silently. Built (step 2) with a second bound, in bytes: a push can be as large as `maxReplyBytes` on its own,
+    so the set-aside pushes hold at most that much too, in a `Deque`, so dropping the oldest costs nothing.
   - `call` refuses `CLIENT TRACKING` and `CLIENT CACHING` with `Usage`: caching is `enableCache`'s alone.
 - **Client-side caching follows rueidis.** (**0.3.0**, by the release plan. The research and the decisions stay here,
   so that release starts from them.)
@@ -265,7 +266,7 @@ Each step ends green before its commit:
      `redis-cli --cluster create` needs three primaries, so the two nodes are joined by hand (ADDSLOTSRANGE, CLUSTER
      MEET), on 7.0 and later only.
    - (0.3.0) Each server's COMMAND INFO flags, for the allow-list: captured in step 5, which uses them.
-2. **A connection's pushes:** `takePushes`, the bound, `droppedPushes`, and `CLIENT TRACKING`/`CACHING` refused.
+2. **Done (2026-10-18).** **A connection's pushes:** `takePushes`, the bound, `droppedPushes`, and `CLIENT TRACKING`/`CACHING` refused.
 3. **`Subscriber`, under RESP2 and RESP3.**
    - Unit: every captured confirmation order; messages queued during a subscribe; a timeout that keeps the
      connection; a hangup; the RESP2 refusals; ping's two shapes; `release`.

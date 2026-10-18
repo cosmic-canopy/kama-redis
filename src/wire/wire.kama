@@ -1,8 +1,8 @@
-import { std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::memory::Owned, std::net::Interest,
+import { std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind, std::memory::Owned, std::net::Interest,
          std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
          redis::Transport, redis::RedisError, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
          redis::resp::Limits };
-export { Wire, Deadline };
+export { Wire, Deadline, footprint };
 
 // redis::wire — RESP over a `Transport`: replies read as they arrive, straight into the reader's buffer
 // (`resp::Reader.spare`/`commit`), and requests written out, each step bounded by a deadline. Internal: a
@@ -148,4 +148,30 @@ type resource Wire implements Sendable {
         Optional<RedisError> own = this.link.explain(error: error);
         return match (give own) { case Some(value: p): give p; case None: RedisError::Io(error: error); };
     }
+}
+
+// What `v` holds in memory, counted as the reader counts a reply (resp::Limits.maxReplyBytes): its bytes, plus
+// `sizeof(Value)` for itself and for each value inside it. It bounds what a connection keeps aside.
+fn int64 footprint(const ref Value v) {
+    int64 own = cast<int64>(sizeof(Value));
+    return match (v) {
+        case Simple(bytes: b): own + cast<int64>(b.length());
+        case Error(bytes: b): own + cast<int64>(b.length());
+        case BigNumber(digits: b): own + cast<int64>(b.length());
+        case Bulk(bytes: b): own + cast<int64>(b.length());
+        case Verbatim(format: m, bytes: b): own + cast<int64>(m.length()) + cast<int64>(b.length());
+        case Array(items: xs): own + footprintAll(xs: xs);
+        case Map(entries: xs): own + footprintAll(xs: xs);
+        case Set(items: xs): own + footprintAll(xs: xs);
+        case Push(items: xs): own + footprintAll(xs: xs);
+        case Attributed(parts: xs): own + footprintAll(xs: xs);
+        case _: own;
+    };
+}
+
+fn int64 footprintAll(const ref DynamicArray<Value> xs) {
+    int64 total = 0;
+    isize i = 0;
+    while (i < xs.length()) { total = total + footprint(v: xs[i]); i = i + 1; }
+    return total;
 }

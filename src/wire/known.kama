@@ -11,6 +11,8 @@ export { admit, serverError, isWatch, Wait, blockingWait, later, callDeadline };
 //   - SUBSCRIBE and its kin put the connection in subscriber mode, where what comes back is messages;
 //   - MONITOR turns it into a stream of every command the server runs, SYNC and PSYNC into a replication stream;
 //   - CLIENT REPLY OFF or SKIP stop replies, and SCRIPT DEBUG turns the next EVAL into a debugging session;
+//   - CLIENT TRACKING and CLIENT CACHING turn on client-side caching's invalidations, which nothing here reads yet
+//     (0.3.0 brings the cache); TRACKINGINFO and GETREDIR, which only report, are allowed;
 //   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it;
 //   - MULTI, EXEC and DISCARD: `Connection.transact` sends a transaction whole, MULTI to EXEC in one write, so the
 //     connection is never left inside one.
@@ -46,6 +48,9 @@ fn string refusal(const ref Command command) {
     }
     if (named(command: command, word: "CLIENT") && subNamed(command: command, word: "REPLY")) {
         return "a connection does not carry CLIENT REPLY: every command it sends is matched to its reply";
+    }
+    if (named(command: command, word: "CLIENT") && (subNamed(command: command, word: "TRACKING") || subNamed(command: command, word: "CACHING"))) {
+        return "a connection does not carry CLIENT TRACKING or CLIENT CACHING: client-side caching comes with a later release of this client, and tracking turned on by hand would pile invalidations up unread";
     }
     if (named(command: command, word: "SCRIPT") && subNamed(command: command, word: "DEBUG")) {
         return "a connection does not carry SCRIPT DEBUG: it turns the next EVAL into a debugging session";

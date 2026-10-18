@@ -179,6 +179,8 @@ my @cases = (
     ['setname', 7000, [], ['CLIENT', 'SETNAME', 'kama-test']],
     ['setname-space', 7000, [], ['CLIENT', 'SETNAME', 'a b']],
     ['ping', 7000, [], ['PING']],
+    # Reported, never refused: CLIENT TRACKING and CACHING are, since nothing here reads invalidations yet.
+    ['trackinginfo', 7000, [], ['CLIENT', 'TRACKINGINFO']],
     # The handshake on the server with a password.
     ['locked-hello3', 7001, [], ['HELLO', '3']],
     ['locked-hello2', 7001, [], ['HELLO', '2']],

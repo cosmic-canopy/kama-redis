@@ -590,6 +590,89 @@ unsafe fn int32 callTests() {
     return f;
 }
 
+// ---- push messages a connection sets aside ----
+
+// The value in `b`, which holds one whole RESP value.
+fn Value valueIn(const ref DynamicArray<uint8> b) {
+    Reader r = Reader.make();
+    r.feed(bytes: b.view());
+    Read got = r.next();
+    return match (give got) { case Complete(value: v): give v; case _: Value::Null; };
+}
+
+// `n` pushes, `a` and `b` in turn, starting with `a`.
+fn DynamicArray<uint8> pushes(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b, isize n) {
+    DynamicArray<uint8> all = DynamicArray.empty();
+    isize i = 0;
+    while (i < n) {
+        if (i % 2 == 0) { all.addAll(items: a.view()); } else { all.addAll(items: b.view()); }
+        i = i + 1;
+    }
+    return give all;
+}
+
+// Pushes that come in place of a reply wait, in order, for takePushes. The pushes are what servers send another
+// connection's tracking redirects here: an invalidation of a key, and of everything (a flush).
+unsafe fn int32 pushTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    DynamicArray<uint8> key = reply(server: s, kase: "tracking-redirect/3");
+    DynamicArray<uint8> flush = reply(server: s, kase: "tracking-flush/3");
+    Value keyValue = valueIn(b: key);
+    Value flushValue = valueIn(b: flush);
+
+    DynamicArray<Step> two = welcome(server: s);
+    two.add(item: Step::Send(bytes: pushes(a: key, b: flush, n: 2)));
+    two.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Connection c = connected(script: give two, url: "redis://", what: "pushes");
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> p = c.call(command: ping);
+    isize waiting = c.pendingPushes();
+    DynamicArray<Value> taken = c.takePushes();
+    bool inOrder = taken.length() == 2 && taken[0].equals(other: keyValue) && taken[1].equals(other: flushValue);
+    f = f + check(ok: isSimple(r: p, text: "PONG") && waiting == 2 && inOrder && c.pendingPushes() == 0 && c.droppedPushes() == 0i64,
+                  what: "pushes: set aside in order, and handed over once");
+    DynamicArray<Value> again = c.takePushes();
+    f = f + check(ok: again.length() == 0, what: "pushes: taken already, none are left");
+
+    // Past 1024, the oldest go, and are counted: of 1030, the first 6 (key, flush, …) are dropped.
+    DynamicArray<Step> many = welcome(server: s);
+    many.add(item: Step::Send(bytes: pushes(a: key, b: flush, n: 1030)));
+    many.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Connection cm = connected(script: give many, url: "redis://", what: "many pushes");
+    Command ping2 = Command.of(name: "PING");
+    Result<Value, RedisError> p2 = cm.call(command: ping2);
+    DynamicArray<Value> kept = cm.takePushes();
+    bool newest = kept.length() == 1024 && kept[0].equals(other: keyValue) && kept[1023].equals(other: flushValue);
+    f = f + check(ok: isSimple(r: p2, text: "PONG") && newest && cm.droppedPushes() == 6i64,
+                  what: "pushes: 1024 at most, the oldest dropped and counted");
+
+    // Past the reader's maxReplyBytes, the oldest go too, however few there are.
+    Config tight = configOf(url: "redis://");
+    Limits small = Limits.defaults();
+    small.maxReplyBytes = 4096i64;
+    tight.setLimits(limits: small);
+    DynamicArray<Step> heavy = welcome(server: s);
+    heavy.add(item: Step::Send(bytes: pushes(a: key, b: flush, n: 100)));
+    heavy.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Result<Connection, RedisError> rh = overConfig(script: give heavy, config: tight);
+    match (give rh) {
+        case Ok(value: ch): {
+            Connection conn = give ch;
+            Command ping3 = Command.of(name: "PING");
+            Result<Value, RedisError> p3 = conn.call(command: ping3);
+            isize count = conn.pendingPushes();
+            int64 gone = conn.droppedPushes();
+            DynamicArray<Value> left = conn.takePushes();
+            bool last = left.length() > 0 && left[left.length() - 1].equals(other: flushValue);
+            f = f + check(ok: isSimple(r: p3, text: "PONG") && count > 1 && count < 100 && cast<int64>(count) + gone == 100i64 && last,
+                          what: "pushes: within maxReplyBytes, the newest kept (${count} kept, ${gone} dropped)");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pushes: connect with small limits (${m})"); }
+    };
+    return f;
+}
+
 // ---- commands a connection does not carry, and commands refused while they were built ----
 
 fn bool isUsage(const ref Result<Value, RedisError> r) {
@@ -635,11 +718,14 @@ unsafe fn int32 refusalTests() {
     refused.add(item: "multi");
     refused.add(item: "EXEC");
     refused.add(item: "Discard");
+    refused.add(item: "client tracking on");
+    refused.add(item: "CLIENT Caching yes");
     DynamicArray<Step> script = welcome(server: s);
     isize i = 0;
     while (i < refused.length()) { script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping"))); i = i + 1; }
-    // Another CLIENT subcommand is sent, in the case it was written in.
+    // Another CLIENT subcommand is sent, in the case it was written in, and so is TRACKINGINFO, which only reports.
     script.add(item: expect(command: "client setname kama-test", answer: reply(server: s, kase: "setname")));
+    script.add(item: expect(command: "CLIENT TRACKINGINFO", answer: reply(server: s, kase: "trackinginfo")));
     // A command refused while it was built, then the PING after it.
     script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
     // A binary argument arrives byte for byte.
@@ -671,7 +757,11 @@ unsafe fn int32 refusalTests() {
     }
     Command setname = commandOf(text: "client setname kama-test");
     Result<Value, RedisError> named = c.call(command: setname);
-    f = f + check(ok: isSimple(r: named, text: "OK"), what: "CLIENT SETNAME is sent: only CLIENT REPLY is refused");
+    f = f + check(ok: isSimple(r: named, text: "OK"), what: "CLIENT SETNAME is sent: only CLIENT REPLY, TRACKING and CACHING are refused");
+    Command trackingInfo = commandOf(text: "CLIENT TRACKINGINFO");
+    Result<Value, RedisError> info = c.call(command: trackingInfo);
+    bool reported = match (info) { case Ok(value: v): match (v) { case Array(items: xs): xs.length() == 6; case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: reported, what: "CLIENT TRACKINGINFO is sent: it only reports");
 
     Command nan = Command.of(name: "SET");
     nan.arg(text: "kr:k");
@@ -750,6 +840,7 @@ unsafe fn int32 connectionTests() {
     f = f + fallbackTests();
     f = f + hostileHandshakeTests();
     f = f + callTests();
+    f = f + pushTests();
     f = f + refusalTests();
     f = f + dialerTests();
     return f;
