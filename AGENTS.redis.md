@@ -39,9 +39,24 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
 ## What is true here and nowhere else
 
 - **Native protocol, no C.** This package speaks RESP2 and RESP3 in kama over `std::net`. There is no hiredis,
-  no `csrc/` and no `csources`, and it should stay that way. TLS will come from `@kama/tls` (`../kama-tls`, on the
+  no `csrc/` and no `csources`, and it should stay that way. TLS comes from `@kama/tls` (`../kama-tls`, on the
   registry), which vendors Mbed TLS. What this package needs from TLS that `@kama/tls` lacks is added THERE, with
-  its own tests, not worked around here.
+  its own tests, not worked around here: 0.1.3 (no IP address as SNI, an IP matched against IP SANs alone,
+  `TlsError` `Sendable`) was this package's ask.
+
+- **TLS is `redis::secure`, internal** (src/secure/), postgres's layering: `TransportStream` makes any `Transport` a
+  `ReliableStream`, and `TlsTransport` makes the session a `Transport` again. `Connection.opened` secures a TLS
+  configuration's link for all three entry points (`connect`, `connectWith`, `connectOver`) before HELLO, within the
+  address's `connect_timeout`, and nothing else dials one: a TLS configuration never carries a plaintext byte. A
+  `TlsConfig` is built for each attempt (`prepareTls`), so files are read at connect, never by `Config.parse`. The
+  settings' enums are this package's own (`TlsVerify`, `TlsVersion`): a consumer cannot name a `tls::` type without
+  declaring `@kama/tls` itself.
+  - A handshake that waits to read counts only a readable transport. The scripted server is always writable, so a
+    loop that took either side spun on a silent server.
+  - The scripted server's `secure` runs Mbed TLS as the server, checks the SNI it receives (`"-"` for none), and
+    sends each step's bytes as records of their own, as a server does; `Truncate` ends a reply mid-record with no
+    close_notify. The unit tests read the PKI through `REDISTEST_CERTDIR`, which `tools/test.sh` sets after running
+    `tools/gen-test-certs.sh` (OpenSSL or LibreSSL).
 
 - **Two test programs, and neither is typed from memory.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug and
@@ -77,6 +92,9 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     - the error codes each server can send, read out of its own binary in the image (each `-CODE message` literal,
       and MOVED and ASK from cluster.c's format); `ServerCode` must name every one;
     - each server's raw reply to every handshake step and to every error a standalone server can be made to send;
+    - the wrong port (phase 5): what the plaintext port sends back to the image's own `redis-cli --tls` ClientHello
+      (nothing, and it stays open: the inline parser's strchr stops at the ClientHello's NUL), and what a TLS port
+      does with a plaintext HELLO (closes). The script requires both, since the client's words rest on them;
     - Envoy's redis proxy's answers to HELLO at 1.32, 1.36 and 1.39, from its pinned source, in the order that
       source checks them. The script verifies that order before it uses it.
     - typed pairs (phase 3): each case under RESP2 and RESP3 on a fresh connection after FLUSHALL, with its setup
@@ -102,9 +120,11 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
   - One container per server runs two servers, configured from `tests/integration/server/`:
     - the main server, in plaintext and over TLS (`tls-auth-clients optional`), and on a Unix socket in the
       container;
-    - the locked server, whose default user has a password, for NOAUTH and the single-argument AUTH.
-  - Each container gets three host ports, bound to 127.0.0.1: base, base + 100 (TLS) and base + 200 (locked).
-    `out/redistest-<server>.env` holds them.
+    - the locked server, whose default user has a password, for NOAUTH and the single-argument AUTH, and over TLS
+      requiring a client certificate (`tls-auth-clients yes`). `start.sh` gives it `tls-auth-clients-user CN` on
+      the servers that have the setting (Redis 8.6+, Valkey 9.0+), so the client certificate logs in as `kr_cert`.
+  - Each container gets four host ports, bound to 127.0.0.1: base, base + 100 (TLS), base + 200 (locked) and
+    base + 300 (locked, TLS). `out/redistest-<server>.env` holds them.
   - There is one ACL user per authentication case. A test picks the case by picking the user:
     - `default`: no password;
     - `kr_acl`: a user with a password;
@@ -113,8 +133,13 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     - `kr_nopass`: any password.
   - `tools/redis.sh smoke` checks each case and transport with the container's own redis-cli. When an
     integration test fails, run it first: it separates "the server is misconfigured" from "the client is wrong".
-  - The test PKI is generated into `out/test-certs` by `tools/gen-test-certs.sh` and is never tracked. `kama
-    publish` refuses a tracked `*.key`, and so does the registry.
+  - The test PKI is generated into `out/test-certs` by `tools/gen-test-certs.sh` and is never tracked: a CA and an
+    untrusted one, the server's certificate (localhost, 127.0.0.1, ::1) and one for another name, a client
+    certificate, its key encrypted, and one the untrusted CA signed. `kama publish` refuses a tracked `*.key`, and
+    so does the registry.
+  - The live TLS test relays through a listener of its own that reads the ClientHello's server name (SNI on the
+    wire), and meets silence at one that never accepts. On macOS an accepted socket inherits the listener's
+    O_NONBLOCK: set it blocking before reading.
 
 - **`redis::resp`'s reader is built so that nothing is read twice and memory follows the bytes that came.** Keep it
   that way when changing it. The rules are in `src/resp/reader.kama`'s header:

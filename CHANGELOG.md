@@ -10,6 +10,25 @@ Needs **kama ≥ 0.9.667**: the first tagged release with the fixes this package
 the `Deserializer` the reply reader implements (`peekKind`, `readNumberText`, `unknownField`, `atKeyedMap`).
 
 ### Added
+- TLS (phase 5), from `@kama/tls` ^0.1.3, which vendors Mbed TLS:
+  - `rediss://` and `valkeys://` connect over TLS, verified by default: the certificate must chain to a trusted root
+    (the system's bundle) and name the server, its host name among the DNS names or its IP address among the IP
+    addresses. The host name is sent as SNI; an IP address is not (RFC 6066).
+  - The URL options `tls_verify` (`full`, `chain`, `none`), `tls_ca`, `tls_cert` and `tls_key` (both or neither) and
+    `tls_server_name`, each refused on `redis://` and `unix://`; a CA with `tls_verify=none` is refused.
+  - `Config.tls`, and setters for the same, for roots and an identity as PEM bytes, an encrypted key's password, and
+    the TLS versions (1.2 and 1.3 by default).
+  - `RedisError::Tls(detail, cause)`, in redis-cli's words, carrying `@kama/tls`'s `TlsError`. A TLS failure while
+    connecting is final; `connect_timeout` bounds the handshake. A refused client certificate says whether one was
+    given.
+  - `Connection.tlsSession()`: the version, the cipher suite and the server's certificate, and whether a client
+    certificate was asked for and sent.
+  - TLS runs over any transport, a `Dialer`'s and `connectOver`'s included; a TLS configuration never carries a
+    plaintext byte.
+  - `redis://` at a TLS port is told to use `rediss://`: `tools/gen-server-vectors.sh` captures that every server
+    closes its TLS port on a plaintext `HELLO`, and says nothing to a ClientHello at its plaintext port.
+  - The test servers' locked server listens on TLS too, requiring a client certificate, and logs one in by its CN
+    where the server can (Redis 8.6+, Valkey 9.0+).
 - Pub/sub (phase 4):
   - `Subscriber`, which owns its connection, under RESP3 and RESP2: `subscribe`, `psubscribe`, `ssubscribe` and the
     three unsubscribes each return once the server has confirmed every name, matched by name; `next(timeout:)` gives

@@ -1,8 +1,9 @@
 // @kama/redis — the Redis and Valkey client for kama. It speaks RESP2 and RESP3 directly, in kama, over
-// std::net; there is no hiredis and nothing to install. TLS will come from @kama/tls.
+// std::net; there is no hiredis and nothing to install. TLS comes from @kama/tls, which vendors Mbed TLS.
 //
 // The shape of the package, as it fills in (docs/ROADMAP.md):
-//   redis            Connection (src/connection.kama), Config (src/config.kama), RedisError, ServerError and
+//   redis            Connection (src/connection.kama), Config, TlsVerify and TlsVersion (src/config.kama),
+//                    TlsSession (src/session.kama), RedisError, ServerError and
 //                    ServerCode (src/error.kama), Command (src/command.kama), RedisArg and the `cmd"…"` tag
 //                    (src/arg.kama), `reply::<T>` and its kin (src/reply.kama), Pipeline and Replies
 //                    (src/pipeline.kama), TxOutcome and TxBody (src/transaction.kama), Script and ScriptCall
@@ -12,6 +13,7 @@
 //   redis::wire      internal: a deadline, RESP over a transport and what a value holds in memory, the commands a
 //                    connection does not carry and the blocking commands' timeouts (src/wire/known.kama), the
 //                    server's integer grammar
+//   redis::secure    internal: TLS over any transport, and the TlsConfig each connect attempt builds
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
 //   redis::cluster   key slots (src/cluster/slot.kama); to come: the slot map and redirections
 //   redis::pool      a connection pool shared by isolates

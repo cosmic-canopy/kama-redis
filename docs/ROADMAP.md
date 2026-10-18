@@ -1,9 +1,9 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0 to 4 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
-client for one server. "The release plan" below says what each release holds. Phase 5 (TLS) is under way: "Phase 5:
-where to start" is its session plan, drawn up from primary sources on 2026-10-18. Phase 7a (reconnection, examples,
-hardening, docs) follows, and then 0.1.0.
+Where this is, 2026-10-18: phases 0 to 5 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
+client for one server. "The release plan" below says what each release holds. Phase 7a (reconnection, examples,
+hardening, docs) is next: "Phase 7a: an outline" is below, and its session plan is drawn up from primary sources at
+its start, as phases 3, 4 and 5's were. Then 0.1.0.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -25,8 +25,13 @@ hardening, docs) follows, and then 0.1.0.
   and a connection's bounded set-aside pushes (`takePushes`, `droppedPushes`); `CLIENT TRACKING` and `CACHING` are
   refused until 0.3.0. The unit suite replays each server's pub/sub captures under both protocols (two cluster nodes
   included), every order of an unsubscribe-all among them; the live suite runs on all eight servers.
+- TLS is in (phase 5): `rediss://` and `valkeys://`, verified by default (the chain and the name, against the system's
+  roots), `tls_verify` `full`, `chain` or `none`, a CA, a client certificate, `tls_server_name`, over any transport,
+  from `@kama/tls` 0.1.3. The unit suite runs Mbed TLS as the scripted server; the live suite checks each server's
+  TLS ports, SNI on the wire, a silent handshake and both wrong ports.
 - Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin, 2026-10-18) and cstar's
-  0.9.668; `tools/test-integration.sh` on all eight servers on 0.9.667; the README's programs live.
+  0.9.668; `tools/test-integration.sh` on all eight servers on 0.9.667; `tools/redis.sh smoke` (19 checks) on all
+  eight; the README's programs live.
 - Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
   and CI pin moved there, `RedisArg` gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone,
   and the reply reader implements 0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
@@ -44,7 +49,7 @@ does its discipline:
 | 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
-| 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0** | |
+| 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0** | |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
@@ -57,8 +62,8 @@ The roadmap is unchanged; its releases are phased. Each release is held to the s
 - every failure path is tested against the scripted server;
 - the whole matrix passes live, debug and release.
 
-Anything not in a release yet is refused clearly rather than half there. Today `rediss://` is refused by name, a
-cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` is refused (phase 4, step 2).
+Anything not in a release yet is refused clearly rather than half there. Today a cluster's MOVED comes back as
+`Server` with its code, and `CLIENT TRACKING` is refused (phase 4, step 2).
 
 - **0.1.0, a complete client for one server:**
   - what phases 0–3 built;
@@ -66,7 +71,7 @@ cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` is r
   - TLS (phase 5);
   - reconnection, examples, hardening and docs (phase 7a).
 
-  The order: phase 4 (done 2026-10-18), then 5, then 7a, then the release.
+  The order: phase 4 (done 2026-10-18), then 5 (done 2026-10-18), then 7a, then the release.
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6).
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), and client-side caching
   (phase 4's research and decisions, kept below).
@@ -82,7 +87,7 @@ cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` is r
   - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word, since a version is
     permanent.
 - **Neighbours, as of 2026-10-18:**
-  - `@kama/tls` 0.1.2 is on the registry, and checks clean on v0.9.667. It is phase 5's.
+  - `@kama/tls` 0.1.3 is on the registry (published 2026-10-18), with what phase 5 asked of it.
   - `@kama/postgres` 0.2.0, the model, no longer builds on v0.9.667 (`DeError`'s kinds, a non-exhaustive
     `Interest`). That is its repository's to fix, but it means postgres's code is a model to read, not one to build
     against.
@@ -413,17 +418,17 @@ Each step ends green before its commit:
 - from step 2 on, the live matrix.
 
 0. **Done (2026-10-18).** The sources above, the decisions, and the repros ("Decided, and why", "Phase 5").
-1. **`@kama/tls` 0.1.3,** in `../kama-tls` with its own tests and gate: `TlsError` is `Sendable`; an IP literal is
+1. **Done (2026-10-18), published by the maintainer.** **`@kama/tls` 0.1.3,** in `../kama-tls` with its own tests and gate: `TlsError` is `Sendable`; an IP literal is
    never sent as SNI, and `Full` verifies it against the certificate's IP SANs. Published on the maintainer's word.
-2. **The PKI, the servers and vectors.**
+2. **Done (2026-10-18).** **The PKI, the servers and vectors.**
    - `tools/gen-test-certs.sh` (generation 2) adds a server certificate for another name and an encrypted client key.
    - The locked server gains a TLS port that requires a client certificate (base + 300), and logs one in by its CN
      where the server can. `smoke` checks it.
    - `tools/gen-server-vectors.sh` captures, on all eight servers, the plaintext port's answer to a TLS ClientHello
      and the TLS port's answer to a plaintext `HELLO`.
-3. **`Config`:** the settings, the URL options and the refusals. The refusal of a TLS configuration moves from parse
+3. **Done (2026-10-18).** **`Config`:** the settings, the URL options and the refusals. The refusal of a TLS configuration moves from parse
    to connect, in the same words, so nothing dials it.
-4. **The TLS layer:** `redis::secure`, `RedisError::Tls`, `tlsSession()`, wired into all three entry points in the
+4. **Done (2026-10-18).** **The TLS layer:** `redis::secure`, `RedisError::Tls`, `tlsSession()`, wired into all three entry points in the
    commit that lifts the refusal. The scripted server gains a TLS front. Unit tests, one byte at a time:
    - verification by name, by IP and by `tls_server_name`, TLS 1.2 and 1.3, another name, another CA, each mode;
    - a client certificate asked for and given, required and missing, an encrypted key and a wrong password, a
@@ -432,11 +437,11 @@ Each step ends green before its commit:
      subscriber's timeout;
    - silence, a hangup at each step, garbage, the servers' plaintext answer, close_notify and a truncated record;
    - no plaintext byte through any entry point.
-5. **Live,** on all eight servers, debug and release: both names, both protocols, the system's trust refusing the
+5. **Done (2026-10-18).** **Live,** on all eight servers, debug and release: both names, both protocols, the system's trust refusing the
    test CA, another CA, another name under each mode, client certificates required and optional, SNI on the wire (read
    by a relay from the ClientHello), a handshake past `connect_timeout`, both wrong ports, a pipeline, a large value, a
    transaction and a subscriber over TLS. A README program over TLS.
-6. **Close phase 5:** ROADMAP, AGENTS.redis.md, README, CHANGELOG, the module header.
+6. **Done (2026-10-18).** **Close phase 5:** ROADMAP, AGENTS.redis.md, README, CHANGELOG, the module header.
 
 **If the session runs long:** steps 0–4, then 5, then 6.
 
@@ -1088,3 +1093,34 @@ says otherwise). Step 0's repros, run 2026-10-18 on v0.9.667 and cstar's 0.9.668
 - **redis-cli's words, read at source** (8.10.2, `redis-cli.c:1732–1755`): a setup failure is `Could not negotiate a
   TLS connection: <why>`; a failed handshake leaves the context's error, printed as `Could not connect to Redis at
   <host>:<port>: SSL_connect failed: <reason>` (hiredis 1.2.0, `ssl.c:388–397`).
+- **What building it settled (steps 1–6):**
+  - `@kama/tls` 0.1.3 gives Mbed TLS no name for an IP literal (`mbedtls_ssl_set_hostname(NULL)`, so no SNI) and
+    matches the address against the leaf's IP SANs in a per-session verify callback, under `Full`. Only an IP SAN
+    names an address, as in OpenSSL's `X509_check_ip` and Go: a certificate whose CN reads `127.0.0.1` and has no
+    SAN is refused for that address (Mbed TLS had compared the CN).
+  - **The wrong port, captured on all eight servers:** a ClientHello at the plaintext port gets nothing back and the
+    connection stays open (the inline parser's `strchr` stops at the ClientHello's first NUL), so `rediss://` there
+    is a `Timeout`, whose message carries no hint. A plaintext HELLO at a TLS port is closed without a byte, so
+    `redis://` there is told "A server's TLS port closes a plaintext connection: connect to one with rediss://"
+    beside the twemproxy hint.
+  - **Words:** a setup failure is `Could not negotiate a TLS connection: invalid CA file "<path>": <reason>` (or the
+    client certificate's, naming both files); a failed handshake is `Could not connect to <place>: <reason>`, the
+    transport's end being hiredis's "Server closed the connection during the TLS handshake"; a failure after the
+    handshake is `the TLS session failed: <reason>`. When the server asked for a client certificate, a refusal adds
+    whether none was given ("set tls_cert and tls_key") or the server did not accept the one sent (its alert names
+    the certificate: 42–46, 48). Under TLS 1.3 an OpenSSL server's refusal arrives at the first read, HELLO's.
+  - **The settings' enums are this package's** (`TlsVerify`, `TlsVersion`), mapped to `@kama/tls`'s in
+    `redis::secure`; `RedisError::Tls` carries `@kama/tls`'s `TlsError` all the same, which a consumer matches without
+    importing it.
+  - **A handshake waiting to read counts only a readable transport** (postgres's loop took either side). A transport
+    that is writable while the server says nothing has timed out; the scripted server, always writable, made the old
+    loop spin.
+  - **The test servers:** the locked server listens on TLS requiring a client certificate (base + 300), and on Redis
+    8.6+ and Valkey 9.0+ logs the certificate in as `kr_cert` (`tls-auth-clients-user CN`; Valkey also reads a URI
+    SAN). A connection that gives its own AUTH is that user instead.
+  - **Live:** on all eight servers, debug and release, both names (`localhost` falls from `::1` to `127.0.0.1` on
+    macOS), both protocols, TLS 1.2 when capped, the system's roots refusing the test CA, another CA, another name
+    under each mode, client certificates (a plain key, an encrypted key, none, one the untrusted CA signed, the
+    optional port checking one), the CN login or its refusal, SNI on the wire through a relay that reads the
+    ClientHello, a handshake past `connect_timeout` at a listener that never accepts, both wrong ports, 1000 INCRs in
+    a pipeline, a 1 MiB value and a subscriber over TLS.
