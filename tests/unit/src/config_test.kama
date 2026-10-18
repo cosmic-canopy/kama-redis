@@ -1,7 +1,8 @@
 // redis::Config. The URL's own reading is RedisUrl's (url_test.kama); these are the options this package decides
 // (src/config.kama's header, docs/ROADMAP.md "Phase 2"), each honoured or refused, and the typed setters.
 import { core::println, std::collections::DynamicArray, std::time::Duration, redis::Config, redis::Protocol,
-         redis::RedisError, redis::UrlTransport, redis::socketPathMax, redis_unit_tests::check };
+         redis::RedisError, redis::UrlTransport, redis::TlsVerify, redis::TlsVersion, redis::socketPathMax,
+         redis_unit_tests::check };
 export { configTests };
 
 fn string refusal(const ref string url) {
@@ -71,10 +72,8 @@ fn int32 optionTests() {
 
 fn int32 refusalTests() {
     int32 f = 0;
-    string tls = "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://";
-    f = f + check(ok: refusal(url: "rediss://host") == tls && refusal(url: "valkeys://host") == tls, what: "refused: TLS, never plaintext instead");
     string unknown = refusal(url: "redis://host?socket_timeout=1");
-    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive",
+    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name",
                   what: "refused: an unknown option: ${unknown}");
     f = f + check(ok: !accepted(url: "redis://host?dial_timeout=1") && !accepted(url: "redis://host?timeout=1"), what: "refused: other clients' names");
     f = f + check(ok: refusal(url: "http://host").startsWith(prefix: "not a URL") || refusal(url: "http://host").startsWith(prefix: "unknown scheme"), what: "refused: RedisUrl's refusal passes through");
@@ -172,11 +171,105 @@ fn int32 setterTests() {
     return f;
 }
 
+fn string orNone(Optional<string> s) { return match (s) { case Some(value: v): copy v; case None: "<none>"; }; }
+fn bool hasBytes(const ref Optional<DynamicArray<uint8>> b) { return match (b) { case Some(value: v): true; case None: false; }; }
+
+// TLS (docs/ROADMAP.md, "Phase 5"): rediss:// and valkeys://, their options, and the setters.
+fn int32 tlsTests() {
+    int32 f = 0;
+    Config d = parsed(url: "rediss://example.com");
+    f = f + check(ok: d.transport() == UrlTransport::Tls && d.host() == "example.com" && d.port() == 6379, what: "tls: rediss:// is TLS over TCP, port 6379");
+    f = f + check(ok: d.tlsVerify() == TlsVerify::Full && orNone(s: d.tlsTrustFile()) == "<none>" && !hasBytes(b: d.tlsTrustPem()),
+                  what: "tls: by default the chain and the name are verified, against the system's roots");
+    f = f + check(ok: orNone(s: d.tlsCertificateFile()) == "<none>" && orNone(s: d.tlsKeyFile()) == "<none>" && d.tlsKeyPassword().length() == 0,
+                  what: "tls: by default no client certificate");
+    f = f + check(ok: d.tlsServerName() == "example.com" && d.tlsMinVersion() == TlsVersion::Tls12 && d.tlsMaxVersion() == TlsVersion::Tls13,
+                  what: "tls: by default the host is the name, and TLS 1.2 to 1.3");
+    Config v = parsed(url: "valkeys://[::1]:6380/2");
+    f = f + check(ok: v.transport() == UrlTransport::Tls && v.host() == "::1" && v.tlsServerName() == "::1" && v.database() == 2i64,
+                  what: "tls: valkeys://, an IPv6 address as the name");
+
+    Config o = parsed(url: "rediss://h?tls_verify=chain&tls_ca=/etc/ca.pem&tls_cert=/c.pem&tls_key=/k.pem&tls_server_name=redis.internal&protocol=2");
+    f = f + check(ok: o.tlsVerify() == TlsVerify::Chain && orNone(s: o.tlsTrustFile()) == "/etc/ca.pem", what: "tls: tls_verify=chain, tls_ca");
+    f = f + check(ok: orNone(s: o.tlsCertificateFile()) == "/c.pem" && orNone(s: o.tlsKeyFile()) == "/k.pem", what: "tls: tls_cert and tls_key");
+    f = f + check(ok: o.tlsServerName() == "redis.internal" && o.host() == "h" && isProtocol(p: o.protocol(), n: 2),
+                  what: "tls: tls_server_name names what is verified, beside the other options");
+    Config n = parsed(url: "rediss://h?tls_verify=none");
+    f = f + check(ok: n.tlsVerify() == TlsVerify::None, what: "tls: tls_verify=none, by name");
+    Config pct = parsed(url: "rediss://h?tls_ca=%2Ftmp%2Fmy%20ca.pem");
+    f = f + check(ok: orNone(s: pct.tlsTrustFile()) == "/tmp/my ca.pem", what: "tls: a path is percent-decoded");
+
+    // Each TLS option, on a URL that is not TLS.
+    DynamicArray<string> keys = DynamicArray.empty();
+    keys.add(item: "tls_verify=full"); keys.add(item: "tls_ca=/ca.pem"); keys.add(item: "tls_cert=/c.pem"); keys.add(item: "tls_key=/k.pem");
+    keys.add(item: "tls_server_name=x");
+    isize i = 0;
+    while (i < keys.length()) {
+        string q = copy keys[i];
+        string m = refusal(url: "redis://h?".concat(other: q));
+        string key = "";
+        isize k = 0;
+        while (k < q.length() && q.bytes()[k] != 61ui8) { k = k + 1; }
+        key = q.substring(start: 0, end: k);
+        f = f + check(ok: m == key.concat(other: " is a TLS option: connect over rediss:// or valkeys://"), what: "tls: ${key} refused on redis://: ${m}");
+        string u = refusal(url: "unix:///tmp/r.sock?".concat(other: q));
+        f = f + check(ok: u == key.concat(other: " is a TLS option: connect over rediss:// or valkeys://"), what: "tls: ${key} refused on unix://");
+        i = i + 1;
+    }
+    f = f + check(ok: refusal(url: "rediss://h?tls_verify=yes") == "tls_verify is full, chain or none: tls_verify=full", what: "tls: tls_verify=yes refused");
+    f = f + check(ok: refusal(url: "rediss://h?tls_verify=FULL") == "tls_verify is full, chain or none: tls_verify=full", what: "tls: tls_verify is lower case");
+    f = f + check(ok: refusal(url: "rediss://h?tls_ca=") == "tls_ca is empty: give a file's path", what: "tls: an empty tls_ca refused");
+    string pair = "tls_cert and tls_key go together: give both, or neither";
+    f = f + check(ok: refusal(url: "rediss://h?tls_cert=/c.pem") == pair && refusal(url: "rediss://h?tls_key=/k.pem") == pair, what: "tls: a certificate without its key, or a key alone, refused");
+    string unused = "a CA (tls_ca) is not used when nothing is verified (tls_verify=none): leave the CA out, or verify";
+    f = f + check(ok: refusal(url: "rediss://h?tls_verify=none&tls_ca=/ca.pem") == unused && refusal(url: "rediss://h?tls_ca=/ca.pem&tls_verify=none") == unused,
+                  what: "tls: a CA with tls_verify=none refused, in either order");
+    f = f + check(ok: refusal(url: "rediss://h?tls_server_name=a%20b").startsWith(prefix: "tls_server_name cannot contain spaces"), what: "tls: a server name with a space refused");
+    f = f + check(ok: refusal(url: "rediss://h?tls_server_name=") == "tls_server_name is empty: an empty name sets none, so leave it out", what: "tls: an empty server name refused");
+    f = f + check(ok: !accepted(url: "rediss://h?ssl_cert_reqs=none") && !accepted(url: "rediss://h?skip_verify=true") && !accepted(url: "rediss://h?verifyPeer=NONE"),
+                  what: "tls: other clients' names for turning verification off are refused, never taken");
+
+    // The setters.
+    Result<Config, RedisError> plain = Config.tcp(host: "h", port: 6379);
+    Config p = match (give plain) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "config_test: tcp"); return 1; } };
+    Result<Unit, RedisError> onPlain = p.setTlsVerify(mode: TlsVerify::Chain);
+    f = f + check(ok: refusedSetting(r: onPlain), what: "tls setters: refused on a configuration that is not TLS");
+    Result<Config, RedisError> made = Config.tls(host: "redis.example", port: 6380);
+    Config t = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "config_test: tls"); return 1; } };
+    f = f + check(ok: t.transport() == UrlTransport::Tls && t.port() == 6380 && t.tlsVerify() == TlsVerify::Full, what: "tls: Config.tls");
+    Result<Config, RedisError> noHost = Config.tls(host: "", port: 6380);
+    f = f + check(ok: refusedConfig(r: noHost), what: "tls: Config.tls refuses an empty host");
+    Result<Unit, RedisError> ca = t.setTlsTrustFile(path: "/ca.pem");
+    Result<Unit, RedisError> none = t.setTlsVerify(mode: TlsVerify::None);
+    f = f + check(ok: !refusedSetting(r: ca) && refusedSetting(r: none) && t.tlsVerify() == TlsVerify::Full, what: "setTlsVerify: None refused while a CA is set");
+    DynamicArray<uint8> pem = DynamicArray.empty();
+    pem.addAll(items: "-----BEGIN CERTIFICATE-----".bytes());
+    Result<Unit, RedisError> pemTrust = t.setTlsTrustPem(pem: give pem);
+    f = f + check(ok: !refusedSetting(r: pemTrust) && hasBytes(b: t.tlsTrustPem()) && orNone(s: t.tlsTrustFile()) == "<none>", what: "setTlsTrustPem: replaces the file");
+    Result<Unit, RedisError> emptyCa = t.setTlsTrustFile(path: "");
+    f = f + check(ok: refusedSetting(r: emptyCa), what: "setTlsTrustFile: an empty path refused");
+    Result<Unit, RedisError> id = t.setTlsIdentityFiles(certificate: "/c.pem", key: "/k.pem", password: "pw");
+    f = f + check(ok: !refusedSetting(r: id) && orNone(s: t.tlsKeyFile()) == "/k.pem" && t.tlsKeyPassword().length() == 2, what: "setTlsIdentityFiles: with a password");
+    Result<Unit, RedisError> noKey = t.setTlsIdentityFiles(certificate: "/c.pem", key: "", password: "");
+    f = f + check(ok: refusedSetting(r: noKey), what: "setTlsIdentityFiles: an empty key path refused");
+    Result<Unit, RedisError> name = t.setTlsServerName(name: "cache.internal");
+    f = f + check(ok: !refusedSetting(r: name) && t.tlsServerName() == "cache.internal", what: "setTlsServerName");
+    Result<Unit, RedisError> backwards = t.setTlsVersions(min: TlsVersion::Tls13, max: TlsVersion::Tls12);
+    Result<Unit, RedisError> only13 = t.setTlsVersions(min: TlsVersion::Tls13, max: TlsVersion::Tls13);
+    f = f + check(ok: refusedSetting(r: backwards) && !refusedSetting(r: only13) && t.tlsMinVersion() == TlsVersion::Tls13, what: "setTlsVersions: a range, never backwards");
+    Config twin = copy t;
+    f = f + check(ok: twin.tlsServerName() == "cache.internal" && hasBytes(b: twin.tlsTrustPem()) && orNone(s: twin.tlsCertificateFile()) == "/c.pem"
+                      && twin.tlsKeyPassword().length() == 2 && twin.tlsMinVersion() == TlsVersion::Tls13 && twin.transport() == UrlTransport::Tls,
+                  what: "copy: the TLS settings too");
+    return f;
+}
+
 fn int32 configTests() {
     int32 f = 0;
     f = f + defaultTests();
     f = f + optionTests();
     f = f + refusalTests();
     f = f + setterTests();
+    f = f + tlsTests();
     return f;
 }

@@ -1,6 +1,6 @@
-import { std::collections::ConstView, std::time::Duration, redis::RedisUrl, redis::UrlTransport, redis::UrlError,
-         redis::RedisError, redis::resp::Limits };
-export { Config, Protocol, socketPathMax };
+import { std::collections::ConstView, std::collections::DynamicArray, std::time::Duration, redis::RedisUrl,
+         redis::UrlTransport, redis::UrlError, redis::RedisError, redis::resp::Limits };
+export { Config, Protocol, TlsVerify, TlsVersion, socketPathMax };
 
 // How to reach a server and what to ask of it: from a URL (`Config.parse`), or from a host or a socket and typed
 // settings (`Config.tcp`, `Config.unix`, then the setters). Every setting is honoured or refused. A URL option this
@@ -17,6 +17,15 @@ export { Config, Protocol, socketPathMax };
 //   keepalive=S           TCP keepalive, as hiredis sets it: idle S seconds, a probe every S/3, 3 probes. 0 is off.
 //                         Default 15, redis-cli's.
 // The database is the URL's path (redis://host/2), or ?db= on unix://, as RedisUrl reads it.
+//
+// Over TLS (rediss://, valkeys://) as well (docs/ROADMAP.md, "Phase 5"); each is refused on redis:// and unix://:
+//   tls_verify=full|chain|none   full (the default): the certificate chains to a trusted root and names the server;
+//                         chain: it chains, and its names are not compared; none: nothing is checked
+//   tls_ca=FILE           the PEM roots to trust instead of the system's bundle
+//   tls_cert=FILE, tls_key=FILE   a client certificate and its key, in PEM: both, or neither
+//   tls_server_name=NAME  the name the certificate must carry, and the SNI sent; default the host. An IP address is
+//                         matched against the certificate's IP addresses, and never sent as SNI.
+// A file is read when a connection is made, never here, so a renewed certificate is read by the next connection.
 
 // The protocol a connection speaks.
 type enum Protocol implements Sendable {
@@ -25,6 +34,31 @@ type enum Protocol implements Sendable {
 
     // 2 or 3, as HELLO takes it.
     public const fn int32 number() { return match (this) { case Resp2: 2; case Resp3: 3; }; }
+}
+
+// How a TLS connection checks the server it reached.
+type enum TlsVerify implements Sendable {
+    // The certificate chains to a trusted root and names the server: a host name among its DNS names, an IP address
+    // among its IP addresses. The default, as every peer client's is.
+    Full,
+    // The certificate chains to a trusted root, and its names are not compared (redis-cli's checking, Lettuce's CA).
+    Chain,
+    // Nothing is checked: the connection is encrypted, and the server is not authenticated. Only ever asked for by
+    // name.
+    None;
+
+    // As the tls_verify option spells it.
+    public const fn string text() { return match (this) { case Full: "full"; case Chain: "chain"; case None: "none"; }; }
+}
+
+// A TLS protocol version. A connection agrees on one between its bounds, TLS 1.2 and 1.3 by default: the servers'
+// own default (tls-protocols).
+type enum TlsVersion implements Sendable {
+    Tls12,
+    Tls13;
+
+    // 2 for TLS 1.2, 3 for TLS 1.3, for comparing.
+    public const fn int32 minor() { return match (this) { case Tls12: 2; case Tls13: 3; }; }
 }
 
 // The longest socket path the platform takes: sizeof(sun_path) less its terminator.
@@ -54,6 +88,17 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     Duration keepAliveIdle;
     Limits readerLimits;
     bool identify = true;
+    TlsVerify verifyMode;
+    Optional<string> trustPath;
+    Optional<DynamicArray<uint8>> trustBytes;
+    Optional<string> certPath;
+    Optional<string> keyPath;
+    Optional<DynamicArray<uint8>> certBytes;
+    Optional<DynamicArray<uint8>> keyBytes;
+    DynamicArray<uint8> keySecret;
+    Optional<string> serverNameText;
+    TlsVersion minVersion;
+    TlsVersion maxVersion;
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -70,6 +115,17 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.keepAliveIdle = Duration.fromSecs(s: DEFAULT_KEEPALIVE_SECS);
         this.readerLimits = Limits.defaults();
         this.identify = true;
+        this.verifyMode = TlsVerify::Full;
+        this.trustPath = Optional::None;
+        this.trustBytes = Optional::None;
+        this.certPath = Optional::None;
+        this.keyPath = Optional::None;
+        this.certBytes = Optional::None;
+        this.keyBytes = Optional::None;
+        this.keySecret = DynamicArray.empty();
+        this.serverNameText = Optional::None;
+        this.minVersion = TlsVersion::Tls12;
+        this.maxVersion = TlsVersion::Tls13;
     }
 
     public ctor copy(ref Config source) {
@@ -87,11 +143,21 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.keepAliveIdle = source.keepAliveIdle;
         this.readerLimits = source.readerLimits;
         this.identify = source.identify;
+        this.verifyMode = source.verifyMode;
+        this.trustPath = copy source.trustPath;
+        this.trustBytes = copy source.trustBytes;
+        this.certPath = copy source.certPath;
+        this.keyPath = copy source.keyPath;
+        this.certBytes = copy source.certBytes;
+        this.keyBytes = copy source.keyBytes;
+        this.keySecret = copy source.keySecret;
+        this.serverNameText = copy source.serverNameText;
+        this.minVersion = source.minVersion;
+        this.maxVersion = source.maxVersion;
     }
 
-    // A connection URL: redis://, valkey://, or unix:// (src/url.kama says how each is read), with the options
-    // above. rediss:// and valkeys:// are refused until TLS arrives (docs/ROADMAP.md, phase 5); they never fall back
-    // to plaintext.
+    // A connection URL: redis://, valkey://, rediss://, valkeys:// or unix:// (src/url.kama says how each is read),
+    // with the options above.
     public ctor Result<Config, RedisError> parse(const ref string url) {
         Result<RedisUrl, UrlError> read = RedisUrl.parse(text: url);
         RedisUrl u = match (give read) {
@@ -99,7 +165,6 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             case Err(error: e): { return Result::Err(error: RedisError::Config(detail: e.message())); }
         };
         UrlTransport kind = u.transport();
-        if (kind == UrlTransport::Tls) { return Result::Err(error: tlsRefused()); }
         Config c = Config.blank(kind: kind);
         if (kind == UrlTransport::Unix) {
             string path = u.socketPath();
@@ -124,6 +189,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
             i = i + 1;
         }
+        Optional<RedisError> unpaired = c.tlsAgreement();
+        match (give unpaired) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
         return Result::Ok(value: give c);
     }
 
@@ -134,6 +201,15 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         Config c = Config.blank(kind: UrlTransport::Tcp);
         c.hostText = give host;
         c.portNumber = port;
+        return Result::Ok(value: give c);
+    }
+
+    // A server at `host` and `port`, over TLS: the certificate is verified against the system's roots and must name
+    // `host` (TlsVerify::Full), until the setters below say otherwise.
+    public ctor Result<Config, RedisError> tls(string host, int32 port) {
+        Result<Config, RedisError> made = Config.tcp(host: give host, port: port);
+        Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        c.kind = UrlTransport::Tls;
         return Result::Ok(value: give c);
     }
 
@@ -204,7 +280,92 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     // Whether the connection names this library to the server (CLIENT SETINFO lib-name and lib-ver). On by default.
     public fn void setIdentity(bool on) { this.identify = on; }
 
-    // TCP, or a Unix-domain socket. (TLS waits for phase 5.)
+    // ---- TLS. Each setter is refused on a configuration that is not TLS (rediss://, valkeys://, Config.tls). ----
+
+    // How the server's certificate is checked (tls_verify). TlsVerify::None is refused while a CA is set: it would
+    // never be used.
+    public fn Result<Unit, RedisError> setTlsVerify(TlsVerify mode) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        this.verifyMode = mode;
+        Optional<RedisError> bad = this.tlsAgreement();
+        match (give bad) { case Some(value: e): { this.verifyMode = TlsVerify::Full; return Result::Err(error: give e); } case None: { } };
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The PEM file of roots to trust instead of the system's bundle (tls_ca).
+    public fn Result<Unit, RedisError> setTlsTrustFile(string path) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (path.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the CA file's path is empty")); }
+        if (this.verifyMode == TlsVerify::None) { return Result::Err(error: unusedTrust()); }
+        this.trustPath = Optional::Some(value: give path);
+        this.trustBytes = Optional::None;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // PEM roots to trust instead of the system's bundle, as bytes.
+    public fn Result<Unit, RedisError> setTlsTrustPem(DynamicArray<uint8> pem) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (pem.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the CA's PEM is empty")); }
+        if (this.verifyMode == TlsVerify::None) { return Result::Err(error: unusedTrust()); }
+        this.trustBytes = Optional::Some(value: give pem);
+        this.trustPath = Optional::None;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A client certificate (its chain) and its key, from PEM files (tls_cert, tls_key). `password` decrypts an
+    // encrypted key; "" for one that is not.
+    public fn Result<Unit, RedisError> setTlsIdentityFiles(string certificate, string key, string password) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (certificate.length() == 0 || key.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the certificate's or the key's path is empty")); }
+        this.certPath = Optional::Some(value: give certificate);
+        this.keyPath = Optional::Some(value: give key);
+        this.certBytes = Optional::None;
+        this.keyBytes = Optional::None;
+        this.keySecret = DynamicArray.empty();
+        this.keySecret.addAll(items: password.bytes());
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A client certificate (its chain) and its key, as PEM bytes. `password` decrypts an encrypted key; empty for one
+    // that is not.
+    public fn Result<Unit, RedisError> setTlsIdentityPem(DynamicArray<uint8> certificate, DynamicArray<uint8> key, DynamicArray<uint8> password) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (certificate.length() == 0 || key.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the certificate's or the key's PEM is empty")); }
+        this.certBytes = Optional::Some(value: give certificate);
+        this.keyBytes = Optional::Some(value: give key);
+        this.certPath = Optional::None;
+        this.keyPath = Optional::None;
+        this.keySecret = give password;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The name the certificate must carry, and the SNI sent, in place of the host (tls_server_name): a host name, or
+    // an IP address without brackets.
+    public fn Result<Unit, RedisError> setTlsServerName(string name) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        Optional<RedisError> bad = checkName(name: name.bytes(), what: "tls_server_name");
+        match (give bad) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        this.serverNameText = Optional::Some(value: give name);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The versions a connection may agree on, from `min` to `max`.
+    public fn Result<Unit, RedisError> setTlsVersions(TlsVersion min, TlsVersion max) {
+        Optional<RedisError> notTls = this.tlsOnly();
+        match (give notTls) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (min.minor() > max.minor()) { return Result::Err(error: RedisError::Config(detail: "the lowest TLS version is above the highest")); }
+        this.minVersion = min;
+        this.maxVersion = max;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // TCP, TLS over TCP, or a Unix-domain socket.
     public const fn UrlTransport transport() { return this.kind; }
     // The host as given, without brackets ("127.0.0.1" when none was); "" for a socket.
     public const fn const ref string host() { return this.hostText; }
@@ -223,6 +384,38 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public const fn Duration keepAlive() { return this.keepAliveIdle; }
     public const fn Limits limits() { return this.readerLimits; }
     public const fn bool identity() { return this.identify; }
+    // The TLS settings, which mean something only over TLS.
+    public const fn TlsVerify tlsVerify() { return this.verifyMode; }
+    // The CA file, or the CA's PEM, trusted instead of the system's bundle; neither when it is the system's.
+    public const fn Optional<string> tlsTrustFile() { return copy this.trustPath; }
+    public const fn const ref Optional<DynamicArray<uint8>> tlsTrustPem() { return this.trustBytes; }
+    // A client certificate and its key, as files or as PEM; none of the four when there is none.
+    public const fn Optional<string> tlsCertificateFile() { return copy this.certPath; }
+    public const fn Optional<string> tlsKeyFile() { return copy this.keyPath; }
+    public const fn const ref Optional<DynamicArray<uint8>> tlsCertificatePem() { return this.certBytes; }
+    public const fn const ref Optional<DynamicArray<uint8>> tlsKeyPem() { return this.keyBytes; }
+    // The key's password; empty for a key that is not encrypted.
+    public const fn const ref DynamicArray<uint8> tlsKeyPassword() { return this.keySecret; }
+    // The name the certificate must carry and the SNI sent: tls_server_name, or the host.
+    public const fn string tlsServerName() { return match (this.serverNameText) { case Some(value: n): copy n; case None: copy this.hostText; }; }
+    public const fn TlsVersion tlsMinVersion() { return this.minVersion; }
+    public const fn TlsVersion tlsMaxVersion() { return this.maxVersion; }
+
+    fn Optional<RedisError> tlsOnly() {
+        if (this.kind == UrlTransport::Tls) { return Optional::None; }
+        return refused(m: "TLS settings need a TLS connection: rediss://, valkeys:// or Config.tls");
+    }
+
+    // What the TLS options must agree on, once all are read: a certificate with its key, and no CA when nothing is
+    // verified.
+    fn Optional<RedisError> tlsAgreement() {
+        bool cert = match (this.certPath) { case Some(value: p): true; case None: false; };
+        bool key = match (this.keyPath) { case Some(value: p): true; case None: false; };
+        if (cert != key) { return refused(m: "tls_cert and tls_key go together: give both, or neither"); }
+        bool trust = match (this.trustPath) { case Some(value: p): true; case None: false; };
+        if (trust && this.verifyMode == TlsVerify::None) { return Optional::Some(value: unusedTrust()); }
+        return Optional::None;
+    }
 
     // One URL option; None when it was honoured.
     fn Optional<RedisError> option(const ref string key, const ref string value) {
@@ -255,14 +448,40 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         }
         // RedisUrl has read a unix:// URL's database already.
         if (key == "db" && this.kind == UrlTransport::Unix) { return Optional::None; }
-        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive"));
+        if (key == "tls_verify" || key == "tls_ca" || key == "tls_cert" || key == "tls_key" || key == "tls_server_name") {
+            if (this.kind != UrlTransport::Tls) { return refused(m: key.concat(other: " is a TLS option: connect over rediss:// or valkeys://")); }
+            return this.tlsOption(key: key, value: value);
+        }
+        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name"));
+    }
+
+    // One TLS option, on a TLS URL. tls_cert and tls_key are checked together, and tls_ca against tls_verify, once
+    // every option is read (tlsAgreement).
+    fn Optional<RedisError> tlsOption(const ref string key, const ref string value) {
+        if (key == "tls_verify") {
+            if (value == "full") { this.verifyMode = TlsVerify::Full; return Optional::None; }
+            if (value == "chain") { this.verifyMode = TlsVerify::Chain; return Optional::None; }
+            if (value == "none") { this.verifyMode = TlsVerify::None; return Optional::None; }
+            return refused(m: "tls_verify is full, chain or none: tls_verify=full");
+        }
+        if (key == "tls_server_name") {
+            Optional<RedisError> bad = checkName(name: value.bytes(), what: "tls_server_name");
+            match (give bad) { case Some(value: e): { return Optional::Some(value: give e); } case None: { } };
+            this.serverNameText = Optional::Some(value: copy value);
+            return Optional::None;
+        }
+        if (value.length() == 0) { return refused(m: key.concat(other: " is empty: give a file's path")); }
+        if (key == "tls_ca") { this.trustPath = Optional::Some(value: copy value); return Optional::None; }
+        if (key == "tls_cert") { this.certPath = Optional::Some(value: copy value); return Optional::None; }
+        this.keyPath = Optional::Some(value: copy value);
+        return Optional::None;
     }
 }
 
 fn Optional<RedisError> refused(const ref string m) { return Optional::Some(value: RedisError::Config(detail: copy m)); }
 
-fn RedisError tlsRefused() {
-    return RedisError::Config(detail: "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://");
+fn RedisError unusedTrust() {
+    return RedisError::Config(detail: "a CA (tls_ca) is not used when nothing is verified (tls_verify=none): leave the CA out, or verify");
 }
 
 fn RedisError keepAliveRefused() {

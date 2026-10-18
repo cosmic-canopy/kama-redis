@@ -81,6 +81,7 @@ type resource Connection implements Sendable {
     // The handshake over a transport the caller opened. `config` supplies everything but where to connect;
     // `connect_timeout` bounds the handshake.
     public unsafe ctor Result<Connection, RedisError> connectOver(Owned<Transport> transport, const ref Config config) {
+        if (config.transport() == UrlTransport::Tls) { return Result::Err(error: tlsNotYet()); }
         Deadline deadline = Deadline.within(span: config.connectTimeout());
         Connection c = Connection.over(transport: give transport, config: config);
         Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
@@ -91,6 +92,7 @@ type resource Connection implements Sendable {
     }
 
     unsafe ctor Result<Connection, RedisError> establish(const ref Config config, ref Opener opener) {
+        if (config.transport() == UrlTransport::Tls) { return Result::Err(error: tlsNotYet()); }
         ConnectError failures = ConnectError.make();
         DynamicArray<DialTarget> targets = Connection::targetsOf(config: config, failures: failures);
         isize i = 0;
@@ -646,4 +648,9 @@ type resource Opener implements Sendable {
         Owned<Transport> transport = give tcp;
         return Result::Ok(value: give transport);
     }
+}
+
+// A TLS configuration is refused until this connection secures its link, and never dialled in plaintext.
+fn RedisError tlsNotYet() {
+    return RedisError::Config(detail: "TLS (rediss://, valkeys://) is not supported yet: connect over redis:// or unix://");
 }
