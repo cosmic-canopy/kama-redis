@@ -5,7 +5,9 @@
 #
 #   ca.crt / ca.key              the test CA
 #   server.crt / server.key      the server: CN localhost, subjectAltName DNS:localhost, IP:127.0.0.1, IP:::1
+#   wronghost.crt / .key         a server certificate for another name: CN and subjectAltName DNS:wrong.example
 #   client.crt / client.key      a client certificate, CN kr_cert, signed by the test CA
+#   client-enc.key               client.key, encrypted as PKCS#8 (PBES2, AES-256-CBC) under kr_client_key_pw
 #   other-ca.crt / other-ca.key  a CA nobody trusts, for the "untrusted" cases
 #   other-client.crt / .key      a client certificate signed by the untrusted CA
 #
@@ -18,7 +20,7 @@ DIR="$ROOT/out/test-certs"
 OPENSSL=${OPENSSL:-openssl}
 
 # Bump GENERATION when the set of files changes, so an older out/test-certs is regenerated rather than used.
-GENERATION=1
+GENERATION=2
 if [ "$(cat "$DIR/.generation" 2>/dev/null)" = "$GENERATION" ] && [ "${1:-}" != "--force" ]; then
     exit 0
 fi
@@ -41,6 +43,11 @@ basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:localhost,IP:127.0.0.1,IP:::1
+[wronghost]
+basicConstraints = CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:wrong.example
 [client]
 basicConstraints = CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
@@ -61,8 +68,10 @@ leaf() {  # leaf <name> <common name> <issuer> <extensions>
 ca   ca           "kama-redis test CA"
 ca   other-ca     "kama-redis untrusted CA"
 leaf server       localhost  ca       server
+leaf wronghost    wrong.example ca    wronghost
 leaf client       kr_cert    ca       client
 leaf other-client kr_cert    other-ca client
+ossl pkcs8 -topk8 -v2 aes-256-cbc -in ../client.key -out ../client-enc.key -passout pass:kr_client_key_pw
 
 # The keys are private to their owner; the server's copy is made readable to the server by start.sh.
 chmod 0600 ../*.key

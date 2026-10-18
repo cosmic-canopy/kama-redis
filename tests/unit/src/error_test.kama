@@ -52,7 +52,8 @@ fn int32 replyTests() {
     isize i = 0;
     while (i < names.length()) {
         DynamicArray<uint8> reply = unhex(text: hex[i]);
-        if (reply[0] == 45ui8) {
+        // A server's silence (tls-at-plaintext, plaintext-at-tls) is a case with no bytes.
+        if (reply.length() > 0 && reply[0] == 45ui8) {
             ServerError e = errorOf(reply: reply.view());
             string name = copy names[i];
             string text = e.message();

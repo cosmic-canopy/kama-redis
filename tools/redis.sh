@@ -10,9 +10,10 @@
 #   tools/redis.sh list                 the supported servers
 #
 # S defaults to redis-8.10. Supported: redis-6.2 redis-7.2 redis-7.4 redis-8.2 redis-8.10, and valkey-7.2
-# valkey-8.1 valkey-9.1. Each server gets its own container (kama-redis-S) and three host ports, bound to
+# valkey-8.1 valkey-9.1. Each server gets its own container (kama-redis-S) and four host ports, bound to
 # 127.0.0.1 only, so servers can run side by side: the main server in plaintext (the base port), over TLS
-# (base + 100), and the locked server, whose default user has a password (base + 200).
+# (base + 100), and the locked server, whose default user has a password (base + 200), over TLS that requires a
+# client certificate (base + 300).
 #
 # The runtime is $CONTAINER_RUNTIME, else podman, else docker. The image is the official
 # docker.io/library/redis:V or docker.io/valkey/valkey:V; REDISTEST_IMAGE overrides. The server is configured
@@ -41,6 +42,7 @@ esac
 PORT=$BASE
 TLS_PORT=$((BASE + 100))
 LOCKED_PORT=$((BASE + 200))
+MTLS_PORT=$((BASE + 300))
 case "$SERVER" in
     redis-*)  IMAGE=${REDISTEST_IMAGE:-docker.io/library/redis:${SERVER#redis-}} ;;
     valkey-*) IMAGE=${REDISTEST_IMAGE:-docker.io/valkey/valkey:${SERVER#valkey-}} ;;
@@ -67,7 +69,10 @@ REDISTEST_HOST=127.0.0.1
 REDISTEST_PORT=$PORT
 REDISTEST_TLS_PORT=$TLS_PORT
 REDISTEST_LOCKED_PORT=$LOCKED_PORT
+REDISTEST_MTLS_PORT=$MTLS_PORT
 REDISTEST_CERTDIR=$ROOT/out/test-certs
+REDISTEST_KEY_PASSWORD=kr_client_key_pw
+REDISTEST_CERT_USER_PASSWORD=kr_cert_pw
 REDISTEST_DEFAULT_PASSWORD=kr_default_pw
 REDISTEST_ACL_PASSWORD=kr_acl_pw
 REDISTEST_RO_PASSWORD=kr_ro_pw
@@ -75,11 +80,12 @@ REDISTEST_OFF_PASSWORD=kr_off_pw
 EOF
 }
 
-# Ready means every listener answers: plaintext, TLS and the locked server, from inside the container.
+# Ready means every listener answers: plaintext, TLS, and the locked server in plaintext and over TLS, from inside
+# the container.
 wait_ready() {
     i=0
     while [ $i -lt 60 ]; do
-        if "$RT" exec "$NAME" sh -c 'redis-cli -p 6379 ping && redis-cli -p 6380 --tls --cacert /run/kr/certs/ca.crt ping && redis-cli -p 6381 -a kr_default_pw --no-auth-warning ping' 2>/dev/null | grep -c PONG | grep -qx 3; then
+        if "$RT" exec "$NAME" sh -c 'redis-cli -p 6379 ping && redis-cli -p 6380 --tls --cacert /run/kr/certs/ca.crt ping && redis-cli -p 6381 -a kr_default_pw --no-auth-warning ping && redis-cli -p 6382 --tls --cacert /run/kr/certs/ca.crt --cert /certs/client.crt --key /certs/client.key -a kr_default_pw --no-auth-warning ping' 2>/dev/null | grep -c PONG | grep -qx 4; then
             return 0
         fi
         running || { echo "redis.sh: $NAME exited during startup:" >&2; "$RT" logs "$NAME" 2>&1 | tail -30 >&2; exit 1; }
@@ -92,18 +98,18 @@ case "$cmd" in
     up)
         "$ROOT/tools/gen-test-certs.sh" >/dev/null
         if running; then
-            echo "redis.sh: $NAME already running on 127.0.0.1:$PORT (TLS $TLS_PORT, locked $LOCKED_PORT)"
+            echo "redis.sh: $NAME already running on 127.0.0.1:$PORT (TLS $TLS_PORT, locked $LOCKED_PORT, locked TLS $MTLS_PORT)"
         else
             "$RT" rm -f "$NAME" >/dev/null 2>&1 || true
             # The entrypoint is replaced by start.sh, so the servers run as the container's root user.
             "$RT" run -d --name "$NAME" \
-                -p "127.0.0.1:$PORT:6379" -p "127.0.0.1:$TLS_PORT:6380" -p "127.0.0.1:$LOCKED_PORT:6381" \
+                -p "127.0.0.1:$PORT:6379" -p "127.0.0.1:$TLS_PORT:6380" -p "127.0.0.1:$LOCKED_PORT:6381" -p "127.0.0.1:$MTLS_PORT:6382" \
                 -v "$ROOT/out/test-certs:/certs:ro" \
                 -v "$ROOT/tests/integration/server:/kr:ro" \
                 --entrypoint /kr/start.sh \
                 "$IMAGE" >/dev/null
             wait_ready
-            echo "redis.sh: $NAME ready on 127.0.0.1:$PORT (TLS $TLS_PORT, locked $LOCKED_PORT): $("$RT" exec "$NAME" redis-server --version)"
+            echo "redis.sh: $NAME ready on 127.0.0.1:$PORT (TLS $TLS_PORT, locked $LOCKED_PORT, locked TLS $MTLS_PORT): $("$RT" exec "$NAME" redis-server --version)"
         fi
         write_env
         ;;
@@ -159,6 +165,14 @@ try PONG          "TLS, server verified"                -p 6380 --tls $CA ping
 try PONG          "TLS, client certificate"             -p 6380 --tls $CA --cert /certs/client.crt --key /certs/client.key ping
 try "*Could not*" "TLS, server's CA not trusted"        -p 6380 --tls --cacert /certs/other-ca.crt ping
 refused           "TLS, client certificate untrusted"   -p 6380 --tls $CA --cert /certs/other-client.crt --key /certs/other-client.key ping
+CERT="--cert /certs/client.crt --key /certs/client.key"
+try PONG          "TLS, client certificate required, given"   -p 6382 --tls $CA $CERT -a kr_default_pw ping
+refused           "TLS, client certificate required, missing" -p 6382 --tls $CA -a kr_default_pw ping
+# start.sh gives tls-auth-clients-user CN to the servers that have it; on the others a certificate logs no one in.
+case "$(redis-cli --no-auth-warning -p 6381 -a kr_default_pw config get tls-auth-clients-user 2>&1)" in
+    *CN*) try kr_cert  "TLS, a certificate logs in as its CN"      -p 6382 --tls $CA $CERT acl whoami ;;
+    *)    try "*NOAUTH*" "TLS, a certificate logs no one in"       -p 6382 --tls $CA $CERT acl whoami ;;
+esac
 try PONG          "Unix socket"                         -s /run/kr/redis.sock ping
 echo "  $n checks"
 EOF

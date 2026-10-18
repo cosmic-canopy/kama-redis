@@ -22,13 +22,18 @@
 #   - Blocking commands: each server's `ACL CAT blocking`, sorted (the server lists them in hash order), and for each
 #     blocking command the server documents (7.0 and later), its arguments as COMMAND DOCS gives them, so the
 #     client's table of where each one's timeout is can be checked against every server.
+#   - The wrong port (phase 5): what the plaintext port sends back to a TLS ClientHello (the image's own
+#     `redis-cli --tls`'s, captured on a listener), and what a TLS port sends back to a plaintext HELLO, with whether
+#     each closed the connection. The script requires what the client relies on: silence, the connection left open,
+#     for the first (the server's inline parser looks for a newline with strchr, which stops at the ClientHello's
+#     NUL), and a close for the second.
 #   - Proxies: Envoy's redis proxy answers HELLO itself, differently in each release. Its messages are read from its
 #     source (command_splitter_impl.cc and .h at v1.32.0, v1.36.0 and v1.39.0, pinned by SHA256), and laid out in
 #     the order that source checks them, which the script verifies before using it. twemproxy has no entry: it
 #     closes the connection on a command it does not know (nc_redis.c), which is a hangup, not bytes.
 #
 # Run it, then `git diff` must be empty unless a server image moved (the header names each server's version).
-# Needs perl, curl, and podman or docker.
+# Needs perl, curl, openssl (tools/gen-test-certs.sh, for the TLS port), and podman or docker.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT="$ROOT/tests/unit/src/server_vectors.kama"
@@ -87,6 +92,8 @@ case "$(redis-server --version)" in
     Redis*) ;;
     *) start 7005 --extended-redis-compatibility yes; start 7006 --availability-zone az-1 ;;
 esac
+# TLS on 7009, with the test PKI mounted at /certs, for what a TLS port answers in plaintext.
+start 7008 --tls-port 7009 --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no
 # Two cluster nodes, for sharded pub/sub's MOVED, CROSSSLOT and the server's own sunsubscribe (ask.pl joins them).
 for p in 7100 7101; do start $p --cluster-enabled yes --cluster-config-file /tmp/nodes-$p.conf --cluster-require-full-coverage no; done
 redis-server --version | sed -n "s/.*[Ss]erver v=\([0-9.]*\) .*/\1/p"
@@ -101,7 +108,7 @@ SH
 # dropped), then the command whose reply is recorded: <case> TAB <command> TAB <the reply's bytes, in hex>. A reply
 # is read as RESP, one whole value, so nothing after it is taken with it.
 cat > "$tmp/ask.pl" <<'PERL'
-use strict; use warnings; use IO::Socket::INET;
+use strict; use warnings; use IO::Socket::INET; use IO::Select;
 my %up = map { $_ => 1 } @ARGV;
 sub open_to {
     my $port = shift; my $s;
@@ -519,15 +526,52 @@ sub scene {
         }
     }
 }
+
+# ---- Phase 5: a port spoken to in the wrong protocol ----
+# Everything the server sends until it is quiet for two seconds, and whether it closed.
+sub drain {
+    my $c = shift; my $got = ''; my $closed = 0;
+    my $sel = IO::Select->new($c->{s});
+    while ($sel->can_read(2)) {
+        my $n = sysread($c->{s}, my $chunk, 65536);
+        if (!$n) { $closed = 1; last; }
+        $got .= $chunk;
+    }
+    return ($got, $closed);
+}
+if ($up{7008}) {
+    # The image's own redis-cli, pointed at a listener here, gives a real ClientHello: its first record is kept.
+    my $l = IO::Socket::INET->new(Listen => 1, LocalAddr => '127.0.0.1', LocalPort => 7200, Proto => 'tcp', ReuseAddr => 1) or die "listen: $!\n";
+    my $pid = fork() // die "fork: $!\n";
+    if ($pid == 0) { open STDOUT, '>', '/dev/null'; open STDERR, '>', '/dev/null'; exec 'redis-cli', '--tls', '--insecure', '-p', '7200', 'PING'; exit 1; }
+    my $a = $l->accept or die "accept: $!\n"; binmode $a;
+    my $hello = '';
+    while (length($hello) < 5 || length($hello) < 5 + unpack('n', substr($hello, 3, 2))) {
+        my $n = sysread($a, my $chunk, 65536); die "redis-cli sent no ClientHello\n" unless $n; $hello .= $chunk;
+    }
+    kill 'KILL', $pid; waitpid($pid, 0); close $a; close $l;
+    die "redis-cli's first record is not a TLS handshake\n" unless substr($hello, 0, 1) eq "\x16";
+    my $c = open_to(7000);
+    print { $c->{s} } substr($hello, 0, 5 + unpack('n', substr($hello, 3, 2)));
+    my ($got, $closed) = drain($c); close $c->{s};
+    record('tls-at-plaintext', ['<a TLS ClientHello, as redis-cli --tls sends it>'], $got);
+    print "ending\ttls-at-plaintext\t", ($closed ? 'closed' : 'open'), "\n";
+    my $t = open_to(7009);
+    print { $t->{s} } enc('HELLO', '3');
+    ($got, $closed) = drain($t); close $t->{s};
+    record('plaintext-at-tls', ['HELLO', '3'], $got);
+    print "ending\tplaintext-at-tls\t", ($closed ? 'closed' : 'open'), "\n";
+}
 PERL
 
+"$ROOT/tools/gen-test-certs.sh" >/dev/null
 : > "$tmp/live.tsv"
 for server in $SERVERS; do
     case "$server" in
         redis-*)  image=docker.io/library/redis:${server#redis-} ;;
         valkey-*) image=docker.io/valkey/valkey:${server#valkey-} ;;
     esac
-    "$RT" run --rm -i --network none "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt"
+    "$RT" run --rm -i --network none -v "$ROOT/out/test-certs:/certs:ro" "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt"
     number=$(head -n 1 "$tmp/one.txt")
     case "$number" in [0-9]*.[0-9]*) ;; *) echo "gen-server-vectors: $server gave no version" >&2; exit 1 ;; esac
     tail -n +2 "$tmp/one.txt" | sed "s/^/${server%%-*}-$number	/" >> "$tmp/live.tsv"
@@ -538,7 +582,7 @@ use strict; use warnings;
 my ($tmp, $out) = @ARGV;
 
 # ---- the servers ----
-my (@versions, %codeServers, @replies, %seen, @blocking, @docs);
+my (@versions, %codeServers, @replies, %seen, @blocking, @docs, %ending);
 open my $f, '<', "$tmp/live.tsv" or die;
 while (<$f>) {
     chomp; my ($version, $what, @rest) = split /\t/, $_, -1;
@@ -551,14 +595,25 @@ while (<$f>) {
     }
     if ($what eq 'blocking') { push @blocking, [$version, $rest[0]]; next; }
     if ($what eq 'docs') { push @docs, ["$version $rest[0]", $rest[1]]; next; }
+    if ($what eq 'ending') { $ending{"$version $rest[0]"} = $rest[1]; next; }
     push @replies, ["$version $what", $rest[0], $rest[1], $rest[2] // ''];
 }
 my %count; $count{(split / /, $_->[0])[1]}++ for @replies;
-for my $must (qw(hello3 hello2 hello3-auth hello3-auth-wrong locked-hello3 locked-auth1 wrongtype unblocked busykey
+for my $must (qw(hello3 hello2 hello3-auth hello3-auth-wrong locked-hello3 locked-auth1 wrongtype unblocked busykey tls-at-plaintext plaintext-at-tls
                  get-hit/2 get-hit/3 exec-null/2 exec-null/3 exec-ok/3 queued/2 script-load evalsha-hit blpop-null/3)) {
     die "gen-server-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 die "gen-server-vectors: no compat-hello3 case\n" unless $count{'compat-hello3'};
+# The wrong port: the client's words rest on these. A ClientHello at the plaintext port meets silence, the connection
+# left open, so a rediss:// client times out; a plaintext HELLO at a TLS port is closed, so a redis:// client reads an
+# end of stream.
+for my $r (@replies) {
+    my ($version, $case) = split / /, $r->[0];
+    next unless $case eq 'tls-at-plaintext' || $case eq 'plaintext-at-tls';
+    my $end = $ending{$r->[0]} // '';
+    die "gen-server-vectors: $version answered a TLS ClientHello at its plaintext port ($r->[2], $end)\n" if $case eq 'tls-at-plaintext' && ($r->[2] ne '' || $end ne 'open');
+    die "gen-server-vectors: $version left a plaintext HELLO at its TLS port open ($r->[2])\n" if $case eq 'plaintext-at-tls' && $end ne 'closed';
+}
 for my $proto (2, 3) {
     for my $must (qw(sub-two sub-twice unsub-all punsub-all unsub-none message message-twice pmessage ping-subscribed ping-left
                      sub-noperm tracking-redirect tracking-flush)) {
@@ -640,6 +695,9 @@ print $o <<"HEAD";
 //     whole. An unsubscribe-all is recorded with its names sorted and its counts falling by one, the order Valkey
 //     9.1 sends: Redis's order follows a hash seeded at random in each process. The cluster cases ran on two nodes
 //     joined by hand (7.0 and later).
+//   - The wrong port: tls-at-plaintext is what the plaintext port sent back to a TLS ClientHello (redis-cli --tls's)
+//     within two seconds of silence, and plaintext-at-tls what a TLS port sent back to a plaintext HELLO. The script
+//     checked that the first left the connection open and the second closed it.
 //   - blockingServers / blockingNames: each server's `ACL CAT blocking`, sorted.
 //   - docsNames / docsArgs: "<server> <command>" for each blocking command a server documents (7.0 and later), and
 //     its arguments from COMMAND DOCS, each name:type:token:flags:children.
