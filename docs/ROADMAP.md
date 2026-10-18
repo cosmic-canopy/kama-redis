@@ -455,6 +455,9 @@ Each step ends green before its commit:
     - Lettuce reconnects on its own and replays.
   - Decide what is retried. Nothing is resent silently: a command that may have run is the caller's to retry.
   - A `Subscriber` resubscribes from its kept sets.
+  - A TLS reconnect reads its files again (a `TlsConfig` per attempt, phase 5), so a renewed certificate is picked up.
+    `@kama/tls` plans session resumption for TLS 1.3 and 1.2 (its ROADMAP, 2026-10-18; 0.1.4 added SNI-chosen server
+    identities): check what it offers then, since resuming saves a reconnect a full handshake.
 - **Examples:** an `examples/` program per area, built and run against a live server by a script, as
   `tools/check-readme.sh` does the README's.
 - **Hardening:** a server restart in the middle of a call, a pipeline and a subscription; `CLIENT KILL`; memory
