@@ -1,9 +1,9 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0 to 3 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
-client for one server. "The release plan" below says what each release holds. Phase 4 (pub/sub) is next, and "Phase 4:
-where to start" is its session plan. Phases 5 (TLS) and 7a (reconnection, examples, hardening, docs) follow, each with
-an outline, and then 0.1.0.
+Where this is, 2026-10-18: phases 0 to 4 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
+client for one server. "The release plan" below says what each release holds. Phase 5 (TLS) is next: "Phase 5: an
+outline" is below, and its session plan is drawn up from primary sources at its start, as phases 3 and 4's were. Phase
+7a (reconnection, examples, hardening, docs) follows, and then 0.1.0.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -21,6 +21,10 @@ an outline, and then 0.1.0.
   - pipelines, blocking deadlines, transactions (`transact`, `watched`), scripts and `Scan`.
   The unit suite reads every typed pair from all eight servers under both protocols, and builds each blocking
   command from every server's COMMAND DOCS. `tools/check-readme.sh` runs the README's programs live.
+- Pub/sub is in (phase 4): `Subscriber` under RESP2 and RESP3, sharded pub/sub with the server's own `sunsubscribe`,
+  and a connection's bounded set-aside pushes (`takePushes`, `droppedPushes`); `CLIENT TRACKING` and `CACHING` are
+  refused until 0.3.0. The unit suite replays each server's pub/sub captures under both protocols (two cluster nodes
+  included), every order of an unsubscribe-all among them; the live suite runs on all eight servers.
 - Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin, 2026-10-18) and cstar's
   0.9.668; `tools/test-integration.sh` on all eight servers on 0.9.667; the README's programs live.
 - Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
@@ -39,7 +43,7 @@ does its discipline:
 | 1 | Pure layers. `redis::resp`: a reader and a writer for every RESP2 and RESP3 type (attributes, push, streamed strings and aggregates, big numbers, verbatim strings), bounded and hostile-input safe, with vectors from the RESP specification and hiredis's reader tests, by script. The `redis://`, `rediss://` and `unix://` URL forms. CRC16 key slots and hash tags, with the cluster specification's vectors | **done** |
 | 2 | Connection. `Config` from a URL or settings. TCP and Unix sockets, non-blocking with connect and command deadlines, TCP keepalive. `HELLO 3` with `AUTH` and `SETNAME` in one round trip, RESP2 when asked for (`protocol=2`) or when a proxy refuses `HELLO`, `SELECT`. Errors as values, by their code (`ERR`, `WRONGTYPE`, `NOAUTH`, `NOPERM`, `WRONGPASS`, `MOVED`, `ASK`, `LOADING`, `BUSY`, `READONLY`, …). A `Transport` contract and a scripted fake server for every hostile path. Integration suite on the whole matrix | **done** |
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
-| 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | next |
+| 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0** | |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0** | |
@@ -54,7 +58,7 @@ The roadmap is unchanged; its releases are phased. Each release is held to the s
 - the whole matrix passes live, debug and release.
 
 Anything not in a release yet is refused clearly rather than half there. Today `rediss://` is refused by name, a
-cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` will be refused (phase 4, step 2).
+cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` is refused (phase 4, step 2).
 
 - **0.1.0, a complete client for one server:**
   - what phases 0–3 built;
@@ -62,7 +66,7 @@ cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` will
   - TLS (phase 5);
   - reconnection, examples, hardening and docs (phase 7a).
 
-  The order: phase 4 (its session plan is below), then 5, then 7a, then the release.
+  The order: phase 4 (done 2026-10-18), then 5, then 7a, then the release.
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6).
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), and client-side caching
   (phase 4's research and decisions, kept below).
@@ -86,7 +90,9 @@ cluster's MOVED comes back as `Server` with its code, and `CLIENT TRACKING` will
 
 ## Phase 4: where to start
 
-The plan for the next session, drawn up on 2026-10-13 from primary sources:
+The session plan, drawn up on 2026-10-13 from primary sources. It was carried out on 2026-10-18: every step but 5
+(client-side caching, 0.3.0's) is done, each noting what it found, and the decisions are under "Decided, and why",
+"Phase 4". The sources:
 - **The peers' source:** go-redis v9.23.0 (`pubsub.go`, `csc_*.go`), redis-py 8.1.0 (`client.py`'s `PubSub`,
   `cache.py`), redis-rs 1.7.1 (`connection.rs`, `aio/pubsub.rs`, `caching/`), Lettuce 7.9.0 (`PubSubEndpoint`,
   `ClientSideCaching`), and rueidis (`pipe.go`, `lru.go`), the most complete client-side cache.
@@ -277,7 +283,7 @@ Each step ends green before its commit:
    generated allow-list, the race (pending entries, through the scripted server), and every flush rule. Live: another
    connection's write, FLUSHALL, a key's TTL, reading one's own write, and the bounds. Step 1's COMMAND INFO capture
    serves it then.
-6. **Close phase 4:** ROADMAP, AGENTS.redis.md, README (programs checked by `tools/check-readme.sh`), CHANGELOG, the
+6. **Done (2026-10-18).** **Close phase 4:** ROADMAP, AGENTS.redis.md, README (programs checked by `tools/check-readme.sh`), CHANGELOG, the
    module header.
 
 **For 0.1.0:** steps 0–4 and 6. If the session runs long, do 0–3, then 4.
@@ -894,16 +900,6 @@ facts underneath; they are listed at the end.
   keeps every payload as a `Value`. Here, client-side caching is 0.3.0's, and until then an invalidation has no
   reader of its own.
 
-- **What step 0's repros showed** (in the session's scratchpad; each on v0.9.667 and 0.9.668, debug and release):
-  - A resource taken by value into a `DynamicArray` of one, used in place through `held[0]`, and handed back by
-    `pop()`; a second pop is None.
-  - A `friend` grant from one type to another type's private and public methods, across files, reaches private
-    fields and methods (`friend r0::Holder::exchange[secret, shut, setAside];`).
-  - A `Delivery` enum with a resource payload and a bytes payload, matched with `give`, and handed out of a queue
-    with `remove(index: 0)`.
-  - `next(timeout: Optional<Duration>)` returning `Result<Optional<Delivery>, E>`.
-  - A ctor returning `Result<Holder, E>` that refuses a value it was given hands it to a local first.
-  - A type cannot be named `Err` (a language name).
 - **What building it settled (step 3):**
   - `Subscriber` reaches its connection through five private members `Connection` grants it, method by method:
     `transmit` (write a command), `receiveFrame` (the next value, a failure handed back rather than acted on, so
@@ -936,3 +932,14 @@ facts underneath; they are listed at the end.
   - Live on a standalone server: shard channels in two slots together, SPUBLISH reaching them, a plain PUBLISH not,
     and SUNSUBSCRIBE by name; Redis 6.2 answers SSUBSCRIBE with `ERR unknown command`, and the subscriber goes on.
     Routing a shard channel to the node that serves its slot is phase 6's.
+
+- **What step 0's repros showed** (in the session's scratchpad; each on v0.9.667 and 0.9.668, debug and release):
+  - A resource taken by value into a `DynamicArray` of one, used in place through `held[0]`, and handed back by
+    `pop()`; a second pop is None.
+  - A `friend` grant from one type to another type's private and public methods, across files, reaches private
+    fields and methods (`friend r0::Holder::exchange[secret, shut, setAside];`).
+  - A `Delivery` enum with a resource payload and a bytes payload, matched with `give`, and handed out of a queue
+    with `remove(index: 0)`.
+  - `next(timeout: Optional<Duration>)` returning `Result<Optional<Delivery>, E>`.
+  - A ctor returning `Result<Holder, E>` that refuses a value it was given hands it to a local first.
+  - A type cannot be named `Err`, `Ok`, `Some` or `None` (language names, in every scope).

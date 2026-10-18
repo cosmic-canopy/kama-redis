@@ -53,8 +53,10 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     - Its Unix-socket test listens on a socket of its own and relays to the server's TCP port, because macOS cannot
       reach the container's socket (as postgres's `socket_test` does).
     - It starts with FLUSHALL, so the debug and release runs share the server cleanly.
-  - The scripted server's steps include `ExpectBytes` (a command's binary arguments, byte for byte) and `Patient`
-    (a reply given only to a wait that allows a stated time, which shows how long a connection waited).
+  - The scripted server's steps include `ExpectBytes` (a command's binary arguments, byte for byte), `Patient`
+    (a reply given only to a wait that allows a stated time, which shows how long a connection waited) and `Pause`
+    (nothing more of the server's own accord until the client's next wait comes back empty, which splits a message
+    across a subscriber's timeout).
   - `tools/check-readme.sh` builds every complete program in README.md and runs it against a live server.
   - Vectors come from upstream by script. Each generator pins every upstream file by SHA256 and dies on a
     mismatch. Run it, and `git diff` must be empty unless a server image moved.
@@ -81,6 +83,12 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
       written beside it (`replySetups`), so tests derive expected values from the setup; transactions, scripts,
       SCAN pages and BLPOP; each server's `ACL CAT blocking`, sorted, and COMMAND DOCS's arguments for each
       blocking command. Every capture must come out the same on every run (intsets, explicit stream IDs).
+    - pub/sub (phase 4): scenes on a pair of connections (a subscriber and another client) under both protocols,
+      every step's confirmations recorded as a case of its own, so a test replays a scene in the order a server sent
+      it. An unsubscribe-all confirms in the order of a hash Redis seeds at random in each process, so the script
+      checks the names and counts and records one canonical order (`canonical()`); the unit test plays every order.
+      Two cluster nodes joined by hand (ADDSLOTSRANGE, CLUSTER MEET: `redis-cli --cluster create` wants three)
+      give CROSSSLOT, MOVED and the server's own sunsubscribe. Run it twice: the two outputs must be the same.
     A case that needs a server setting Redis lacks (Valkey's `extended-redis-compatibility`) is started by
     product: Redis 8 passes a setting it does not know to its modules and fails only after daemonizing.
   - The live parts run in throwaway `--network none` containers of the matrix's images. They never touch the
@@ -120,6 +128,11 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
 - **`RedisArg`'s adapters write through `Command`'s `arg*` methods**, and `uint8` has none on purpose: that is what
   lets `DynamicArray<uint8>` be bytes (one argument) beside `<DynamicArray> when [T: RedisArg]` (an argument per
   element). An adapter must live in the contract's module (src/arg.kama).
+
+- **A `Subscriber` reaches its connection only through five private members `Connection` grants it, method by
+  method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`). Nothing on `Connection` is public for it. Pub/sub
+  frames are read by one classifier (`classify` in src/subscriber.kama) for both protocols; a push that is not pub/sub
+  goes to the connection's bounded set-aside list, never to a subscriber's deliveries.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.
@@ -172,6 +185,11 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
   - A hand-written `Deserializer` latches a `DeErrorKind` (`failWith(kind:)`, `errorKind()`); the derive adds where
     on the way out, so a `DeError` recovered with `e.as<DeError>()` names its field (`c.field()`: `f2`, `[1].f2`).
   - A path dependency's path is relative to its manifest; an absolute one is not found.
+  - `Err`, `Ok`, `Some` and `None` are language names: no type may take one.
+  - A contract-typed parameter (`RedisArg names`) is a borrow: pass a value to it as it is, never with `give` or `copy`.
+  - A `DynamicArray<uint8>` is `Equatable` but not `Hashable`: a std `Set` of byte names needs a small key type that
+    hashes them (`Name` in src/subscriber.kama).
+  - A `Deque` gives O(1) push and pop at both ends (`pushBack` is `unsafe`): the bounded queues use it.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates

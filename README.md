@@ -4,10 +4,10 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS will come from
 [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: commands work; not yet published.** A connection authenticates, picks its protocol and database, and
-> sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. It is tested live
-> on Redis 6.2–8.10 and Valkey 7.2–9.1. The first release, 0.1.0, adds pub/sub, TLS and reconnection; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
+> **Status: commands and pub/sub work; not yet published.** A connection authenticates, picks its protocol and
+> database, and sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. A
+> subscriber listens to channels, patterns and shard channels. It is tested live on Redis 6.2–8.10 and Valkey
+> 7.2–9.1. The first release, 0.1.0, adds TLS and reconnection; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
 
@@ -224,6 +224,108 @@ fn int32 main() {
   `Pipeline.addScript` sends EVAL.
 - **SCAN, SSCAN, HSCAN and ZSCAN** a page at a time, with `matching`, `countHint`, `ofType` and `noValues`.
 
+## Pub/sub
+
+```kama
+import { core::println, std::collections::DynamicArray, std::time::Duration, redis::Config, redis::Connection,
+         redis::Subscriber, redis::Delivery, redis::Message, redis::Command, redis::RedisError, redis::cmd,
+         redis::reply };
+
+fn string describe(const ref Message m) {
+    Result<string, RedisError> channel = m.channelText();
+    Result<string, RedisError> payload = m.text();
+    return match (channel) {
+        case Ok(value: c): match (payload) { case Ok(value: p): c.concat(other: ": ").concat(other: p); case Err(error: e): e.message(); };
+        case Err(error: e): e.message();
+    };
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379");
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    // A subscriber owns a connection of its own, under RESP3 and RESP2 alike.
+    Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
+    Subscriber sub = match (give made) {
+        case Ok(value: s): give s;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    // Each call returns once the server has confirmed every name.
+    DynamicArray<string> channels = DynamicArray.empty();
+    channels.add(item: "news");
+    channels.add(item: "alerts");
+    Result<Unit, RedisError> subscribed = sub.subscribe(names: channels);
+    match (subscribed) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Unit, RedisError> patterned = sub.psubscribe(names: "log:*");
+    match (patterned) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Publishing is an ordinary command, on any other connection. It answers how many subscribers got the message.
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Command publish = cmd"PUBLISH news hello";
+    Result<int64, RedisError> count = reply::<int64>(result: conn.call(command: publish));
+    match (count) { case Ok(value: n): { println(s: "${n} subscriber got it"); } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Wait up to a second for the next message. None means the time passed; the subscriber goes on.
+    Optional<Duration> second = Optional::Some(value: Duration.fromSecs(s: 1i64));
+    Result<Optional<Delivery>, RedisError> next = sub.next(timeout: second);
+    match (give next) {
+        case Ok(value: o): {
+            match (give o) {
+                case Some(value: d): {
+                    match (give d) {
+                        case Message(message: m): { println(s: describe(m: m)); }
+                        case Unsubscribed(kind: k, channel: c): { println(s: "the server ended a shard subscription"); }
+                    };
+                }
+                case None: { println(s: "nothing within a second"); }
+            };
+        }
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+
+    // Unsubscribe from everything and take the connection back, for commands.
+    Result<Connection, RedisError> released = sub.release();
+    Connection again = match (give released) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Command ping = cmd"PING";
+    Result<string, RedisError> pong = reply::<string>(result: again.call(command: ping));
+    match (give pong) { case Ok(value: p): { println(s: give p); } case Err(error: e): { println(s: e.message()); return 1; } };
+    conn.close();
+    again.close();
+    return 0;
+}
+```
+
+- **A `Subscriber` owns its connection**, as every peer client gives pub/sub a connection of its own: waiting for
+  messages blocks it, and under RESP2 a subscribed connection takes no other command. `Subscriber.over` takes a
+  `Connection` you already have, and `release()` gives it back; `Connection.call` refuses the (un)subscribe
+  commands.
+- **`subscribe`, `psubscribe` and `ssubscribe`**, and the three unsubscribes, take one name or a list (strings, or
+  `DynamicArray<uint8>` for bytes). Each returns once the server has confirmed every name. An unsubscribe given an
+  empty list unsubscribes from every name of its kind. An error in place of the confirmations (NOPERM, or in a
+  cluster CROSSSLOT or MOVED) is `RedisError::Server`, and the subscriber goes on.
+- **`next(timeout:)`** gives the messages: those that arrived while a call waited, then the next to arrive. None
+  waits as long as it takes, and zero takes only what has already arrived. A `Message` has its kind, channel,
+  pattern and payload as bytes, with `channelText()`, `patternText()` and `text()` refusing bytes that are not UTF-8.
+  A shard channel the server unsubscribes on its own (its slot moved) comes as `Delivery::Unsubscribed`.
+- **Delivery is at most once**, as the server's own is. Unread messages wait in the socket and the server's buffer,
+  and the server disconnects a subscriber that falls too far behind (`client-output-buffer-limit pubsub`).
+  Resubscribing after a reconnect comes with reconnection.
+- **Sharded pub/sub** (`SSUBSCRIBE`, `SPUBLISH`) needs Redis 7.0 or Valkey 7.2. Routing a shard channel to the node
+  that serves its slot comes with cluster support (0.2.0).
+- **Pushes that are not pub/sub** (an invalidation another connection's `CLIENT TRACKING … REDIRECT` sends) are set
+  aside on the connection: `Connection.takePushes()` hands them over, at most 1024 and within `maxReplyBytes`, and
+  `droppedPushes()` counts any past that. `CLIENT TRACKING` and `CLIENT CACHING` are refused until client-side
+  caching comes (0.3.0).
+
 ## Underneath
 
 - **`redis::resp`**, the protocol as data. A proxy, a fake server or a test harness can use it on its own.
@@ -268,8 +370,8 @@ fn int32 main() {
 ## What it will cover
 
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
-- **0.1.0, one server, complete:** what is here now, plus pub/sub (sharded too), TLS (`rediss://`) with verification,
-  client certificates and SNI, reconnection, and examples.
+- **0.1.0, one server, complete:** what is here now (commands and pub/sub, sharded too), plus TLS (`rediss://`)
+  with verification, client certificates and SNI, reconnection, and examples.
 - **0.2.0, topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
 - **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
 

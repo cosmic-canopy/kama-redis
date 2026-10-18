@@ -10,6 +10,21 @@ Needs **kama ≥ 0.9.667**: the first tagged release with the fixes this package
 the `Deserializer` the reply reader implements (`peekKind`, `readNumberText`, `unknownField`, `atKeyedMap`).
 
 ### Added
+- Pub/sub (phase 4):
+  - `Subscriber`, which owns its connection, under RESP3 and RESP2: `subscribe`, `psubscribe`, `ssubscribe` and the
+    three unsubscribes each return once the server has confirmed every name, matched by name; `next(timeout:)` gives
+    each `Delivery` (a `Message`, or a shard channel the server `Unsubscribed` on its own), None when the time
+    passes with the connection kept open; `ping()`; `release()` unsubscribes from everything and hands the
+    `Connection` back. `Subscriber.over`, `connect` and `connectWith`.
+  - `Message`: its `ChannelKind`, channel, pattern and payload as bytes, and `channelText()`, `patternText()` and
+    `text()`, which refuse bytes that are not UTF-8.
+  - `Connection.takePushes()` and `droppedPushes()`: the pushes set aside in place of replies, at most 1024 and
+    within `maxReplyBytes`, the oldest dropped and counted past either.
+  - `CLIENT TRACKING` and `CLIENT CACHING` join the commands a connection refuses before writing them, until
+    client-side caching comes (0.3.0): turned on by hand, invalidations would pile up unread.
+  - `tools/gen-server-vectors.sh` captures pub/sub on all eight servers under both protocols: confirmations,
+    messages from a second connection, PING's two shapes, refusals, invalidations redirected to a subscriber, and,
+    on two cluster nodes joined by hand, CROSSSLOT, MOVED and the server's own sunsubscribe.
 - Commands (phase 3):
   - `RedisArg`, a value that writes itself as a command's argument: the integers, `isize`, the floats (shortest
     round trip, `inf`/`-inf`, NaN refused), `string`, `DynamicArray<uint8>` (one binary argument), any
