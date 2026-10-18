@@ -1,9 +1,9 @@
 # Roadmap
 
 Where this is, 2026-10-18: phases 0 to 4 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
-client for one server. "The release plan" below says what each release holds. Phase 5 (TLS) is next: "Phase 5: an
-outline" is below, and its session plan is drawn up from primary sources at its start, as phases 3 and 4's were. Phase
-7a (reconnection, examples, hardening, docs) follows, and then 0.1.0.
+client for one server. "The release plan" below says what each release holds. Phase 5 (TLS) is under way: "Phase 5:
+where to start" is its session plan, drawn up from primary sources on 2026-10-18. Phase 7a (reconnection, examples,
+hardening, docs) follows, and then 0.1.0.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -288,31 +288,157 @@ Each step ends green before its commit:
 
 **For 0.1.0:** steps 0–4 and 6. If the session runs long, do 0–3, then 4.
 
-## Phase 5: an outline (draw up its session plan from primary sources at its start, as phases 3 and 4 were)
+## Phase 5: where to start
 
-- **What is known.**
-  - `@kama/tls` 0.1.2 gives a client `TlsConfig`: `Verify::Full` (chain and name) by default, trust from the system,
-    a file or PEM, a client identity (`identityFiles`/`identityPem`), revocation, ALPN and version bounds.
-  - `TlsStream::<S>.client(inner:, config:, serverName:)` sends SNI and checks the name. A stepwise `handshake()`
-    fits a deadline. `TlsError::Certificate` names each check that failed.
-  - The model is @kama/postgres's `src/secure/`. Its `transport.kama` makes any `Transport` a `ReliableStream`, so
-    TLS runs over TCP, a caller's tunnel and the scripted server alike, non-blocking end to end. `setup.kama` builds
-    a configuration per attempt.
-  - Redis starts TLS at once, with no in-protocol request, so postgres's `negotiate.kama` has no counterpart.
-  - The test servers listen on TLS (base + 100, `tls-auth-clients optional`), with the PKI from
-    `tools/gen-test-certs.sh`.
-  - `rediss://` and `valkeys://` are parsed today and refused in `Config` (`tlsRefused`).
-- **To research at its start:**
-  - redis-cli 8.10's and valkey-cli 9.1's TLS flags (`--tls`, `--cacert`, `--cacertdir`, `--cert`, `--key`, `--sni`,
-    `--insecure`, `--tls-ciphers`);
-  - the peers' URL options and defaults (redis-py's `ssl_*`, go-redis's `rediss` with `ServerName`, redis-rs's
-    `rediss` and `#insecure`, Lettuce's `verifyPeer`);
-  - which option names to honour and which to refuse;
-  - whether `insecure` (no verification) exists at all, or only `Verify` modes named for what they check.
-- **Tests:**
-  - unit: a TLS session over the scripted server;
-  - live, on every server's TLS port: the chain and the name verified, a wrong CA, a wrong name, a client
-    certificate required and offered, SNI, and a handshake past `connect_timeout`.
+The session plan, drawn up on 2026-10-18 from primary sources. The sources:
+- **The reference:** redis-cli 8.10.2's and valkey-cli 9.1.2's `cli_common.c` and `redis-cli.c`/`valkey-cli.c`, and
+  the hiredis 1.2.0 that Redis 8.10 bundles (`deps/hiredis/ssl.c`).
+- **The peers:** go-redis v9.23.0 (`options.go`, `osscluster.go`), redis-py 8.1.0 (`connection.py`), redis-rs 1.7.1
+  (`connection.rs`, `tls.rs`), Lettuce 7.9.0 (`RedisURI`, `SslVerifyMode`, `SslConnectionBuilder`), and beside them
+  GLIDE v2.5.3 and ioredis v6.0.0. Go 1.25's `crypto/tls`, CPython 3.13's `ssl` and Node 22's `tls` were read where
+  a peer leaves the behaviour to them.
+- **The servers:** Redis 8.10.2's and Valkey 9.1.2's `config.c` and `tls.c`; the redis.io and valkey.io TLS pages;
+  IANA's provisional `redis` and `rediss` schemes.
+- **The library:** `@kama/tls` 0.1.2 (`src/`, `csrc/ktls.c`, the vendored Mbed TLS 4.1.1).
+- **The model:** @kama/postgres's `src/secure/` and its unit and live TLS tests.
+
+The bar is phase 3's: every form honoured or refused, every failure path against the scripted server, the whole matrix
+live, debug and release.
+
+### What the sources showed
+
+- **redis-cli and valkey-cli.**
+  - `rediss://` (and `valkeys://` for valkey-cli) turns TLS on. Neither CLI reads a URL's query.
+  - Their flags are `--tls`, `--cacert`, `--cacertdir`, `--cert`, `--key`, `--sni`, `--insecure`, `--tls-ciphers` and
+    `--tls-ciphersuites`.
+  - With no CA given, they trust the system's (`SSL_CTX_set_default_verify_paths`).
+  - They verify the chain and **never the host name**: nothing calls `SSL_set1_host`. hiredis gained an opt-in
+    `verify_name` only in v1.5.0 (2026-10-15), and redis-cli builds its own `SSL_CTX` in any case.
+  - They send **no SNI** unless given `--sni`.
+  - They set no minimum version beyond refusing SSLv2 and SSLv3, and do not check that `--cert` comes with `--key`.
+  - A setup failure prints `Could not negotiate a TLS connection: <why>` (`Invalid CA Certificate File/Directory`,
+    `Invalid client certificate`, `Invalid private key`). A failed handshake prints `Could not connect to Redis at
+    <host>:<port>: SSL_connect failed: <OpenSSL's reason>`.
+- **The peers agree with one another, and not with the CLIs.**
+  - All six verify the chain and the name by default, against the system's trust. A name is matched against DNS
+    SANs, and an IP literal against IP SANs.
+  - Go, CPython, rustls and Node never send an IP literal as SNI (RFC 6066, section 3). They send the host name
+    otherwise, except ioredis, which sends none unless told.
+  - Each has a way to verify nothing: go-redis `skip_verify`, redis-py `ssl_cert_reqs=none`, redis-rs `#insecure`,
+    Lettuce `verifyPeer=NONE`, GLIDE `InsecureTls`. Lettuce (`CA`), redis-rs (`danger_accept_invalid_hostnames`) and
+    redis-py (`ssl_check_hostname=False`) can also verify the chain alone.
+  - The footguns: redis-py's `ssl_cert_reqs=none` silently turns its host-name check off too, and its `ssl_ca_certs`
+    adds to the system's trust rather than replacing it. redis-rs documents `#insecure` as turning off the host-name
+    check, and it turns off every check and SNI. Lettuce's `setVerifyPeer(false)` means NONE, not CA. go-redis's
+    cluster URL sends the seed's name to every node.
+  - URL options: go-redis reads `skip_verify` and refuses it on `redis://`; redis-py passes every `ssl_*` key through
+    as a string; redis-rs reads only the `#insecure` fragment; Lettuce reads `verifyPeer` and ignores unknown keys.
+    A CA, a client certificate or a key is set in code everywhere but redis-py.
+  - TLS 1.2 is the floor in Go, CPython and go-redis. No peer offers a CA directory but redis-py (`ssl_ca_path`).
+- **The servers.**
+  - `tls-auth-clients` is `yes` by default: a stock server requires a client certificate. `optional` takes one and
+    checks it when it comes.
+  - `tls-protocols` is TLSv1.2 and TLSv1.3 by default.
+  - Redis 8.10 and Valkey 9.1 can log a client in as the ACL user its certificate's CN names
+    (`tls-auth-clients-user CN`; Valkey also reads a URI SAN). Redis 8.2 and Valkey 8.1 cannot.
+  - Under TLS 1.3 a server that refuses a client's certificate does so after the handshake has finished on the
+    client's side, as an alert at its first read (`tools/redis.sh smoke` already notes it).
+- **`@kama/tls` 0.1.2** has what a client needs: `Verify::None`, `Chain` and `Full` (the client's default); trust from
+  a file, PEM or the system's bundle (`SSL_CERT_FILE`, then the known bundle paths); a client identity from files or
+  PEM, with an encrypted key's password; version bounds (TLS 1.2 and 1.3); a stepwise `handshake()`; and
+  `TlsError::Certificate`, which names each check that failed. It lacks two things this package needs:
+  - **`TlsError` is not `Sendable`,** and `RedisError` is.
+  - **It sends an IP literal as SNI** (Mbed TLS's `ssl_write_hostname_ext` writes whatever name it holds). Its
+    ROADMAP records this as a known difference.
+
+  It has no CA directory, no cipher setting and no session resumption.
+- **The model.** Postgres's `TransportStream` makes any `Transport` a `ReliableStream`, and `TlsTransport` makes the
+  session a `Transport` again, non-blocking end to end. A `TlsConfig` is built for each attempt. Its unit tests run a
+  real @kama/tls server inside the scripted server, which checks the SNI it receives. Redis starts TLS at once, with
+  no in-protocol request, so postgres's `negotiate.kama` has no counterpart.
+- **What here must change with it.** `Connection.targetsOf` and `Opener.open` dial everything that is not `unix://`
+  as plain TCP. So no TLS configuration may reach them until all three entry points (`connect`, `connectWith`,
+  `connectOver`) secure the link. The scripted server reads what it receives as RESP, so it needs a TLS front.
+
+### Proposed decisions (step 0 confirmed the kama facts by repro; "Decided, and why", "Phase 5", holds them as decided)
+
+The maintainer decided two things on 2026-10-18: the changes `@kama/tls` needs ship as its 0.1.3, and verification has
+three modes, each named for what it checks, as the peers' three states are.
+- **Verification.** `full`, the default, verifies the chain and the name: a DNS SAN, or an IP SAN for an IP literal.
+  `chain` verifies the chain alone (Lettuce's `CA`, and the CLIs' own behaviour). `none` verifies nothing, and only
+  `tls_verify=none` or `setTlsVerify` turns it on: no other setting implies it. A CA with `none` is refused, since it
+  would never be used.
+  - The CLIs' chain-only default is not followed: on this the reference is the outlier, and every peer verifies the
+    name.
+- **Trust.** The system's bundle by default (`trustSystem`), as the CLIs, Go, CPython and rustls-native-certs do; with
+  none found, the connect fails, naming `SSL_CERT_FILE`. A CA given replaces the system's trust, as Go's `RootCAs`,
+  redis-rs and GLIDE do (redis-py adds to it). There is no CA directory: `@kama/tls` has none, and neither have Go,
+  redis-rs, Lettuce or GLIDE.
+- **A client certificate,** with its key: both or neither. A key's password is a setting, never a URL option.
+- **The name.** The name verified and sent as SNI is the host, or `tls_server_name` (go-redis's `ServerName`). An IP
+  literal is verified against IP SANs and never sent as SNI (`@kama/tls` 0.1.3). TLS over `unix://` is refused.
+- **Versions:** TLS 1.2 and 1.3, the servers' default, with `setTlsVersions(min:, max:)`.
+- **Left out of 0.1.0:** ciphers (`@kama/tls` has no setting; Mbed TLS's defaults), CRLs and the key log (`@kama/tls`
+  has them, and no Redis peer offers them in a URL), and session resumption. Each can come later without changing
+  what an accepted setting means.
+- **URL options,** refused when unknown as today, and refused on `redis://` and `unix://`, as go-redis refuses
+  `skip_verify` there:
+
+  | option | value | default |
+  |---|---|---|
+  | `tls_verify` | `full`, `chain` or `none` | `full` |
+  | `tls_ca` | a PEM file | the system's bundle |
+  | `tls_cert`, `tls_key` | PEM files, both or neither | none |
+  | `tls_server_name` | a host name or an IP address | the URL's host |
+- **Settings:** `Config.tls(host:, port:)` and setters (`setTlsVerify`, `setTlsTrustFile`, `setTlsTrustPem`,
+  `setTlsIdentityFiles`, `setTlsIdentityPem`, `setTlsServerName`, `setTlsVersions`), each refused on a configuration
+  that is not TLS. Their enums are this package's own (`TlsVerify`, `TlsVersion`): a consumer cannot name a
+  `tls::` type without declaring `@kama/tls` itself (step 0).
+- **Files are read at each connect,** never by `Config.parse`, as postgres and libpq read them for each attempt. A
+  renewed certificate is read by the next connection, which reconnection (phase 7a) will rely on.
+- **Errors.** `RedisError::Tls(detail, cause)`, carrying the `TlsError`. A setup failure is worded in redis-cli's
+  frame, `Could not negotiate a TLS connection: …`, and a failed handshake in `Connect`'s, `Could not connect to
+  <place>: …`, each with `@kama/tls`'s reason. A TLS failure after the TCP connect is final, as `HELLO`'s outcome is,
+  so the next address is not tried. The handshake shares the address's `connect_timeout` with the connect and the
+  handshake that follows it. An alert after the handshake (a client certificate refused under TLS 1.3) is `Tls` too.
+- **The wrong port** is told from the bytes, captured from the servers: `rediss://` at a plaintext port (the server
+  answers the ClientHello in RESP), and `redis://` at a TLS port.
+- **`Connection.tlsSession()`** gives the version, the cipher suite and the server's certificate.
+- **Code.** An internal `redis::secure` module (`transport.kama`, `setup.kama`), from postgres's.
+
+### The session's steps
+
+Each step ends green before its commit:
+- `tools/test.sh`, debug and release, on CI's tag and on cstar's newest build;
+- from step 2 on, the live matrix.
+
+0. **Done (2026-10-18).** The sources above, the decisions, and the repros ("Decided, and why", "Phase 5").
+1. **`@kama/tls` 0.1.3,** in `../kama-tls` with its own tests and gate: `TlsError` is `Sendable`; an IP literal is
+   never sent as SNI, and `Full` verifies it against the certificate's IP SANs. Published on the maintainer's word.
+2. **The PKI, the servers and vectors.**
+   - `tools/gen-test-certs.sh` (generation 2) adds a server certificate for another name and an encrypted client key.
+   - The locked server gains a TLS port that requires a client certificate (base + 300), and logs one in by its CN
+     where the server can. `smoke` checks it.
+   - `tools/gen-server-vectors.sh` captures, on all eight servers, the plaintext port's answer to a TLS ClientHello
+     and the TLS port's answer to a plaintext `HELLO`.
+3. **`Config`:** the settings, the URL options and the refusals. The refusal of a TLS configuration moves from parse
+   to connect, in the same words, so nothing dials it.
+4. **The TLS layer:** `redis::secure`, `RedisError::Tls`, `tlsSession()`, wired into all three entry points in the
+   commit that lifts the refusal. The scripted server gains a TLS front. Unit tests, one byte at a time:
+   - verification by name, by IP and by `tls_server_name`, TLS 1.2 and 1.3, another name, another CA, each mode;
+   - a client certificate asked for and given, required and missing, an encrypted key and a wrong password, a
+     missing file;
+   - HELLO, a pipeline through the jammed server, a transaction and a subscriber over TLS, a record split across a
+     subscriber's timeout;
+   - silence, a hangup at each step, garbage, the servers' plaintext answer, close_notify and a truncated record;
+   - no plaintext byte through any entry point.
+5. **Live,** on all eight servers, debug and release: both names, both protocols, the system's trust refusing the
+   test CA, another CA, another name under each mode, client certificates required and optional, SNI on the wire (read
+   by a relay from the ClientHello), a handshake past `connect_timeout`, both wrong ports, a pipeline, a large value, a
+   transaction and a subscriber over TLS. A README program over TLS.
+6. **Close phase 5:** ROADMAP, AGENTS.redis.md, README, CHANGELOG, the module header.
+
+**If the session runs long:** steps 0–4, then 5, then 6.
 
 ## Phase 7a: an outline (likewise, drawn up at its start)
 
@@ -943,3 +1069,22 @@ facts underneath; they are listed at the end.
   - `next(timeout: Optional<Duration>)` returning `Result<Optional<Delivery>, E>`.
   - A ctor returning `Result<Holder, E>` that refuses a value it was given hands it to a local first.
   - A type cannot be named `Err`, `Ok`, `Some` or `None` (language names, in every scope).
+
+### Phase 5
+
+Drawn up 2026-10-18 (see "Phase 5: where to start" for the sources and the proposals, which hold unless this section
+says otherwise). Step 0's repros, run 2026-10-18 on v0.9.667 and cstar's 0.9.668, confirmed the kama facts underneath.
+
+- **What step 0's repros showed** (in the session's scratchpad, against `@kama/tls` 0.1.2 from the registry):
+  - A `TlsStream` over a resource that makes a `Transport`-like contract a `ReliableStream`, inside a resource that
+    implements the contract again and is `Sendable`, checks clean on both compilers: postgres's layering carries over.
+  - A `Sendable` enum cannot carry a `TlsError` (`tls::TlsError does not declare implements Sendable`). `@kama/tls`
+    0.1.3 declares it.
+  - `tls::Verify` and `tls::TlsVersion`, enums without payloads, sit in a `Sendable`, `Copyable` resource without
+    declaring either.
+  - A consumer cannot import `tls::Verify` through this package: it would have to declare `@kama/tls` itself. So the
+    settings take this package's own enums.
+  - A consumer matches `Tls(detail:, cause:)` on an error that carries a `TlsError` without importing `tls`.
+- **redis-cli's words, read at source** (8.10.2, `redis-cli.c:1732–1755`): a setup failure is `Could not negotiate a
+  TLS connection: <why>`; a failed handshake leaves the context's error, printed as `Could not connect to Redis at
+  <host>:<port>: SSL_connect failed: <reason>` (hiredis 1.2.0, `ssl.c:388–397`).
