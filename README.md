@@ -1,13 +1,13 @@
 # @kama/redis
 
 The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 and RESP3 directly, in kama, over
-`std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS will come from
+`std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS comes from
 [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: commands and pub/sub work; not yet published.** A connection authenticates, picks its protocol and
-> database, and sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. A
-> subscriber listens to channels, patterns and shard channels. It is tested live on Redis 6.2–8.10 and Valkey
-> 7.2–9.1. The first release, 0.1.0, adds TLS and reconnection; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
+> **Status: commands, pub/sub and TLS work; not yet published.** A connection authenticates, picks its protocol and
+> database, connects over TLS, and sends commands, pipelines, transactions and scripts with deadlines; replies read
+> into kama types. A subscriber listens to channels, patterns and shard channels. It is tested live on Redis 6.2–8.10
+> and Valkey 7.2–9.1. The first release, 0.1.0, adds reconnection; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
 
@@ -68,6 +68,62 @@ fn int32 main() {
   `ServerCode` to match, beside the server's message, and the connection goes on. A failure of the connection itself
   (I/O, bytes that are not RESP, a call past its deadline) closes it.
 - **The connection belongs to one isolate at a time,** and moves between them whole.
+
+## TLS
+
+`rediss://` (and `valkeys://`) connect over TLS, from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls), which
+vendors Mbed TLS: still nothing to install.
+
+```kama
+import { core::println, redis::Config, redis::Connection, redis::RedisError, redis::cmd, redis::reply };
+
+fn int32 main() {
+    // The server's certificate must chain to this CA and name 127.0.0.1; a client certificate goes with it.
+    string url = "rediss://127.0.0.1:6380?tls_ca=/etc/redis/ca.crt&tls_cert=/etc/redis/client.crt&tls_key=/etc/redis/client.key";
+    Result<Config, RedisError> parsed = Config.parse(url: url);
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<string, RedisError> pong = reply::<string>(result: conn.call(command: cmd"PING"));
+    match (give pong) {
+        case Ok(value: p): { println(s: give p); }
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    conn.close();
+    return 0;
+}
+```
+
+- **Verified by default.** The certificate must chain to a trusted root (the system's bundle, unless `tls_ca` names
+  others) and must name the server: its host name among the certificate's DNS names, or its IP address among its IP
+  addresses. go-redis, redis-py, redis-rs and Lettuce verify the same; redis-cli checks only the chain. The host name
+  is sent as SNI, and an IP address is not (RFC 6066).
+- **The TLS options**, each refused on `redis://` and `unix://`:
+
+  | option | value | default |
+  |---|---|---|
+  | `tls_verify` | `full`: the chain and the name; `chain`: the chain alone; `none`: nothing | `full` |
+  | `tls_ca` | a PEM file of roots to trust instead of the system's | the system's bundle (`SSL_CERT_FILE` overrides) |
+  | `tls_cert`, `tls_key` | a client certificate and its key, in PEM: both, or neither | none |
+  | `tls_server_name` | the name the certificate must carry, and the SNI sent | the host |
+
+  `Config.tls` and its setters do the same, and more: roots and an identity as PEM bytes, an encrypted key's
+  password, and the TLS versions (1.2 and 1.3 by default, the servers' own).
+- **Files are read at each connect,** never when the configuration is made, so a renewed certificate is read by the
+  next connection.
+- **A TLS failure is `RedisError::Tls`**, in redis-cli's words, carrying `@kama/tls`'s `TlsError`, whose
+  `Certificate(flags, reasons)` names each check that failed. It is final: the next address is not tried.
+  `connect_timeout` bounds the TLS handshake with the rest. `Connection.tlsSession()` says what was agreed.
+- **The wrong port.** A server's plaintext port says nothing to a TLS client, so `rediss://` there times out; its TLS
+  port closes on a plaintext one, and `redis://` there is told to use `rediss://`.
+- **Not offered:** cipher choice (Mbed TLS's defaults), a CA directory, CRLs and session resumption, each refused as
+  an unknown option.
 
 ## Commands
 
@@ -362,7 +418,8 @@ fn int32 main() {
   and against `CLUSTER KEYSLOT` on every server.
 
 - **`redis::Connection`**, `Config` and `RedisError`, as above:
-  - TCP and Unix-domain sockets, non-blocking, with connect and command deadlines and TCP keepalive;
+  - TCP, TLS (`redis::secure`, internal, over any transport) and Unix-domain sockets, non-blocking, with connect and
+    command deadlines and TCP keepalive;
   - ACL users and passwords, the password alone of a server's default user, the client's name and the database;
   - RESP3 by default, and RESP2 for proxies such as twemproxy and Envoy;
   - `server()`, the server's own account of itself from `HELLO`.
@@ -370,8 +427,8 @@ fn int32 main() {
 ## What it will cover
 
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
-- **0.1.0, one server, complete:** what is here now (commands and pub/sub, sharded too), plus TLS (`rediss://`)
-  with verification, client certificates and SNI, reconnection, and examples.
+- **0.1.0, one server, complete:** what is here now (commands, pub/sub, sharded too, and TLS with verification,
+  client certificates and SNI), plus reconnection, and examples.
 - **0.2.0, topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
 - **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
 

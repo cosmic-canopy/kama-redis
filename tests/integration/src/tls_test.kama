@@ -1,0 +1,420 @@
+// TLS, live (docs/ROADMAP.md, "Phase 5"): the main server's TLS port (tls-auth-clients optional), and the locked
+// server's, which requires a client certificate (tls-auth-clients yes), with the PKI tools/gen-test-certs.sh writes.
+// Two listeners of the test's own: a relay that reads the server name from the client's ClientHello before passing
+// the connection on to the TLS port, so SNI is seen on the wire; and one that never accepts, so a handshake meets
+// silence.
+import { core::println, std::collections::DynamicArray, std::collections::FixedArray, std::collections::View,
+         std::collections::ConstView, std::io::IoError, std::net::TcpListener, std::net::TcpStream, std::net::Poller,
+         std::net::Interest, std::net::SocketAddr, std::time::Duration, std::time::monotonicNow, std::time::Instant,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::SendResult,
+         std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         redis::Connection, redis::Config, redis::RedisError, redis::Protocol, redis::TlsVersion, redis::TlsSession,
+         redis::Subscriber, redis::Message, redis::Pipeline, redis::Replies, redis::Command, redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting, open, attempt, ask, mainUrl, commandOf, shown };
+export { tlsTests };
+
+fn string cert(const ref string name) { return setting(name: "REDISTEST_CERTDIR").concat(other: "/").concat(other: name); }
+
+// rediss://<userinfo><host>:<the main server's TLS port><tail>.
+unsafe fn string tlsUrl(const ref string userinfo, const ref string host, const ref string tail) {
+    return "rediss://".concat(other: userinfo).concat(other: host).concat(other: ":").concat(other: setting(name: "REDISTEST_TLS_PORT")).concat(other: tail);
+}
+
+// The same, for the locked server's TLS port, which requires a client certificate.
+unsafe fn string mtlsUrl(const ref string userinfo, const ref string host, const ref string tail) {
+    return "rediss://".concat(other: userinfo).concat(other: host).concat(other: ":").concat(other: setting(name: "REDISTEST_MTLS_PORT")).concat(other: tail);
+}
+
+fn string trusting() { return "?tls_ca=".concat(other: cert(name: "ca.crt")); }
+fn string withClient() { return "&tls_cert=".concat(other: cert(name: "client.crt")).concat(other: "&tls_key=").concat(other: cert(name: "client.key")); }
+
+// What a connection over `url` says to `command`, or why it could not be made.
+unsafe fn string through(const ref string url, const ref string command) {
+    Result<Connection, RedisError> r = open(url: url);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    string answer = ask(c: c, text: command);
+    c.close();
+    return answer;
+}
+
+unsafe fn Config configOf(const ref string url) {
+    Result<Config, RedisError> r = Config.parse(url: url);
+    return match (give r) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: ${m}"); := configOf(url: url); } };
+}
+
+fn bool isTls(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Tls(detail: d, cause: c): true; case _: false; }; case Ok(value: c): false; };
+}
+
+fn bool isTimeout(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: c): false; };
+}
+
+fn string outcome(const ref Result<Connection, RedisError> r) { return match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); }; }
+
+// The session's version, "1.2" or "1.3"; or why there is none.
+fn string versionOf(const ref Connection c) {
+    return match (c.tlsSession()) {
+        case None: "no session";
+        case Some(value: s): match (s.version()) { case Tls12: "1.2"; case Tls13: "1.3"; };
+    };
+}
+
+// ---- the relay that reads SNI ----
+
+// The server name a ClientHello carries ("-" for none), from its first record: RFC 8446 section 4.1.2, and the
+// server_name extension of RFC 6066 section 3. "?" for bytes that are not a ClientHello.
+fn string sniOf(ConstView<uint8> b) {
+    if (b.length() < 5 || b[0] != 22ui8) { return "?"; }
+    isize p = 5;
+    if (b.length() < p + 4 || b[p] != 1ui8) { return "?"; }
+    p = p + 4 + 2 + 32;   // handshake header, legacy_version, random
+    if (p >= b.length()) { return "?"; }
+    p = p + 1 + cast<isize>(b[p]);   // legacy_session_id
+    if (p + 2 > b.length()) { return "?"; }
+    p = p + 2 + (cast<isize>(b[p]) * 256 + cast<isize>(b[p + 1]));   // cipher_suites
+    if (p >= b.length()) { return "?"; }
+    p = p + 1 + cast<isize>(b[p]);   // legacy_compression_methods
+    if (p + 2 > b.length()) { return "-"; }
+    isize end = p + 2 + (cast<isize>(b[p]) * 256 + cast<isize>(b[p + 1]));
+    p = p + 2;
+    while (p + 4 <= end && p + 4 <= b.length()) {
+        isize kind = cast<isize>(b[p]) * 256 + cast<isize>(b[p + 1]);
+        isize len = cast<isize>(b[p + 2]) * 256 + cast<isize>(b[p + 3]);
+        if (kind == 0 && p + 9 <= b.length()) {
+            isize nameLen = cast<isize>(b[p + 7]) * 256 + cast<isize>(b[p + 8]);
+            if (b[p + 6] != 0ui8 || p + 9 + nameLen > b.length()) { return "?"; }
+            Result<string, Utf8Error> name = decode(bytes: b.slice(from: p + 9, count: nameLen));
+            return match (give name) { case Ok(value: s): give s; case Err(error: e): "?"; };
+        }
+        p = p + 4 + len;
+    }
+    return "-";
+}
+
+// Write all of `bytes` to `to`.
+unsafe fn bool sendAll(ref TcpStream to, ConstView<uint8> bytes) {
+    isize sent = 0;
+    while (sent < bytes.length()) {
+        Result<isize, IoError> w = to.write(bytes: bytes.slice(from: sent, count: bytes.length() - sent));
+        isize n = match (w) { case Ok(value: k): k; case Err(error: e): match (e.kind()) { case WouldBlock: 0; case _: -1; }; };
+        if (n < 0) { return false; }
+        sent = sent + n;
+    }
+    return true;
+}
+
+// Copy what `from` has to `to`: false once `from` has closed or failed.
+unsafe fn bool forward(ref TcpStream from, ref TcpStream to, View<uint8> buf) {
+    Result<isize, IoError> r = from.read(into: buf);
+    isize n = match (r) { case Ok(value: k): k; case Err(error: e): match (e.kind()) { case WouldBlock: -2; case _: -1; }; };
+    if (n == -2) { return true; }
+    if (n <= 0) { return false; }
+    return sendAll(to: to, bytes: buf.slice(from: 0, count: n));
+}
+
+// Relay one connection until either side closes.
+unsafe fn void pump(TcpStream client, TcpStream server) {
+    Result<Unit, IoError> a = client.setNonBlocking(on: true);
+    Result<Unit, IoError> b = server.setNonBlocking(on: true);
+    Result<Poller, IoError> made = Poller.create();
+    Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { return; } };
+    isize cf = client.rawHandle();
+    isize sf = server.rawHandle();
+    p.add(fd: cf, interest: Interest::Read);
+    p.add(fd: sf, interest: Interest::Read);
+    FixedArray<uint8> buf = FixedArray.make(size: 65536);
+    bool live = true;
+    while (live) {
+        Result<int32, IoError> waited = p.wait(timeoutMs: 30000);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): 0; };
+        if (n == 0) { live = false; }
+        if (live && p.readyFor(fd: cf).readable) { live = forward(from: ref client, to: ref server, buf: buf.viewMut()); }
+        if (live && p.readyFor(fd: sf).readable) { live = forward(from: ref server, to: ref client, buf: buf.viewMut()); }
+    }
+}
+
+type resource SniRelay implements Sendable {
+    TcpListener listener;
+    uint16 upstream = 0ui16;
+    int32 count = 0;
+    Sender<string> seen;
+
+    public ctor make(TcpListener listener, uint16 upstream, int32 count, Sender<string> seen) {
+        this.listener = give listener; this.upstream = upstream; this.count = count; this.seen = give seen;
+    }
+
+    // For each of `count` connections: read the ClientHello's first record, report its server name, and relay the
+    // connection to the TLS port. A connection that never comes ends the relay after 10 seconds.
+    public unsafe fn void run() {
+        Result<Unit, IoError> nb = this.listener.setNonBlocking(on: true);
+        Result<Poller, IoError> made = Poller.create();
+        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { SendResult<string> r = this.seen.send(item: "poller"); return; } };
+        p.add(fd: this.listener.rawHandle(), interest: Interest::Read);
+        int32 served = 0;
+        while (served < this.count) {
+            Result<int32, IoError> w = p.wait(timeoutMs: 10000);
+            int32 ready = match (w) { case Ok(value: k): k; case Err(error: e): 0; };
+            if (ready == 0) { SendResult<string> r = this.seen.send(item: "no connection"); return; }
+            Result<TcpStream, IoError> accepted = this.listener.accept();
+            match (give accepted) {
+                case Ok(value: c): {
+                    TcpStream client = give c;
+                    // On macOS an accepted socket inherits the listener's O_NONBLOCK; the ClientHello is read blocking.
+                    Result<Unit, IoError> blocking = client.setNonBlocking(on: false);
+                    DynamicArray<uint8> hello = DynamicArray.empty();
+                    FixedArray<uint8> buf = FixedArray.make(size: 16384);
+                    bool whole = false;
+                    while (!whole) {
+                        Result<isize, IoError> r = client.read(into: buf.viewMut());
+                        isize n = match (r) { case Ok(value: k): k; case Err(error: e): -1; };
+                        if (n <= 0) { whole = true; }
+                        else {
+                            hello.addAll(items: buf.view().slice(from: 0, count: n));
+                            whole = hello.length() >= 5 && hello.length() >= 5 + cast<isize>(hello[3]) * 256 + cast<isize>(hello[4]);
+                        }
+                    }
+                    SendResult<string> sent = this.seen.send(item: sniOf(b: hello.view()));
+                    Result<TcpStream, IoError> up = TcpStream.connect(host: "127.0.0.1", port: this.upstream);
+                    match (give up) {
+                        case Ok(value: s): {
+                            TcpStream server = give s;
+                            bool passed = sendAll(to: server, bytes: hello.view());
+                            // A ClientHello that could not be passed on leaves the client to its handshake's end.
+                            if (!passed) { TcpStream dropped = give server; TcpStream ended = give client; }
+                            else { pump(client: give client, server: give server); }
+                        }
+                        case Err(error: e): { TcpStream unanswered = give client; }
+                    };
+                    served = served + 1;
+                }
+                case Err(error: e): { }
+            };
+        }
+    }
+}
+
+fn void relay(SniRelay job) { job.run(); }
+
+fn uint16 portNumber(const ref string text) {
+    uint16 n = 0ui16;
+    foreach (uint8 b in text) { n = n * 10ui16 + cast<uint16>(b - 48ui8); }
+    return n;
+}
+
+// ---- the cases ----
+
+// Connecting, by name and by address, under both protocols, and the version agreed.
+unsafe fn int32 connectingTests() {
+    int32 f = 0;
+    string none = "";
+    Result<Connection, RedisError> r1 = open(url: tlsUrl(userinfo: none, host: "localhost", tail: trusting()));
+    match (give r1) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            string v = versionOf(c: conn);
+            string pong = ask(c: conn, text: "PING");
+            f = f + check(ok: pong == "PONG" && v == "1.3" && conn.protocol() == Protocol::Resp3,
+                          what: "tls: rediss://localhost, verified by DNS name, RESP3, TLS ${v}: ${pong}");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "tls: rediss://localhost: ${m}"); }
+    };
+    string byIp = through(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting().concat(other: "&protocol=2")), command: "PING");
+    f = f + check(ok: byIp == "PONG", what: "tls: rediss://127.0.0.1, verified by IP address, protocol=2: ${byIp}");
+    string user = setting(name: "REDISTEST_ACL_PASSWORD");
+    string who = through(url: tlsUrl(userinfo: "kr_acl:".concat(other: user).concat(other: "@"), host: "127.0.0.1", tail: trusting()), command: "ACL WHOAMI");
+    f = f + check(ok: who == "kr_acl", what: "tls: a user and password over TLS: ${who}");
+
+    Config capped = configOf(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting()));
+    Result<Unit, RedisError> cap = capped.setTlsVersions(min: TlsVersion::Tls12, max: TlsVersion::Tls12);
+    Result<Connection, RedisError> r2 = Connection.connect(config: capped);
+    string v2 = match (r2) { case Ok(value: c): versionOf(c: c); case Err(error: e): e.message(); };
+    f = f + check(ok: v2 == "1.2", what: "tls: capped at TLS 1.2: ${v2}");
+
+    // valkeys:// is the same.
+    string valkeys = "valkeys://127.0.0.1:".concat(other: setting(name: "REDISTEST_TLS_PORT")).concat(other: trusting());
+    string vk = through(url: valkeys, command: "PING");
+    f = f + check(ok: vk == "PONG", what: "tls: valkeys:// ${vk}");
+    return f;
+}
+
+// Trust: the system's by default, another CA, another name under each mode.
+unsafe fn int32 trustTests() {
+    int32 f = 0;
+    string none = "";
+    // The system's roots hold no test CA: refused, never trusted for want of a CA.
+    Result<Connection, RedisError> r1 = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: none));
+    string g1 = outcome(r: r1);
+    f = f + check(ok: isTls(r: r1) && (g1.contains(substring: "not correctly signed by the trusted CA") || g1.contains(substring: "SSL_CERT_FILE")),
+                  what: "tls: by default the system's roots, which refuse the test CA: ${g1}");
+    Result<Connection, RedisError> r2 = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: "?tls_ca=".concat(other: cert(name: "other-ca.crt"))));
+    string g2 = outcome(r: r2);
+    f = f + check(ok: isTls(r: r2) && g2.contains(substring: "certificate verify failed") && g2.contains(substring: "not correctly signed by the trusted CA"),
+                  what: "tls: another CA: ${g2}");
+    Result<Connection, RedisError> r3 = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting().concat(other: "&tls_server_name=wrong.example")));
+    string g3 = outcome(r: r3);
+    f = f + check(ok: isTls(r: r3) && g3.contains(substring: "certificate verify failed") && g3.contains(substring: "Common Name"),
+                  what: "tls: another name: ${g3}");
+    string chain = through(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting().concat(other: "&tls_server_name=wrong.example&tls_verify=chain")), command: "PING");
+    f = f + check(ok: chain == "PONG", what: "tls: another name under tls_verify=chain: ${chain}");
+    string nothing = through(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: "?tls_verify=none&tls_server_name=wrong.example"), command: "PING");
+    f = f + check(ok: nothing == "PONG", what: "tls: tls_verify=none, no CA: ${nothing}");
+    return f;
+}
+
+// Client certificates: required and given, with a plain key and an encrypted one; required and missing; a
+// certificate the server's CA did not sign; and the login by certificate where the server has it.
+unsafe fn int32 certificateTests() {
+    int32 f = 0;
+    string none = "";
+    string pw = setting(name: "REDISTEST_DEFAULT_PASSWORD");
+    string auth = ":".concat(other: pw).concat(other: "@");
+    string given = through(url: mtlsUrl(userinfo: auth, host: "127.0.0.1", tail: trusting().concat(other: withClient())), command: "ACL WHOAMI");
+    f = f + check(ok: given == "default", what: "tls: a required certificate, given: ${given}");
+
+    Config encrypted = configOf(url: mtlsUrl(userinfo: auth, host: "127.0.0.1", tail: trusting()));
+    Result<Unit, RedisError> id = encrypted.setTlsIdentityFiles(certificate: cert(name: "client.crt"), key: cert(name: "client-enc.key"), password: setting(name: "REDISTEST_KEY_PASSWORD"));
+    Result<Connection, RedisError> r1 = Connection.connect(config: encrypted);
+    string g1 = match (give r1) { case Ok(value: c): { Connection conn = give c; := ask(c: conn, text: "PING"); } case Err(error: e): e.message(); };
+    f = f + check(ok: g1 == "PONG", what: "tls: a required certificate with an encrypted key: ${g1}");
+
+    Result<Connection, RedisError> r2 = open(url: mtlsUrl(userinfo: auth, host: "127.0.0.1", tail: trusting()));
+    string g2 = outcome(r: r2);
+    f = f + check(ok: isTls(r: r2) && g2.contains(substring: "none was given: set tls_cert and tls_key"), what: "tls: a required certificate, missing: ${g2}");
+    string other = "&tls_cert=".concat(other: cert(name: "other-client.crt")).concat(other: "&tls_key=").concat(other: cert(name: "other-client.key"));
+    Result<Connection, RedisError> r3 = open(url: mtlsUrl(userinfo: auth, host: "127.0.0.1", tail: trusting().concat(other: other)));
+    string g3 = outcome(r: r3);
+    f = f + check(ok: isTls(r: r3) && g3.contains(substring: "did not accept the client certificate"), what: "tls: a certificate the server's CA did not sign: ${g3}");
+    // The main server's port takes a certificate when one comes, and checks it.
+    Result<Connection, RedisError> r4 = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting().concat(other: other)));
+    string g4 = outcome(r: r4);
+    f = f + check(ok: isTls(r: r4) && g4.contains(substring: "did not accept the client certificate"), what: "tls: an optional certificate, checked: ${g4}");
+
+    // Redis 8.6 and Valkey 9.0 log a certificate in as its CN (tools/redis.sh's start.sh): no AUTH, and kr_cert. The
+    // others want the password.
+    string server = setting(name: "REDISTEST_SERVER");
+    bool byCert = server == "redis-8.10" || server == "valkey-9.1";
+    string who = through(url: mtlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting().concat(other: withClient())), command: "ACL WHOAMI");
+    if (byCert) { f = f + check(ok: who == "kr_cert", what: "tls: the certificate logs in as its CN: ${who}"); }
+    else { f = f + check(ok: who.contains(substring: "NOAUTH"), what: "tls: a certificate logs no one in on ${server}: ${who}"); }
+    return f;
+}
+
+// SNI on the wire, a handshake past connect_timeout, and each wrong port.
+unsafe fn int32 wireTests() {
+    int32 f = 0;
+    string none = "";
+    Result<TcpListener, IoError> bound = TcpListener.bind(host: "127.0.0.1", port: 0ui16);
+    TcpListener listener = match (give bound) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "tls: bind the relay"); } };
+    Result<SocketAddr, IoError> at = listener.localAddr();
+    uint16 port = match (at) { case Ok(value: a): a.port; case Err(error: e): 0ui16; };
+    string relayPort = "${port}";
+    Channel<string> names = Channel.bounded(capacity: 4);
+    Receiver<string> rx = names.receiver();
+    SniRelay job = SniRelay.make(listener: give listener, upstream: portNumber(text: setting(name: "REDISTEST_TLS_PORT")), count: 3, seen: names.sender());
+    string a = "";
+    string b = "";
+    string c = "";
+    scope {
+        spawn relay(job: give job);
+        a = through(url: "rediss://localhost:".concat(other: relayPort).concat(other: trusting()), command: "PING");
+        b = through(url: "rediss://127.0.0.1:".concat(other: relayPort).concat(other: trusting()), command: "PING");
+        c = through(url: "rediss://127.0.0.1:".concat(other: relayPort).concat(other: trusting()).concat(other: "&tls_server_name=wrong.example&tls_verify=chain"), command: "PING");
+    }
+    Optional<string> s1 = rx.recv();
+    Optional<string> s2 = rx.recv();
+    Optional<string> s3 = rx.recv();
+    string n1 = match (give s1) { case Some(value: v): give v; case None: "<none>"; };
+    string n2 = match (give s2) { case Some(value: v): give v; case None: "<none>"; };
+    string n3 = match (give s3) { case Some(value: v): give v; case None: "<none>"; };
+    f = f + check(ok: a == "PONG" && n1 == "localhost", what: "tls: SNI localhost, on the wire (${n1}; ${a})");
+    f = f + check(ok: b == "PONG" && n2 == "-", what: "tls: no SNI for an IP address, on the wire (${n2}; ${b})");
+    f = f + check(ok: c == "PONG" && n3 == "wrong.example", what: "tls: tls_server_name is the SNI, on the wire (${n3}; ${c})");
+
+    // A listener that never accepts: the kernel completes the TCP connect, and the handshake meets silence.
+    Result<TcpListener, IoError> mute = TcpListener.bind(host: "127.0.0.1", port: 0ui16);
+    TcpListener silent = match (give mute) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "tls: bind the silent listener"); } };
+    Result<SocketAddr, IoError> sat = silent.localAddr();
+    uint16 sport = match (sat) { case Ok(value: x): x.port; case Err(error: e): 0ui16; };
+    string silentPort = "${sport}";
+    Instant t0 = monotonicNow();
+    Result<Connection, RedisError> r1 = open(url: "rediss://127.0.0.1:".concat(other: silentPort).concat(other: trusting()).concat(other: "&connect_timeout=0.5"));
+    int64 ms = (monotonicNow() - t0).asMillis();
+    f = f + check(ok: isTimeout(r: r1) && ms >= 450i64 && ms < 3000i64, what: "tls: a handshake past connect_timeout is Timeout, in ${ms} ms");
+
+    // rediss:// at the plaintext port: the server says nothing to a ClientHello (server_vectors' tls-at-plaintext).
+    Result<Connection, RedisError> r2 = open(url: "rediss://127.0.0.1:".concat(other: setting(name: "REDISTEST_PORT")).concat(other: trusting()).concat(other: "&connect_timeout=0.5"));
+    f = f + check(ok: isTimeout(r: r2), what: "tls: rediss:// at the plaintext port times out: ".concat(other: outcome(r: r2)));
+    // redis:// at a TLS port: the server closes, and the client says where to look.
+    string plainAtTls = attempt(url: "redis://127.0.0.1:".concat(other: setting(name: "REDISTEST_TLS_PORT")));
+    f = f + check(ok: plainAtTls.contains(substring: "connect to one with rediss://"), what: "tls: redis:// at a TLS port: ${plainAtTls}");
+    return f;
+}
+
+fn bool sameBytes(ConstView<uint8> a, ConstView<uint8> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (a[i] != b[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+fn string messageText(const ref Message m) {
+    string channel = match (m.channelText()) { case Ok(value: t): copy t; case Err(error: e): "?"; };
+    string payload = match (m.text()) { case Ok(value: t): copy t; case Err(error: e): "?"; };
+    return channel.concat(other: " ").concat(other: payload);
+}
+
+// Everything over TLS: a pipeline, a large value, a transaction, a subscriber.
+unsafe fn int32 sessionTests() {
+    int32 f = 0;
+    string none = "";
+    Result<Connection, RedisError> r = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting()));
+    Connection c = match (give r) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: session: ${m}"); } };
+    string del = ask(c: c, text: "DEL kr:tls:n");
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < 1000) { Command incr = commandOf(text: "INCR kr:tls:n"); p.add(command: incr); i = i + 1; }
+    Result<Replies, RedisError> rr = c.run(pipeline: p);
+    isize got = match (rr) { case Ok(value: rs): rs.length(); case Err(error: e): -1; };
+    string n = ask(c: c, text: "GET kr:tls:n");
+    f = f + check(ok: got == 1000 && n == "1000", what: "tls: 1000 INCRs in one pipeline: ${n}");
+
+    // A 1 MiB value, across many records.
+    string big = "";
+    string block = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    i = 0;
+    while (i < 16384) { big = big.concat(other: block); i = i + 1; }
+    Command set = Command.of(name: "SET");
+    set.arg(text: "kr:tls:big");
+    set.arg(text: big);
+    Result<Value, RedisError> stored = c.call(command: set);
+    Result<Value, RedisError> back = c.call(command: commandOf(text: "GET kr:tls:big"));
+    bool same = match (back) { case Ok(value: v): match (v) { case Bulk(bytes: b): b.length() == big.length() && sameBytes(a: b.view(), b: big.bytes()); case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: same, what: "tls: a 1 MiB value, set and read back whole");
+
+    // A subscriber over TLS, a message from another connection, and a wait that ends with None.
+    Result<Connection, RedisError> rs = open(url: tlsUrl(userinfo: none, host: "127.0.0.1", tail: trusting()));
+    Connection sc = match (give rs) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "tls: subscriber: ${m}"); } };
+    Result<Subscriber, RedisError> so = Subscriber.over(connection: give sc);
+    Subscriber s = match (give so) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "tls: subscriber over"); } };
+    Result<Unit, RedisError> subscribed = s.subscribe(names: "kr:tls:ch");
+    string published = ask(c: c, text: "PUBLISH kr:tls:ch hello");
+    string message = match (s.next(timeout: Optional::Some(value: Duration.fromSecs(s: 5i64)))) {
+        case Ok(value: o): match (o) { case Some(value: d): match (d) { case Message(message: m): messageText(m: m); case _: "other"; }; case None: "none"; };
+        case Err(error: e): e.message();
+    };
+    string quiet = match (s.next(timeout: Optional::Some(value: Duration.fromMillis(ms: 200i64)))) { case Ok(value: o): match (o) { case Some(value: d): "a delivery"; case None: "none"; }; case Err(error: e): e.message(); };
+    f = f + check(ok: published == "1" && message == "kr:tls:ch hello" && quiet == "none" && !s.isClosed(),
+                  what: "tls: a subscriber gets a message over TLS (${published}; ${message}), and a wait ends with none (${quiet})");
+    return f;
+}
+
+unsafe fn int32 tlsTests() {
+    int32 f = 0;
+    f = f + connectingTests();
+    f = f + trustTests();
+    f = f + certificateTests();
+    f = f + wireTests();
+    f = f + sessionTests();
+    return f;
+}

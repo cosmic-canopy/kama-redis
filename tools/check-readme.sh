@@ -1,7 +1,8 @@
 #!/bin/sh
 # check-readme.sh — build every complete program in README.md (each ```kama block with a `fn int32 main()`) against
 # this package, and run it against a live server. The only change made to an example is its URL: the test server's
-# host and port take the place of 127.0.0.1:6379. A program that does not build, or exits other than 0, fails.
+# host and port take the place of 127.0.0.1:6379, its TLS port that of 127.0.0.1:6380, and the test PKI's files those
+# under /etc/redis/. A program that does not build, or exits other than 0, fails.
 #
 #   tools/check-readme.sh                    on redis-8.10
 #   tools/check-readme.sh --server S         on the server named (tools/redis.sh list)
@@ -46,7 +47,8 @@ for ex in "$work"/ex*.kama; do
     name=$(basename "$ex" .kama)
     project="$work/$name"
     mkdir -p "$project/src"
-    sed "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" "$ex" > "$project/src/main.kama"
+    sed -e "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" -e "s#127\.0\.0\.1:6380#$REDISTEST_HOST:$REDISTEST_TLS_PORT#g" \
+        -e "s#/etc/redis/#$REDISTEST_CERTDIR/#g" "$ex" > "$project/src/main.kama"
     cat > "$project/kama.json" <<EOF
 { "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.667",
   "entry": "src/main.kama", "dependencies": { "@kama/redis": { "path": "../../.." } },
