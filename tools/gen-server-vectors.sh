@@ -14,6 +14,11 @@
 #     beside each reply, so a test derives its expected values from it rather than from memory. Transactions (MULTI,
 #     QUEUED, EXEC, EXEC's null after a broken WATCH), scripts (SCRIPT LOAD and an EVALSHA hit), SCAN pages and
 #     BLPOP's replies are captured the same way.
+#   - Pub/sub (phase 4): under RESP2 and RESP3, what a subscribing connection reads: confirmations, messages from a
+#     second connection, PING's two shapes, refusals, and invalidations another connection's tracking redirects to
+#     it. An unsubscribe-all's order follows a hash Redis seeds at random in each process, so it is checked and then
+#     recorded in one order (canonical()). On two cluster nodes joined by hand (7.0 and later): CROSSSLOT, MOVED, and
+#     the server's own sunsubscribe when a slot leaves the node.
 #   - Blocking commands: each server's `ACL CAT blocking`, sorted (the server lists them in hash order), and for each
 #     blocking command the server documents (7.0 and later), its arguments as COMMAND DOCS gives them, so the
 #     client's table of where each one's timeout is can be checked against every server.
@@ -82,6 +87,8 @@ case "$(redis-server --version)" in
     Redis*) ;;
     *) start 7005 --extended-redis-compatibility yes; start 7006 --availability-zone az-1 ;;
 esac
+# Two cluster nodes, for sharded pub/sub's MOVED, CROSSSLOT and the server's own sunsubscribe (ask.pl joins them).
+for p in 7100 7101; do start $p --cluster-enabled yes --cluster-config-file /tmp/nodes-$p.conf --cluster-require-full-coverage no; done
 redis-server --version | sed -n "s/.*[Ss]erver v=\([0-9.]*\) .*/\1/p"
 bin=$(readlink -f "$(command -v redis-server)")
 perl -0777 -ne 'my %c; $c{$1}++ while /\x00-([A-Z][A-Z0-9_]+) [\x21-\x7e]/g;
@@ -332,6 +339,184 @@ for my $proto (2, 3) {
     }
     close $c->{s};
 }
+
+# ---- Phase 4: pub/sub, under RESP2 and RESP3 ----
+# A scene runs on a fresh pair of connections to one port: `a`, the subscriber, and `b`, another client. Its actions,
+# in order:
+#   ['a', n, @cmd]           send @cmd on a and read its next n values;
+#   ['b', n, @cmd]           the same, on b;
+#   ['send', @cmd]           send @cmd on a, and read nothing;
+#   ['id']                   read a's CLIENT ID: "<id>" in a later command is replaced by it;
+#   ['rec', case, n, @cmd]   send @cmd on a (nothing, when @cmd is empty), and record a's next n values as
+#                            "<case>/<protocol>";
+#   ['recb', case, n, @cmd]  the same, on b;
+#   ['all', case, n, @cmd]   'rec', for an unsubscribe-all (canonical(), below).
+# A read of n values stops after an error: the server refused the whole command, so nothing else is coming for it. A
+# recorded case's setup is the scene's actions before it, b's marked "from another connection".
+#
+# An unsubscribe-all confirms each name in the order of the server's hash table. Redis seeds that hash at random in each
+# process (Valkey 9.1 keeps the order of subscribing), so the bytes would differ from one run to the next. canonical()
+# checks that the server confirmed exactly the names subscribed, each once, with counts falling by one, and records
+# them in one order: sorted by name, the counts falling from the first. That is the order Valkey 9.1 sends, for names
+# subscribed in sorted order, as every scene here subscribes them.
+sub reads {
+    my ($c, $n) = @_; my @got;
+    for (1 .. $n) { my $r = reply($c); push @got, $r; last if $r =~ /\A[-!]/; }
+    return @got;
+}
+sub canonical {
+    my ($want, @frames) = @_;
+    my @parts;
+    for my $f (@frames) {
+        $f =~ /\A([*>])3\r\n\$(\d+)\r\n([a-z]+)\r\n\$(\d+)\r\n(.*)\r\n:(\d+)\r\n\z/s && length($3) == $2 && length($5) == $4
+            or die "canonical: not a confirmation: " . unpack('H*', $f) . "\n";
+        push @parts, [$1, $3, $5, $6];
+    }
+    my @names = sort map { $_->[2] } @parts;
+    die "canonical: confirmed [@names], subscribed [@$want]\n" unless "@names" eq join(' ', sort @$want);
+    my @counts = sort { $b <=> $a } map { $_->[3] } @parts;
+    for my $i (0 .. $#counts) { die "canonical: counts [@counts] do not fall by one\n" unless $counts[$i] == $counts[0] - $i; }
+    my @sorted = sort { $a->[2] cmp $b->[2] } @parts;
+    return join('', map { my ($t, $kind, $name) = @{ $sorted[$_] }; "${t}3\r\n\$" . length($kind) . "\r\n$kind\r\n\$" . length($name) . "\r\n$name\r\n:$counts[$_]\r\n" } 0 .. $#sorted);
+}
+sub scene {
+    my ($proto, $port, @actions) = @_;
+    my $a = open_to($port); my $b = open_to($port);
+    call($a, 'HELLO', '3') if $proto == 3;
+    my ($id, @setup) = ('');
+    for my $act (@actions) {
+        my ($what, @rest) = @$act;
+        local $SIG{ALRM} = sub { die "scene: no answer to [$what @rest] on $port under RESP$proto\n" };
+        alarm 10;
+        if ($what eq 'id') {
+            my $r = call($a, 'CLIENT', 'ID'); $r =~ /\A:(\d+)\r\n\z/ or die "CLIENT ID: $r\n"; $id = $1;
+            push @setup, ['CLIENT', 'ID'];
+        } elsif ($what eq 'send') {
+            print { $a->{s} } enc(map { s/<id>/$id/r } @rest);
+            push @setup, shown(@rest) . ', unanswered yet';
+        } elsif ($what eq 'a' || $what eq 'b') {
+            my ($n, @cmd) = @rest;
+            my $c = $what eq 'a' ? $a : $b;
+            print { $c->{s} } enc(map { s/<id>/$id/r } @cmd);
+            reads($c, $n);
+            push @setup, $what eq 'a' ? [@cmd] : shown(@cmd) . ', from another connection';
+        } else {
+            my ($case, $n, @cmd) = @rest;
+            my $want = $what eq q(all) ? $n : undef;
+            $n = @$want if $want;
+            my $c = $what eq q(recb) ? $b : $a;
+            print { $c->{s} } enc(map { s/<id>/$id/r } @cmd) if @cmd;
+            my @got = reads($c, $n);
+            my $r = $want ? canonical($want, @got) : join(q(), @got);
+            my @shown = @cmd ? @cmd : ('(nothing: what arrives)');
+            @shown = ('(from another connection)', @shown) if $what eq 'recb';
+            record("$case/$proto", [@shown], $r, [@setup]);
+            push @setup, $what eq 'recb' ? shown(@cmd) . ', from another connection' : [@cmd];
+        }
+        alarm 0;
+    }
+    close $a->{s}; close $b->{s};
+}
+{
+    my $c = open_to(7000);
+    my $sharded = ask($c, 'COMMAND', 'INFO', 'ssubscribe');
+    $sharded = ref $sharded eq 'ARRAY' && defined $sharded->[0];
+    close $c->{s};
+    my $all = sub { my ($case, $want, @cmd) = @_; return [q(all), $case, $want, @cmd]; };
+    for my $proto (2, 3) {
+        # Confirmations: one per name, a name subscribed twice confirmed twice with the count unchanged.
+        scene($proto, 7000, ['rec', 'sub-one', 1, 'SUBSCRIBE', 'kr:c1']);
+        scene($proto, 7000, ['rec', 'sub-two', 2, 'SUBSCRIBE', 'kr:c1', 'kr:c2']);
+        scene($proto, 7000, ['rec', 'sub-twice', 2, 'SUBSCRIBE', 'kr:c1', 'kr:c1']);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'sub-again', 1, 'SUBSCRIBE', 'kr:c1']);
+        scene($proto, 7000, ['rec', 'psub-two', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*']);
+        # On a standalone server, shard channels in different slots are accepted together. 6.2 refuses the command.
+        scene($proto, 7000, ['rec', 'ssub-two', 2, 'SSUBSCRIBE', 'kr:s1', 'kr:s2']);
+        # Unsubscribing by name, a name never subscribed included.
+        scene($proto, 7000, ['a', 2, 'SUBSCRIBE', 'kr:c1', 'kr:c2'], ['rec', 'unsub-one', 1, 'UNSUBSCRIBE', 'kr:c1']);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'unsub-never', 1, 'UNSUBSCRIBE', 'kr:nope']);
+        scene($proto, 7000, ['a', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*'], ['rec', 'punsub-one', 1, 'PUNSUBSCRIBE', 'kr:q*']);
+        # Unsubscribing from all: one confirmation per name, the other kinds' counts included; with none, one with
+        # a null name.
+        scene($proto, 7000, ['a', 3, 'SUBSCRIBE', 'kr:c1', 'kr:c2', 'kr:c3'], ['a', 1, 'PSUBSCRIBE', 'kr:p*'],
+              $all->('unsub-all', ['kr:c1', 'kr:c2', 'kr:c3'], 'UNSUBSCRIBE'));
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 2, 'PSUBSCRIBE', 'kr:p*', 'kr:q*'],
+              $all->('punsub-all', ['kr:p*', 'kr:q*'], 'PUNSUBSCRIBE'));
+        scene($proto, 7000, ['rec', 'unsub-none', 1, 'UNSUBSCRIBE']);
+        scene($proto, 7000, ['rec', 'punsub-none', 1, 'PUNSUBSCRIBE']);
+        scene($proto, 7000, ['a', 1, 'PSUBSCRIBE', 'kr:p*'], ['rec', 'unsub-none-pattern', 1, 'UNSUBSCRIBE']);
+        if ($sharded) {
+            scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 2, 'SSUBSCRIBE', 'kr:s1', 'kr:s2'],
+                  $all->('sunsub-all', ['kr:s1', 'kr:s2'], 'SUNSUBSCRIBE'));
+            scene($proto, 7000, ['rec', 'sunsub-none', 1, 'SUNSUBSCRIBE']);
+        }
+        # Messages, from another connection: message, pmessage and smessage; binary and empty payloads; a message both
+        # a channel and a pattern match, which comes twice.
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['recb', 'publish-one', 1, 'PUBLISH', 'kr:c1', 'hello'],
+              ['rec', 'message', 1]);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', "kr:\x00\xff"], ['b', 1, 'PUBLISH', "kr:\x00\xff", $bin],
+              ['rec', 'message-binary', 1]);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['b', 1, 'PUBLISH', 'kr:c1', ''], ['rec', 'message-empty', 1]);
+        scene($proto, 7000, ['a', 1, 'PSUBSCRIBE', 'kr:p*'], ['b', 1, 'PUBLISH', 'kr:p1', 'hello'], ['rec', 'pmessage', 1]);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'PSUBSCRIBE', 'kr:c*'],
+              ['recb', 'publish-two', 1, 'PUBLISH', 'kr:c1', 'hello'], ['rec', 'message-twice', 2]);
+        if ($sharded) {
+            scene($proto, 7000, ['a', 1, 'SSUBSCRIBE', 'kr:s1'], ['recb', 'spublish-one', 1, 'SPUBLISH', 'kr:s1', 'hello'],
+                  ['rec', 'smessage', 1]);
+            # A plain PUBLISH does not reach a shard subscriber: the PING's answer is the next thing to come.
+            scene($proto, 7000, ['a', 1, 'SSUBSCRIBE', 'kr:s1'], ['recb', 'publish-shard', 1, 'PUBLISH', 'kr:s1', 'hello'],
+                  ['rec', 'shard-ping', 1, 'PING']);
+        }
+        # PING while subscribed (RESP2's ["pong", ""], RESP3's +PONG), and once every count is back to 0.
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'ping-subscribed', 1, 'PING']);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'ping-subscribed-text', 1, 'PING', 'hello']);
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'UNSUBSCRIBE', 'kr:c1'], ['rec', 'ping-left', 1, 'PING']);
+        # What else a subscribed connection is told: RESP2 refuses other commands; RESP3 runs them.
+        scene($proto, 7000, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['rec', 'subscribed-get', 1, 'GET', 'kr:k']);
+        # A user who may not subscribe (kr_ro has no @pubsub): one error, and no confirmation.
+        scene($proto, 7000, ['a', 1, 'AUTH', 'kr_ro', 'kr_ro_pw'], ['rec', 'sub-noperm', 2, 'SUBSCRIBE', 'kr:c1', 'kr:c2']);
+        # Invalidations another connection's tracking sends here (REDIRECT): RESP3's invalidate push, and RESP2's message
+        # on __redis__:invalidate, whose payload is an array of keys, or a null for a flush.
+        scene($proto, 7000, ['id'], ['a', 1, 'SUBSCRIBE', '__redis__:invalidate'],
+              ['b', 1, 'CLIENT', 'TRACKING', 'on', 'REDIRECT', '<id>'], ['b', 1, 'GET', 'kr:t'], ['b', 1, 'SET', 'kr:t', '1'],
+              ['rec', 'tracking-redirect', 1], ['b', 1, 'GET', 'kr:t'], ['b', 1, 'FLUSHALL'], ['rec', 'tracking-flush', 1]);
+    }
+    # A cluster of two nodes (7.0 and later): MOVED and CROSSSLOT in place of confirmations, and the server's own
+    # sunsubscribe when a slot leaves the node. redis-cli --cluster create wants three primaries, so the two are joined
+    # by hand. A slot taken away does not fail the cluster (cluster-require-full-coverage no).
+    if ($sharded && $up{7100} && $up{7101}) {
+        my $x = open_to(7100); my $y = open_to(7101);
+        ask($x, 'CLUSTER', 'ADDSLOTSRANGE', '0', '8191');
+        ask($y, 'CLUSTER', 'ADDSLOTSRANGE', '8192', '16383');
+        ask($x, 'CLUSTER', 'MEET', '127.0.0.1', '7101');
+        my $ready = 0;
+        for (1 .. 400) {
+            my $i = ask($x, 'CLUSTER', 'INFO'); my $j = ask($y, 'CLUSTER', 'INFO');
+            if ("$i$j" !~ /cluster_state:(?!ok)/ && $i =~ /cluster_slots_assigned:16384/ && $j =~ /cluster_slots_assigned:16384/) { $ready = 1; last; }
+            select(undef, undef, undef, 0.05);
+        }
+        die "the two-node cluster never came up\n" unless $ready;
+        # Shard channels: two in the first node's slots, in different slots, and one in the second node's.
+        my (@mine, $theirs);
+        for my $k (map { "kr:s$_" } 1 .. 200) {
+            my $slot = ask($x, 'CLUSTER', 'KEYSLOT', $k);
+            if ($slot < 8192) { push @mine, [$k, $slot] if @mine < 4 && !grep { $_->[1] == $slot } @mine; }
+            else { $theirs //= $k; }
+            last if @mine == 4 && defined $theirs;
+        }
+        die "no shard channels for the cluster\n" unless @mine == 4 && defined $theirs;
+        close $x->{s}; close $y->{s};
+        for my $proto (2, 3) {
+            my ($one, $other) = $proto == 2 ? @mine[0, 1] : @mine[2, 3];
+            scene($proto, 7100, ['rec', 'cluster-crossslot', 2, 'SSUBSCRIBE', $one->[0], $other->[0]]);
+            scene($proto, 7100, ['rec', 'cluster-moved', 1, 'SSUBSCRIBE', $theirs]);
+            scene($proto, 7100, ['a', 1, 'SUBSCRIBE', 'kr:c1'], ['a', 1, 'SSUBSCRIBE', $one->[0]],
+                  ['b', 1, 'CLUSTER', 'DELSLOTS', $one->[1]], ['rec', 'cluster-sunsubscribe', 1], ['rec', 'cluster-sunsubscribe-ping', 1, 'PING']);
+            scene($proto, 7100, ['a', 1, 'SSUBSCRIBE', $other->[0]], ['b', 1, 'CLUSTER', 'DELSLOTS', $other->[1]],
+                  ['rec', 'cluster-sunsubscribe-last', 1], ['rec', 'cluster-sunsubscribe-last-ping', 1, 'PING']);
+        }
+    }
+}
 PERL
 
 : > "$tmp/live.tsv"
@@ -372,6 +557,19 @@ for my $must (qw(hello3 hello2 hello3-auth hello3-auth-wrong locked-hello3 locke
     die "gen-server-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 die "gen-server-vectors: no compat-hello3 case\n" unless $count{'compat-hello3'};
+for my $proto (2, 3) {
+    for my $must (qw(sub-two sub-twice unsub-all punsub-all unsub-none message message-twice pmessage ping-subscribed ping-left
+                     sub-noperm tracking-redirect tracking-flush)) {
+        die "gen-server-vectors: case $must/$proto is not on every server\n" unless ($count{"$must/$proto"} // 0) == @versions;
+    }
+    # Sharded pub/sub is 7.0's: a server that answers SSUBSCRIBE has every sharded case, the cluster's included.
+    my $sharded = grep { $_->[0] =~ / ssub-two\/$proto$/ && $_->[2] !~ /^2d/ } @replies;
+    die "gen-server-vectors: no server answered SSUBSCRIBE\n" unless $sharded;
+    for my $must (qw(sunsub-all smessage shard-ping cluster-crossslot cluster-moved cluster-sunsubscribe cluster-sunsubscribe-ping
+                     cluster-sunsubscribe-last cluster-sunsubscribe-last-ping)) {
+        die "gen-server-vectors: case $must/$proto is not on every server with sharded pub/sub\n" unless ($count{"$must/$proto"} // 0) == $sharded;
+    }
+}
 die "gen-server-vectors: a server gave no blocking category\n" unless @blocking == @versions;
 my %docServers; $docServers{(split / /, $_->[0])[0]}++ for @docs;
 die "gen-server-vectors: no COMMAND DOCS from any server\n" unless %docServers;
@@ -435,6 +633,11 @@ print $o <<"HEAD";
 //     noperm, …); tools/gen-server-vectors.sh lists them.
 //   - replySetups: the commands that ran before each case's command, on the same connection (joined by " ; "). The
 //     typed pairs ("<case>/2", "<case>/3") ran on a fresh connection after FLUSHALL, under that protocol.
+//   - Pub/sub (sub-two/2, message/3, cluster-moved/2, …): what a subscribing connection reads after its command, or
+//     after another connection's (its setup says which), under each protocol; several values in one case are each
+//     whole. An unsubscribe-all is recorded with its names sorted and its counts falling by one, the order Valkey
+//     9.1 sends: Redis's order follows a hash seeded at random in each process. The cluster cases ran on two nodes
+//     joined by hand (7.0 and later).
 //   - blockingServers / blockingNames: each server's `ACL CAT blocking`, sorted.
 //   - docsNames / docsArgs: "<server> <command>" for each blocking command a server documents (7.0 and later), and
 //     its arguments from COMMAND DOCS, each name:type:token:flags:children.

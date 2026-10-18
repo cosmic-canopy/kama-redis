@@ -253,7 +253,10 @@ Each step ends green before its commit:
 0. **Done (2026-10-18).** Repros: a `Subscriber` that takes a `Connection` by value and hands it back, a `Delivery`
    enum with resource payloads, and per-method `friend` grants from `Connection`. The decisions are under "Decided,
    and why", "Phase 4". The cache's LRU and a reachable `drain` wait for 0.3.0, with the cache.
-1. **Vectors** (`tools/gen-server-vectors.sh`).
+1. **Vectors** (`tools/gen-server-vectors.sh`). **Done (2026-10-18)**: 80 pub/sub cases a server, 56 on 6.2, which has
+   no sharded pub/sub. Two runs give the same file, and the existing cases' bytes did not move. Found on the way: a
+   redirected flush is `>2 invalidate $-1` under RESP3 (not `_`), and RESP2's redirected invalidation is a `message`
+   with an array payload ("Decided, and why", "Phase 4").
    - Captures read by count, and second-connection setups (PUBLISH, SET, FLUSHALL), for every probe above under both
      protocols.
    - An unsubscribe-all's confirmations are recorded sorted. Their order follows the server's hash seed, which is
@@ -882,6 +885,13 @@ facts underneath; they are listed at the end.
 - **A RESP3 push that is not pub/sub** goes to the connection's set-aside pushes (bounded), and comes back with it
   from `release()`. On a subscriber that can be a module's push, or an `invalidate` that another connection's
   `CLIENT TRACKING … REDIRECT` sends here.
+- **Invalidations are never deliveries, under either protocol.** Under RESP2, a redirected invalidation is a
+  `message` on `__redis__:invalidate` whose payload is an array of keys, or a null for a flush (captured on all
+  eight servers: `tracking-redirect/2`, `tracking-flush/2`). It is the only message whose payload is not a string,
+  and it is RESP2's form of RESP3's `invalidate` push. So it is set aside on the connection as that push is, and a
+  `Message`'s payload is always bytes. go-redis gives such a payload a field of its own (`PayloadSlice`), and redis-rs
+  keeps every payload as a `Value`. Here, client-side caching is 0.3.0's, and until then an invalidation has no
+  reader of its own.
 
 - **What step 0's repros showed** (in the session's scratchpad; each on v0.9.667 and 0.9.668, debug and release):
   - A resource taken by value into a `DynamicArray` of one, used in place through `held[0]`, and handed back by
