@@ -569,6 +569,50 @@ type resource ReplyReader implements Deserializer {
         return true;
     }
 
+    // The kind of the next value, unread: what a type whose shape is not declared reads by. An error inside the
+    // reply is the server's, as any read of it is.
+    public fn ValueKind peekKind() {
+        if (this.err || this.topIs(h: Hold::Bytes) || this.at >= this.limit()) { return ValueKind::Null; }
+        if (this.isFailureAt()) {
+            string w = "a value";
+            this.mismatch(asked: w);
+            return ValueKind::Null;
+        }
+        return match (this.nodes[this.at]) {
+            case Null: ValueKind::Null;
+            case Boolean(value: t): ValueKind::Bool;
+            case Integer(value: n): ValueKind::Number;
+            case Double(value: d): ValueKind::Number;
+            case Big(digits: d): ValueKind::Number;
+            case Text(bytes: b, shape: s): ValueKind::String;
+            case Many(count: c, shape: s): manyKind(s: s);
+            case _: ValueKind::Null;
+        };
+    }
+
+    // The next number's exact decimal text: an integer's, a big number's digits, a double's shortest form (inf, -inf
+    // and nan spelled out).
+    public fn string readNumberText() {
+        string w = "a number";
+        if (!this.ready(asked: w)) { return ""; }
+        bool number = match (this.nodes[this.at]) { case Integer(value: n): true; case Double(value: d): true; case Big(digits: d): true; case _: false; };
+        if (!number) {
+            this.mismatch(asked: w);
+            return "";
+        }
+        string text = this.textAt(i: this.at);
+        this.at = this.at + 1;
+        return text;
+    }
+
+    // A key that names no field of the struct being read: its value is skipped, so a newer server's extra field reads
+    // as before.
+    public fn void unknownField() { this.skipValue(); }
+
+    // A map here is read as its pairs (std Map's array of entries), which serves a RESP3 map, a flat RESP2 array and
+    // an array of pairs alike, so the answer is no.
+    public fn bool atKeyedMap() { return false; }
+
     public fn void skipValue() {
         if (this.err || this.topIs(h: Hold::Bytes) || this.at >= this.limit()) { return; }
         this.at = this.ends[this.at];
@@ -617,6 +661,10 @@ fn string shapeName(Shape s) {
         case Set: "a set";
         case Push: "a push message";
     };
+}
+
+fn ValueKind manyKind(Shape s) {
+    return match (s) { case Map: ValueKind::Object; case _: ValueKind::Array; };
 }
 
 fn string boolName(bool t) { if (t) { return "a boolean true"; } return "a boolean false"; }

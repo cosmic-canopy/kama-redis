@@ -17,7 +17,7 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.573**, declared as `"kama"` in every manifest here, and CI pins `v0.9.573`. That is the
+**The package needs kama ≥ 0.9.667**, declared as `"kama"` in every manifest here, and CI pins `v0.9.667`. That is the
 first tagged compiler with everything this package relies on (users install tagged releases):
 - the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
 - `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
@@ -27,11 +27,14 @@ first tagged compiler with everything this package relies on (users install tagg
 - `std::memory::replace` (0.9.563), which `Replies.take` uses;
 - std's `deserialize` reading a program's types in the program's scope (0.9.565, KRD-8), and an adapter's signature
   read in the adapter's module (0.9.566, KRD-7), which the bytes, list and Uuid adapters need;
-- `DeErrorKind`, `failWith(kind:)` and `DeError.field()` (0.9.569), which the reply reader implements.
+- `DeErrorKind`, `failWith(kind:)` and `DeError.field()` (0.9.569), which the reply reader implements;
+- the `Deserializer` members `peekKind`/`readNumberText`, `unknownField` and `atKeyedMap` (all in v0.9.667), which the
+  reader implements too, and `std::memory::replace`, which `ServerInfo` reads its HELLO reply with (v0.9.667's
+  borrow rule refuses a borrow of a field across a call that may write it).
 
 Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8). Install a tag beside your own with cstar's `install.sh`
-(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.573`), and run the gates with `KAMA=<dir>/bin/kama`.
+(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
 
 ## What is true here and nowhere else
 
@@ -161,6 +164,11 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     a call (`isize n = xs.length();`) first.
   - A local may not share a name with a field, nor with a local of an enclosing scope.
   - A `Template<C>`'s holes are `const ref`, so a contract method a tag calls on one is a `const fn`.
+  - A `match` on a std enum marked `@nonExhaustive` (`Utf8Error`, `Interest`, …) needs `case _:`, since a later std
+    may add a case.
+  - A block arm that yields a `string` says `:= give s;` (or `copy`): every arm is a hand-off.
+  - A borrow of a field's payload does not live across a call that may write `this`; hold the value aside with
+    `replace` (`ServerInfo.read`).
   - A hand-written `Deserializer` latches a `DeErrorKind` (`failWith(kind:)`, `errorKind()`); the derive adds where
     on the way out, so a `DeError` recovered with `e.as<DeError>()` names its field (`c.field()`: `f2`, `[1].f2`).
   - A path dependency's path is relative to its manifest; an absolute one is not found.

@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, redis::resp::Value, redis::RedisError };
+         std::encoding::utf8::Utf8Error, redis::resp::Value, redis::RedisError, std::memory::replace };
 export { ServerInfo };
 
 // What a server says of itself in its HELLO reply: a map under RESP3, a flat array of the same pairs under RESP2.
@@ -87,14 +87,19 @@ type resource ServerInfo implements Sendable, Copyable<This>(bare: give) {
         bool haveServer = false;
         bool haveVersion = false;
         bool haveProto = false;
-        match (this.reply) {
+        // The reply is held aside while its pairs fill this value's other fields, then put back.
+        Value held = replace::<Value>(place: this.reply, with: Value::Null);
+        bool shaped = true;
+        match (held) {
             case Map(entries: e): { bad = this.readPairs(pairs: e, haveServer: ref haveServer, haveVersion: ref haveVersion, haveProto: ref haveProto); }
             case Array(items: e): {
-                if (e.length() % 2 != 0) { return Optional::Some(value: "the HELLO reply is an array of odd length, not key and value pairs"); }
-                bad = this.readPairs(pairs: e, haveServer: ref haveServer, haveVersion: ref haveVersion, haveProto: ref haveProto);
+                if (e.length() % 2 != 0) { bad = Optional::Some(value: "the HELLO reply is an array of odd length, not key and value pairs"); }
+                else { bad = this.readPairs(pairs: e, haveServer: ref haveServer, haveVersion: ref haveVersion, haveProto: ref haveProto); }
             }
-            case _: { return Optional::Some(value: "the HELLO reply is not a map"); }
+            case _: { shaped = false; }
         };
+        this.reply = give held;
+        if (!shaped) { return Optional::Some(value: "the HELLO reply is not a map"); }
         match (give bad) { case Some(value: why): { return Optional::Some(value: give why); } case None: { } };
         if (!haveServer || !haveVersion || !haveProto) { return Optional::Some(value: "the HELLO reply has no server, version or proto"); }
         return Optional::None;

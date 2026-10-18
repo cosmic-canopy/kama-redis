@@ -5,8 +5,8 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.573` (tag `v0.9.573`), which CI pins and the manifests' floor names. Each repro is
-also run on cstar's newest build (`0.9.577+g135c27c5` on 2026-10-13).
+**Current compiler:** `kama 0.9.667` (tag `v0.9.667`), which CI pins and the manifests' floor names. Each repro is
+also run on cstar's newest build (`0.9.668+g425eecff` on 2026-10-18).
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design

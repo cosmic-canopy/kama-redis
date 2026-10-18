@@ -12,7 +12,7 @@ fn string listed(const ref Result<DynamicArray<string>, RedisError> r) {
             string s = "";
             isize i = 0;
             while (i < xs.length()) { if (i > 0) { s = s.concat(other: ","); } s = s.concat(other: xs[i]); i = i + 1; }
-            := s;
+            := give s;
         }
         case Err(error: e): "(failed) ".concat(other: e.message());
     };

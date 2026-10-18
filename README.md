@@ -7,7 +7,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 > **Status: commands work; not yet published.** A connection authenticates, picks its protocol and database, and
 > sends commands, pipelines, transactions and scripts with deadlines; replies read into kama types. It is tested live
 > on Redis 6.2–8.10 and Valkey 7.2–9.1. Push messages, TLS and cluster come next; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.573**.
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
 

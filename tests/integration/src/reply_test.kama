@@ -64,7 +64,7 @@ unsafe fn int32 readTests(const ref string tail, const ref string protocol) {
                 s = s.concat(other: item).concat(other: ";");
                 i = i + 1;
             }
-            := s;
+            := give s;
         }
         case Err(error: e): failed(e: e);
     };
@@ -73,7 +73,7 @@ unsafe fn int32 readTests(const ref string tail, const ref string protocol) {
     string z = ask(c: c, text: "ZADD kr:r:z 1.5 a 2 b");
     Result<DynamicArray<Scored>, RedisError> scored = reply::<DynamicArray<Scored>>(result: sent(c: c, text: "ZRANGE kr:r:z 0 -1 WITHSCORES"));
     string g3 = match (scored) {
-        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := s; }
+        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := give s; }
         case Err(error: e): failed(e: e);
     };
     f = f + check(ok: g3 == "a=1.5;b=2;", what: "reply: ZRANGE WITHSCORES as records under ${protocol}: ${g3}");
@@ -82,7 +82,7 @@ unsafe fn int32 readTests(const ref string tail, const ref string protocol) {
     string x2 = ask(c: c, text: "XADD kr:r:x 2-1 g w h u");
     Result<DynamicArray<Entry>, RedisError> entries = reply::<DynamicArray<Entry>>(result: sent(c: c, text: "XRANGE kr:r:x - +"));
     string g4 = match (entries) {
-        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := s; }
+        case Ok(value: xs): { string s = ""; isize i = 0; while (i < xs.length()) { s = s.concat(other: xs[i].shown()).concat(other: ";"); i = i + 1; } := give s; }
         case Err(error: e): failed(e: e);
     };
     f = f + check(ok: g4 == "1-1/1;2-1/2;", what: "reply: XRANGE as records under ${protocol}: ${g4}");

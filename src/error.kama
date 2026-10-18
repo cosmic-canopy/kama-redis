@@ -241,7 +241,7 @@ fn string shown(ConstView<uint8> b) {
         Result<string, Utf8Error> part = decode(bytes: b.slice(from: from, count: b.length() - from));
         isize bad = match (give part) {
             case Ok(value: s): { text = text.concat(other: s); := b.length(); }
-            case Err(error: e): match (e) { case Invalid(at: a): a + from; };
+            case Err(error: e): match (e) { case Invalid(at: a): a + from; case _: from; };
         };
         if (bad >= b.length()) { break; }
         if (bad > from) {

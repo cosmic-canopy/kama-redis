@@ -6,7 +6,8 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.573**, the first tagged release with the fixes this package relies on (KAMA_GAPS.md).
+Needs **kama ≥ 0.9.667**: the first tagged release with the fixes this package relies on (KAMA_GAPS.md) and with
+the `Deserializer` the reply reader implements (`peekKind`, `readNumberText`, `unknownField`, `atKeyedMap`).
 
 ### Added
 - Commands (phase 3):

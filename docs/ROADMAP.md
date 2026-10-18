@@ -20,8 +20,8 @@ was. "Before 0.1.0" lists everything between here and a publish.
   - pipelines, blocking deadlines, transactions (`transact`, `watched`), scripts and `Scan`.
   The unit suite reads every typed pair from all eight servers under both protocols, and builds each blocking
   command from every server's COMMAND DOCS. `tools/check-readme.sh` runs the README's programs live.
-- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.573 (the floor and CI's pin) and cstar's 0.9.577;
-  `tools/test-integration.sh` on all eight servers on 0.9.573, and on Redis 6.2 and Valkey 9.1 on 0.9.577.
+- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin, 2026-10-18) and cstar's
+  0.9.668; `tools/test-integration.sh` on all eight servers on 0.9.667; the README's programs live.
 - Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
   and CI pin moved there, `RedisArg` gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone,
   and the reply reader implements 0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
