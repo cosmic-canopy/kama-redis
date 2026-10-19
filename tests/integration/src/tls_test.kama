@@ -160,7 +160,8 @@ type resource SniRelay implements Sendable {
             match (give accepted) {
                 case Ok(value: c): {
                     TcpStream client = give c;
-                    // On macOS an accepted socket inherits the listener's O_NONBLOCK; the ClientHello is read blocking.
+                    // An accepted stream starts in its listener's mode (on every OS since kama 0.9.671; on macOS always),
+                    // and the listener is non-blocking: the ClientHello is read blocking.
                     Result<Unit, IoError> blocking = client.setNonBlocking(on: false);
                     DynamicArray<uint8> hello = DynamicArray.empty();
                     FixedArray<uint8> buf = FixedArray.make(size: 16384);

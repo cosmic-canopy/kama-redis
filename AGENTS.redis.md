@@ -32,7 +32,8 @@ first tagged compiler with everything this package relies on (users install tagg
   reader implements too, and `std::memory::replace`, which `ServerInfo` reads its HELLO reply with (v0.9.667's
   borrow rule refuses a borrow of a field across a call that may write it).
 
-Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+Verified on v0.9.673 (2026-10-19, the newest tag), which needs nothing changed, so the floor and the pin stay: `ci.yml`
+moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8). Install a tag beside your own with cstar's `install.sh`
 (`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
 
@@ -138,8 +139,8 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     certificate, its key encrypted, and one the untrusted CA signed. `kama publish` refuses a tracked `*.key`, and
     so does the registry.
   - The live TLS test relays through a listener of its own that reads the ClientHello's server name (SNI on the
-    wire), and meets silence at one that never accepts. On macOS an accepted socket inherits the listener's
-    O_NONBLOCK: set it blocking before reading.
+    wire), and meets silence at one that never accepts. An accepted stream starts in its listener's mode (on every OS
+    since kama 0.9.671, on macOS before it too): set it blocking before reading from a non-blocking listener.
 
 - **`redis::resp`'s reader is built so that nothing is read twice and memory follows the bytes that came.** Keep it
   that way when changing it. The rules are in `src/resp/reader.kama`'s header:

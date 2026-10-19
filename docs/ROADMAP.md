@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0 to 5 are done, on kama v0.9.667. **The goal now is releasing 0.1.0**, a complete
+Where this is, 2026-10-19: phases 0 to 5 are done, on kama v0.9.667, and verified on v0.9.673. **The goal now is releasing 0.1.0**, a complete
 client for one server. "The release plan" below says what each release holds. Phase 7a (reconnection, examples,
 hardening, docs) is next: "Phase 7a: an outline" is below, and its session plan is drawn up from primary sources at
 its start, as phases 3, 4 and 5's were. Then 0.1.0.
@@ -29,9 +29,11 @@ its start, as phases 3, 4 and 5's were. Then 0.1.0.
   roots), `tls_verify` `full`, `chain` or `none`, a CA, a client certificate, `tls_server_name`, over any transport,
   from `@kama/tls` 0.1.3. The unit suite runs Mbed TLS as the scripted server; the live suite checks each server's
   TLS ports, SNI on the wire, a silent handshake and both wrong ports.
-- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin, 2026-10-18) and cstar's
-  0.9.668; `tools/test-integration.sh` on all eight servers on 0.9.667; `tools/redis.sh smoke` (19 checks) on all
-  eight; the README's programs live.
+- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin) and on v0.9.673 (the
+  newest tag, 2026-10-19, which needs nothing changed); `tools/test-integration.sh` on all eight servers on both;
+  `tools/redis.sh smoke` (19 checks) on all eight; the README's programs live; CI green on `03f3968`.
+  - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
+    jobs failed on the phase 5 push until it did (2026-10-18).
 - Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
   and CI pin moved there, `RedisArg` gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone,
   and the reply reader implements 0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
@@ -87,10 +89,14 @@ Anything not in a release yet is refused clearly rather than half there. Today a
   - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word, since a version is
     permanent.
 - **Neighbours, as of 2026-10-18:**
-  - `@kama/tls` 0.1.3 is on the registry (published 2026-10-18), with what phase 5 asked of it.
-  - `@kama/postgres` 0.2.0, the model, no longer builds on v0.9.667 (`DeError`'s kinds, a non-exhaustive
-    `Interest`). That is its repository's to fix, but it means postgres's code is a model to read, not one to build
-    against.
+  - `@kama/tls` 0.1.3 is on the registry (published 2026-10-18), with what phase 5 asked of it, and `kama.lock` pins
+    it. 0.1.4 (a server's identities chosen by SNI) is published too, and 0.1.5 (setters on a configuration shared
+    between isolates hold a lock) is under way; neither touches this client, which builds a configuration for each
+    attempt and shares none. Session resumption is on its roadmap (phase 7a, below).
+  - `@kama/postgres` 0.2.1 builds on v0.9.667 and is in its phase 8 (a pool, 0.3.0). Its TLS handshake carries the
+    fix found here (only the side waited for counts, 2026-10-18). Its phase 8 S1 (`Connection.ping()`,
+    `resetSession()`) is the groundwork phase 7a's reconnection and 7b's pool will want to read, and it now holds that
+    a mutation must make a test fail before the test is called good (`tools/mutate.sh`).
   - `@kama/http` is seeded, with nothing usable yet. The UI packages (`ui`, `rmlui`, `freetype`) do not touch this one.
 
 ## Phase 4: where to start
@@ -446,6 +452,21 @@ Each step ends green before its commit:
 **If the session runs long:** steps 0–4, then 5, then 6.
 
 ## Phase 7a: an outline (likewise, drawn up at its start)
+
+**The next session starts here.** Draw up the session plan from primary sources, as phase 5's was ("Phase 5: where to
+start" is the shape: sources, what they showed, proposed decisions, the session's steps), confirm the kama facts by
+repro on CI's tag and on the newest build, then build step by step, each step green before its commit, and watch CI
+after each push. The sources to read:
+- **The peers' reconnection, from source at current tags:** go-redis (`pool.go`, `redis.go`'s `withConn` and its
+  retry of a bad connection, `MaxRetries`, `pubsub.go`'s reconnect and resubscribe), redis-py (`retry.py`, `backoff.py`,
+  `client.py`'s `_execute`/`_disconnect_raise`, `PubSub.on_connect`), redis-rs (`aio/connection_manager.rs`,
+  `ConnectionManagerConfig`, its resubscribe), Lettuce (`ConnectionWatchdog`, `ReconnectionHandler`,
+  `ClientOptions.autoReconnect`, the command replay and `DisconnectedBehavior`), and hiredis and redis-cli
+  (`cliConnect`'s reconnect).
+- **The servers:** what a client sees from `CLIENT KILL`, a restart, `SHUTDOWN`, a `timeout` idle close, and a full
+  output buffer, on all eight, captured by `tools/gen-server-vectors.sh` in throwaway containers.
+- **The model:** @kama/postgres's phase 8 (`ping()`, `resetSession()`, its pool plan) and its mutation rule.
+- **`@kama/tls`'s resumption,** if it has shipped.
 
 - **Reconnection.**
   - Research the peers first:
