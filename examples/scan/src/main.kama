@@ -1,0 +1,56 @@
+// scan: walk the keys that match a pattern a page at a time, never blocking the server as KEYS would. Each page is
+// one round trip; a key can come back on more than one page, as SCAN promises, so the walk keeps what it has seen.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/scan/kama.json
+import { core::println, core::env, std::collections::DynamicArray, std::collections::Set, redis::Config,
+         redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Scan, redis::cmd,
+         redis::reply };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+unsafe fn isize walk(ref Connection conn) {
+    // Twenty-five keys to find, set in one pipeline.
+    Pipeline setup = Pipeline.make();
+    int32 i = 0;
+    while (i < 25) {
+        Command set = Command.of(name: "SET");
+        set.arg(text: "example:scan:${i}");
+        set.argInt(value: cast<int64>(i));
+        setup.add(command: set);
+        i = i + 1;
+    }
+    Result<Replies, RedisError> ran = conn.run(pipeline: setup);
+    match (ran) { case Ok(value: r): { } case Err(error: e): { println(s: e.message()); return -1; } };
+
+    Scan scan = Scan.keys();
+    string pattern = "example:scan:*";
+    scan.matching(pattern: pattern);
+    // A hint of how many keys a page looks at; the server may give more or fewer.
+    scan.countHint(count: 10);
+    Set<string> seen = Set.empty();
+    int32 pages = 0;
+    while (!scan.isDone()) {
+        Result<DynamicArray<string>, RedisError> page = reply::<DynamicArray<string>>(result: scan.next(conn: conn));
+        DynamicArray<string> keys = match (give page) { case Ok(value: k): give k; case Err(error: e): { println(s: e.message()); return -1; } };
+        pages = pages + 1;
+        isize k = 0;
+        while (k < keys.length()) { seen.add(key: copy keys[k]); k = k + 1; }
+    }
+    isize found = seen.length();
+    println(s: "${found} keys in ${pages} pages");
+    return found;
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    isize found = walk(conn: conn);
+    conn.close();
+    if (found != 25) { return 1; }
+    return 0;
+}

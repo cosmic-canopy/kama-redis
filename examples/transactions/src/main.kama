@@ -1,0 +1,88 @@
+// transactions: a pipeline (many commands in one write), and a transfer between two accounts run under WATCH, which
+// runs again from fresh reads whenever another client changes either account first.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/transactions/kama.json
+import { core::println, core::env, redis::Config, redis::Connection, redis::Command, redis::Pipeline, redis::Replies,
+         redis::RedisError, redis::TxOutcome, redis::TxBody, redis::cmd, redis::reply };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+// The transfer's body: it reads the balance while the keys are watched, and builds the transaction from what it read.
+// It is asked again for each attempt, so it always builds from what is there now.
+type resource Transfer implements TxBody {
+    string from;
+    string to;
+    int64 amount;
+    int32 tries = 0;
+
+    public ctor make(string from, string to, int64 amount) { this.from = give from; this.to = give to; this.amount = amount; }
+
+    public unsafe fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        this.tries = this.tries + 1;
+        Command balance = cmd"GET ${this.from}";
+        Result<int64, RedisError> had = reply::<int64>(result: conn.call(command: balance));
+        int64 available = match (give had) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: give e); } };
+        if (available < this.amount) {
+            return Result::Err(error: RedisError::Value(detail: "not enough to transfer"));
+        }
+        int64 taken = 0 - this.amount;
+        Command debit = cmd"INCRBY ${this.from} ${taken}";
+        Command credit = cmd"INCRBY ${this.to} ${this.amount}";
+        tx.add(command: debit);
+        tx.add(command: credit);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    public const fn int32 attempts() { return this.tries; }
+}
+
+unsafe fn bool run(ref Connection conn) {
+    // A pipeline: a hundred INCRs in one write, a hundred replies in order.
+    string hits = "example:hits";
+    Command clear = cmd"DEL ${hits} example:alice example:bob";
+    Result<int64, RedisError> cleared = reply::<int64>(result: conn.call(command: clear));
+    Pipeline many = Pipeline.make();
+    Command incr = cmd"INCR ${hits}";
+    int32 i = 0;
+    while (i < 100) { many.add(command: incr); i = i + 1; }
+    Result<Replies, RedisError> ran = conn.run(pipeline: many);
+    Replies replies = match (give ran) { case Ok(value: r): give r; case Err(error: e): { println(s: e.message()); return false; } };
+    Result<int64, RedisError> lastHit = reply::<int64>(result: replies.take(index: 99));
+    int64 total = match (lastHit) { case Ok(value: n): n; case Err(error: e): { println(s: e.message()); return false; } };
+    println(s: "a pipeline of 100 INCRs: ${total}");
+    if (total != 100i64) { return false; }
+
+    // Two accounts, and a transfer under WATCH. Without a WATCH, transact is MULTI … EXEC in one write.
+    Command open = cmd"MSET example:alice 100 example:bob 20";
+    Result<string, RedisError> opened = reply::<string>(result: conn.call(command: open));
+    Command watch = cmd"WATCH example:alice example:bob";
+    Transfer move = Transfer.make(from: "example:alice", to: "example:bob", amount: 30);
+    Result<TxOutcome, RedisError> outcome = conn.watched(watch: watch, body: move, attempts: 5);
+    // Committed, or WatchConflict when another client changed an account in every attempt.
+    bool committed = match (give outcome) {
+        case Ok(value: o): match (give o) { case Committed(replies: r): true; case WatchConflict: false; };
+        case Err(error: e): { println(s: e.message()); := false; }
+    };
+    if (!committed) { println(s: "not transferred"); return false; }
+    int32 tries = move.attempts();
+    println(s: "transferred, in ${tries} attempt(s)");
+    Command alice = cmd"GET example:alice";
+    Result<int64, RedisError> left = reply::<int64>(result: conn.call(command: alice));
+    int64 a = match (left) { case Ok(value: n): n; case Err(error: e): -1i64; };
+    println(s: "alice has ${a}");
+    return a == 70i64;
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    bool ok = run(conn: conn);
+    conn.close();
+    if (!ok) { return 1; }
+    return 0;
+}

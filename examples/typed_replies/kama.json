@@ -1,0 +1,9 @@
+{
+  "name": "typed_replies",
+  "version": "0.1.0",
+  "kind": "executable",
+  "kama": ">=0.9.667",
+  "entry": "src/main.kama",
+  "dependencies": { "@kama/redis": { "path": "../.." } },
+  "modules": { ".": { "visibility": "internal" } }
+}

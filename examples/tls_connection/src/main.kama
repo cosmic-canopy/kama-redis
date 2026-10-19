@@ -1,0 +1,41 @@
+// tls_connection: a connection over TLS, its server verified by name against a CA, and what the handshake settled.
+//
+//   REDIS_TLS_URL='rediss://localhost:6380?tls_ca=/etc/redis/ca.crt' kama run examples/tls_connection/kama.json
+//
+// rediss:// (or valkeys://) is TLS. By default the server's certificate must chain to the system's roots and name
+// the host; tls_ca trusts a CA of your own instead, tls_cert and tls_key give a client certificate, and
+// tls_verify=chain or none checks less. The files are read at each connect, so a renewed certificate is used by the
+// next connection, a reconnection included.
+import { core::println, core::env, redis::Config, redis::Connection, redis::RedisError, redis::TlsSession, redis::cmd,
+         redis::reply };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_TLS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "rediss://localhost:6380?tls_ca=/etc/redis/ca.crt"; };
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        // A certificate refused, a CA file that will not load, or a server that does not speak TLS here.
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Optional<TlsSession> session = conn.tlsSession();
+    match (session) {
+        case Some(value: s): {
+            string suite = copy s.cipherSuite();
+            isize der = s.serverCertificate().length();
+            println(s: "TLS, ${suite}; the server's certificate is ${der} bytes");
+        }
+        case None: { println(s: "not TLS"); return 1; }
+    };
+    Result<string, RedisError> pong = reply::<string>(result: conn.call(command: cmd"PING"));
+    string answer = match (give pong) { case Ok(value: p): give p; case Err(error: e): { println(s: e.message()); return 1; } };
+    println(s: "PING: ${answer}");
+    conn.close();
+    if (answer != "PONG") { return 1; }
+    return 0;
+}

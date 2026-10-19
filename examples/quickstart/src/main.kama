@@ -1,0 +1,65 @@
+// quickstart: connect, store a value and read it back, count, and close.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/quickstart/kama.json
+//
+// REDIS_URL is any URL this package reads (redis://, rediss://, unix://, with options such as
+// ?command_timeout=2.5); without it, the server on this machine's default port.
+import { core::println, core::env, redis::Config, redis::Connection, redis::Command, redis::RedisError, redis::cmd,
+         redis::reply, redis::replyOpt };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+
+    // SET with an expiry: each hole is one whole argument, never spliced into text.
+    string key = "example:greeting";
+    string greeting = "hello from kama";
+    int64 seconds = 60;
+    Command set = cmd"SET ${key} ${greeting} EX ${seconds}";
+    Result<string, RedisError> stored = reply::<string>(result: conn.call(command: set));
+    match (stored) { case Ok(value: ok): { println(s: "SET: ${ok}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // GET reads as an Optional: None is a key that does not exist.
+    Command get = cmd"GET ${key}";
+    Result<Optional<string>, RedisError> read = replyOpt::<string>(result: conn.call(command: get));
+    string got = match (give read) {
+        case Ok(value: o): match (give o) { case Some(value: v): give v; case None: "(none)"; };
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    println(s: "GET: ${got}");
+    if (got != greeting) { return 1; }
+
+    // A counter.
+    string counter = "example:visits";
+    Command reset = cmd"DEL ${counter}";
+    Result<int64, RedisError> removed = reply::<int64>(result: conn.call(command: reset));
+    Command incr = cmd"INCR ${counter}";
+    Result<int64, RedisError> one = reply::<int64>(result: conn.call(command: incr));
+    Result<int64, RedisError> two = reply::<int64>(result: conn.call(command: incr));
+    int64 visits = match (two) { case Ok(value: n): n; case Err(error: e): { println(s: e.message()); return 1; } };
+    println(s: "visits: ${visits}");
+    if (visits != 2i64) { return 1; }
+
+    // A key that is not there.
+    Command missing = cmd"GET example:nothing-here";
+    Result<Optional<string>, RedisError> none = replyOpt::<string>(result: conn.call(command: missing));
+    bool absent = match (none) { case Ok(value: o): match (o) { case Some(value: v): false; case None: true; }; case Err(error: e): false; };
+    println(s: "a missing key reads as None: ${absent}");
+    if (!absent) { return 1; }
+
+    conn.close();
+    return 0;
+}

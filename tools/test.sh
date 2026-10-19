@@ -22,4 +22,9 @@ for mode in --debug --release; do
     "$KAMA" build "$ROOT/tests/unit/kama.json" $mode -o "$tmp/unit$mode"
     "$tmp/unit$mode"
 done
+# The examples build, debug and release; tools/check-examples.sh runs them against a live server.
+for manifest in "$ROOT"/examples/*/kama.json; do
+    "$KAMA" pkg install "$manifest" >/dev/null
+    for mode in --debug --release; do "$KAMA" build "$manifest" $mode -o "$tmp/example" >/dev/null; done
+done
 echo "test.sh: OK"

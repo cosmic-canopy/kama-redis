@@ -13,7 +13,7 @@ newest build): unit and live gates green, debug and release, nothing changed.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-9. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-9, KRD-10. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -84,6 +84,43 @@ buffer or a codec also needs.
 
 **Workaround:** none taken. The package's floor and CI's pin (`v0.9.667`) and the newest tag (`v0.9.673`) build it.
 Until the fix, this package's gate uses `v0.9.673` in place of cstar's newest build.
+
+### KRD-10 · MED · An application named like a dependency's module breaks that dependency's imports
+
+**Found** 2026-10-19, building this package's examples: one named `tls` would not build, its errors all inside
+`@kama/redis` (`module tls is not visible from redis`). A project's name is its root module, and kama resolved
+`@kama/redis`'s own `import { tls::… }` to the application instead of to `@kama/tls`. Any application named `tls`
+that uses `@kama/redis`, or `@kama/postgres`, fails the same way, with errors that point at the library.
+
+**Repro**, three files and two applications that differ only in their name:
+
+```
+middle/kama.json      { "name": "@repro/middle", "version": "0.1.0", "kind": "library", "kama": ">=0.9.667",
+                        "dependencies": { "@kama/tls": { "version": "^0.1.3" } },
+                        "modules": { ".": { "visibility": "public" } } }
+middle/src/middle.kama
+                      import { tls::version };
+                      export { engine };
+                      fn string engine() { return version(); }
+app-NAME/kama.json    { "name": "NAME", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.667",
+                        "entry": "src/main.kama", "dependencies": { "@repro/middle": { "path": "../middle" } },
+                        "modules": { ".": { "visibility": "internal" } } }
+app-NAME/src/main.kama
+                      import { core::println, middle::engine };
+                      fn int32 main() { string e = engine(); println(s: give e); return 0; }
+```
+
+- NAME `other`: prints `4.1.1` on `v0.9.667`, `v0.9.673` and `0.9.675+g4afcda97`.
+- NAME `tls`: refused on all three, in the library's file: "`.kama/deps/middle/src/middle.kama:1:9: error: module
+  `tls` is not visible from `middle` — its `visibility` in `kama.json` does not name this module`", then "`module
+  `tls` does not export `version`".
+
+**What would close it:** a library's imports resolve within the library's own dependencies, whatever the
+application is called. Short of that, an application whose name is the module of one of its dependencies, direct
+or not, could be refused when its manifest is read, naming the clash, as a reserved word already is ("`name` is
+"base", but a project's name is its root module…").
+
+**Workaround:** the example is named `tls_connection`, which it can keep either way. Nothing else here depends on it.
 
 ## FIXED — kept for the record
 

@@ -1,0 +1,94 @@
+// pubsub_worker: a subscriber that handles every kind of delivery, fed by a publisher in another isolate. A
+// subscriber owns its connection; if the connection is lost (a restart, a kill), it is made again and every
+// subscription with it, and `Reconnected` says that messages published meanwhile were missed.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/pubsub_worker/kama.json
+import { core::println, core::env, std::collections::DynamicArray, std::concurrent::Isolate, std::time::Duration,
+         std::time::sleep, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         redis::Config, redis::Connection, redis::Subscriber, redis::Delivery, redis::Message, redis::Command,
+         redis::RedisError, redis::cmd, redis::reply };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+// Publishes the jobs, then "done", from an isolate of its own over a connection of its own.
+type resource Publisher implements Sendable {
+    Connection conn;
+    public ctor make(Connection conn) { this.conn = give conn; }
+    public unsafe fn void run() {
+        sleep(d: Duration.fromMillis(ms: 200i64));
+        DynamicArray<string> jobs = DynamicArray.empty();
+        jobs.add(item: "resize photo 1"); jobs.add(item: "resize photo 2"); jobs.add(item: "send newsletter"); jobs.add(item: "done");
+        isize i = 0;
+        while (i < jobs.length()) {
+            string job = copy jobs[i];
+            Command publish = cmd"PUBLISH example:jobs ${job}";
+            Result<int64, RedisError> heard = reply::<int64>(result: this.conn.call(command: publish));
+            i = i + 1;
+        }
+        this.conn.close();
+    }
+}
+
+fn void publishAll(Publisher job) { job.run(); }
+
+fn string textOf(const ref Message m) {
+    Result<string, RedisError> t = m.text();
+    return match (give t) { case Ok(value: s): give s; case Err(error: e): "(a payload that is not UTF-8)"; };
+}
+
+unsafe fn int32 work(ref Subscriber sub) {
+    int32 handled = 0;
+    while (true) {
+        // Wait up to five seconds for the next delivery; None is the time passing, and the subscriber goes on.
+        Result<Optional<Delivery>, RedisError> next = sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: 5i64)));
+        Optional<Delivery> got = match (give next) {
+            case Ok(value: o): give o;
+            case Err(error: e): { println(s: e.message()); return -1; }
+        };
+        Delivery d = match (give got) {
+            case Some(value: x): give x;
+            case None: { println(s: "nothing for five seconds"); return -1; }
+        };
+        match (give d) {
+            case Message(message: m): {
+                string job = textOf(m: m);
+                if (job == "done") { return handled; }
+                println(s: "working on: ${job}");
+                handled = handled + 1;
+            }
+            // The connection was lost and made again: messages published meanwhile were not received.
+            case Reconnected(cause: e): { string why = e.message(); println(s: "reconnected (${why}); messages may have been missed"); }
+            // The server ended a subscription of its own accord.
+            case Unsubscribed(kind: k, channel: c): { println(s: "no longer subscribed to a channel"); }
+        };
+    }
+    return handled;
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
+    Subscriber sub = match (give made) { case Ok(value: s): give s; case Err(error: e): { println(s: e.message()); return 1; } };
+    DynamicArray<string> channels = DynamicArray.empty();
+    channels.add(item: "example:jobs");
+    Result<Unit, RedisError> subscribed = sub.subscribe(names: channels);
+    match (subscribed) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    Result<Connection, RedisError> other = Connection.connect(config: config);
+    Connection publisherConn = match (give other) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Publisher job = Publisher.make(conn: give publisherConn);
+    Isolate publisher = spawn publishAll(job: give job);
+
+    int32 handled = work(sub: sub);
+    publisher.join();
+    println(s: "handled ${handled} jobs");
+    // Unsubscribe from everything, and take the connection back for commands.
+    Result<Connection, RedisError> released = sub.release();
+    match (give released) { case Ok(value: c): { Connection conn = give c; conn.close(); } case Err(error: e): { println(s: e.message()); return 1; } };
+    if (handled != 3) { return 1; }
+    return 0;
+}

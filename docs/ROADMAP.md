@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–8 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–9 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -799,12 +799,16 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
      accepts, then closes. So a live redial meets the closed-before-the-handshake transient, never `Connect` (the
      unit tests prove `Connect`), and the step's live mutation targets the close.
    - 3 live mutations, all caught.
-9. **Examples** (`examples/<name>/`):
-   - quickstart, typed replies, a pipeline and a transaction, a pub/sub worker, a BLPOP job queue, TLS, SCAN and
-     scripts;
-   - each takes its URL from the environment;
-   - `tools/test.sh` builds them, and `tools/check-examples.sh` (on `tools/check-readme.sh`'s model, run in CI's
-     integration job) runs them live.
+9. **Done (2026-10-19).** **Examples** (`examples/<name>/`), each its own project with a path dependency on the
+   package, reading `REDIS_URL` (or `REDIS_TLS_URL`) and checking its own results:
+   - the eight: `quickstart`, `typed_replies`, `transactions`, `pubsub_worker`, `job_queue` (BLMOVE into a processing
+     list: how to live with a call that may have run), `tls_connection`, `scan`, `scripts`;
+   - `tools/test.sh` builds them, debug and release; `tools/check-examples.sh --server S` runs them live. CI's
+     integration job now runs it, and `tools/check-readme.sh`, on every server. All pass on all eight servers.
+   - **Their `kama.lock`s** resolved `@kama/tls` 0.1.5 (published since), the newest the package's `^0.1.3` admits,
+     as a consumer's would. The package's own locks stay on its floor, 0.1.3.
+   - **Found on the way:** KRD-10. The TLS example, named `tls`, would not build: a project's name is its root module,
+     and it shadowed `@kama/tls`'s for `@kama/redis`'s own imports. It is `tls_connection` now.
 10. **Docs and 0.1.0.**
     - The README: a Reconnection section, the "was it sent?" table, the examples, absolute links.
     - The CHANGELOG as `[0.1.0]`, AGENTS.redis.md, this file, and the module headers.

@@ -1,0 +1,99 @@
+// typed_replies: replies read straight into kama types, the same way under RESP3 and RESP2: a struct from a hash, a
+// list, an Optional per key of an MGET, and a sorted set's members with their scores as a Map.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/typed_replies/kama.json
+//
+// Add ?protocol=2 to the URL to see the same values read from RESP2's replies.
+import { core::println, core::env, std::collections::DynamicArray, std::collections::Map, redis::Config, redis::Connection,
+         redis::Command, redis::RedisError, redis::cmd, redis::reply, redis::replyOpts };
+
+// A struct reads by its fields' names: HGETALL's map under RESP3, its flat list under RESP2. A struct that holds a
+// string owns it, so it is a resource, and its fields are its own: it offers what a caller reads.
+@generate(Deserializable)
+type resource User {
+    @field string name;
+    @field string email;
+    @field int64 logins;
+    public const fn string describe() { int64 n = this.logins; return copy this.name.concat(other: " <").concat(other: this.email).concat(other: ">, ${n} logins"); }
+    public const fn int64 loginCount() { return this.logins; }
+}
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+unsafe fn bool run(ref Connection conn) {
+    string user = "example:user:7";
+    string tags = "example:tags";
+    string board = "example:board";
+    Command clear = cmd"DEL ${user} ${tags} ${board}";
+    Result<int64, RedisError> cleared = reply::<int64>(result: conn.call(command: clear));
+
+    // A hash, then the struct it reads as.
+    string name = "ada";
+    string email = "ada@example.org";
+    int64 logins = 3;
+    Command fill = cmd"HSET ${user} name ${name} email ${email} logins ${logins}";
+    Result<int64, RedisError> filled = reply::<int64>(result: conn.call(command: fill));
+    Command all = cmd"HGETALL ${user}";
+    Result<User, RedisError> read = reply::<User>(result: conn.call(command: all));
+    match (read) {
+        case Ok(value: u): { println(s: u.describe()); if (u.loginCount() != 3i64) { return false; } }
+        case Err(error: e): { println(s: e.message()); return false; }
+    };
+
+    // A list.
+    Command push = cmd"RPUSH ${tags} redis valkey kama";
+    Result<int64, RedisError> pushed = reply::<int64>(result: conn.call(command: push));
+    int64 first = 0;
+    int64 last = -1;
+    Command range = cmd"LRANGE ${tags} ${first} ${last}";
+    Result<DynamicArray<string>, RedisError> listed = reply::<DynamicArray<string>>(result: conn.call(command: range));
+    isize count = match (listed) { case Ok(value: xs): xs.length(); case Err(error: e): { println(s: e.message()); return false; } };
+    println(s: "${count} tags");
+
+    // MGET: each key is there or not, so each element is an Optional.
+    string missing = "example:no-such-key";
+    Command several = cmd"MGET ${user} ${missing}";
+    Result<DynamicArray<Optional<string>>, RedisError> values = replyOpts::<string>(result: conn.call(command: several));
+    match (values) {
+        case Ok(value: xs): {
+            // The hash is not a string: MGET answers null for it, as for the key that is not there.
+            isize present = 0;
+            isize i = 0;
+            while (i < xs.length()) { match (xs[i]) { case Some(value: v): { present = present + 1; } case None: { } }; i = i + 1; }
+            println(s: "MGET: ${present} of 2 present");
+        }
+        case Err(error: e): { println(s: e.message()); return false; }
+    };
+
+    // A sorted set with its scores, as a Map from member to score.
+    float64 low = 1.5;
+    float64 high = 42.0;
+    Command scores = cmd"ZADD ${board} ${low} carol ${high} bob";
+    Result<int64, RedisError> added = reply::<int64>(result: conn.call(command: scores));
+    Command ranked = cmd"ZRANGE ${board} 0 -1 WITHSCORES";
+    Result<Map<string, float64>, RedisError> board2 = reply::<Map<string, float64>>(result: conn.call(command: ranked));
+    match (board2) {
+        case Ok(value: m): {
+            Optional<float64> bob = m.get(key: "bob");
+            float64 b = match (bob) { case Some(value: x): x; case None: -1.0; };
+            println(s: "bob scored ${b}");
+            if (b != 42.0) { return false; }
+        }
+        case Err(error: e): { println(s: e.message()); return false; }
+    };
+    return true;
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    bool ok = run(conn: conn);
+    conn.close();
+    if (!ok) { return 1; }
+    return 0;
+}
