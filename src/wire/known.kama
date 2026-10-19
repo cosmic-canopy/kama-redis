@@ -16,6 +16,11 @@ export { admit, serverError, isWatch, Wait, blockingWait, later, callDeadline };
 //   - HELLO and RESET change the protocol or the connection's state behind the client's back, and QUIT closes it;
 //   - MULTI, EXEC and DISCARD: `Connection.transact` sends a transaction whole, MULTI to EXEC in one write, so the
 //     connection is never left inside one.
+// And a command that sets what the connection is is refused, since a reconnect would quietly undo it (docs/ROADMAP.md,
+// "Phase 7a"): SELECT and AUTH, which `Connection.select` and `authenticate` do and every reconnect keeps; CLIENT
+// SETNAME and SETINFO, which the handshake sends from the Config; and CLIENT NO-EVICT, NO-TOUCH, CAPA and
+// IMPORT-SOURCE, READONLY and READWRITE, which nothing here would set again. The table is checked against every
+// server's `ACL CAT connection` (tests/unit/src/connection_test.kama).
 // WATCH and UNWATCH are allowed, outside a transaction (the server refuses them inside one).
 //
 // A blocking command waits on the server for as long as its own timeout says, so its deadline is that timeout plus
@@ -66,6 +71,25 @@ fn string refusal(const ref Command command) {
     }
     if (named(command: command, word: "QUIT")) {
         return "a connection does not carry QUIT, which is deprecated since 7.2: close() closes the connection";
+    }
+    if (named(command: command, word: "SELECT")) {
+        return "a connection does not carry SELECT: a reconnect would go back to the Config's database without a word; select(db:) changes it, and every reconnect keeps it";
+    }
+    if (named(command: command, word: "AUTH")) {
+        return "a connection does not carry AUTH: a reconnect logs in as the Config says; authenticate(user:, password:) changes who it is, and every reconnect keeps it";
+    }
+    if (named(command: command, word: "CLIENT") && subNamed(command: command, word: "SETNAME")) {
+        return "a connection does not carry CLIENT SETNAME: the name is the Config's client_name, which the handshake sends, and every reconnect sends again";
+    }
+    if (named(command: command, word: "CLIENT") && subNamed(command: command, word: "SETINFO")) {
+        return "a connection does not carry CLIENT SETINFO: the handshake names this library (Config.setIdentity), and every reconnect does again";
+    }
+    if (named(command: command, word: "CLIENT") && (subNamed(command: command, word: "NO-EVICT") || subNamed(command: command, word: "NO-TOUCH")
+        || subNamed(command: command, word: "CAPA") || subNamed(command: command, word: "IMPORT-SOURCE"))) {
+        return "a connection does not carry CLIENT NO-EVICT, NO-TOUCH, CAPA or IMPORT-SOURCE: each sets something on the connection that a reconnect would lose without a word";
+    }
+    if (named(command: command, word: "READONLY") || named(command: command, word: "READWRITE")) {
+        return "a connection does not carry READONLY or READWRITE: they are for reading from a cluster's replicas, which a later release of this client brings, and a reconnect would lose them without a word";
     }
     return "";
 }

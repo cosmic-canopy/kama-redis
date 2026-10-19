@@ -150,6 +150,12 @@ fn int32 main() {
 - **Commands a connection does not carry** are refused, by name, before anything is written: the pub/sub commands,
   `MONITOR`, `SYNC`, `PSYNC`, `CLIENT REPLY`, `SCRIPT DEBUG`, `HELLO`, `RESET`, `QUIT`, and `MULTI`, `EXEC` and
   `DISCARD`, since `transact` sends a transaction whole.
+- **What sets what a connection is goes through the connection,** because a reconnect would quietly undo a command
+  that set it. `conn.select(db: 3)` and `conn.authenticate(user: Optional::Some(value: "app"), password: pw)` send
+  `SELECT` and `AUTH`, and every reconnect keeps what they set. `SELECT` and `AUTH` themselves are refused, and so are
+  `CLIENT SETNAME` and `SETINFO` (the `Config`'s `client_name` and identity, sent by the handshake), `CLIENT
+  NO-EVICT`, `NO-TOUCH`, `CAPA` and `IMPORT-SOURCE`, `READONLY` and `READWRITE`, each saying what to do instead. The
+  table is checked against every server's `ACL CAT connection`.
 - **Blocking commands wait for their own timeouts.** `BLPOP k 5` waits 5 s plus `command_timeout`, and a timeout of 0
   has no deadline. The table covers every command each server calls blocking, and is checked against their
   `COMMAND DOCS`: `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BRPOPLPUSH`, `BLMOVE`, `BLMOVEM`, `BLMPOP`, `BZMPOP`,

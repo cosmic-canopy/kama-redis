@@ -199,6 +199,44 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Value, RedisError> call(const ref Command command) {
         Result<Unit, RedisError> admitted = admit(command: command);
         match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.exchange(command: command);
+    }
+
+    // Change the database this connection uses: SELECT, and every reconnect selects it too. A database the Config
+    // would refuse (below 0) is `Config`, and nothing is sent; an error reply (past the server's last database) is
+    // `Server`, and nothing changes.
+    public unsafe fn Result<Unit, RedisError> select(int64 db) {
+        Config next = copy this.settings;
+        Result<Unit, RedisError> valid = next.setDatabase(db: db);
+        match (give valid) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Command choose = Command.of(name: "SELECT");
+        choose.argInt(value: db);
+        Result<Value, RedisError> r = this.exchange(command: choose);
+        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.settings = give next;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Change who this connection is: AUTH, and every reconnect logs in as that user too. With no user, the password
+    // is the `default` user's. A user or password the Config would refuse (empty) is `Config`, and nothing is sent; a
+    // refusal (WRONGPASS) is `Server`, and the connection stays the user it was.
+    public unsafe fn Result<Unit, RedisError> authenticate(Optional<string> user, string password) {
+        Config next = copy this.settings;
+        Optional<string> named = copy user;
+        string secret = copy password;
+        Result<Unit, RedisError> valid = next.setAuth(user: give named, password: give secret);
+        match (give valid) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Command auth = Command.of(name: "AUTH");
+        match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
+        auth.arg(text: password);
+        Result<Value, RedisError> r = this.exchange(command: auth);
+        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.settings = give next;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Send `command`, which the table of commands a connection cannot carry has passed, and return its reply.
+    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {
         if (!this.live) { return Result::Err(error: RedisError::Closed); }
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: blockingWait(command: command));
         this.outbox.clear();

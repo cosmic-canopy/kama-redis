@@ -97,5 +97,25 @@ unsafe fn int32 connectTests() {
     string port = setting(name: "REDISTEST_PORT");
     string local = attempt(url: "redis://localhost:".concat(other: port));
     f = f + check(ok: local == "ok", what: "connect: localhost, every address in turn: ${local}");
+
+    // select changes the database a connection uses: what it writes, a connection to that database reads, and one to
+    // database 0 does not. SELECT itself is refused, since a reconnect would quietly undo it.
+    Connection chooser = connected(url: mainUrl(userinfo: "", tail: ""), what: "select");
+    string cleared = ask(c: chooser, text: "DEL kr:selected");
+    Result<Unit, RedisError> chose = chooser.select(db: 3);
+    bool selected = match (chose) { case Ok(value: u): true; case Err(error: e): false; };
+    string wrote = ask(c: chooser, text: "SET kr:selected three");
+    Connection three = connected(url: mainUrl(userinfo: "", tail: "/3"), what: "db 3");
+    string read3 = ask(c: three, text: "GET kr:selected");
+    Connection zero = connected(url: mainUrl(userinfo: "", tail: ""), what: "db 0");
+    string read0 = ask(c: zero, text: "GET kr:selected");
+    Result<Unit, RedisError> past = chooser.select(db: 100000);
+    string pastCode = match (past) { case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: e.message(); }; case Ok(value: u): "ok"; };
+    string still = ask(c: chooser, text: "GET kr:selected");
+    string refused = ask(c: chooser, text: "SELECT 0");
+    string dropped = ask(c: three, text: "DEL kr:selected");
+    f = f + check(ok: selected && wrote == "OK" && read3 == "three" && read0 == "(nil)" && pastCode == "ERR" && still == "three"
+                      && refused.startsWith(prefix: "(failed) a connection does not carry SELECT"),
+                  what: "connect: select(db: 3): ${wrote}, read in db 3: ${read3}, in db 0: ${read0}; past the last: ${pastCode}, still ${still}; SELECT itself: ${refused}");
     return f;
 }

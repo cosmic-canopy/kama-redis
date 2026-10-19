@@ -1,6 +1,6 @@
 // Authentication, live: one ACL user per case (tests/integration/server/redis.conf), and the locked server, whose
 // default user has a password (locked.conf).
-import { redis::Connection, redis::RedisError, redis::Protocol, redis_integration_tests::check,
+import { std::collections::DynamicArray, redis::Connection, redis::RedisError, redis::Protocol, redis_integration_tests::check,
          redis_integration_tests::setting, mainUrl, lockedUrl, open, attempt, ask, codeOf };
 export { authTests };
 
@@ -65,5 +65,29 @@ unsafe fn int32 authTests() {
     string lockedWrong = refusal(url: lockedUrl(userinfo: ":wrong@", tail: ""));
     string lockedWrong2 = refusal(url: lockedUrl(userinfo: ":wrong@", tail: "?protocol=2"));
     f = f + check(ok: lockedWrong == "WRONGPASS" && lockedWrong2 == "WRONGPASS", what: "auth: the locked server, a wrong password: ${lockedWrong}, ${lockedWrong2}");
+
+    // authenticate changes who a connection is, under each protocol; a wrong password leaves it as it was; AUTH itself
+    // is refused, since a reconnect would quietly undo it.
+    DynamicArray<string> tails = DynamicArray.empty();
+    tails.add(item: ""); tails.add(item: "?protocol=2");
+    isize t = 0;
+    while (t < tails.length()) {
+        string tail = copy tails[t];
+        Result<Connection, RedisError> opened = open(url: mainUrl(userinfo: "", tail: tail));
+        Connection switcher = match (give opened) {
+            case Ok(value: v): give v;
+            case Err(error: e): { string m = e.message(); panic(msg: "auth_test: authenticate: ${m}"); return 1; }
+        };
+        Result<Unit, RedisError> bad = switcher.authenticate(user: Optional::Some(value: "kr_acl"), password: "wrong");
+        string badCode = match (bad) { case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: e.message(); }; case Ok(value: u): "ok"; };
+        string still = ask(c: switcher, text: "ACL WHOAMI");
+        Result<Unit, RedisError> good = switcher.authenticate(user: Optional::Some(value: "kr_acl"), password: copy aclPw);
+        bool switched = match (good) { case Ok(value: u): true; case Err(error: e): false; };
+        string now = ask(c: switcher, text: "ACL WHOAMI");
+        string refused = ask(c: switcher, text: "AUTH kr_acl x");
+        f = f + check(ok: badCode == "WRONGPASS" && still == "default" && switched && now == "kr_acl" && refused.startsWith(prefix: "(failed) a connection does not carry AUTH"),
+                      what: "auth: authenticate${tail}: wrong (${badCode}, still ${still}), then right (${now}); AUTH itself: ${refused}");
+        t = t + 1;
+    }
     return f;
 }

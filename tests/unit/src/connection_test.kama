@@ -4,11 +4,11 @@
 import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned,
          std::time::Duration, std::io::IoError, std::net::SocketAddr, std::net::resolve, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error,
-         redis::Connection, redis::libraryVersion, redis::Config, redis::Command, redis::Protocol, redis::RedisError, redis::ServerError,
+         redis::Connection, redis::libraryVersion, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::Protocol, redis::RedisError, redis::ServerError,
          redis::ServerCode, redis::ServerInfo, redis::Transport, redis::Dialer, redis::resp::Value, redis::resp::Limits,
          redis::resp::Reader, redis::resp::Read,
          redis_unit_tests::check, unhex, FakeServer, Step, ScriptDialer, Dial,
-         serverVersions, replyNames, replyHex, proxyNames, proxyHex, respNames, respInputs };
+         serverVersions, replyNames, replyHex, proxyNames, proxyHex, respNames, respInputs, connectionServers, connectionNames };
 export { connectionTests, welcome, connected, expect, reply, callOutcome, callClosed, isSimple, textOf, resp, pushIn, configOf, bytesOf,
          commandOf };
 
@@ -572,6 +572,168 @@ unsafe fn int32 loadingTests() {
     return f;
 }
 
+// ---- what sets what the connection is: refused, or recorded ----
+
+// Whether a closed connection refuses `command` as a pipeline's (Usage), rather than answering Closed: the table,
+// asked without writing anything.
+unsafe fn bool tableRefuses(const ref Command command) {
+    DynamicArray<Step> script = welcome(server: "redis-8.10.2");
+    Connection c = connected(script: give script, url: "redis://", what: "table");
+    c.close();
+    Pipeline p = Pipeline.make();
+    p.add(command: command);
+    Result<Replies, RedisError> r = c.run(pipeline: p);
+    return match (r) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: x): false; };
+}
+
+// A command from an ACL category entry: "select", or "client|setname" as CLIENT SETNAME.
+fn Command fromCategory(const ref string entry) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    string current = "";
+    foreach (uint8 b in entry) {
+        if (b == 124ui8) { parts.add(item: give current); current = ""; }
+        else {
+            DynamicArray<uint8> one = DynamicArray.empty();
+            one.add(item: b);
+            current = current.concat(other: textOf(b: one.view()));
+        }
+    }
+    parts.add(item: give current);
+    Command c = Command.of(name: parts[0]);
+    isize i = 1;
+    while (i < parts.length()) { c.arg(text: parts[i]); i = i + 1; }
+    return give c;
+}
+
+fn bool listed(const ref DynamicArray<string> names, const ref string name) {
+    isize i = 0;
+    while (i < names.length()) { if (names[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
+unsafe fn int32 sessionStateTests() {
+    int32 f = 0;
+    string s = "redis-8.10.2";
+    // Each refusal names the way to do it.
+    DynamicArray<string> forms = DynamicArray.empty();
+    DynamicArray<string> ways = DynamicArray.empty();
+    forms.add(item: "SELECT 2"); ways.add(item: "select(db:)");
+    forms.add(item: "AUTH kr_acl kr_acl_pw"); ways.add(item: "authenticate(user:, password:)");
+    forms.add(item: "CLIENT SETNAME other"); ways.add(item: "client_name");
+    forms.add(item: "CLIENT SETINFO LIB-VER 9"); ways.add(item: "Config.setIdentity");
+    forms.add(item: "CLIENT NO-EVICT on"); ways.add(item: "a reconnect would lose");
+    forms.add(item: "READONLY"); ways.add(item: "a reconnect would lose");
+    DynamicArray<Step> script = welcome(server: s);
+    script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Connection c = connected(script: give script, url: "redis://", what: "session state");
+    isize i = 0;
+    while (i < forms.length()) {
+        Command bad = commandOf(text: forms[i]);
+        Result<Value, RedisError> r = c.call(command: bad);
+        string m = callOutcome(r: r);
+        string form = copy forms[i];
+        string way = copy ways[i];
+        f = f + check(ok: isUsage(r: r) && m.contains(substring: way), what: "session state: ${form} is refused, naming ${way}: ${m}");
+        i = i + 1;
+    }
+    // In a pipeline and a transaction too, before anything is written: the PING after them is the script's next.
+    Pipeline p = Pipeline.make();
+    Command get = commandOf(text: "GET kr:k");
+    p.add(command: get);
+    Command sel = commandOf(text: "select 3");
+    p.add(command: sel);
+    Result<Replies, RedisError> rp = c.run(pipeline: p);
+    string pm = match (rp) { case Err(error: e): e.message(); case Ok(value: x): "ran"; };
+    f = f + check(ok: pm.startsWith(prefix: "command 2: a connection does not carry SELECT"), what: "session state: SELECT in a pipeline is refused before it is written: ${pm}");
+    Result<TxOutcome, RedisError> rt = c.transact(pipeline: p);
+    string tm = match (rt) { case Err(error: e): e.message(); case Ok(value: x): "ran"; };
+    f = f + check(ok: tm.startsWith(prefix: "command 2: a connection does not carry SELECT"), what: "session state: SELECT in a transaction is refused before it is written: ${tm}");
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> after = c.call(command: ping);
+    f = f + check(ok: isSimple(r: after, text: "PONG"), what: "session state: nothing refused was written");
+
+    // Every server's connection category, each entry refused or let through on purpose: a server that adds one
+    // fails here until it is placed.
+    DynamicArray<string> refusedNames = DynamicArray.empty();
+    refusedNames.add(item: "auth"); refusedNames.add(item: "select"); refusedNames.add(item: "hello"); refusedNames.add(item: "reset");
+    refusedNames.add(item: "quit"); refusedNames.add(item: "readonly"); refusedNames.add(item: "readwrite");
+    refusedNames.add(item: "client|setname"); refusedNames.add(item: "client|setinfo"); refusedNames.add(item: "client|no-evict");
+    refusedNames.add(item: "client|no-touch"); refusedNames.add(item: "client|capa"); refusedNames.add(item: "client|import-source");
+    refusedNames.add(item: "client|reply"); refusedNames.add(item: "client|tracking"); refusedNames.add(item: "client|caching");
+    // Let through: they report, act on other connections, or block (the blocking table has WAIT and WAITAOF).
+    // ASKING applies to the next command only, and a lost link makes that command's MOVED or ASK come back as it is.
+    DynamicArray<string> allowedNames = DynamicArray.empty();
+    allowedNames.add(item: "asking"); allowedNames.add(item: "client"); allowedNames.add(item: "command"); allowedNames.add(item: "echo");
+    allowedNames.add(item: "ping"); allowedNames.add(item: "wait"); allowedNames.add(item: "waitaof");
+    allowedNames.add(item: "client|getname"); allowedNames.add(item: "client|getredir"); allowedNames.add(item: "client|help");
+    allowedNames.add(item: "client|id"); allowedNames.add(item: "client|info"); allowedNames.add(item: "client|kill");
+    allowedNames.add(item: "client|list"); allowedNames.add(item: "client|pause"); allowedNames.add(item: "client|trackinginfo");
+    allowedNames.add(item: "client|unblock"); allowedNames.add(item: "client|unpause"); allowedNames.add(item: "command|count");
+    allowedNames.add(item: "command|docs"); allowedNames.add(item: "command|getkeys"); allowedNames.add(item: "command|getkeysandflags");
+    allowedNames.add(item: "command|help"); allowedNames.add(item: "command|info"); allowedNames.add(item: "command|list");
+    DynamicArray<string> servers = connectionServers();
+    DynamicArray<string> lists = connectionNames();
+    f = f + check(ok: servers.length() == 8, what: "session state: every server's connection category");
+    isize k = 0;
+    while (k < servers.length()) {
+        string server = copy servers[k];
+        DynamicArray<string> names = words(text: lists[k]);
+        isize j = 0;
+        while (j < names.length()) {
+            string name = copy names[j];
+            Command probe = fromCategory(entry: name);
+            bool refuses = tableRefuses(command: probe);
+            if (listed(names: refusedNames, name: name)) {
+                f = f + check(ok: refuses, what: "session state: ${server}'s ${name} is refused");
+            } else if (listed(names: allowedNames, name: name)) {
+                f = f + check(ok: !refuses, what: "session state: ${server}'s ${name} is let through");
+            } else {
+                f = f + check(ok: false, what: "session state: ${server} lists ${name} in ACL CAT connection, and the table does not place it");
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+
+    // select and authenticate: sent past the table, answered as the servers answer; an argument the Config refuses
+    // sends nothing; an error reply is Server.
+    DynamicArray<Step> rec = welcome(server: s);
+    rec.add(item: expect(command: "SELECT 2", answer: reply(server: s, kase: "select1")));
+    rec.add(item: expect(command: "SELECT 16", answer: reply(server: s, kase: "select-range")));
+    rec.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: s, kase: "auth2")));
+    rec.add(item: expect(command: "AUTH kr_acl wrong", answer: reply(server: s, kase: "auth2-wrong")));
+    rec.add(item: expect(command: "AUTH kr_default_pw", answer: reply(server: s, kase: "locked-auth1")));
+    rec.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
+    Connection r = connected(script: give rec, url: "redis://", what: "select and authenticate");
+    Result<Unit, RedisError> s2 = r.select(db: 2);
+    Result<Unit, RedisError> sNeg = r.select(db: -1i64);
+    Result<Unit, RedisError> s16 = r.select(db: 16);
+    string g16 = match (s16) { case Err(error: e): match (e) { case Server(error: x): x.codeText(); case _: e.message(); }; case Ok(value: u): "ok"; };
+    string gNeg = match (sNeg) { case Err(error: e): match (e) { case Config(detail: d): copy d; case _: "?"; }; case Ok(value: u): "ok"; };
+    bool s2ok = match (s2) { case Ok(value: u): true; case Err(error: e): false; };
+    f = f + check(ok: s2ok, what: "select: SELECT 2, answered OK");
+    f = f + check(ok: gNeg == "the database is a number from 0", what: "select: below 0 is the Config's refusal, and nothing is sent: ${gNeg}");
+    f = f + check(ok: g16 == "ERR", what: "select: past the server's last database is Server: ${g16}");
+    Result<Unit, RedisError> a1 = r.authenticate(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw");
+    Result<Unit, RedisError> a2 = r.authenticate(user: Optional::Some(value: "kr_acl"), password: "wrong");
+    Result<Unit, RedisError> aEmpty = r.authenticate(user: Optional::Some(value: ""), password: "x");
+    Result<Unit, RedisError> aNone = r.authenticate(user: Optional::None, password: "");
+    Result<Unit, RedisError> a3 = r.authenticate(user: Optional::None, password: "kr_default_pw");
+    bool a1ok = match (a1) { case Ok(value: u): true; case Err(error: e): false; };
+    string g2 = match (a2) { case Err(error: e): match (e) { case Server(error: x): x.codeText(); case _: e.message(); }; case Ok(value: u): "ok"; };
+    bool emptyRefused = match (aEmpty) { case Err(error: e): match (e) { case Config(detail: d): true; case _: false; }; case Ok(value: u): false; };
+    bool noneRefused = match (aNone) { case Err(error: e): match (e) { case Config(detail: d): true; case _: false; }; case Ok(value: u): false; };
+    bool a3ok = match (a3) { case Ok(value: u): true; case Err(error: e): false; };
+    f = f + check(ok: a1ok, what: "authenticate: AUTH user password, answered OK");
+    f = f + check(ok: g2 == "WRONGPASS", what: "authenticate: a wrong password is WRONGPASS: ${g2}");
+    f = f + check(ok: emptyRefused && noneRefused, what: "authenticate: an empty user or password is the Config's refusal, and nothing is sent");
+    f = f + check(ok: a3ok, what: "authenticate: no user is the default user's password, AUTH with one argument");
+    Command last = Command.of(name: "PING");
+    Result<Value, RedisError> lastPing = r.call(command: last);
+    f = f + check(ok: isSimple(r: lastPing, text: "PONG") && !r.isClosed(), what: "select and authenticate: the connection goes on");
+    return f;
+}
+
 // ---- calls ----
 
 unsafe fn int32 callTests() {
@@ -826,11 +988,24 @@ unsafe fn int32 refusalTests() {
     refused.add(item: "Discard");
     refused.add(item: "client tracking on");
     refused.add(item: "CLIENT Caching yes");
+    // What sets what the connection is: a reconnect would quietly undo it.
+    refused.add(item: "select 1");
+    refused.add(item: "SELECT 0");
+    refused.add(item: "auth kr_default_pw");
+    refused.add(item: "AUTH kr_acl kr_acl_pw");
+    refused.add(item: "client setname kama-test");
+    refused.add(item: "CLIENT SETINFO LIB-NAME other");
+    refused.add(item: "client no-evict on");
+    refused.add(item: "CLIENT No-Touch on");
+    refused.add(item: "client capa redirect");
+    refused.add(item: "CLIENT IMPORT-SOURCE on");
+    refused.add(item: "readonly");
+    refused.add(item: "ReadWrite");
     DynamicArray<Step> script = welcome(server: s);
     isize i = 0;
     while (i < refused.length()) { script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping"))); i = i + 1; }
-    // Another CLIENT subcommand is sent, in the case it was written in, and so is TRACKINGINFO, which only reports.
-    script.add(item: expect(command: "client setname kama-test", answer: reply(server: s, kase: "setname")));
+    // TRACKINGINFO, which only reports, is sent, in the case it was written in.
+    script.add(item: expect(command: "client trackinginfo", answer: reply(server: s, kase: "trackinginfo")));
     script.add(item: expect(command: "CLIENT TRACKINGINFO", answer: reply(server: s, kase: "trackinginfo")));
     // A command refused while it was built, then the PING after it.
     script.add(item: expect(command: "PING", answer: reply(server: s, kase: "ping")));
@@ -861,9 +1036,10 @@ unsafe fn int32 refusalTests() {
                       what: "refused before it is written: ${w}: ${m}");
         i = i + 1;
     }
-    Command setname = commandOf(text: "client setname kama-test");
-    Result<Value, RedisError> named = c.call(command: setname);
-    f = f + check(ok: isSimple(r: named, text: "OK"), what: "CLIENT SETNAME is sent: only CLIENT REPLY, TRACKING and CACHING are refused");
+    Command lower = commandOf(text: "client trackinginfo");
+    Result<Value, RedisError> lowerInfo = c.call(command: lower);
+    bool lowerReported = match (lowerInfo) { case Ok(value: v): match (v) { case Array(items: xs): xs.length() == 6; case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: lowerReported, what: "client trackinginfo is sent, in its own case");
     Command trackingInfo = commandOf(text: "CLIENT TRACKINGINFO");
     Result<Value, RedisError> info = c.call(command: trackingInfo);
     bool reported = match (info) { case Ok(value: v): match (v) { case Array(items: xs): xs.length() == 6; case _: false; }; case Err(error: e): false; };
@@ -962,6 +1138,7 @@ unsafe fn int32 connectionTests() {
     f = f + callTests();
     f = f + pushTests();
     f = f + refusalTests();
+    f = f + sessionStateTests();
     f = f + dialerTests();
     return f;
 }

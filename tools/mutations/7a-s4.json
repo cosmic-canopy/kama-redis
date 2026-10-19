@@ -1,0 +1,106 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": "    if (named(command: command, word: \"SELECT\")) {\n        return \"a connection does not carry SELECT",
+  "new": "    if (false && named(command: command, word: \"SELECT\")) {\n        return \"a connection does not carry SELECT",
+  "expect": "SELECT 2 is refused, naming select(db:)"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": "    if (named(command: command, word: \"AUTH\")) {",
+  "new": "    if (false && named(command: command, word: \"AUTH\")) {",
+  "expect": "AUTH kr_acl kr_acl_pw is refused"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": "    if (named(command: command, word: \"CLIENT\") && subNamed(command: command, word: \"SETNAME\")) {",
+  "new": "    if (false && named(command: command, word: \"CLIENT\") && subNamed(command: command, word: \"SETNAME\")) {",
+  "expect": "CLIENT SETNAME other is refused"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": "    if (named(command: command, word: \"CLIENT\") && subNamed(command: command, word: \"SETINFO\")) {",
+  "new": "    if (false && named(command: command, word: \"CLIENT\") && subNamed(command: command, word: \"SETINFO\")) {",
+  "expect": "CLIENT SETINFO LIB-VER 9 is refused"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": "|| subNamed(command: command, word: \"CAPA\") ",
+  "new": "",
+  "expect": "client|capa is refused"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": " || subNamed(command: command, word: \"IMPORT-SOURCE\")",
+  "new": "",
+  "expect": "client|import-source is refused"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": " || subNamed(command: command, word: \"NO-TOUCH\")",
+  "new": "",
+  "expect": "client|no-touch is refused"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/wire/known.kama",
+  "old": " || named(command: command, word: \"READWRITE\")",
+  "new": "",
+  "expect": "readwrite is refused"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "Result<Unit, RedisError> valid = next.setDatabase(db: db);",
+  "new": "Result<Unit, RedisError> valid = Result::Ok(value: Unit::Unit);",
+  "expect": "select: below 0 is the Config's refusal"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "Result<Unit, RedisError> valid = next.setAuth(user: give named, password: give secret);",
+  "new": "Result<Unit, RedisError> valid = Result::Ok(value: Unit::Unit);",
+  "expect": "authenticate: an empty user or password"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Command auth = Command.of(name: \"AUTH\");\n        match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };",
+  "new": "        Command auth = Command.of(name: \"AUTH\");\n        match (user) { case Some(value: u): { auth.arg(text: u); } case None: { auth.arg(text: \"default\"); } };",
+  "expect": "authenticate: no user is the default user's password"
+ },
+ {
+  "id": "M12",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        choose.argInt(value: db);",
+  "new": "        choose.argInt(value: 0i64);",
+  "expect": "connect: select(db: 3)"
+ },
+ {
+  "id": "M13",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        auth.arg(text: password);",
+  "new": "        auth.arg(text: \"x\");",
+  "expect": "auth: authenticate"
+ }
+]
