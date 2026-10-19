@@ -6,8 +6,9 @@ that is an absence cites the cstar files that show it instead. This file is excl
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
 **Current compiler:** `kama 0.9.667` (tag `v0.9.667`), which CI pins and the manifests' floor names. Each repro is
-also run on cstar's newest build. The package was last verified on `v0.9.673` (2026-10-19, the newest tag and cstar's
-newest build): unit and live gates green, debug and release, nothing changed.
+also run on cstar's newest build, which the registry publishes with. The package was last verified on `v0.9.675`
+(2026-10-19, the newest tag and cstar's newest build): unit and live gates green, debug and release; it needed
+KRD-9's workaround, the reader moving its unread bytes one at a time.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design

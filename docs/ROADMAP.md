@@ -1,9 +1,9 @@
 # Roadmap
 
-Where this is, 2026-10-19: phases 0 to 5 and 7a are done, on kama v0.9.667, and verified on v0.9.673. **0.1.0, a
-complete client for one server, is ready to release**: the CHANGELOG has it, and the checklist in "The release plan"
-holds but for the steps that are the maintainer's (the push, CI on it, the publish). Next is phase 6 (Cluster and
-Sentinel, 0.2.0), whose session plan is drawn up from primary sources at its start, as 7a's was.
+Where this is, 2026-10-19: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
+v0.9.675 (the newest tag, and the build the registry publishes with). **0.1.0, a complete client for one server, is
+published** (2026-10-19, from `146a4d8`). **Next is phase 6, Cluster and Sentinel, for 0.2.0: "Phase 6: an outline",
+just below, is where the next session starts.**
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -67,7 +67,7 @@ does its discipline:
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
-| — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
+| — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
 
 ### The release plan (decided by the maintainer, 2026-10-18)
 
@@ -85,14 +85,23 @@ Anything not in a release yet is refused clearly rather than half there. Today a
   - TLS (phase 5);
   - reconnection, examples, hardening and docs (phase 7a).
 
-  The order: phase 4 (done 2026-10-18), then 5 (done 2026-10-18), then 7a (done 2026-10-19), then the release.
+  The order: phase 4 (done 2026-10-18), then 5 (done 2026-10-18), then 7a (done 2026-10-19), then the release
+  (published 2026-10-19). The first publish stopped at the registry's `kama check` with cstar's 0.9.675, which
+  refused the reader (KRD-9); `146a4d8` fixed it, and that is what is published. The registry checks with cstar's
+  newest build, not CI's tag: gate on that build before calling a release ready.
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6).
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), and client-side caching
   (phase 4's research and decisions, kept below).
 - **Carried, to be placed in a release:**
   - `Command.addFields(value: Serializable)` (HSET from a struct);
   - a `<Map>` adapter;
-  - measuring the typed read of `DynamicArray<uint8>`, byte by byte, before asking cstar for a bulk read.
+  - measuring the typed read of `DynamicArray<uint8>`, byte by byte, before asking cstar for a bulk read;
+  - a credentials provider, a contract called at each connect, for tokens that expire (go-redis, redis-py and Lettuce
+    have one; 0.1.0 has `authenticate`, which a caller calls before a token expires);
+  - postgres's seeded mutations of every scripted reply (its phase 8 S2d: each must end in an error, never a panic),
+    beside the resp reader's hostile vectors here.
+- **The published description** (`kama.json`'s, on the registry) names cluster and sentinel, which come in 0.2.0. A
+  published version cannot change; 0.2.0 makes it true.
 - **Each release** (AGENTS.package.md, "Publishing"):
   - the CHANGELOG's Unreleased section becomes the version, kept in step with `kama.json` and `libraryVersion()`
     (`tools/test.sh` checks the two);
@@ -100,16 +109,81 @@ Anything not in a release yet is refused clearly rather than half there. Today a
   - `kama publish kama.json --dry-run` lists no certificates and no agent files;
   - `./ops publish ../kama-redis/kama.json` from `../kama-registry`, only on the maintainer's word, since a version is
     permanent.
-- **Neighbours, as of 2026-10-18:**
-  - `@kama/tls` 0.1.3 is on the registry (published 2026-10-18), with what phase 5 asked of it, and `kama.lock` pins
-    it. 0.1.4 (a server's identities chosen by SNI) is published too, and 0.1.5 (setters on a configuration shared
-    between isolates hold a lock) is under way; neither touches this client, which builds a configuration for each
-    attempt and shares none. Session resumption is on its roadmap (phase 7a, below).
-  - `@kama/postgres` 0.2.1 builds on v0.9.667 and is in its phase 8 (a pool, 0.3.0). Its TLS handshake carries the
-    fix found here (only the side waited for counts, 2026-10-18). Its phase 8 S1 (`Connection.ping()`,
-    `resetSession()`) is the groundwork phase 7a's reconnection and 7b's pool will want to read, and it now holds that
-    a mutation must make a test fail before the test is called good (`tools/mutate.sh`).
+- **Neighbours, as of 2026-10-19:**
+  - `@kama/tls` 0.1.5 is on the registry (setters on a shared configuration hold a lock); this package's own locks pin
+    0.1.3, its floor, and the examples' pin 0.1.5, as a consumer's resolves. Its next phases are Windows, WebAssembly,
+    then session resumption (TLS 1.3, then 1.2), which a redial here could use once it ships.
+  - `@kama/postgres` is in its phase 8: S2 (hardening, with restarts and seeded mutations of every scripted reply) is
+    done, and S3, a pool shared by isolates, is next. 0.3.0's pool here (phase 7b) follows it.
   - `@kama/http` is seeded, with nothing usable yet. The UI packages (`ui`, `rmlui`, `freetype`) do not touch this one.
+
+## Phase 6: an outline (drawn up at its start)
+
+**The next session starts here.** Draw up the session plan from primary sources, as 7a's was ("Phase 7a: where to
+start" is the shape: sources, what they showed, proposed decisions, the session's steps). Put the questions that are
+the maintainer's to them, with what the peers do and a recommendation. Confirm the kama facts by repro on CI's tag and
+on cstar's newest build, which the registry publishes with. Then build step by step: each step green before its
+commit, proven by mutation (`tools/mutations/6-sN.json`), and CI watched after each push.
+
+**The sources to read:**
+- **The specifications:**
+  - the Redis Cluster specification: slots, `MOVED`, `ASK` and `ASKING`, `TRYAGAIN`, `CLUSTERDOWN`, `CROSSSLOT`,
+    `READONLY`/`READWRITE`;
+  - `CLUSTER SHARDS` (7.0 and later) and `CLUSTER SLOTS` (6.2);
+  - the Sentinel documentation and its client guidelines: `SENTINEL GET-MASTER-ADDR-BY-NAME`, `SENTINEL SENTINELS`
+    and `REPLICAS`, `ROLE` to confirm a master, and the `+switch-master` event;
+  - Valkey's cluster additions: several databases in cluster mode (9.0), atomic slot migration (9.0), and
+    `CLUSTERSCAN`, with string cursors (9.1).
+- **The servers' own source,** at the matrix's tags: Redis 8.10.2's and Valkey 9.1.2's `cluster.c` and
+  `cluster_legacy.c` (how a node answers a key it does not serve, during a migration and after a failover), and
+  `sentinel.c`.
+- **The peers, at their current tags:**
+  - go-redis: `osscluster.go` (`ClusterClient`, its slot state and reloads, `MaxRedirects`, `ReadOnly`,
+    `RouteByLatency`) and `sentinel.go` (`FailoverClient`);
+  - redis-py: `cluster.py` (`RedisCluster`, `NodesManager`) and `sentinel.py`;
+  - redis-rs: `cluster_async/`, `cluster_routing.rs` and `sentinel.rs`;
+  - Lettuce: `RedisClusterClient`, `ClusterTopologyRefreshOptions`, `MasterReplica` and `SentinelConnector`;
+  - rueidis: `cluster.go` and `sentinel.go`;
+  - redis-cli's `-c`, and its `--cluster` tooling for the test topology.
+- **The model:** postgres's hosts list and `target_session_attrs` (its phase 7). A cluster client is built on this
+  package's 7a: never resend what may have run, and a node's lost connection is made again by its next call.
+
+**What the session must settle** (each a proposal to research, not a decision yet):
+- **The shape:** a `Cluster` type over a connection per node (go-redis's `ClusterClient`, Lettuce's
+  `RedisClusterClient`), owned by one isolate as a `Connection` is, or routing inside `Connection`. What a URL with
+  several hosts means, since every peer spells seed nodes differently; accepted or refused.
+- **The slot map:**
+  - read from `CLUSTER SHARDS`, or `CLUSTER SLOTS` on 6.2;
+  - when it is read again: on `MOVED`, on a node's lost connection, on a timer or never;
+  - what is kept of each node: its address, its role, its TLS name.
+- **Routing:**
+  - a command's keys from `COMMAND INFO`'s key specs, generated by script from every server as the blocking table
+    was, with a command that has no key going to any node;
+  - multi-key commands on one slot, a `CROSSSLOT` refused before it is sent or left to the server;
+  - pipelines split by node and their replies put back in order;
+  - transactions and `WATCH` on one slot;
+  - scripts by their keys;
+  - `SCAN` across every primary (or Valkey 9.1's `CLUSTERSCAN`);
+  - pub/sub: `SSUBSCRIBE` and `SPUBLISH` to the slot's node, and phase 4's `Unsubscribed` hook when a slot moves.
+- **Redirections:**
+  - `MOVED`: the map is read again and the command sent again, which is safe since a `MOVED` command never ran;
+  - `ASK`: `ASKING`, then the command at the target, once;
+  - `TRYAGAIN` (a multi-key command during a migration) and `CLUSTERDOWN`, with a backoff;
+  - a bound on redirections.
+- **Replicas:** `READONLY` reads, opt-in, with what it costs in consistency said plainly.
+- **Failover:** a promoted replica (`MOVED` points there) and a node lost, on 7a's rules.
+- **Sentinel:**
+  - the URL form (Lettuce's `redis-sentinel://`; redis-py and go-redis take it in code);
+  - finding the master by name, and confirming it with `ROLE`;
+  - following `+switch-master` on a subscriber of the sentinels;
+  - a sentinel's own credentials and TLS, apart from the data servers'.
+- **The test topology:** in `tools/redis.sh`, per image:
+  - a cluster of three primaries with a replica each;
+  - a sentinel setup: a master, two replicas and three sentinels;
+  - on all eight servers (6.2 has no `CLUSTER SHARDS`).
+  Vectors are captured from them by script: the maps, the redirections, a migration's `ASK`. The scripted server
+  serves several nodes, a `ScriptDialer` dial per address. Live: a resharding under traffic, `CLUSTER FAILOVER`,
+  `SENTINEL FAILOVER`, and a node killed.
 
 ## Phase 4: where to start
 
