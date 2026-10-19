@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::io::IoError, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error, tls::TlsError, redis::resp::ProtocolError };
-export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt };
+export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, ReconnectError };
 
 // What can go wrong talking to Redis or Valkey. A data error is one of these; a contract violation (an index out of
 // range) panics, as one does on a collection.
@@ -39,7 +39,11 @@ type enum RedisError implements Error, Sendable {
     Value(string detail),
     // A call this client does not make in this form: a command a connection cannot carry (SUBSCRIBE, MONITOR, …), a
     // malformed `cmd"…"` literal. Nothing was sent, and the connection is still usable.
-    Usage(string detail);
+    Usage(string detail),
+    // The connection had been lost, and making it again failed, so nothing of this call was sent: `cause()` is why the
+    // last try failed (`Connect` while the server is down, WRONGPASS when its password changed, …). The next call
+    // tries again.
+    Reconnect(ReconnectError error);
 
     public const fn string message() {
         return match (this) {
@@ -54,6 +58,7 @@ type enum RedisError implements Error, Sendable {
             case Tls(detail: d, cause: c): copy d;
             case Value(detail: d): copy d;
             case Usage(detail: d): copy d;
+            case Reconnect(error: r): r.message();
         };
     }
 
@@ -305,6 +310,32 @@ fn bool isDeadline(IoError e) {
     bool timedOut = match (e.kind()) { case TimedOut: true; case _: false; };
     bool raised = match (e.rawOsError()) { case Some(value: c): false; case None: true; };
     return timedOut && raised;
+}
+
+// Why a lost connection could not be made again: the last try's error, and how many tries the call made (each with
+// every address of the host). Only the last try is kept, so this stays small however long a server is down.
+type resource ReconnectError implements Sendable {
+    DynamicArray<RedisError> last;
+    int32 count;
+
+    public ctor of(RedisError cause, int32 tries) {
+        this.last = DynamicArray.empty();
+        this.last.add(item: give cause);
+        this.count = tries;
+    }
+
+    public const fn const ref RedisError cause() { return this.last[0]; }
+    public const fn int32 tries() { return this.count; }
+
+    // "the connection was lost, and reconnecting failed (2 tries): Could not connect to 127.0.0.1:6379: Connection
+    // refused".
+    public const fn string message() {
+        int32 n = this.count;
+        string tries = "${n} tries";
+        if (n == 1) { tries = "1 try"; }
+        string why = this.last[0].message();
+        return "the connection was lost, and reconnecting failed (".concat(other: tries).concat(other: "): ").concat(other: why);
+    }
 }
 
 // Every attempt of a failed connect, in the order made. There is at least one.

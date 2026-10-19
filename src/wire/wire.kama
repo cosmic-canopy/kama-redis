@@ -24,6 +24,12 @@ type value Deadline implements Sendable {
 
     public const fn bool isBounded() { return this.bounded; }
 
+    // The instant it passes; meaningful only when it is bounded.
+    public const fn Instant end() { return this.at; }
+
+    // Whether a wait that ends at `at` ends before this deadline passes: always, when it is not bounded.
+    public const fn bool allows(Instant at) { return !this.bounded || at < this.at; }
+
     // What `Transport.wait` takes: -1 for no limit, else the milliseconds left, rounded up so a wait never ends
     // just short of the deadline and spins; 0 once it has passed.
     public unsafe const fn int32 remainingMs() {

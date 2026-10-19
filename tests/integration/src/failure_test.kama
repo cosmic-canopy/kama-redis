@@ -16,7 +16,7 @@ unsafe fn Connection connected(const ref string what) {
 unsafe fn int32 failureTests() {
     int32 f = 0;
 
-    // A connection the server kills: the next call fails on I/O, and every one after is Closed.
+    // A connection the server kills: the call that meets the loss fails on I/O, and the next makes a new connection.
     Connection victim = connected(what: "victim");
     int64 id = match (victim.server()) { case Some(value: v): v.id(); case None: -1i64; };
     Connection killer = connected(what: "killer");
@@ -24,13 +24,27 @@ unsafe fn int32 failureTests() {
     Command ping = Command.of(name: "PING");
     Result<Value, RedisError> after = victim.call(command: ping);
     bool io = match (after) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
+    bool lostNotClosed = !victim.isClosed();
     string next = ask(c: victim, text: "PING");
-    f = f + check(ok: killed == "1" && io && victim.isClosed() && next == "(failed) the connection is closed",
-                  what: "failure: CLIENT KILL: ${killed}, then an I/O error, then: ${next}");
+    int64 newId = match (victim.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    f = f + check(ok: killed == "1" && io && lostNotClosed && next == "PONG" && newId != id,
+                  what: "failure: CLIENT KILL: ${killed}, then an I/O error, then a redial: ${next}, id ${id} -> ${newId}");
+
+    // What select and authenticate set outlives the redial.
+    string aclPw = setting(name: "REDISTEST_ACL_PASSWORD");
+    Connection kept = connected(what: "kept");
+    Result<Unit, RedisError> chose = kept.select(db: 5);
+    Result<Unit, RedisError> became = kept.authenticate(user: Optional::Some(value: "kr_acl"), password: copy aclPw);
+    int64 keptId = match (kept.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    string killedKept = ask(c: killer, text: "CLIENT KILL ID ${keptId}");
+    string lostKept = ask(c: kept, text: "PING");
+    string info = ask(c: kept, text: "CLIENT INFO");
+    f = f + check(ok: killedKept == "1" && lostKept.startsWith(prefix: "(failed) ") && info.contains(substring: " db=5 ") && info.contains(substring: " user=kr_acl "),
+                  what: "failure: CLIENT KILL after select(db: 5) and authenticate(kr_acl): the redial is both: ${info}");
 
     // A server with no room left refuses a connection as it accepts it, then closes: each connect is that refusal, in
     // the server's words, whatever the handshake had sent. maxclients is put back however it went.
-    string aclPassword = setting(name: "REDISTEST_ACL_PASSWORD");
+    string aclPassword = copy aclPw;
     Connection admin = connected(what: "maxclients");
     Command getLimit = commandOf(text: "CONFIG GET maxclients");
     Result<Map<string, int64>, RedisError> limits = reply::<Map<string, int64>>(result: admin.call(command: getLimit));

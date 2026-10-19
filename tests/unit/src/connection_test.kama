@@ -9,7 +9,7 @@ import { core::println, std::collections::DynamicArray, std::collections::ConstV
          redis::resp::Reader, redis::resp::Read,
          redis_unit_tests::check, unhex, FakeServer, Step, ScriptDialer, Dial,
          serverVersions, replyNames, replyHex, proxyNames, proxyHex, respNames, respInputs, connectionServers, connectionNames };
-export { connectionTests, welcome, connected, expect, reply, callOutcome, callClosed, isSimple, textOf, resp, pushIn, configOf, bytesOf,
+export { connectionTests, welcome, connected, expect, reply, proxy, callOutcome, callClosed, isSimple, textOf, resp, pushIn, configOf, bytesOf,
          commandOf };
 
 // ---- the vectors ----

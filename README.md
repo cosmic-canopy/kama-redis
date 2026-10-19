@@ -65,11 +65,21 @@ fn int32 main() {
   | `command_timeout` | seconds, to the millisecond; `0` is no limit | 5 |
   | `client_name` | `CLIENT SETNAME`'s name | none |
   | `keepalive` | whole seconds, as hiredis sets it; `0` is off | 15 |
+  | `reconnect` | `on` or `off` | `on` |
+  | `reconnect_timeout` | seconds, to the millisecond; `0` is no limit | 5 |
 
   `Config.tcp`, `Config.unix` and typed setters do the same without a URL.
 - **Errors are values.** An error reply is `RedisError::Server`. Its code (`WRONGTYPE`, `NOAUTH`, `MOVED`, …) is a
   `ServerCode` to match, beside the server's message, and the connection goes on. A failure of the connection itself
-  (I/O, bytes that are not RESP, a call past its deadline) closes it.
+  (I/O, bytes that are not RESP, a call past its deadline) loses it, and the next call makes it again.
+- **Reconnecting never resends.** The call that meets a lost connection fails with what happened, because its command
+  may have run; retrying it is the caller's choice. The next call makes the connection again: every address, the TLS
+  files read again, the handshake in the protocol it spoke, with the database and user `select` and `authenticate`
+  last set, then a `PING`. While the server is down, restarting, full or still loading, that call keeps trying, with a
+  backoff, for up to `reconnect_timeout`. If it gives up, its error is `Reconnect`, which carries why, and nothing of
+  the call was sent. A transaction whose `WATCH` was lost with the connection answers `WatchConflict` without being
+  sent, so `watched` runs its body again. `reconnect=off` leaves a lost connection closed. A connection over your own
+  transport (`connectOver`) has nothing to redial with, so it stays closed too.
 - **The connection belongs to one isolate at a time,** and moves between them whole.
 
 ## TLS

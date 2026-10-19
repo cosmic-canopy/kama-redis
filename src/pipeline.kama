@@ -2,7 +2,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::time:
          redis::Command, redis::RedisError,
          redis::ScriptCall,
          redis::resp::Writer, redis::resp::Value, redis::wire::admit, redis::wire::serverError, redis::wire::Wait,
-         redis::wire::blockingWait, redis::wire::later, redis::wire::isWatch };
+         redis::wire::blockingWait, redis::wire::later, redis::wire::isWatch, redis::wire::watchEffect };
 export { Pipeline, Replies };
 
 // Commands sent together: `Connection.run` writes them all in one write and reads their replies in order, one round
@@ -26,8 +26,10 @@ type resource Pipeline implements Sendable {
     string trouble = "";
     Wait waits;   // how long its blocking commands may wait on the server, in turn
     bool watching = false;   // it has a WATCH or UNWATCH, which a transaction cannot
+    isize lastWatch = -1;    // the index of its last WATCH or UNWATCH, whose reply settles what is watched after it
+    int32 lastEffect = 0;    // and what that command does (watchEffect)
 
-    friend redis::Connection::run[bytes, problem, waiting];
+    friend redis::Connection::run[bytes, problem, waiting, watchIndex, watchResult];
     friend redis::Connection::transact[bytes, problem, watches];
 
     public ctor make() {
@@ -52,7 +54,11 @@ type resource Pipeline implements Sendable {
             }
         };
         if (!this.refused) {
-            if (isWatch(command: command)) { this.watching = true; }
+            if (isWatch(command: command)) {
+                this.watching = true;
+                this.lastWatch = this.count - 1;
+                this.lastEffect = watchEffect(command: command);
+            }
             command.encode(into: this.encoded);
             this.waits = later(a: this.waits, b: blockingWait(command: command));
         }
@@ -71,6 +77,9 @@ type resource Pipeline implements Sendable {
     const fn ConstView<uint8> bytes() { return this.encoded.view(); }
     const fn Wait waiting() { return this.waits; }
     const fn bool watches() { return this.watching; }
+    // The index of the last WATCH or UNWATCH, -1 for none, and what it does once answered OK.
+    const fn isize watchIndex() { return this.lastWatch; }
+    const fn int32 watchResult() { return this.lastEffect; }
 
     // Why it will not be sent, if it will not: `Value` for an argument, `Usage` otherwise.
     const fn Optional<RedisError> problem() {

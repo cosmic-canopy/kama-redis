@@ -1,7 +1,7 @@
 import { std::collections::ConstView, std::time::Duration, std::fmt::parse, std::fmt::ParseError,
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, redis::Command, redis::RedisError,
          redis::ServerError, redis::resp::Value, Deadline, decimal };
-export { admit, serverError, isWatch, Wait, blockingWait, later, callDeadline };
+export { admit, serverError, isWatch, watchEffect, Wait, blockingWait, later, callDeadline };
 
 // What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
 //
@@ -97,6 +97,14 @@ fn string refusal(const ref Command command) {
 // Whether `command` is WATCH or UNWATCH, which the server refuses inside a transaction.
 fn bool isWatch(const ref Command command) {
     return named(command: command, word: "WATCH") || named(command: command, word: "UNWATCH");
+}
+
+// What `command` does to the keys a connection watches, once the server answers it OK: 1 for WATCH, which adds to
+// them, -1 for UNWATCH, which drops them all, and 0 for anything else.
+fn int32 watchEffect(const ref Command command) {
+    if (named(command: command, word: "WATCH")) { return 1; }
+    if (named(command: command, word: "UNWATCH")) { return -1; }
+    return 0;
 }
 
 // The error a `Value::Error` holds.

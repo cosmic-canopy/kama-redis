@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–4 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–5 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -689,19 +689,39 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
      test until it is placed.
    - Live: `select(db: 3)` writes where a `/3` connection reads; `authenticate` under each protocol, wrong then
      right; SELECT and AUTH themselves refused.
-5. **The lazy redial.**
-   - `Reconnect`, the two options, the transients, the PING that ends a redial, the backoff kept across calls, and
-     `WatchConflict` after a loss.
-   - Unit, through `ScriptDialer`, which gains a record of each dial:
-     - a hangup, then the redial;
-     - three refusals, then a server;
-     - accepted and closed, then a server;
-     - WRONGPASS at the redial is `Reconnect`, with nothing sent;
-     - RESP2 stays RESP2;
-     - the TLS files are read again;
-     - `connectOver` and `close()` stay `Closed`;
-     - `select` and `authenticate` are restored.
-   - Live: `failure_test`'s CLIENT KILL, and `timeout_test`'s two checks, move to a redial.
+5. **Done (2026-10-19).** **The lazy redial.** `ready()` stands before every call (`exchange`, `run`, `transact`):
+   the link as it is, made again once lost, or `Closed`. What building it settled:
+   - **A try** is `reach` and `secure` (step 3), the handshake on the new link, then a PING; LOADING to that PING, a
+     link closed or reset before the handshake ended (a TLS handshake's `Closed` included), a timeout, no address
+     opening and a refusal with the generic `ERR` are retried, anything else is final. A redial's handshake reports a
+     close in answer to HELLO as the close it is: the twemproxy hint is for a first connect only.
+   - **The protocol is pinned** after the first handshake, in the kept `Config`, so RESP2 (a proxy) stays RESP2, and a
+     redial whose HELLO is refused never takes the RESP2 path.
+   - **The backoff** (100 ms doubling to 1 s, half of it drawn at random) and the count of failed tries live on the
+     connection; each call waits for the backoff, within its own `reconnect_timeout`, and makes at least one try.
+   - **`Reconnect`** holds the last try's error and how many tries the call made, in words: "the connection was lost,
+     and reconnecting failed (2 tries): …".
+   - **WATCH** is recorded from replies answered OK (a call's, or the last WATCH or UNWATCH of a pipeline). A
+     transaction clears it before it is sent, since EXEC ends every WATCH. A loss while it is in force makes the next
+     transaction `WatchConflict`, unsent.
+   - Unit, through `ScriptDialer`, whose scripts are everything a new link must carry, so a resent command meets an
+     Expect it does not match:
+     - lost mid-call, then the next call alone;
+     - refused three times, then up;
+     - a link closed and one reset, then up;
+     - LOADING waited out;
+     - maxclients tried again;
+     - WRONGPASS final after one try;
+     - down past `reconnect_timeout`;
+     - `reconnect=off`, `close()`;
+     - RESP2 and RESP3 kept;
+     - `select` and `authenticate` restored;
+     - four WATCH cases;
+     - the backoff across calls;
+     - over TLS: a handshake closed, then a TLS 1.2 link, and the CA file replaced on disk refusing the next redial.
+   - Live: CLIENT KILL, then a PONG with a new client id; `select(db: 5)` and `authenticate(kr_acl)` outlive a kill
+     (`CLIENT INFO`); a timeout, then a redial; `setCommandTimeout` outlives one.
+   - 23 mutations, all caught.
 6. **The zero-time check** (`src/wire/wire.kama`, `Reader.pendingKind`).
    - Unit:
      - a hangup while idle does not reach the caller;

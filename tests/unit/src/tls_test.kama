@@ -4,7 +4,7 @@
 // split everywhere it can be.
 import { core::println, core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
          std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::SocketAddr, std::net::resolve,
-         std::memory::Owned, std::time::Duration,
+         std::memory::Owned, std::time::Duration, std::fs::readFile, std::fs::writeFile,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion as EngineVersion,
          redis::Connection, redis::Config, redis::RedisError, redis::Transport, redis::Dialer, redis::TlsVerify, redis::TlsVersion,
          redis::TlsSession, redis::Subscriber, redis::Pipeline, redis::Command, redis::Replies, redis::resp::Value,
@@ -531,6 +531,69 @@ unsafe fn int32 entryTests() {
     return f;
 }
 
+// A TLS connection made again (docs/ROADMAP.md, "Phase 7a"): a link closed during its TLS handshake is tried again,
+// as a server that is down behind a forwarder closes one; and each redial reads the TLS files again, so a CA
+// replaced on disk is the next redial's.
+unsafe fn int32 redialTests() {
+    int32 f = 0;
+    TlsConfig server = serverTls(cert: "server", policy: 0, only: 0);
+    Config config = configOf(url: trusting(host: "localhost", more: "&reconnect_timeout=0.5"));
+    DynamicArray<Dial> dials = DynamicArray.empty();
+    DynamicArray<Step> first = welcome(server: vectorServer());
+    first.add(item: Step::Close);
+    dials.add(item: Dial::ServeTls(steps: give first, config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
+    DynamicArray<Step> dropped = DynamicArray.empty();
+    dropped.add(item: Step::Hangup);
+    dials.add(item: Dial::Serve(steps: give dropped));
+    // The redial's own PING, then the call's; this server agrees on TLS 1.2 where the first agreed on 1.3, so the
+    // session read after the redial is the new link's.
+    DynamicArray<Step> up = greeting();
+    up.add(item: expect(command: "PING", answer: reply(server: vectorServer(), kase: "ping")));
+    dials.add(item: Dial::ServeTls(steps: give up, config: serverTls(cert: "server", policy: 0, only: 12), sni: "localhost"));
+    Owned<Dialer> d = new ScriptDialer.make(dials: give dials);
+    Result<Connection, RedisError> made = Connection.connectWith(dialer: give d, config: config);
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: redial: ${m}"); return 1; } };
+    Command lose = commandOf(text: "GET kr:lost");
+    Result<Value, RedisError> lost = c.call(command: lose);
+    Command ping = Command.of(name: "PING");
+    Result<Value, RedisError> back = c.call(command: ping);
+    string backGot = callOutcome(r: back);
+    bool secured = match (c.tlsSession()) { case Some(value: s): s.version() == TlsVersion::Tls12; case None: false; };
+    f = f + check(ok: isSimple(r: back, text: "PONG") && secured, what: "tls: redial: a link closed during the TLS handshake is tried again, and the new link is TLS, its own session kept: ${backGot}");
+
+    // The CA, from a file of its own: replaced on disk while the link is lost, it is the redial's.
+    string ca = certPath(name: "redial-ca.crt");
+    Result<DynamicArray<uint8>, IoError> trusted = readFile(path: certPath(name: "ca.crt"));
+    Result<DynamicArray<uint8>, IoError> other = readFile(path: certPath(name: "other-ca.crt"));
+    DynamicArray<uint8> trustedPem = match (give trusted) { case Ok(value: b): give b; case Err(error: e): DynamicArray.empty(); };
+    DynamicArray<uint8> otherPem = match (give other) { case Ok(value: b): give b; case Err(error: e): DynamicArray.empty(); };
+    Result<isize, IoError> w1 = writeFile(path: ca, bytes: trustedPem);
+    Config own = configOf(url: "rediss://localhost?tls_ca=".concat(other: ca).concat(other: "&reconnect_timeout=0.2"));
+    DynamicArray<Dial> again = DynamicArray.empty();
+    DynamicArray<Step> one = welcome(server: vectorServer());
+    one.add(item: Step::Close);
+    again.add(item: Dial::ServeTls(steps: give one, config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
+    again.add(item: Dial::ServeTls(steps: greeting(), config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
+    Owned<Dialer> d2 = new ScriptDialer.make(dials: give again);
+    Result<Connection, RedisError> made2 = Connection.connectWith(dialer: give d2, config: own);
+    Connection c2 = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: redial ca: ${m}"); return 1; } };
+    Command lose2 = commandOf(text: "GET kr:lost");
+    Result<Value, RedisError> lost2 = c2.call(command: lose2);
+    Result<isize, IoError> w2 = writeFile(path: ca, bytes: otherPem);
+    Command ping2 = Command.of(name: "PING");
+    Result<Value, RedisError> refused = c2.call(command: ping2);
+    bool reread = match (refused) {
+        case Err(error: e): match (e) {
+            case Reconnect(error: r): r.tries() == 1 && match (r.cause()) { case Tls(detail: dt, cause: t): match (t) { case Certificate(flags: fl, reasons: rs): (fl & BADCERT_NOT_TRUSTED) != 0ui32; case _: false; }; case _: false; };
+            case _: false;
+        };
+        case Ok(value: v): false;
+    };
+    string refusedGot = callOutcome(r: refused);
+    f = f + check(ok: reread, what: "tls: redial: the CA file is read again, and a certificate refused there is final: ${refusedGot}");
+    return f;
+}
+
 unsafe fn int32 tlsTests() {
     int32 f = 0;
     f = f + verificationTests();
@@ -539,5 +602,6 @@ unsafe fn int32 tlsTests() {
     f = f + sessionTests();
     f = f + hostileTests();
     f = f + entryTests();
+    f = f + redialTests();
     return f;
 }

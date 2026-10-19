@@ -1,0 +1,186 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        return this.redial();\n    }",
+  "new": "        return Result::Err(error: RedisError::Closed);\n    }",
+  "expect": "redial: the next call makes a new link"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        case Connect(error: c): true;\n        case Timeout: true;",
+  "new": "        case Connect(error: c): false;\n        case Timeout: true;",
+  "expect": "refused three times, then served"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        case Io(error: x): closedKind(x: x);\n        case Tls(detail: d, cause: t)",
+  "new": "        case Io(error: x): false;\n        case Tls(detail: d, cause: t)",
+  "expect": "a link closed, then one reset"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Tls(detail: d, cause: t): match (t) { case Closed: true; case Io(error: x): closedKind(x: x); case _: false; };",
+  "new": "case Tls(detail: d, cause: t): false;",
+  "expect": "a link closed during the TLS handshake is tried again"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };",
+  "new": "case Server(error: s): match (s.code()) { case Err: false; case Loading: true; case _: false; };",
+  "expect": "a server with no room left is tried again"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };",
+  "new": "case Server(error: s): match (s.code()) { case Err: true; case Loading: false; case _: false; };",
+  "expect": "LOADING is waited out"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        return this.probe(deadline: left);",
+  "new": "        return Result::Ok(value: Unit::Unit);",
+  "expect": "LOADING is waited out"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                if (again) { return Result::Err(error: give e); }\n",
+  "new": "",
+  "expect": "a link closed, then one reset"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);\n        return match (give done) {\n            case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }",
+  "new": "        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);\n        return match (give done) {\n            case Ok(value: u): { := Result::Ok(value: give c); }",
+  "expect": "RESP3 stays RESP3"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<Value, RedisError> r = this.exchange(command: choose);\n        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };\n        this.settings = give next;",
+  "new": "        Result<Value, RedisError> r = this.exchange(command: choose);\n        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };",
+  "expect": "a redial selects database 2"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<Value, RedisError> r = this.exchange(command: auth);\n        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };\n        this.settings = give next;",
+  "new": "        Result<Value, RedisError> r = this.exchange(command: auth);\n        match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };",
+  "expect": "a redial selects database 2"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.watching) { this.watching = false; this.watchLost = true; }\n",
+  "new": "",
+  "expect": "a transaction after its WATCH was lost"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (effect < 0) { this.watching = false; this.watchLost = false; }",
+  "new": "        if (effect < 0) { }",
+  "expect": "after UNWATCH, a loss loses no WATCH"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (at >= 0 && !values[at].isError()) { this.noteWatch(effect: pipeline.watchResult()); }\n",
+  "new": "",
+  "expect": "a WATCH in a pipeline"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.watching = false;\n        Deadline deadline = Deadline.within(span: this.commandLimit);",
+  "new": "        Deadline deadline = Deadline.within(span: this.commandLimit);",
+  "expect": "a transaction ends its WATCH"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    const fn bool canRedial() { return !this.shut && this.dialing.canDial() && this.settings.reconnect(); }",
+  "new": "    const fn bool canRedial() { return !this.shut && this.dialing.canDial(); }",
+  "expect": "reconnect=off leaves"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    const fn bool canRedial() { return !this.shut && this.dialing.canDial() && this.settings.reconnect(); }",
+  "new": "    const fn bool canRedial() { return this.dialing.canDial() && this.settings.reconnect(); }",
+  "expect": "caller closed stays closed"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            this.pace(window: window);\n",
+  "new": "",
+  "expect": "pace: a call right after"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                        return Result::Err(error: RedisError::Reconnect(error: ReconnectError.of(cause: give e, tries: tries)));",
+  "new": "                        return Result::Err(error: give e);",
+  "expect": "WRONGPASS at a redial is Reconnect"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    public const fn bool isClosed() { return !this.live && !this.canRedial(); }",
+  "new": "    public const fn bool isClosed() { return !this.live; }",
+  "expect": "is not closed"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }\n",
+  "new": "",
+  "expect": "a transaction after its WATCH was lost"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (!transient(e: e) || !window.allows(at: this.redialAfter)) {",
+  "new": "                    if (!window.allows(at: this.redialAfter)) {",
+  "expect": "WRONGPASS at a redial is Reconnect after one try"
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.secured = give session;\n        this.live = true;",
+  "new": "        this.live = true;",
+  "expect": "its own session kept"
+ }
+]

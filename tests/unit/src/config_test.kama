@@ -67,15 +67,36 @@ fn int32 optionTests() {
     Config u = parsed(url: "unix:///tmp/redis.sock?db=2&command_timeout=0.001");
     f = f + check(ok: u.transport() == UrlTransport::Unix && u.socketPath() == "/tmp/redis.sock" && u.database() == 2i64, what: "options: unix:// and ?db=");
     f = f + check(ok: ms(d: u.commandTimeout()) == 1i64, what: "options: a millisecond");
+
+    // Reconnecting: on, with 5 s, by default; reconnect=off; reconnect_timeout in seconds, 0 for no limit.
+    Config r = parsed(url: "redis://h");
+    f = f + check(ok: r.reconnect() && ms(d: r.reconnectTimeout()) == 5000i64, what: "options: reconnect on, reconnect_timeout 5 s, by default");
+    Config ro = parsed(url: "redis://h?reconnect=off&reconnect_timeout=0.25");
+    f = f + check(ok: !ro.reconnect() && ms(d: ro.reconnectTimeout()) == 250i64, what: "options: reconnect=off, reconnect_timeout=0.25");
+    Config rz = parsed(url: "unix:///tmp/r.sock?reconnect=on&reconnect_timeout=0");
+    f = f + check(ok: rz.reconnect() && rz.reconnectTimeout().asNanos() == 0i64, what: "options: reconnect=on, reconnect_timeout=0 for no limit, on unix:// too");
+    Config set = parsed(url: "redis://h");
+    set.setReconnect(on: false);
+    Result<Unit, RedisError> neg = set.setReconnectTimeout(timeout: Duration.fromMillis(ms: -1i64));
+    Result<Unit, RedisError> two = set.setReconnectTimeout(timeout: Duration.fromSecs(s: 2i64));
+    bool negRefused = match (neg) { case Err(error: e): e.message() == "reconnect_timeout cannot be negative: 0 is no limit"; case Ok(value: x): false; };
+    bool twoSet = match (two) { case Ok(value: x): true; case Err(error: e): false; };
+    f = f + check(ok: !set.reconnect() && negRefused && twoSet && ms(d: set.reconnectTimeout()) == 2000i64, what: "setters: setReconnect, setReconnectTimeout, a negative one refused");
+    Config copied = copy set;
+    f = f + check(ok: !copied.reconnect() && ms(d: copied.reconnectTimeout()) == 2000i64, what: "copy: the reconnect settings");
     return f;
 }
 
 fn int32 refusalTests() {
     int32 f = 0;
     string unknown = refusal(url: "redis://host?socket_timeout=1");
-    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name",
+    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name",
                   what: "refused: an unknown option: ${unknown}");
     f = f + check(ok: !accepted(url: "redis://host?dial_timeout=1") && !accepted(url: "redis://host?timeout=1"), what: "refused: other clients' names");
+    string maybe = refusal(url: "redis://host?reconnect=yes");
+    f = f + check(ok: maybe == "reconnect is on or off: reconnect=off", what: "refused: reconnect=yes: ${maybe}");
+    string slow = refusal(url: "redis://host?reconnect_timeout=5s");
+    f = f + check(ok: slow == "reconnect_timeout is seconds, to the millisecond, and 0 for no limit: reconnect_timeout=2.5", what: "refused: reconnect_timeout=5s: ${slow}");
     f = f + check(ok: refusal(url: "http://host").startsWith(prefix: "not a URL") || refusal(url: "http://host").startsWith(prefix: "unknown scheme"), what: "refused: RedisUrl's refusal passes through");
 
     DynamicArray<string> protocols = DynamicArray.empty();

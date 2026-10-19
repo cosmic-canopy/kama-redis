@@ -16,6 +16,10 @@ export { Config, Protocol, TlsVerify, TlsVersion, socketPathMax };
 //   client_name=NAME      CLIENT SETNAME's name: the bytes ! to ~, as the server allows
 //   keepalive=S           TCP keepalive, as hiredis sets it: idle S seconds, a probe every S/3, 3 probes. 0 is off.
 //                         Default 15, redis-cli's.
+//   reconnect=on|off      whether a lost connection is made again by its next call (docs/ROADMAP.md, "Phase 7a"). On
+//                         by default; off leaves it closed, for a pool that replaces it.
+//   reconnect_timeout=S   seconds, to the millisecond; 0 for no limit. Default 5. How long a call may go on trying to
+//                         make a lost connection again, while the server is down or restarting.
 // The database is the URL's path (redis://host/2), or ?db= on unix://, as RedisUrl reads it.
 //
 // Over TLS (rediss://, valkeys://) as well (docs/ROADMAP.md, "Phase 5"); each is refused on redis:// and unix://:
@@ -99,6 +103,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     Optional<string> serverNameText;
     TlsVersion minVersion;
     TlsVersion maxVersion;
+    bool reconnecting = true;
+    Duration reconnectLimit;
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -126,6 +132,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.serverNameText = Optional::None;
         this.minVersion = TlsVersion::Tls12;
         this.maxVersion = TlsVersion::Tls13;
+        this.reconnecting = true;
+        this.reconnectLimit = Duration.fromSecs(s: DEFAULT_TIMEOUT_SECS);
     }
 
     public ctor copy(ref Config source) {
@@ -154,6 +162,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.serverNameText = copy source.serverNameText;
         this.minVersion = source.minVersion;
         this.maxVersion = source.maxVersion;
+        this.reconnecting = source.reconnecting;
+        this.reconnectLimit = source.reconnectLimit;
     }
 
     // A connection URL: redis://, valkey://, rediss://, valkeys:// or unix:// (src/url.kama says how each is read),
@@ -274,6 +284,16 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         return Result::Ok(value: Unit::Unit);
     }
 
+    // Whether a lost connection is made again by its next call. On by default; off leaves it closed.
+    public fn void setReconnect(bool on) { this.reconnecting = on; }
+
+    // How long a call may go on trying to make a lost connection again. Zero is no limit.
+    public fn Result<Unit, RedisError> setReconnectTimeout(Duration timeout) {
+        if (timeout.isNegative()) { return Result::Err(error: RedisError::Config(detail: "reconnect_timeout cannot be negative: 0 is no limit")); }
+        this.reconnectLimit = timeout;
+        return Result::Ok(value: Unit::Unit);
+    }
+
     // The bounds on what the server may send (resp::Limits).
     public fn void setLimits(Limits limits) { this.readerLimits = limits; }
 
@@ -384,6 +404,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public const fn Duration keepAlive() { return this.keepAliveIdle; }
     public const fn Limits limits() { return this.readerLimits; }
     public const fn bool identity() { return this.identify; }
+    public const fn bool reconnect() { return this.reconnecting; }
+    public const fn Duration reconnectTimeout() { return this.reconnectLimit; }
     // The TLS settings, which mean something only over TLS.
     public const fn TlsVerify tlsVerify() { return this.verifyMode; }
     // The CA file, or the CA's PEM, trusted instead of the system's bundle; neither when it is the system's.
@@ -424,13 +446,20 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             if (value == "3") { this.protocolChoice = Optional::Some(value: Protocol::Resp3); return Optional::None; }
             return refused(m: "protocol is 2 or 3: protocol=3");
         }
-        if (key == "connect_timeout" || key == "command_timeout") {
+        if (key == "reconnect") {
+            if (value == "on") { this.reconnecting = true; return Optional::None; }
+            if (value == "off") { this.reconnecting = false; return Optional::None; }
+            return refused(m: "reconnect is on or off: reconnect=off");
+        }
+        if (key == "connect_timeout" || key == "command_timeout" || key == "reconnect_timeout") {
             Optional<Duration> d = seconds(b: value.bytes());
             Duration t = match (d) {
                 case Some(value: v): v;
                 case None: { return refused(m: key.concat(other: " is seconds, to the millisecond, and 0 for no limit: ").concat(other: key).concat(other: "=2.5")); }
             };
-            if (key == "connect_timeout") { this.connectLimit = t; } else { this.commandLimit = t; }
+            if (key == "connect_timeout") { this.connectLimit = t; }
+            else if (key == "command_timeout") { this.commandLimit = t; }
+            else { this.reconnectLimit = t; }
             return Optional::None;
         }
         if (key == "client_name") {
@@ -452,7 +481,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             if (this.kind != UrlTransport::Tls) { return refused(m: key.concat(other: " is a TLS option: connect over rediss:// or valkeys://")); }
             return this.tlsOption(key: key, value: value);
         }
-        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name and keepalive, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name"));
+        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name"));
     }
 
     // One TLS option, on a TLS URL. tls_cert and tls_key are checked together, and tls_ca against tls_verify, once

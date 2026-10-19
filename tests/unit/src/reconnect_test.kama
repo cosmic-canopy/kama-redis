@@ -1,0 +1,391 @@
+// Reconnecting (docs/ROADMAP.md, "Phase 7a") over a scripted dialer: a lost connection is made again by its next
+// call, and never resends the call that saw it lost. Each redial's script is everything the new link must carry,
+// in order: the handshake, the PING that ends a redial, then the next command, never the lost one. A command the
+// client should not send meets an Expect it does not match, and the call fails.
+import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::Instant, std::time::monotonicNow,
+         redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::Protocol, redis::RedisError,
+         redis::TxOutcome, redis::Dialer, redis::resp::Value,
+         redis_unit_tests::check, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
+         commandOf, transaction, setThenIncr };
+export { reconnectTests };
+
+
+// The server whose replies the scripts play.
+fn string server() { return "redis-8.10.2"; }
+
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// A redial's handshake with server(), and the PING that ends it.
+fn DynamicArray<Step> again() {
+    DynamicArray<Step> s = welcome(server: server());
+    s.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    return give s;
+}
+
+// A connection over `dials`, the first of which must serve its handshake.
+unsafe fn Connection dialed(DynamicArray<Dial> dials, const ref Config config, const ref string what) {
+    Owned<Dialer> d = new ScriptDialer.make(dials: give dials);
+    Result<Connection, RedisError> r = Connection.connectWith(dialer: give d, config: config);
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "reconnect_test: ${what}: ${m}"); return dialed(dials: DynamicArray.empty(), config: config, what: what); }
+    };
+    return give c;
+}
+
+// The first link: the handshake, then GET kr:lost, which the server reads and answers by closing the connection.
+fn DynamicArray<Step> losing() {
+    DynamicArray<Step> s = welcome(server: server());
+    s.add(item: Step::Close);
+    return give s;
+}
+
+unsafe fn Result<Value, RedisError> send(ref Connection c, const ref string text) {
+    Command command = commandOf(text: text);
+    return c.call(command: command);
+}
+
+fn bool isIo(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
+}
+
+// The cause of a call's Reconnect, as "<tries> <what>": "1 WRONGPASS", "2 connect"; "-" for anything else.
+fn string reconnectOf(const ref Result<Value, RedisError> r) {
+    return match (r) {
+        case Err(error: e): match (e) {
+            case Reconnect(error: x): {
+                int32 n = x.tries();
+                string why = match (x.cause()) {
+                    case Server(error: s): s.codeText();
+                    case Connect(error: c): "connect";
+                    case Tls(detail: d, cause: t): "tls";
+                    case Timeout: "timeout";
+                    case _: x.cause().message();
+                };
+                := "${n} ".concat(other: why);
+            }
+            case _: "-";
+        };
+        case Ok(value: v): "-";
+    };
+}
+
+unsafe fn int32 redialTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+
+    // A link lost mid-call: that call's error is the loss, and the next call makes a new link and sends only itself.
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    d1.add(item: Dial::Serve(steps: losing()));
+    DynamicArray<Step> next = again();
+    next.add(item: expect(command: "GET kr:next", answer: reply(server: server(), kase: "get-missing/3")));
+    d1.add(item: Dial::Serve(steps: give next));
+    Connection c1 = dialed(dials: give d1, config: plain, what: "lost mid-call");
+    Result<Value, RedisError> lost = send(c: c1, text: "GET kr:lost");
+    bool open = !c1.isClosed();
+    Result<Value, RedisError> after = send(c: c1, text: "GET kr:next");
+    string afterGot = callOutcome(r: after);
+    f = f + check(ok: isIo(r: lost) && open, what: "redial: the call that saw the link lost fails with it, and the connection is not closed");
+    f = f + check(ok: afterGot == "ok", what: "redial: the next call makes a new link, and sends only itself: ${afterGot}");
+
+    // A server still down: refused three times, then up. The call waits it out within reconnect_timeout.
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    d2.add(item: Dial::Serve(steps: losing()));
+    d2.add(item: Dial::Refuse); d2.add(item: Dial::Refuse); d2.add(item: Dial::Refuse);
+    DynamicArray<Step> up = again();
+    up.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d2.add(item: Dial::Serve(steps: give up));
+    Connection c2 = dialed(dials: give d2, config: plain, what: "down, then up");
+    Result<Value, RedisError> lost2 = send(c: c2, text: "GET kr:lost");
+    Result<Value, RedisError> back = send(c: c2, text: "PING");
+    string backGot = callOutcome(r: back);
+    f = f + check(ok: isSimple(r: back, text: "PONG"), what: "redial: refused three times, then served, within reconnect_timeout: ${backGot}");
+
+    // A forwarder in front of a server that is down accepts, then closes: tried again, as a refusal is.
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    d3.add(item: Dial::Serve(steps: losing()));
+    DynamicArray<Step> closing = steps();
+    closing.add(item: Step::Hangup);
+    d3.add(item: Dial::Serve(steps: give closing));
+    DynamicArray<Step> resetting = steps();
+    resetting.add(item: Step::Reset);
+    d3.add(item: Dial::Serve(steps: give resetting));
+    DynamicArray<Step> up3 = again();
+    up3.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d3.add(item: Dial::Serve(steps: give up3));
+    Connection c3 = dialed(dials: give d3, config: plain, what: "accepted and closed");
+    Result<Value, RedisError> lost3 = send(c: c3, text: "GET kr:lost");
+    Result<Value, RedisError> back3 = send(c: c3, text: "PING");
+    string back3Got = callOutcome(r: back3);
+    f = f + check(ok: isSimple(r: back3, text: "PONG"), what: "redial: a link closed, then one reset, before the handshake ended, are tried again: ${back3Got}");
+
+    // A server reloading its dataset takes the handshake and answers the closing PING -LOADING: waited out.
+    DynamicArray<Dial> d4 = DynamicArray.empty();
+    d4.add(item: Dial::Serve(steps: losing()));
+    DynamicArray<Step> loading = welcome(server: server());
+    loading.add(item: expect(command: "PING", answer: reply(server: server(), kase: "loading-ping")));
+    d4.add(item: Dial::Serve(steps: give loading));
+    DynamicArray<Step> loaded = again();
+    loaded.add(item: expect(command: "GET kr:next", answer: reply(server: server(), kase: "get-missing/3")));
+    d4.add(item: Dial::Serve(steps: give loaded));
+    Connection c4 = dialed(dials: give d4, config: plain, what: "loading");
+    Result<Value, RedisError> lost4 = send(c: c4, text: "GET kr:lost");
+    Result<Value, RedisError> back4 = send(c: c4, text: "GET kr:next");
+    string back4Got = callOutcome(r: back4);
+    f = f + check(ok: back4Got == "ok", what: "redial: a server that answers PING with LOADING is waited out, and the call goes to the one that loaded: ${back4Got}");
+
+    // A server with no room left refuses as it accepts (maxclients): tried again.
+    DynamicArray<Dial> d5 = DynamicArray.empty();
+    d5.add(item: Dial::Serve(steps: losing()));
+    DynamicArray<Step> full = steps();
+    full.add(item: Step::Send(bytes: reply(server: server(), kase: "maxclients")));
+    full.add(item: Step::Hangup);
+    d5.add(item: Dial::Serve(steps: give full));
+    DynamicArray<Step> room = again();
+    room.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d5.add(item: Dial::Serve(steps: give room));
+    Connection c5 = dialed(dials: give d5, config: plain, what: "maxclients");
+    Result<Value, RedisError> lost5 = send(c: c5, text: "GET kr:lost");
+    Result<Value, RedisError> back5 = send(c: c5, text: "PING");
+    string back5Got = callOutcome(r: back5);
+    f = f + check(ok: isSimple(r: back5, text: "PONG"), what: "redial: a server with no room left is tried again: ${back5Got}");
+    return f;
+}
+
+unsafe fn int32 finalTests() {
+    int32 f = 0;
+    // A refusal with a code of its own is final: WRONGPASS, once, with nothing of the call sent.
+    Config auth = configOf(url: "redis://kr_acl:kr_acl_pw@127.0.0.1:6379?reconnect_timeout=0.2");
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> first = steps();
+    first.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "hello3-auth")));
+    first.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    first.add(item: Step::Any(reply: reply(server: server(), kase: "setinfo-ver")));
+    first.add(item: Step::Close);
+    d1.add(item: Dial::Serve(steps: give first));
+    DynamicArray<Step> wrong = steps();
+    wrong.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "hello3-auth-wrong")));
+    d1.add(item: Dial::Serve(steps: give wrong));
+    Connection c1 = dialed(dials: give d1, config: auth, what: "wrongpass");
+    Result<Value, RedisError> lost = send(c: c1, text: "GET kr:lost");
+    Result<Value, RedisError> refused = send(c: c1, text: "GET kr:next");
+    string why = reconnectOf(r: refused);
+    string words = callOutcome(r: refused);
+    f = f + check(ok: why == "1 WRONGPASS", what: "final: WRONGPASS at a redial is Reconnect after one try: ${why}");
+    f = f + check(ok: words.startsWith(prefix: "the connection was lost, and reconnecting failed (1 try): WRONGPASS"), what: "final: the Reconnect's words: ${words}");
+    f = f + check(ok: !c1.isClosed(), what: "final: the connection is not closed after a failed redial: the next call tries again");
+
+    // A server still down past reconnect_timeout: Reconnect, with the last try's Connect.
+    Config brief = configOf(url: "redis://127.0.0.1:6379?reconnect_timeout=0.2");
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    d2.add(item: Dial::Serve(steps: losing()));
+    Connection c2 = dialed(dials: give d2, config: brief, what: "down");
+    Result<Value, RedisError> lost2 = send(c: c2, text: "GET kr:lost");
+    Result<Value, RedisError> down = send(c: c2, text: "PING");
+    string downWhy = reconnectOf(r: down);
+    f = f + check(ok: downWhy.endsWith(suffix: " connect") && !downWhy.startsWith(prefix: "1 "), what: "final: a server down past reconnect_timeout is Reconnect, after more than one try: ${downWhy}");
+
+    // reconnect=off, connectOver and close(): the connection stays closed.
+    Config off = configOf(url: "redis://127.0.0.1:6379?reconnect=off");
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    d3.add(item: Dial::Serve(steps: losing()));
+    d3.add(item: Dial::Serve(steps: again()));
+    Connection c3 = dialed(dials: give d3, config: off, what: "reconnect=off");
+    Result<Value, RedisError> lost3 = send(c: c3, text: "GET kr:lost");
+    Result<Value, RedisError> stays = send(c: c3, text: "PING");
+    f = f + check(ok: callClosed(r: stays) && c3.isClosed(), what: "final: reconnect=off leaves a lost connection closed");
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    DynamicArray<Dial> d4 = DynamicArray.empty();
+    d4.add(item: Dial::Serve(steps: welcome(server: server())));
+    d4.add(item: Dial::Serve(steps: again()));
+    Connection c4 = dialed(dials: give d4, config: plain, what: "close()");
+    c4.close();
+    Result<Value, RedisError> shut = send(c: c4, text: "PING");
+    f = f + check(ok: callClosed(r: shut) && c4.isClosed(), what: "final: a connection the caller closed stays closed");
+    return f;
+}
+
+unsafe fn int32 keptTests() {
+    int32 f = 0;
+    // The protocol the connection speaks is the redial's: RESP2 (a proxy refused HELLO) stays RESP2.
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> envoy = steps();
+    envoy.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3")));
+    envoy.add(item: Step::Any(reply: reply(server: "redis-6.2.24", kase: "setinfo-name")));
+    envoy.add(item: Step::Any(reply: reply(server: "redis-6.2.24", kase: "setinfo-ver")));
+    envoy.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    envoy.add(item: Step::Close);
+    d1.add(item: Dial::Serve(steps: give envoy));
+    DynamicArray<Step> envoy2 = steps();
+    envoy2.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    envoy2.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    envoy2.add(item: expect(command: "GET kr:next", answer: reply(server: "redis-6.2.24", kase: "get-missing/2")));
+    d1.add(item: Dial::Serve(steps: give envoy2));
+    Connection c1 = dialed(dials: give d1, config: plain, what: "resp2");
+    Result<Value, RedisError> lost1 = send(c: c1, text: "GET kr:lost");
+    Result<Value, RedisError> back1 = send(c: c1, text: "GET kr:next");
+    string back1Got = callOutcome(r: back1);
+    f = f + check(ok: back1Got == "ok" && c1.protocol() == Protocol::Resp2, what: "kept: RESP2 stays RESP2, with no HELLO: ${back1Got}");
+
+    // RESP3 stays RESP3: a redial whose HELLO is refused never falls back to the RESP2 path.
+    Config brief = configOf(url: "redis://127.0.0.1:6379?reconnect_timeout=0.05");
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    d2.add(item: Dial::Serve(steps: losing()));
+    DynamicArray<Step> refuses = steps();
+    refuses.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3")));
+    refuses.add(item: Step::Any(reply: reply(server: "redis-6.2.24", kase: "setinfo-name")));
+    refuses.add(item: Step::Any(reply: reply(server: "redis-6.2.24", kase: "setinfo-ver")));
+    refuses.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    refuses.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    refuses.add(item: expect(command: "GET kr:next", answer: reply(server: "redis-6.2.24", kase: "get-missing/2")));
+    d2.add(item: Dial::Serve(steps: give refuses));
+    Connection c2 = dialed(dials: give d2, config: brief, what: "resp3");
+    Result<Value, RedisError> lost2 = send(c: c2, text: "GET kr:lost");
+    Result<Value, RedisError> back2 = send(c: c2, text: "GET kr:next");
+    string back2Got = callOutcome(r: back2);
+    f = f + check(ok: back2Got != "ok" && c2.protocol() == Protocol::Resp3, what: "kept: RESP3 stays RESP3, never the RESP2 path: ${back2Got}");
+
+    // What select and authenticate set, every redial sets again; a refused select sets nothing.
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    DynamicArray<Step> first = welcome(server: server());
+    first.add(item: expect(command: "SELECT 2", answer: reply(server: server(), kase: "select1")));
+    first.add(item: expect(command: "SELECT 16", answer: reply(server: server(), kase: "select-range")));
+    first.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "auth2")));
+    first.add(item: Step::Close);
+    d3.add(item: Dial::Serve(steps: give first));
+    DynamicArray<Step> restored = steps();
+    restored.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "hello3-auth")));
+    restored.add(item: expect(command: "SELECT 2", answer: reply(server: server(), kase: "select1")));
+    restored.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    restored.add(item: Step::Any(reply: reply(server: server(), kase: "setinfo-ver")));
+    restored.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    restored.add(item: expect(command: "GET kr:next", answer: reply(server: server(), kase: "get-missing/3")));
+    d3.add(item: Dial::Serve(steps: give restored));
+    Connection c3 = dialed(dials: give d3, config: plain, what: "select and authenticate");
+    Result<Unit, RedisError> s2 = c3.select(db: 2);
+    Result<Unit, RedisError> s16 = c3.select(db: 16);
+    Result<Unit, RedisError> a = c3.authenticate(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw");
+    Result<Value, RedisError> lost3 = send(c: c3, text: "GET kr:lost");
+    Result<Value, RedisError> back3 = send(c: c3, text: "GET kr:next");
+    string back3Got = callOutcome(r: back3);
+    f = f + check(ok: back3Got == "ok", what: "kept: a redial selects database 2 and logs in as kr_acl, as select and authenticate set: ${back3Got}");
+    return f;
+}
+
+// How a transaction ended: "held back" (WatchConflict: it was never sent, since every script here commits what is
+// sent), "committed", or the error.
+fn string fate(Result<TxOutcome, RedisError> r) {
+    return match (give r) {
+        case Ok(value: o): match (o) { case WatchConflict: "held back"; case _: "committed"; };
+        case Err(error: e): e.message();
+    };
+}
+
+// A link that commits the next transaction (setThenIncr), after a redial's handshake.
+fn DynamicArray<Step> committing() {
+    DynamicArray<Step> s = again();
+    transaction(s: s, server: server(), protocol: "3", exec: reply(server: server(), kase: "exec-ok/3"));
+    return give s;
+}
+
+unsafe fn int32 watchTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    Pipeline tx = setThenIncr();
+    // A WATCH lost with its link: the next transaction is held back as WatchConflict, never sent; the one after it has
+    // no WATCH to lose, and is sent (committed) on a new link.
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> first = welcome(server: server());
+    first.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "select1")));
+    first.add(item: Step::Close);
+    d1.add(item: Dial::Serve(steps: give first));
+    d1.add(item: Dial::Serve(steps: committing()));
+    Connection c1 = dialed(dials: give d1, config: plain, what: "watch lost");
+    Result<Value, RedisError> w = send(c: c1, text: "WATCH kr:w");
+    Result<Value, RedisError> lost = send(c: c1, text: "GET kr:lost");
+    string t1 = fate(r: c1.transact(pipeline: tx));
+    string t2 = fate(r: c1.transact(pipeline: tx));
+    f = f + check(ok: t1 == "held back", what: "watch: a transaction after its WATCH was lost with the link is WatchConflict, and is not sent: ${t1}");
+    f = f + check(ok: t2 == "committed", what: "watch: the transaction after that one redials and is sent: ${t2}");
+
+    // An UNWATCH answered OK drops the WATCH: a loss after it loses nothing, and the transaction is sent.
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    DynamicArray<Step> one = welcome(server: server());
+    one.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "select1")));
+    one.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "select1")));
+    one.add(item: Step::Close);
+    d2.add(item: Dial::Serve(steps: give one));
+    d2.add(item: Dial::Serve(steps: committing()));
+    Connection c2 = dialed(dials: give d2, config: plain, what: "unwatch");
+    Result<Value, RedisError> w2 = send(c: c2, text: "WATCH kr:w");
+    Result<Value, RedisError> u2 = send(c: c2, text: "UNWATCH");
+    Result<Value, RedisError> lost2 = send(c: c2, text: "GET kr:lost");
+    string t3 = fate(r: c2.transact(pipeline: tx));
+    f = f + check(ok: t3 == "committed", what: "watch: after UNWATCH, a loss loses no WATCH: the transaction is sent: ${t3}");
+
+    // A WATCH in a pipeline counts, once the server answered it OK.
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    DynamicArray<Step> three = welcome(server: server());
+    three.add(item: expect(command: "GET kr:w", answer: reply(server: server(), kase: "get-missing/3")));
+    three.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "select1")));
+    three.add(item: Step::Close);
+    d3.add(item: Dial::Serve(steps: give three));
+    d3.add(item: Dial::Serve(steps: committing()));
+    Connection c3 = dialed(dials: give d3, config: plain, what: "pipeline watch");
+    Pipeline p = Pipeline.make();
+    Command get = commandOf(text: "GET kr:w");
+    p.add(command: get);
+    Command watch = commandOf(text: "WATCH kr:w");
+    p.add(command: watch);
+    Result<Replies, RedisError> rp = c3.run(pipeline: p);
+    Result<Value, RedisError> lost3 = send(c: c3, text: "GET kr:lost");
+    string t4 = fate(r: c3.transact(pipeline: tx));
+    f = f + check(ok: t4 == "held back", what: "watch: a WATCH in a pipeline, lost with the link, makes the next transaction WatchConflict: ${t4}");
+
+    // A transaction ends its WATCH, whatever EXEC answers: a loss after it loses nothing.
+    DynamicArray<Dial> d5 = DynamicArray.empty();
+    DynamicArray<Step> five = welcome(server: server());
+    five.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "select1")));
+    transaction(s: five, server: server(), protocol: "3", exec: reply(server: server(), kase: "exec-ok/3"));
+    five.add(item: Step::Close);
+    d5.add(item: Dial::Serve(steps: give five));
+    d5.add(item: Dial::Serve(steps: committing()));
+    Connection c5 = dialed(dials: give d5, config: plain, what: "watch ended");
+    Result<Value, RedisError> w5 = send(c: c5, text: "WATCH kr:w");
+    string t5 = fate(r: c5.transact(pipeline: tx));
+    Result<Value, RedisError> lost5 = send(c: c5, text: "GET kr:lost");
+    string t6 = fate(r: c5.transact(pipeline: tx));
+    f = f + check(ok: t5 == "committed" && t6 == "committed", what: "watch: a transaction ends its WATCH, so a loss after it loses none: ${t5}, ${t6}");
+    return f;
+}
+
+// The backoff is the connection's, across calls: a call right after a failed redial waits for it, within its own
+// reconnect_timeout, and still makes a try.
+unsafe fn int32 paceTests() {
+    int32 f = 0;
+    Config brief = configOf(url: "redis://127.0.0.1:6379?reconnect_timeout=0.05");
+    DynamicArray<Dial> d = DynamicArray.empty();
+    d.add(item: Dial::Serve(steps: losing()));
+    Connection c = dialed(dials: give d, config: brief, what: "pace");
+    Result<Value, RedisError> lost = send(c: c, text: "GET kr:lost");
+    Result<Value, RedisError> first = send(c: c, text: "PING");
+    Instant before = monotonicNow();
+    Result<Value, RedisError> second = send(c: c, text: "PING");
+    int64 waited = before.elapsed().asMillis();
+    string firstWhy = reconnectOf(r: first);
+    string secondWhy = reconnectOf(r: second);
+    f = f + check(ok: firstWhy.endsWith(suffix: " connect") && secondWhy.endsWith(suffix: " connect"), what: "pace: each call makes at least one try: ${firstWhy}, ${secondWhy}");
+    f = f + check(ok: waited >= 40i64, what: "pace: a call right after a failed redial waits for the backoff, within its reconnect_timeout (${waited} ms)");
+    return f;
+}
+
+unsafe fn int32 reconnectTests() {
+    int32 f = 0;
+    f = f + redialTests();
+    f = f + finalTests();
+    f = f + keptTests();
+    f = f + watchTests();
+    f = f + paceTests();
+    return f;
+}

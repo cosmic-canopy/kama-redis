@@ -1,11 +1,12 @@
 import { std::collections::DynamicArray, std::collections::Deque, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
-         std::net::SocketAddr, std::net::resolve, std::time::Duration,
+         std::net::SocketAddr, std::net::resolve, std::time::Duration, std::time::Instant, std::time::monotonicNow, std::time::sleep,
+         std::random::Rng,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
-         redis::ConnectError, redis::ConnectAttempt, redis::Transport, redis::TcpTransport, redis::UnixTransport,
+         redis::ConnectError, redis::ConnectAttempt, redis::ReconnectError, redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo, redis::TlsSession,
-         redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig,
+         redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig, tls::TlsError,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
-         redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
+         redis::wire::watchEffect, redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
          redis::resp::Writer, redis::resp::Value };
 export { Connection, libraryName, libraryVersion };
 
@@ -25,8 +26,10 @@ export { Connection, libraryName, libraryVersion };
 // After that, `call` sends one command and returns its reply, `run` sends a pipeline's commands in one write and
 // returns their replies, and `transact` sends them as one transaction (src/transaction.kama). A command a connection cannot carry (SUBSCRIBE,
 // MONITOR, …) or one refused while it was built is refused before anything is written (`Usage`, `Value`). An error
-// reply is `RedisError::Server`, and the connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) closes
-// it, and every later call answers `Closed`.
+// reply is `RedisError::Server`, and the connection goes on. A failure of the connection itself (I/O, bytes that are not RESP, `command_timeout`) loses
+// it: that call fails with what happened, and is never sent again, since it may have run. The next call makes the
+// connection again (`redial`, docs/ROADMAP.md "Phase 7a"), unless the caller closed it, it is over the caller's own
+// transport, or reconnect=off; then every call answers `Closed`.
 
 // This library's name and version, as CLIENT SETINFO's lib-name and lib-ver tell them to the server.
 // tools/test.sh checks the version against kama.json's.
@@ -58,6 +61,15 @@ type resource Connection implements Sendable {
     // own sockets, or neither, for a transport the caller opened (`connectOver`).
     Config settings;
     Opener dialing;
+    // A WATCH the server answered OK is in force. One in force when the link was lost is lost with it, and the next
+    // transaction answers WatchConflict without being sent: it never runs on a new link without its WATCH.
+    bool watching = false;
+    bool watchLost = false;
+    // The redial's backoff, kept across calls so that a caller's loop cannot storm a server that is down: how many
+    // redials in a row have failed, the instant before which the next may not start, and the jitter's source.
+    int32 failedRedials = 0;
+    Instant redialAfter;
+    Rng jitter;
 
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
@@ -66,7 +78,7 @@ type resource Connection implements Sendable {
     friend redis::Subscriber::keepAside[setAside];
     friend redis::Subscriber::over[budget];
 
-    ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
+    unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
         this.outbox = Writer.make();
         this.live = true;
@@ -78,6 +90,8 @@ type resource Connection implements Sendable {
         this.commandLimit = config.commandTimeout();
         this.settings = copy config;
         this.dialing = give dialing;
+        this.redialAfter = monotonicNow();
+        this.jitter = Rng.fromEntropy();
     }
 
     // Connect to the server `config` names, over a socket of this client's.
@@ -101,9 +115,9 @@ type resource Connection implements Sendable {
         Owned<Transport> link = match (give secured) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
         Connection c = Connection.over(transport: give link, config: config, dialing: Opener.none());
         c.secured = give session;
-        Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
+        Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline, again: false);
         return match (give done) {
-            case Ok(value: u): Result::Ok(value: give c);
+            case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }
             case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
         };
     }
@@ -116,9 +130,9 @@ type resource Connection implements Sendable {
         Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
         Connection c = Connection.over(transport: give link, config: config, dialing: give opener);
         c.secured = give session;
-        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left);
+        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);
         return match (give done) {
-            case Ok(value: u): Result::Ok(value: give c);
+            case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }
             case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
         };
     }
@@ -237,7 +251,8 @@ type resource Connection implements Sendable {
 
     // Send `command`, which the table of commands a connection cannot carry has passed, and return its reply.
     unsafe fn Result<Value, RedisError> exchange(const ref Command command) {
-        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> up = this.ready();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: blockingWait(command: command));
         this.outbox.clear();
         command.encode(into: this.outbox);
@@ -250,6 +265,7 @@ type resource Connection implements Sendable {
             Value dropped = give v;
             return Result::Err(error: RedisError::Server(error: give refused));
         }
+        this.noteWatch(effect: watchEffect(command: command));
         return Result::Ok(value: give v);
     }
 
@@ -262,7 +278,8 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) {
         Optional<RedisError> problem = pipeline.problem();
         match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
-        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> up = this.ready();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         DynamicArray<Value> values = DynamicArray.empty();
         if (pipeline.length() == 0) { return Result::Ok(value: Replies.of(values: give values)); }
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: pipeline.waiting());
@@ -275,6 +292,8 @@ type resource Connection implements Sendable {
                 case Err(error: e): { return Result::Err(error: give e); }
             };
         }
+        isize at = pipeline.watchIndex();
+        if (at >= 0 && !values[at].isError()) { this.noteWatch(effect: pipeline.watchResult()); }
         return Result::Ok(value: Replies.of(values: give values));
     }
 
@@ -308,7 +327,13 @@ type resource Connection implements Sendable {
         if (pipeline.watches()) {
             return Result::Err(error: RedisError::Usage(detail: "WATCH and UNWATCH cannot be inside a transaction, where the server refuses them: WATCH first, with call or watched"));
         }
-        if (!this.live) { return Result::Err(error: RedisError::Closed); }
+        if (!this.live && !this.canRedial()) { return Result::Err(error: RedisError::Closed); }
+        // The keys watched were lost with the link: nothing would guard this transaction, so it does not run.
+        if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }
+        Result<Unit, RedisError> up = this.ready();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        // EXEC drops every watched key, whatever it answers; a link lost from here on loses no WATCH.
+        this.watching = false;
         Deadline deadline = Deadline.within(span: this.commandLimit);
         this.outbox.clear();
         Command multi = Command.of(name: "MULTI");
@@ -388,14 +413,14 @@ type resource Connection implements Sendable {
         while (tries < attempts) {
             tries = tries + 1;
             Result<Value, RedisError> w = this.call(command: watch);
-            bool watching = match (w) { case Ok(value: v): true; case Err(error: e): false; };
-            if (!watching) {
+            bool watchSet = match (w) { case Ok(value: v): true; case Err(error: e): false; };
+            if (!watchSet) {
                 return match (give w) { case Err(error: e): Result::Err(error: give e); case Ok(value: v): Result::Err(error: RedisError::Closed); };
             }
             Pipeline tx = Pipeline.make();
             Result<Unit, RedisError> built = body.build(conn: ref this, tx: ref tx);
-            bool ready = match (built) { case Ok(value: u): true; case Err(error: e): false; };
-            if (!ready) {
+            bool buildOk = match (built) { case Ok(value: u): true; case Err(error: e): false; };
+            if (!buildOk) {
                 Command unwatch = Command.of(name: "UNWATCH");
                 Result<Value, RedisError> ignored = this.call(command: unwatch);
                 return match (give built) { case Err(error: e): Result::Err(error: give e); case Ok(value: u): Result::Err(error: RedisError::Closed); };
@@ -429,7 +454,10 @@ type resource Connection implements Sendable {
     // Close the connection. It sends no QUIT, which is deprecated since 7.2. Closing twice is harmless.
     public unsafe fn void close() { this.shut = true; this.lose(); }
 
-    public const fn bool isClosed() { return !this.live; }
+    // Whether every call answers `Closed`: the caller closed it, or it was lost and cannot be made again (over a
+    // transport the caller opened, or with reconnect=off). A lost connection that can be made again is not closed:
+    // its next call makes it.
+    public const fn bool isClosed() { return !this.live && !this.canRedial(); }
 
     // The protocol the handshake settled on.
     public const fn Protocol protocol() { return this.speaking; }
@@ -492,7 +520,7 @@ type resource Connection implements Sendable {
     unsafe ~Connection() { this.close(); }
 
     // HELLO, then what follows it in the same write (docs/ROADMAP.md, "Phase 2", "The handshake is one round trip").
-    unsafe fn Result<Unit, RedisError> handshake(const ref Config config, Deadline deadline) {
+    unsafe fn Result<Unit, RedisError> handshake(const ref Config config, Deadline deadline, bool again) {
         Optional<Protocol> asked = config.protocol();
         bool resp2 = match (asked) { case Some(value: p): p == Protocol::Resp2; case None: false; };
         if (resp2) { return this.resp2Handshake(config: config, deadline: deadline); }
@@ -541,7 +569,12 @@ type resource Connection implements Sendable {
         Result<Value, RedisError> first = this.wire.receive(deadline: deadline);
         Value reply = match (give first) {
             case Ok(value: v): give v;
-            case Err(error: e): { this.lose(); return Result::Err(error: helloFailure(e: give e, tls: config.transport() == UrlTransport::Tls)); }
+            case Err(error: e): {
+                this.lose();
+                // A redial meets a server that spoke HELLO before: a close here is the server going away, not a proxy.
+                if (again) { return Result::Err(error: give e); }
+                return Result::Err(error: helloFailure(e: give e, tls: config.transport() == UrlTransport::Tls));
+            }
         };
         if (reply.isError()) {
             ServerError refused = serverError(v: reply);
@@ -696,7 +729,113 @@ type resource Connection implements Sendable {
     unsafe fn void lose() {
         if (!this.live) { return; }
         this.live = false;
+        if (this.watching) { this.watching = false; this.watchLost = true; }
         this.wire.shutdown();
+    }
+
+    // What a call that the server answered OK does to the keys watched (watchEffect).
+    fn void noteWatch(int32 effect) {
+        if (effect > 0) { this.watching = true; }
+        if (effect < 0) { this.watching = false; this.watchLost = false; }
+    }
+
+    // ---- reconnecting (docs/ROADMAP.md, "Phase 7a") ----
+
+    // Whether a lost link can be made again: not closed by the caller, made by a dialer of this connection's own (not
+    // a transport the caller opened), and reconnect on.
+    const fn bool canRedial() { return !this.shut && this.dialing.canDial() && this.settings.reconnect(); }
+
+    // The link, ready for a call: as it is, or made again once it was lost. `Closed` when it cannot be.
+    unsafe fn Result<Unit, RedisError> ready() {
+        if (this.live) { return Result::Ok(value: Unit::Unit); }
+        if (!this.canRedial()) { return Result::Err(error: RedisError::Closed); }
+        return this.redial();
+    }
+
+    // Make the link again, as the first was made: every address of the kept Config, the TLS files read again, the
+    // handshake in the protocol this connection speaks, as the database and user it was last given; then a PING,
+    // which a server still loading its dataset answers -LOADING. What a server that is down, restarting or full does
+    // (`transient`) is tried again after a pause (`backoff`), for up to reconnect_timeout; anything else is final.
+    // The call that redials has sent nothing of its own, so its error is `Reconnect`.
+    unsafe fn Result<Unit, RedisError> redial() {
+        Config config = copy this.settings;
+        Deadline window = Deadline.within(span: config.reconnectTimeout());
+        int32 tries = 0;
+        while (true) {
+            this.pace(window: window);
+            tries = tries + 1;
+            Result<Unit, RedisError> once = this.redialOnce(config: config);
+            match (give once) {
+                case Ok(value: u): {
+                    this.failedRedials = 0;
+                    this.redialAfter = monotonicNow();
+                    return Result::Ok(value: Unit::Unit);
+                }
+                case Err(error: e): {
+                    this.failedRedials = this.failedRedials + 1;
+                    this.redialAfter = monotonicNow() + this.backoff();
+                    if (!transient(e: e) || !window.allows(at: this.redialAfter)) {
+                        return Result::Err(error: RedisError::Reconnect(error: ReconnectError.of(cause: give e, tries: tries)));
+                    }
+                }
+            };
+        }
+        return Result::Err(error: RedisError::Closed);
+    }
+
+    // Wait for the backoff to end, but not past `window`: each call makes at least one try.
+    unsafe fn void pace(Deadline window) {
+        Instant now = monotonicNow();
+        if (now >= this.redialAfter) { return; }
+        Instant until = this.redialAfter;
+        if (window.isBounded() && window.end() < until) { until = window.end(); }
+        if (now < until) { sleep(d: until - now); }
+    }
+
+    // The pause before the next try: 100 ms, doubling with each that failed, to 1 s; half of it fixed and half drawn at
+    // random, so that clients that lost one server do not all come back at once.
+    unsafe fn Duration backoff() {
+        int64 ms = 100i64;
+        int32 n = 1;
+        while (n < this.failedRedials && ms < 1000i64) { ms = ms * 2i64; n = n + 1; }
+        if (ms > 1000i64) { ms = 1000i64; }
+        int64 half = ms / 2i64;
+        int64 drawn = cast<int64>(this.jitter.below(n: cast<isize>(half + 1i64)));
+        return Duration.fromMillis(ms: half + drawn);
+    }
+
+    // One try: the link, the handshake on it, then a PING.
+    unsafe fn Result<Unit, RedisError> redialOnce(const ref Config config) {
+        Deadline left = Deadline.none();
+        DynamicArray<TlsSession> session = DynamicArray.empty();
+        Result<Owned<Transport>, RedisError> reached = Connection::reach(config: config, opener: this.dialing, left: left, session: session);
+        Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        this.wire = Wire.over(transport: give link, limits: config.limits());
+        this.identified = DynamicArray.empty();
+        this.secured = give session;
+        this.live = true;
+        Result<Unit, RedisError> done = this.handshake(config: config, deadline: left, again: true);
+        match (give done) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        return this.probe(deadline: left);
+    }
+
+    // A server that took the handshake may still be loading its dataset: PING, and -LOADING is the redial's to wait
+    // out. Any other answer, an error included (a user who may not PING, a script that keeps the server BUSY), is a
+    // server that is serving.
+    unsafe fn Result<Unit, RedisError> probe(Deadline deadline) {
+        this.outbox.clear();
+        Command ping = Command.of(name: "PING");
+        ping.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        Result<Value, RedisError> got = this.nextReply(deadline: deadline);
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (v.isError()) {
+            ServerError answer = serverError(v: v);
+            bool loading = match (answer.code()) { case Loading: true; case _: false; };
+            if (loading) { this.lose(); return Result::Err(error: RedisError::Server(error: give answer)); }
+        }
+        return Result::Ok(value: Unit::Unit);
     }
 }
 
@@ -728,8 +867,25 @@ fn RedisError refusedOr(RedisError e, ServerError refused) {
 
 // Whether `e` is the server closing the connection: an end of stream, or a write or read the peer reset.
 fn bool closedLink(const ref RedisError e) {
+    return match (e) { case Io(error: x): closedKind(x: x); case _: false; };
+}
+
+fn bool closedKind(IoError x) {
+    return match (x.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+}
+
+// What a server that is down, restarting or full does to a redial, which tries again: no address opened (`Connect`),
+// one opened and said nothing in time (`Timeout`), the link closed or reset before the handshake ended (a forwarder
+// in front of a server that is down accepts, then closes), a refusal with the generic code (maxclients's ERR: this
+// configuration was accepted before), and -LOADING. A refusal with a code of its own (WRONGPASS, NOPERM, NOAUTH), a
+// certificate refused, a TLS setting that will not load, and bytes that are not RESP are final.
+fn bool transient(const ref RedisError e) {
     return match (e) {
-        case Io(error: x): match (x.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+        case Connect(error: c): true;
+        case Timeout: true;
+        case Io(error: x): closedKind(x: x);
+        case Tls(detail: d, cause: t): match (t) { case Closed: true; case Io(error: x): closedKind(x: x); case _: false; };
+        case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };
         case _: false;
     };
 }

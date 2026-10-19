@@ -60,8 +60,8 @@ unsafe fn int32 timeoutTests() {
         case Err(error: e): { f = f + check(ok: false, what: "timeout: bind a listener"); }
     };
 
-    // A call that outlasts command_timeout ends in Timeout, and closes the connection. The call is a write, held by
-    // the server because another connection paused writes: nothing the client could know.
+    // A call that outlasts command_timeout ends in Timeout, and the connection is lost: the next call makes it again.
+    // The call is a write, held by the server because another connection paused writes: nothing the client could know.
     Connection pauser = reach(tail: "", what: "the pausing connection");
     Connection c = reach(tail: "?command_timeout=0.3", what: "command_timeout=0.3");
     string paused = pauseWrites(other: pauser);
@@ -73,9 +73,10 @@ unsafe fn int32 timeoutTests() {
     int64 ms = (monotonicNow() - started).asMillis();
     string unpaused = unpause(other: pauser);
     bool timedOut = match (late) { case Err(error: e): match (e) { case Timeout: true; case _: false; }; case Ok(value: x): false; };
+    bool lostNotClosed = !c.isClosed();
     string after = ask(c: c, text: "PING");
-    f = f + check(ok: paused == "OK" && unpaused == "OK" && timedOut && ms >= 280i64 && ms < 1400i64 && c.isClosed() && after == "(failed) the connection is closed",
-                  what: "timeout: a SET held by the server against command_timeout=0.3, after ${ms} ms, then: ${after}");
+    f = f + check(ok: paused == "OK" && unpaused == "OK" && timedOut && ms >= 280i64 && ms < 1400i64 && lostNotClosed && after == "PONG",
+                  what: "timeout: a SET held by the server against command_timeout=0.3, after ${ms} ms, then a redial: ${after}");
 
     // A blocking command waits for its own timeout, on top of command_timeout: BLPOP 1 under 0.5 returns its null.
     Connection b = reach(tail: "?command_timeout=0.5", what: "command_timeout=0.5");
@@ -110,6 +111,9 @@ unsafe fn int32 timeoutTests() {
     string paused2 = pauseWrites(other: pauser);
     string cut = ask(c: unlimited, text: "SET kr:t:stall v");
     string unpaused2 = unpause(other: pauser);
-    f = f + check(ok: paused2 == "OK" && unpaused2 == "OK" && cut == "(failed) timed out" && unlimited.isClosed(), what: "timeout: setCommandTimeout takes effect: ${cut}");
+    string redialed = ask(c: unlimited, text: "PING");
+    int64 kept = unlimited.commandTimeout().asMillis();
+    f = f + check(ok: paused2 == "OK" && unpaused2 == "OK" && cut == "(failed) timed out" && redialed == "PONG" && kept == 200i64,
+                  what: "timeout: setCommandTimeout takes effect, and outlives the redial: ${cut}, then ${redialed}, ${kept} ms");
     return f;
 }
