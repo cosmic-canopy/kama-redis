@@ -1,0 +1,50 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Err(error: e): { failures.add(attempt: ConnectAttempt.make(place: targets[i].place(), failure: e)); }",
+  "new": "case Err(error: e): { }",
+  "expect": "dialer: a refused address"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    left = deadline;\n",
+  "new": "",
+  "expect": "dialer: the handshake after a dial has connect_timeout's deadline"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        session.add(item: secured.session());\n",
+  "new": "",
+  "expect": "tls: full, by name, SNI localhost"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Connection c = Connection.over(transport: give link, config: config, dialing: give opener);\n        c.secured = give session;\n",
+  "new": "        Connection c = Connection.over(transport: give link, config: config, dialing: give opener);\n",
+  "expect": "tls: TLS over a dialer's transport, its session kept"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Connection c = Connection.over(transport: give link, config: config, dialing: Opener.none());\n        c.secured = give session;\n",
+  "new": "        Connection c = Connection.over(transport: give link, config: config, dialing: Opener.none());\n",
+  "expect": "tls: full, by name, SNI localhost"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (config.transport() != UrlTransport::Tls) { return Result::Ok(value: give link); }",
+  "new": "        if (true) { return Result::Ok(value: give link); }",
+  "expect": "tls: connectWith sends TLS, never plaintext"
+ }
+]

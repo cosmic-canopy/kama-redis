@@ -40,6 +40,8 @@ type resource Connection implements Sendable {
     Wire wire;
     Writer outbox;
     bool live = false;
+    // Closed by the caller (`close()`): for good. A connection that is not live otherwise was lost.
+    bool shut = false;
     Protocol speaking;
     // The server's HELLO, when the handshake sent one: zero or one.
     DynamicArray<ServerInfo> identified;
@@ -52,6 +54,10 @@ type resource Connection implements Sendable {
     int64 pushBudget = 0;
     int64 pushesDropped = 0;
     Duration commandLimit;
+    // What this connection was made from, kept whole, and how it opened its link: the caller's dialer, this client's
+    // own sockets, or neither, for a transport the caller opened (`connectOver`).
+    Config settings;
+    Opener dialing;
 
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
@@ -60,7 +66,7 @@ type resource Connection implements Sendable {
     friend redis::Subscriber::keepAside[setAside];
     friend redis::Subscriber::over[budget];
 
-    ctor over(Owned<Transport> transport, const ref Config config) {
+    ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
         this.outbox = Writer.make();
         this.live = true;
@@ -70,26 +76,31 @@ type resource Connection implements Sendable {
         this.pushes = Deque.empty();
         this.pushBudget = config.limits().maxReplyBytes;
         this.commandLimit = config.commandTimeout();
+        this.settings = copy config;
+        this.dialing = give dialing;
     }
 
     // Connect to the server `config` names, over a socket of this client's.
     public unsafe ctor Result<Connection, RedisError> connect(const ref Config config) {
         Opener opener = Opener.builtIn(keepAlive: config.keepAlive());
-        return Connection.establish(config: config, opener: opener);
+        return Connection.establish(config: config, opener: give opener);
     }
 
     // `connect`, with each address's transport opened by `dialer` (a tunnel, a proxy) rather than by this client.
     public unsafe ctor Result<Connection, RedisError> connectWith(Owned<Dialer> dialer, const ref Config config) {
         Opener opener = Opener.through(dialer: give dialer);
-        return Connection.establish(config: config, opener: opener);
+        return Connection.establish(config: config, opener: give opener);
     }
 
     // The handshake over a transport the caller opened: TLS first, when `config` is a TLS one. `config` supplies
     // everything but where to connect; `connect_timeout` bounds the handshake.
     public unsafe ctor Result<Connection, RedisError> connectOver(Owned<Transport> transport, const ref Config config) {
         Deadline deadline = Deadline.within(span: config.connectTimeout());
-        Result<Connection, RedisError> opened = Connection.opened(link: give transport, config: config, place: hostAndPort(config: config), deadline: deadline);
-        Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        DynamicArray<TlsSession> session = DynamicArray.empty();
+        Result<Owned<Transport>, RedisError> secured = Connection::secure(link: give transport, config: config, place: hostAndPort(config: config), deadline: deadline, session: session);
+        Owned<Transport> link = match (give secured) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        Connection c = Connection.over(transport: give link, config: config, dialing: Opener.none());
+        c.secured = give session;
         Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
         return match (give done) {
             case Ok(value: u): Result::Ok(value: give c);
@@ -97,7 +108,25 @@ type resource Connection implements Sendable {
         };
     }
 
-    unsafe ctor Result<Connection, RedisError> establish(const ref Config config, ref Opener opener) {
+    // A connection to the first address of `config` that opens, made by `opener`, which the connection keeps.
+    unsafe ctor Result<Connection, RedisError> establish(const ref Config config, Opener opener) {
+        Deadline left = Deadline.none();
+        DynamicArray<TlsSession> session = DynamicArray.empty();
+        Result<Owned<Transport>, RedisError> reached = Connection::reach(config: config, opener: opener, left: left, session: session);
+        Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        Connection c = Connection.over(transport: give link, config: config, dialing: give opener);
+        c.secured = give session;
+        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left);
+        return match (give done) {
+            case Ok(value: u): Result::Ok(value: give c);
+            case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
+        };
+    }
+
+    // The link to the first address of `config` that opens, secured when `config` is a TLS one, and in `left` the
+    // deadline its handshake has: each address has `connect_timeout` for all of it. An address that does not open is
+    // an attempt in `Connect`, and the next is tried; once one opens, what follows is final.
+    static unsafe fn Result<Owned<Transport>, RedisError> reach(const ref Config config, ref Opener opener, ref Deadline left, ref DynamicArray<TlsSession> session) {
         ConnectError failures = ConnectError.make();
         DynamicArray<DialTarget> targets = Connection::targetsOf(config: config, failures: failures);
         isize i = 0;
@@ -107,13 +136,8 @@ type resource Connection implements Sendable {
             match (give opened) {
                 case Err(error: e): { failures.add(attempt: ConnectAttempt.make(place: targets[i].place(), failure: e)); }
                 case Ok(value: t): {
-                    Result<Connection, RedisError> secured = Connection.opened(link: give t, config: config, place: targets[i].place(), deadline: deadline);
-                    Connection c = match (give secured) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
-                    Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline);
-                    match (give done) {
-                        case Ok(value: u): { return Result::Ok(value: give c); }
-                        case Err(error: e): { Connection failed = give c; return Result::Err(error: give e); }
-                    };
+                    left = deadline;
+                    return Connection::secure(link: give t, config: config, place: targets[i].place(), deadline: deadline, session: session);
                 }
             };
             i = i + 1;
@@ -121,10 +145,11 @@ type resource Connection implements Sendable {
         return Result::Err(error: RedisError::Connect(error: give failures));
     }
 
-    // A connection over `link`, secured first when `config` is a TLS one: the TLS handshake runs within `deadline`,
-    // and its failure names the server at `place`. A TLS configuration is never carried in plaintext.
-    unsafe ctor Result<Connection, RedisError> opened(Owned<Transport> link, const ref Config config, string place, Deadline deadline) {
-        if (config.transport() != UrlTransport::Tls) { return Result::Ok(value: Connection.over(transport: give link, config: config)); }
+    // `link`, secured first when `config` is a TLS one: the TLS handshake runs within `deadline`, its failure names
+    // the server at `place`, and what it settled goes into `session`. A TLS configuration is never carried in
+    // plaintext.
+    static unsafe fn Result<Owned<Transport>, RedisError> secure(Owned<Transport> link, const ref Config config, string place, Deadline deadline, ref DynamicArray<TlsSession> session) {
+        if (config.transport() != UrlTransport::Tls) { return Result::Ok(value: give link); }
         Result<TlsConfig, RedisError> prepared = prepareTls(config: config);
         TlsConfig tls = match (give prepared) {
             case Ok(value: x): give x;
@@ -132,14 +157,12 @@ type resource Connection implements Sendable {
         };
         string name = config.tlsServerName();
         Result<Owned<TlsTransport>, RedisError> started = new TlsTransport.start(link: give link, config: tls, name: name, certificateLoaded: hasIdentity(config: config));
-        Owned<TlsTransport> secure = match (give started) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Unit, RedisError> shaken = secure.handshake(deadline: deadline, place: place);
-        match (give shaken) { case Ok(value: u): { } case Err(error: e): { secure.shutdown(); return Result::Err(error: give e); } };
-        TlsSession session = secure.session();
-        Owned<Transport> up = give secure;
-        Connection c = Connection.over(transport: give up, config: config);
-        c.secured.add(item: give session);
-        return Result::Ok(value: give c);
+        Owned<TlsTransport> secured = match (give started) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> shaken = secured.handshake(deadline: deadline, place: place);
+        match (give shaken) { case Ok(value: u): { } case Err(error: e): { secured.shutdown(); return Result::Err(error: give e); } };
+        session.add(item: secured.session());
+        Owned<Transport> up = give secured;
+        return Result::Ok(value: give up);
     }
 
     // Where `config` can be reached: its socket, or every address its host resolves to. A name that does not resolve
@@ -366,7 +389,7 @@ type resource Connection implements Sendable {
     }
 
     // Close the connection. It sends no QUIT, which is deprecated since 7.2. Closing twice is harmless.
-    public unsafe fn void close() { this.lose(); }
+    public unsafe fn void close() { this.shut = true; this.lose(); }
 
     public const fn bool isClosed() { return !this.live; }
 
@@ -696,6 +719,7 @@ fn string hostAndPort(const ref Config config) {
 type resource Opener implements Sendable {
     DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
     Duration keepIdle;
+    bool dials = true;                      // false for a transport the caller opened: there is nothing to dial with
 
     public ctor builtIn(Duration keepAlive) { this.dialers = DynamicArray.empty(); this.keepIdle = keepAlive; }
     public ctor through(Owned<Dialer> dialer) {
@@ -703,6 +727,10 @@ type resource Opener implements Sendable {
         this.dialers.add(item: give dialer);
         this.keepIdle = Duration.zero();
     }
+    public ctor none() { this.dialers = DynamicArray.empty(); this.keepIdle = Duration.zero(); this.dials = false; }
+
+    // Whether this can open a link again: false for a transport the caller opened.
+    public const fn bool canDial() { return this.dials; }
 
     public unsafe fn Result<Owned<Transport>, IoError> open(const ref DialTarget target, int32 timeoutMs) {
         if (this.dialers.length() > 0) { return this.dialers[0].dial(target: target, timeoutMs: timeoutMs); }

@@ -913,6 +913,18 @@ unsafe fn int32 dialerTests() {
     Result<Connection, RedisError> r2 = Connection.connectWith(dialer: give d2, config: one);
     string g2 = outcome(r: r2);
     f = f + check(ok: g2 == "Could not connect to 127.0.0.1:6379: Connection timed out", what: "dialer: a connect that timed out: ${g2}");
+    // The handshake after a dial has what is left of the address's connect_timeout: a HELLO reply given only to a
+    // wait with no limit never comes. (Identity off, so HELLO is the whole handshake: with no limit it would connect.)
+    DynamicArray<Step> patient = steps();
+    patient.add(item: Step::Patient(reply: reply(server: "redis-8.10.2", kase: "hello3"), atLeastMs: -1));
+    DynamicArray<Dial> bounded = DynamicArray.empty();
+    bounded.add(item: Dial::Serve(steps: give patient));
+    Owned<Dialer> d2b = new ScriptDialer.make(dials: give bounded);
+    Config quietOne = configOf(url: "redis://127.0.0.1:6379");
+    quietOne.setIdentity(on: false);
+    Result<Connection, RedisError> r2b = Connection.connectWith(dialer: give d2b, config: quietOne);
+    string g2b = outcome(r: r2b);
+    f = f + check(ok: isTimeout(r: r2b), what: "dialer: the handshake after a dial has connect_timeout's deadline: ${g2b}");
 
     // localhost: every address it resolves to, in turn. The last one serves.
     Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: "localhost", port: 6379ui16);

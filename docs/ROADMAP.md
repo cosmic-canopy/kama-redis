@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–2 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–3 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -669,11 +669,14 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
      reset branches are proven by the scripted server alone.
    - **Live:** `CONFIG SET maxclients 1`, then connects under each protocol, with a password, a database and a name,
      are each the refusal; the limit is put back.
-3. **The refactor, with no change in behaviour.**
-   - The connection keeps a copy of its `Config` (`settings`) and its opener (`dialing`).
-   - `establish` and `opened` become helpers that return the link and its session.
-   - Lost is told from closed.
-   - Every test passes unchanged.
+3. **Done (2026-10-19).** **The refactor, with no change in behaviour.**
+   - The connection keeps a copy of its `Config` (`settings`) and its opener (`dialing`); `connectOver`'s opener is
+     `Opener.none()`, which cannot dial.
+   - `establish` takes its opener whole and keeps it. `reach` (static) returns the first address's link, secured,
+     with the deadline its handshake has left; `secure` (static) is the TLS step. A redial will call both.
+   - `close()` records `shut`, so lost is told from closed.
+   - Every test passed unchanged. Two were strengthened so that a mutation of the moved code fails them: a dialer's
+     link gets the handshake's deadline (`Patient`), and a dialer's TLS session reaches the connection.
 4. **Session state.**
    - The refusals, in `src/wire/known.kama` and through `Pipeline.add`.
    - `select(db:)`, `authenticate(user:, password:)`, and the WATCH record.
