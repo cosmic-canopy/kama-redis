@@ -2,8 +2,8 @@
 
 Where this is, 2026-10-19: phases 0 to 5 are done, on kama v0.9.667, and verified on v0.9.673. **The goal now is releasing 0.1.0**, a complete
 client for one server. "The release plan" below says what each release holds. Phase 7a (reconnection, examples,
-hardening, docs) is next: "Phase 7a: an outline" is below, and its session plan is drawn up from primary sources at
-its start, as phases 3, 4 and 5's were. Then 0.1.0.
+hardening, docs) is under way: its session plan, drawn up from primary sources, is "Phase 7a: where to start" below,
+and step 0 is done. Then 0.1.0.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -34,9 +34,11 @@ its start, as phases 3, 4 and 5's were. Then 0.1.0.
   `tools/redis.sh smoke` (19 checks) on all eight; the README's programs live; CI green on `03f3968`.
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
-- Open gaps here: none. KRD-7, KRD-8 and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor
-  and CI pin moved there, `RedisArg` gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone,
-  and the reply reader implements 0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
+- Open gaps here: KRD-9 (2026-10-19). cstar's untagged 0.9.675 refuses the reader's in-buffer slide, which every tag
+  builds; until it is fixed, the newest tag (v0.9.673) stands in for cstar's newest build in the gate. KRD-7, KRD-8
+  and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor and CI pin moved there, `RedisArg`
+  gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone, and the reply reader implements
+  0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
 
 The model is `@kama/postgres` (`../kama-postgres`). Its decisions carry over unless this file says otherwise, and so
 does its discipline:
@@ -53,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0** | |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: step 0 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -451,40 +453,257 @@ Each step ends green before its commit:
 
 **If the session runs long:** steps 0–4, then 5, then 6.
 
-## Phase 7a: an outline (likewise, drawn up at its start)
+## Phase 7a: where to start
 
-**The next session starts here.** Draw up the session plan from primary sources, as phase 5's was ("Phase 5: where to
-start" is the shape: sources, what they showed, proposed decisions, the session's steps), confirm the kama facts by
-repro on CI's tag and on the newest build, then build step by step, each step green before its commit, and watch CI
-after each push. The sources to read:
-- **The peers' reconnection, from source at current tags:** go-redis (`pool.go`, `redis.go`'s `withConn` and its
-  retry of a bad connection, `MaxRetries`, `pubsub.go`'s reconnect and resubscribe), redis-py (`retry.py`, `backoff.py`,
-  `client.py`'s `_execute`/`_disconnect_raise`, `PubSub.on_connect`), redis-rs (`aio/connection_manager.rs`,
-  `ConnectionManagerConfig`, its resubscribe), Lettuce (`ConnectionWatchdog`, `ReconnectionHandler`,
-  `ClientOptions.autoReconnect`, the command replay and `DisconnectedBehavior`), and hiredis and redis-cli
-  (`cliConnect`'s reconnect).
-- **The servers:** what a client sees from `CLIENT KILL`, a restart, `SHUTDOWN`, a `timeout` idle close, and a full
-  output buffer, on all eight, captured by `tools/gen-server-vectors.sh` in throwaway containers.
-- **The model:** @kama/postgres's phase 8 (`ping()`, `resetSession()`, its pool plan) and its mutation rule.
-- **`@kama/tls`'s resumption,** if it has shipped.
+The session plan, drawn up on 2026-10-19 from primary sources. The maintainer chose two of its decisions (a subscriber
+resubscribes and reports the gap; a redial waits out a restart) and left the rest to this plan's recommendation. The
+sources:
+- **The peers, at their current tags:**
+  - go-redis v9.23.0: `redis.go`, `error.go`, `internal/pool/`, `pubsub.go`;
+  - redis-py 8.1.0: `client.py`, `connection.py`, `retry.py`, `backoff.py`;
+  - redis-rs 1.7.1: `aio/connection_manager.rs`, `aio/multiplexed_connection.rs`, `errors/`;
+  - Lettuce 7.9.0: `ConnectionWatchdog`, `DefaultEndpoint`, `CommandHandler`, `RedisHandshake`, `PubSubEndpoint`;
+  - hiredis v1.5.0 (`redisReconnect`) and redis-cli 8.10.2 (`cliConnect`, `issueCommandRepeat`).
+- **The servers:** Redis 8.10.2's and Valkey 9.1.2's `networking.c` and `server.c`, and the command flags in
+  `src/commands/*.json`.
+- **The model:** @kama/postgres's phase 8: S1's `ping()` and `resetSession()`, its pool plan, and `tools/mutate.sh`.
+- **`@kama/tls`:** session resumption is its phases 9 and 10, after Windows and WebAssembly. It has not shipped, so a
+  reconnect makes a full handshake in 0.1.0. Resumption can come later without changing what any setting means.
 
-- **Reconnection.**
-  - Research the peers first:
-    - go-redis redials through its pool;
-    - redis-py retries on the next command;
-    - redis-rs's `ConnectionManager` reconnects and resubscribes;
-    - Lettuce reconnects on its own and replays.
-  - Decide what is retried. Nothing is resent silently: a command that may have run is the caller's to retry.
-  - A `Subscriber` resubscribes from its kept sets.
-  - A TLS reconnect reads its files again (a `TlsConfig` per attempt, phase 5), so a renewed certificate is picked up.
-    `@kama/tls` plans session resumption for TLS 1.3 and 1.2 (its ROADMAP, 2026-10-18; 0.1.4 added SNI-chosen server
-    identities): check what it offers then, since resuming saves a reconnect a full handshake.
-- **Examples:** an `examples/` program per area, built and run against a live server by a script, as
-  `tools/check-readme.sh` does the README's.
-- **Hardening:** a server restart in the middle of a call, a pipeline and a subscription; `CLIENT KILL`; memory
-  bounded under a flood of pushes and replies.
-- **Docs and the release:** the README, the CHANGELOG as `[0.1.0]`, and the checklist in "The release plan".
+The bar is phase 3's: every form honoured or refused, every failure path against the scripted server, the whole
+matrix live, debug and release. From this phase on, a test is good only once a mutation of the code it covers makes
+it fail (`tools/mutate.sh`, postgres's rule).
 
+### What the sources showed
+
+- **Resending.**
+  - **Most peers resend by default, and can run a write twice:**
+    - go-redis retries a command three times after an EOF, a reset or a read timeout (`shouldRetry`), and resends a
+      plain pipeline whole. There is no per-command opt-out, only `MaxRetries: -1`.
+    - redis-py's `Redis(host=…)` retries ten times on any `ConnectionError` or `TimeoutError`, pipelines and unwatched
+      MULTI/EXEC included. `Redis.from_url()` retries none: the same application behaves differently by how it was
+      built.
+    - Lettuce re-queues the commands it sent but has no answer for, and replays them on reconnect
+      (`notifyDrainQueuedCommands`). Its `replayFilter` never sees those.
+  - **Three never resend:** redis-rs's `ConnectionManager` returns the error and reconnects in the background;
+    hiredis's `redisReconnect` drops what was queued; redis-cli prints the error, and the next typed command reconnects.
+- **What a reconnect restores.** Each peer restores what its configuration holds: AUTH or HELLO, SELECT, the name and
+  CLIENT SETINFO. A user's own SETNAME or AUTH is lost by all of them. Lettuce (`preProcessCommand`) and redis-cli
+  (`input_dbnum`) remember a user's SELECT, and the others revert it silently. Lettuce lets a user's AUTH replace its
+  credentials provider.
+- **Pub/sub.**
+  - go-redis, redis-py and Lettuce resubscribe silently. Messages published during the outage vanish, and nothing
+    says so.
+  - redis-rs resubscribes only when asked (`set_automatic_resubscription`), and forwards a `Disconnection` push.
+  - The order is channels, then patterns or shard channels.
+  - redis-py undoes an unsubscribe that was in flight when the link dropped.
+  - Health checks: go-redis writes a PING every 3 s and never checks the answer. redis-py's is off by default.
+    redis-rs and Lettuce have none, and lean on TCP keepalive.
+- **A dead idle connection.** go-redis peeks every pooled connection before use (`MSG_PEEK|MSG_DONTWAIT`, not on
+  TLS). redis-py reads without blocking on checkout. Neither can close the window between the check and the write.
+- **Backoff.**
+  - go-redis: 10 ms to 1 s, three retries.
+  - redis-py: full jitter, 10 ms to 1 s, ten retries (about 5 s).
+  - redis-rs: 100 ms × 2ⁿ, six retries, jittered (about 6–12 s).
+  - Lettuce: 1 ms doubling to 30 s, forever, no jitter.
+- **Files and credentials at a reconnect.** redis-py and Lettuce read the TLS files again at each connect; go-redis and
+  redis-rs do not. Every peer but hiredis calls its credentials provider at each connect. This package already reads
+  its TLS files at each attempt (phase 5).
+- **The servers.**
+  - A server sends nothing when it drops a client: `CLIENT KILL`, the idle `timeout`, a full output buffer and
+    SHUTDOWN all close without a byte.
+  - At accept, `maxclients` reached writes `-ERR max number of clients reached` and closes. Today the handshake takes
+    that ERR for "HELLO unsupported", takes the RESP2 path, and reports the close that follows. That is misleading.
+  - During a reload after a restart, HELLO, AUTH, SELECT and CLIENT SETINFO/SETNAME are allowed (they carry the
+    `LOADING` flag), but PING and ordinary commands answer `-LOADING`. So a reconnect succeeds while the server still
+    loads, and only the first command is refused.
+- **The model.** @kama/postgres has no reconnect on a single connection; its pool (phase 8, S3) will replace a broken
+  one. Its S2 adds `tools/pg.sh restart`, restart tests and bounds. S6 adds `examples/<name>/`, each its own
+  executable project as in @kama/sodium.
+
+### Decisions
+
+**1. A `Connection` redials lazily, on its next call, and never resends.**
+- The call that saw a failure returns it, because its command may have run.
+- The next call redials, using a copy of the `Config` and the opener (or the caller's `Dialer`), both kept on the
+  connection:
+  - every address is tried, with `connect_timeout` each;
+  - the TLS files are read again;
+  - the handshake runs;
+  - then the call's command is sent, once.
+- A redial asks for the protocol the connection already speaks. It is written into the kept `Config`, so an ERR to
+  HELLO cannot quietly move a RESP3 connection to RESP2.
+- These stay `Closed`, as today: a connection the caller closed, a `connectOver` connection (it has no dialer), and
+  one with `reconnect=off`. `isClosed()` means "every call answers `Closed`".
+- The 0.3.0 pool will use `reconnect=off`, and replace a connection itself.
+
+**2. A redial waits out a restart.**
+- **What is retried within `reconnect_timeout`:** a failed dial, and two failures that only a redial treats as
+  transient:
+  - the link closing or resetting before the server's first byte, which is what docker-proxy, gvproxy, a Kubernetes
+    service or HAProxy do while the server behind them is down;
+  - a HELLO refused and then closed, which is how maxclients answers.
+- **What stays final:** WRONGPASS, NOPERM, a certificate failure, and a refusal of the pinned protocol.
+- **The backoff:** 100 ms doubling to a 1 s cap, jittered. `reconnect_timeout` defaults to 5 s, and `0` is no limit,
+  as for the other timeouts.
+- **A redial ends with a PING.** `-LOADING` backs off within the window. Any other answer, an error included, means
+  the server is serving.
+- **The backoff state lives on the connection across calls,** so a caller's tight loop cannot storm a server that is
+  down. A failed redial keeps its last round of attempts, with a count of the rounds, so it stays bounded with no
+  limit set.
+- **New URL options:** `reconnect` (`on` or `off`, default `on`) and `reconnect_timeout`, with setters.
+
+**3. A failed redial is `RedisError::Reconnect`, holding the redial's own error.**
+- It says nothing of the call was sent. It is how a caller tells WRONGPASS at a redial from a `Server` error to its
+  own command.
+- The README gets a table of each error and whether the command could have run.
+
+**4. A zero-time check before a call writes.** It finds a link the server closed while the connection sat idle.
+- **How:** `wait(Readable, 0)`, then read until WouldBlock, with a cap. WouldBlock counts as quiet: a TLS 1.3 session
+  ticket makes the socket readable and then reads as nothing.
+- **What it finds:**
+  - **the end of the stream:** the connection is lost before anything was written, so the call redials and sends;
+  - **a RESP3 push:** set aside, as today. A partial push stays in the reader (`Reader.pendingKind()`);
+  - **anything else:** lose the connection, redial, send.
+- **Where it runs:** before the call's deadline starts, and not in a subscriber's `transmit`. On `connectOver` the
+  end of the stream it finds is `Io(UnexpectedEof)`, as today.
+- **What the docs promise:** "usually invisible". A close can still land between the check and the write.
+
+**5. Session state is refused or recorded, never silently lost.**
+- **Refused in `call`, `run` and `transact`, with `Usage` naming the way:** SELECT, AUTH, CLIENT SETNAME, CLIENT
+  SETINFO, CLIENT NO-EVICT, CLIENT NO-TOUCH, READONLY, READWRITE, and Valkey's CLIENT CAPA and CLIENT
+  IMPORT-SOURCE.
+- **Recorded, and restored by every redial:** `Connection.select(db:)` and `Connection.authenticate(user:, password:)`.
+  The second answers token rotation (ElastiCache IAM, Entra ID). A credentials provider, a contract called at each
+  connect, is carried.
+- **Kept complete:** the table is checked against every server's `ACL CAT connection`, as the blocking table is
+  against `ACL CAT blocking`.
+
+**6. A WATCH lost with its connection.**
+- The connection records that a WATCH is in force. A WATCH answered OK sets it; UNWATCH, `transact` and the last of
+  a pipeline's WATCH or UNWATCH update it.
+- A loss while it is in force makes the next `transact` answer `WatchConflict` and send nothing, so `watched` tries
+  again. MULTI/EXEC never runs on a fresh link without its WATCH; redis-py raises WatchError there.
+
+**7. A `Subscriber` resubscribes and reports the gap.**
+- **When it redials:** inside `next`, `ping` and the subscribe calls (nothing was sent, so it is safe). The redial has
+  its own budget, so `next(timeout: zero)` can still make one.
+- **What it sends:** SUBSCRIBE, then PSUBSCRIBE, then SSUBSCRIBE (one per slot, since a cluster answers CROSSSLOT
+  otherwise), from the kept sets. The sets are taken out first, and the confirmations put back what the server
+  restored.
+- **What the caller sees:** `Delivery::Reconnected(cause)` comes first. It follows what was already queued and comes
+  before any message of the new link. Then comes an `Unsubscribed` delivery for each name the server refused (NOPERM,
+  MOVED). Nothing is silent.
+- **A failed unsubscribe is never undone** (redis-py's bug): its names are left out of what is resubscribed.
+- **Which failures redial:** queue overflow, Protocol and Unexpected redial too, and report the gap. `close()` closes
+  for good. `release()` on a lost subscriber hands back the connection, which can still redial.
+- **No automatic PING health check in 0.1.0.** TCP keepalive (on, 15 s) finds a dead peer; the docs say it does not
+  cover a caller's own dialer or `keepalive=0`, and `Subscriber.ping()` is there.
+
+**8. Hardening.**
+- **Vectors** for each way a server drops a client.
+- **maxclients** is reported as the server's refusal, told by the close that follows the refused HELLO, never by its
+  words.
+- **Restarts:** `start.sh` keeps the main server in a restart loop, so a live test can `SHUTDOWN NOSAVE` it from
+  another connection and watch the client ride the restart.
+- **Floods:** a subscriber flooded past the server's pub/sub output-buffer limit comes back `Reconnected`, its memory
+  bounded.
+
+**9. Examples, mutations and the docs.**
+- **Examples:** `examples/<name>/` executables, published with the package as @kama/sodium's are.
+- **Mutations:** a mutations file per step (`tools/mutations/7a-sN.json`).
+- **The README:** its links become absolute, because the registry renders a relative link as plain text
+  (postgres's S7).
+
+### The session's steps
+
+Each step ends green before its commit:
+- `tools/test.sh`, debug and release, on CI's tag and on cstar's newest build;
+- from step 1 on, the live matrix;
+- from step 2 on, the step's mutations, every one CAUGHT.
+
+While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest build, which refuses the reader.
+
+0. **Done (2026-10-19).**
+   - This plan, from the sources above.
+   - The repros ("Decided, and why", "Phase 7a"), on v0.9.667 and cstar's 0.9.675, debug and release.
+   - KRD-9, filed when 0.9.675 refused the reader's slide.
+   - `tools/mutate.sh`, ported from postgres. Its baseline mutation, `nextReply` no longer losing the connection, is
+     CAUGHT by "call: a hangup mid-reply".
+1. **Vectors** (`tools/gen-server-vectors.sh`), on all eight servers, captured with `drain`. Two runs give the same
+   file.
+   - `CLIENT KILL`.
+   - `SHUTDOWN NOSAVE`, both for an idle client and for the client that sends it.
+   - A restart: a refused connect, then a fresh HELLO.
+   - `timeout 1`, drained past 2 s.
+   - A full output buffer, recorded as its shape.
+   - `maxclients 1`.
+   - LOADING: `DEBUG POPULATE` and `SAVE`, then a restart under `key-load-delay`, with the debug command enabled by
+     product.
+   - `ACL CAT connection`.
+2. **The handshake.** maxclients is reported as the server's refusal. A handshake during LOADING succeeds, and the
+   scripted server proves it.
+3. **The refactor, with no change in behaviour.**
+   - The connection keeps a copy of its `Config` (`settings`) and its opener (`dialing`).
+   - `establish` and `opened` become helpers that return the link and its session.
+   - Lost is told from closed.
+   - Every test passes unchanged.
+4. **Session state.**
+   - The refusals, in `src/wire/known.kama` and through `Pipeline.add`.
+   - `select(db:)`, `authenticate(user:, password:)`, and the WATCH record.
+   - Unit: each refusal names its way and writes nothing, and the table covers `ACL CAT connection`.
+5. **The lazy redial.**
+   - `Reconnect`, the two options, the transients, the PING that ends a redial, the backoff kept across calls, and
+     `WatchConflict` after a loss.
+   - Unit, through `ScriptDialer`, which gains a record of each dial:
+     - a hangup, then the redial;
+     - three refusals, then a server;
+     - accepted and closed, then a server;
+     - WRONGPASS at the redial is `Reconnect`, with nothing sent;
+     - RESP2 stays RESP2;
+     - the TLS files are read again;
+     - `connectOver` and `close()` stay `Closed`;
+     - `select` and `authenticate` are restored.
+   - Live: `failure_test`'s CLIENT KILL, and `timeout_test`'s two checks, move to a redial.
+6. **The zero-time check** (`src/wire/wire.kama`, `Reader.pendingKind`).
+   - Unit:
+     - a hangup while idle does not reach the caller;
+     - a push is set aside;
+     - a stray reply makes the call redial, then send;
+     - a partial push is kept;
+     - a close_notify while idle;
+     - `connectOver` answers `Io`.
+   - Live: CLIENT KILL and `CONFIG SET timeout 1` do not reach the caller.
+7. **The subscriber.**
+   - Unit, from phase 4's captures:
+     - the resubscribe order;
+     - `Reconnected` first, after what was queued;
+     - refused names;
+     - shard channels by slot;
+     - a failed unsubscribe not undone;
+     - a zero timeout that still redials;
+     - `release` of a lost subscriber.
+   - Live: a subscriber killed with CLIENT KILL.
+8. **Live hardening.**
+   - The restart loop in `start.sh`.
+   - `SHUTDOWN NOSAVE` during calls, a pipeline, a BLPOP in flight (its error, then OK), a subscriber and a TLS
+     connection.
+   - The pub/sub flood.
+   - The descriptors stay flat over 50 redials.
+   - `tools/redis.sh smoke` still passes.
+9. **Examples** (`examples/<name>/`):
+   - quickstart, typed replies, a pipeline and a transaction, a pub/sub worker, a BLPOP job queue, TLS, SCAN and
+     scripts;
+   - each takes its URL from the environment;
+   - `tools/test.sh` builds them, and `tools/check-examples.sh` (on `tools/check-readme.sh`'s model, run in CI's
+     integration job) runs them live.
+10. **Docs and 0.1.0.**
+    - The README: a Reconnection section, the "was it sent?" table, the examples, absolute links.
+    - The CHANGELOG as `[0.1.0]`, AGENTS.redis.md, this file, and the module headers.
+    - The checklist in "The release plan".
+    - Then stop: the maintainer pushes and publishes.
+
+**If the session runs long:** steps 0–6, then 7, then 8–10.
 
 
 ## Phase 3: where to start
@@ -1148,3 +1367,28 @@ says otherwise). Step 0's repros, run 2026-10-18 on v0.9.667 and cstar's 0.9.668
     optional port checking one), the CN login or its refusal, SNI on the wire through a relay that reads the
     ClientHello, a handshake past `connect_timeout` at a listener that never accepts, both wrong ports, 1000 INCRs in
     a pipeline, a 1 MiB value and a subscriber over TLS.
+
+### Phase 7a
+
+Drawn up 2026-10-19 (see "Phase 7a: where to start" for the sources and the decisions, which hold unless this section
+says otherwise). Step 0's repros, run 2026-10-19 on v0.9.667 and cstar's 0.9.675, debug and release, confirmed the kama
+facts underneath.
+
+- **What step 0's repros showed** (in the session's scratchpad):
+  - A `Sendable` connection can keep a copy of its configuration (a `Copyable` resource) and an opener holding an
+    `Owned<Dialer>`, beside its wire.
+  - A method can redial in place: assigning a new wire to the field drops the old one, and its transport, at once.
+    The arrays the handshake fills are cleared first.
+  - A field cannot be passed as the `const ref` argument of a method that writes `this`. The compiler's own words
+    are "copy it into a local first", which is what a redial does with its kept configuration (`Config c = copy
+    this.settings;`).
+  - A `Set` iterates its keys only when the key is `Copyable`, so `Name` gains a copy constructor before a subscriber
+    can resubscribe from its sets.
+  - An error enum can hold a resource that holds a 0/1 `DynamicArray` of the same enum
+    (`Reconnect(ReconnectError)`), and its `message()` can call the inner one's. So can a variant holding the array
+    directly. Both build, `Sendable`, in debug and release.
+  - `std::time::sleep` and `std::random::Rng.fromEntropy()` are there, both `unsafe`, for the backoff and its jitter.
+- **Found on the way:** KRD-9. cstar's 0.9.675 refuses `Reader.spare`'s slide of the unread bytes (two windows of one
+  buffer, one written). v0.9.667 and v0.9.673 build it.
+- **`tools/mutate.sh`** is postgres's, with `--server S` and this repo's `REDISTEST_*` settings. Each step from 2 on
+  adds `tools/mutations/7a-sN.json`.

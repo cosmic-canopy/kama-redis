@@ -13,7 +13,7 @@ newest build): unit and live gates green, debug and release, nothing changed.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-9. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -29,7 +29,61 @@ the commit that made it pass.
 
 ## OPEN
 
-(none)
+### KRD-9 · HIGH · 0.9.675 refuses copying between two windows of one buffer, and std has no in-place copy
+
+**Found** 2026-10-19, on cstar's `0.9.675+g4afcda97`, at its first build of this package. It is a regression of
+`ada8bd36` ("check: a `ref` argument that holds the receiver is refused, and a contract receiver is judged"). The
+package builds on `v0.9.667` and `v0.9.673`. Once a tag carries the rule, it does not build at all:
+`src/resp/reader.kama:187`, `Reader.spare`, slides the unread bytes to the front of its buffer before it reads more.
+
+**Repro**, a whole program:
+
+```kama
+import { core::println, std::collections::FixedArray };
+
+// Slide the unread tail of a buffer to its front, as a reader does before it reads more: two windows of one buffer
+// that do not overlap, one written and one read.
+type resource Buffer {
+    FixedArray<uint8> buf;
+    public ctor make() {
+        this.buf = FixedArray.make(size: 8);
+        isize i = 0;
+        while (i < 8) { this.buf[i] = cast<uint8>(i); i = i + 1; }
+    }
+    public fn void slide(isize start, isize unread) {
+        this.buf.sliceMut(from: 0, count: unread).copyFrom(source: this.buf.slice(from: start, count: unread));
+    }
+    public const fn uint8 at(isize i) { return this.buf[i]; }
+}
+
+fn int32 main() {
+    Buffer b = Buffer.make();
+    b.slide(start: 5, unread: 3);
+    uint8 a0 = b.at(i: 0); uint8 a1 = b.at(i: 1); uint8 a2 = b.at(i: 2);
+    println(s: "ok ${a0} ${a1} ${a2}");
+    return 0;
+}
+```
+
+- `v0.9.667` and `v0.9.673`: prints `ok 5 6 7`.
+- `0.9.675+g4afcda97`: refused at the `copyFrom` line, with "`this.buf` is borrowed by the view argument `source`
+  while `this.buf.sliceMut(from: 0, count: unread)` is the receiver of non-`const fn` `copyFrom` — the method may
+  grow the very storage that window views, leaving it dangling".
+
+**Why it is a gap, on either reading:**
+- **The reason does not hold for this receiver.** The receiver is a `View`, a window of fixed length, and its
+  `copyFrom` cannot grow or free the `FixedArray` beneath it. A collection receiver (`buf.addAll(items:
+  buf.view())`) could, and refusing that is right.
+- **Refusing two windows of one buffer, one written, may be the intent.** Rust refuses `buf[..n].copy_from_slice(
+  &buf[s..s + n])` too. But Rust answers it with `copy_within`, and std has nothing that does: `DynamicArray`'s
+  `memmove` is private to its insert and remove. So kama has no safe way left to move bytes within one buffer.
+
+**What would close it:** let the copy through for a `View` receiver; or give `FixedArray` and `View` a
+`copyWithin(from:, count:, to:)` (one `memmove`, overlap allowed), which this reader would use, and which a ring
+buffer or a codec also needs.
+
+**Workaround:** none taken. The package's floor and CI's pin (`v0.9.667`) and the newest tag (`v0.9.673`) build it.
+Until the fix, this package's gate uses `v0.9.673` in place of cstar's newest build.
 
 ## FIXED — kept for the record
 

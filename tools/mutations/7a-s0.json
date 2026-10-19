@@ -1,0 +1,10 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                case Err(error: e): { this.lose(); return Result::Err(error: give e); }\n            };\n            bool push",
+  "new": "                case Err(error: e): { return Result::Err(error: give e); }\n            };\n            bool push",
+  "expect": "call: a hangup mid-reply"
+ }
+]
