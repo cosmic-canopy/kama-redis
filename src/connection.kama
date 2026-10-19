@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::io::IoErr
          redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig, tls::TlsError,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::watchEffect, redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
-         redis::resp::Writer, redis::resp::Value };
+         redis::resp::Writer, redis::resp::Value, redis::resp::Read };
 export { Connection, libraryName, libraryVersion };
 
 // One connection to a Redis or Valkey server. It belongs to one isolate at a time and moves between them whole.
@@ -251,6 +251,8 @@ type resource Connection implements Sendable {
 
     // Send `command`, which the table of commands a connection cannot carry has passed, and return its reply.
     unsafe fn Result<Value, RedisError> exchange(const ref Command command) {
+        Result<Unit, RedisError> idle = this.settle();
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Result<Unit, RedisError> up = this.ready();
         match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: blockingWait(command: command));
@@ -278,6 +280,8 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) {
         Optional<RedisError> problem = pipeline.problem();
         match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        Result<Unit, RedisError> idle = this.settle();
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Result<Unit, RedisError> up = this.ready();
         match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         DynamicArray<Value> values = DynamicArray.empty();
@@ -328,6 +332,8 @@ type resource Connection implements Sendable {
             return Result::Err(error: RedisError::Usage(detail: "WATCH and UNWATCH cannot be inside a transaction, where the server refuses them: WATCH first, with call or watched"));
         }
         if (!this.live && !this.canRedial()) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> idle = this.settle();
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         // The keys watched were lost with the link: nothing would guard this transaction, so it does not run.
         if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }
         Result<Unit, RedisError> up = this.ready();
@@ -740,6 +746,56 @@ type resource Connection implements Sendable {
     }
 
     // ---- reconnecting (docs/ROADMAP.md, "Phase 7a") ----
+
+    // Before a call writes: what came while the connection sat idle. A push is set aside, and a push half come stays
+    // in the reader for the call to finish. The link closed (CLIENT KILL, the server's idle timeout, a restart) or
+    // anything else (a reply no call asked for, part of one, bytes that are not RESP) loses the connection before
+    // anything of the call is written, so the call makes it again and sends. Usually that hides the loss; a close can
+    // still land between this and the write. Over a transport the caller opened there is nothing to make it again
+    // with, and the call fails with what it found, as it would have once it wrote.
+    unsafe fn Result<Unit, RedisError> settle() {
+        if (!this.live) { return Result::Ok(value: Unit::Unit); }
+        Result<Unit, RedisError> caught = this.wire.catchUp();
+        // What came before an end is sorted first: a push that came whole is the caller's, even from a link now gone.
+        Optional<RedisError> stray = this.sortIdle();
+        match (give caught) {
+            case Ok(value: u): { }
+            case Err(error: e): { Optional<RedisError> unused = give stray; this.lose(); return this.lostIdle(e: give e); }
+        };
+        return match (give stray) {
+            case Some(value: e): { this.lose(); := this.lostIdle(e: give e); }
+            case None: Result::Ok(value: Unit::Unit);
+        };
+    }
+
+    // The values among the bytes read while no call waited: each push set aside; anything else, or part of it, is
+    // what `settle` loses the link over. A push half come stays in the reader.
+    fn Optional<RedisError> sortIdle() {
+        while (true) {
+            Read r = this.wire.nextBuffered();
+            match (give r) {
+                case Complete(value: v): {
+                    bool push = match (v) { case Push(items: p): true; case _: false; };
+                    if (!push) { Value unused = give v; return Optional::Some(value: RedisError::Unexpected(detail: "a reply came that no call asked for")); }
+                    this.setAside(push: give v);
+                }
+                case Incomplete: {
+                    uint8 kind = this.wire.pendingKind();
+                    if (kind == 0ui8 || kind == 62ui8) { return Optional::None; }
+                    return Optional::Some(value: RedisError::Unexpected(detail: "part of a reply came that no call asked for"));
+                }
+                case Invalid(error: e): { return Optional::Some(value: RedisError::Protocol(error: e)); }
+            };
+        }
+        return Optional::None;
+    }
+
+    // A link `settle` found lost before the call wrote anything: the call makes it again when it can, and otherwise
+    // fails with what was found.
+    const fn Result<Unit, RedisError> lostIdle(RedisError e) {
+        if (this.canRedial()) { RedisError dropped = give e; return Result::Ok(value: Unit::Unit); }
+        return Result::Err(error: give e);
+    }
 
     // Whether a lost link can be made again: not closed by the caller, made by a dialer of this connection's own (not
     // a transport the caller opened), and reconnect on.

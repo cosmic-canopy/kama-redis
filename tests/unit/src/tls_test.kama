@@ -591,6 +591,22 @@ unsafe fn int32 redialTests() {
     };
     string refusedGot = callOutcome(r: refused);
     f = f + check(ok: reread, what: "tls: redial: the CA file is read again, and a certificate refused there is final: ${refusedGot}");
+
+    // A close_notify while idle is found before the call writes: the call goes to a new link.
+    DynamicArray<Dial> idle = DynamicArray.empty();
+    DynamicArray<Step> closing = welcome(server: vectorServer());
+    closing.add(item: Step::Hangup);
+    idle.add(item: Dial::ServeTls(steps: give closing, config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
+    DynamicArray<Step> next = greeting();
+    next.add(item: expect(command: "PING", answer: reply(server: vectorServer(), kase: "ping")));
+    idle.add(item: Dial::ServeTls(steps: give next, config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
+    Owned<Dialer> d3 = new ScriptDialer.make(dials: give idle);
+    Result<Connection, RedisError> made3 = Connection.connectWith(dialer: give d3, config: config);
+    Connection c3 = match (give made3) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: idle close_notify: ${m}"); return 1; } };
+    Command ping3 = Command.of(name: "PING");
+    Result<Value, RedisError> p3 = c3.call(command: ping3);
+    string p3Got = callOutcome(r: p3);
+    f = f + check(ok: isSimple(r: p3, text: "PONG"), what: "tls: a close_notify while idle is found before the call writes, and the call goes to a new link: ${p3Got}");
     return f;
 }
 

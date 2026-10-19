@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–5 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–6 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -722,15 +722,31 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
    - Live: CLIENT KILL, then a PONG with a new client id; `select(db: 5)` and `authenticate(kr_acl)` outlive a kill
      (`CLIENT INFO`); a timeout, then a redial; `setCommandTimeout` outlives one.
    - 23 mutations, all caught.
-6. **The zero-time check** (`src/wire/wire.kama`, `Reader.pendingKind`).
+6. **Done (2026-10-19).** **The check before a write** (`settle`, `Wire.catchUp`, `Reader.pendingKind`).
+   - Before each call writes (`exchange`, `run`, `transact`), the wire reads whatever has arrived, never waiting, at
+     most 64 reads. No `wait` is needed: a non-blocking read that answers WouldBlock is quiet. That holds over TLS
+     too, where a session ticket reads as nothing, and a read touches none of the scripted server's timing steps.
+   - **What it finds** is sorted before an end is acted on, so a push that came whole before a close is kept:
+     - pushes are set aside;
+     - a push half come stays in the reader;
+     - anything else is lost with the link: a reply no call asked for, part of one (an array, a string), or bytes that
+       are not RESP.
+   - **A lost link** makes the call redial and send; over `connectOver` the call fails with what was found
+     (`Io(UnexpectedEof)`, as it did once it wrote). A WATCH lost there holds the next transaction back.
+   - **Live:** right after a CLIENT KILL, a call may now be answered rather than fail (the close came first). The
+     step 5 checks take either outcome, and require a new client either way. An idle connection killed, then a call
+     300 ms later, and the server's `timeout 1` with a 2.5 s wait: each next call is answered, unaware.
    - Unit:
-     - a hangup while idle does not reach the caller;
-     - a push is set aside;
-     - a stray reply makes the call redial, then send;
-     - a partial push is kept;
-     - a close_notify while idle;
-     - `connectOver` answers `Io`.
-   - Live: CLIENT KILL and `CONFIG SET timeout 1` do not reach the caller.
+     - a hangup while idle;
+     - a push then a close;
+     - a stray reply;
+     - part of a string reply, and part of an array;
+     - a push half come;
+     - a WATCH lost while idle;
+     - a pipeline;
+     - `connectOver`'s `Io`;
+     - a close_notify over TLS.
+   - 13 mutations, all caught.
 7. **The subscriber.**
    - Unit, from phase 4's captures:
      - the resubscribe order;

@@ -45,6 +45,8 @@ type value Deadline implements Sendable {
 
 // How much room a read asks the reader for: hiredis's own read size.
 comptime isize READ_BYTES = 16384;
+// The most reads `catchUp` makes, so that a server sending without pause cannot hold a call before it writes.
+comptime isize CATCH_UP_READS = 64;
 
 type resource Wire implements Sendable {
     Owned<Transport> link;
@@ -103,6 +105,32 @@ type resource Wire implements Sendable {
 
     // Whether no reply is in progress: nothing buffered, nothing half read.
     public const fn bool isIdle() { return this.reader.isIdle(); }
+
+    // Read whatever has arrived, into the reader, without waiting: before a call writes, what came while no call
+    // waited. The end of the stream, or a failure, is `Err`.
+    public unsafe fn Result<Unit, RedisError> catchUp() {
+        isize reads = 0;
+        while (reads < CATCH_UP_READS) {
+            Result<isize, IoError> r = this.link.read(into: this.reader.spare(minimum: READ_BYTES));
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return Result::Err(error: this.failure(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
+                    this.reader.commit(count: n);
+                }
+                case Err(error: e): {
+                    match (e.kind()) { case WouldBlock: { return Result::Ok(value: Unit::Unit); } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                }
+            };
+            reads = reads + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The next whole value among the bytes already read, without reading more.
+    public fn Read nextBuffered() { return this.reader.next(); }
+
+    // The type byte of a value half come; 0 when none is (resp::Reader.pendingKind).
+    public const fn uint8 pendingKind() { return this.reader.pendingKind(); }
 
     // Stop the transport in both directions.
     public unsafe fn void shutdown() { this.link.shutdown(); }

@@ -1,6 +1,6 @@
 // Failures and sizes, live: a connection the server kills, errors by their codes, an error inside EXEC's reply, and
 // replies large in bytes and in elements.
-import { std::collections::DynamicArray, std::collections::Map, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
+import { std::collections::DynamicArray, std::collections::Map, std::time::Duration, std::time::sleep, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
          redis::reply, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask, commandOf, codeOf, shown };
 export { failureTests };
 
@@ -16,7 +16,9 @@ unsafe fn Connection connected(const ref string what) {
 unsafe fn int32 failureTests() {
     int32 f = 0;
 
-    // A connection the server kills: the call that meets the loss fails on I/O, and the next makes a new connection.
+    // A connection the server kills. A call that has already written meets the loss as an I/O error; one made after
+    // the close has come finds it before it writes (step 6). Right after the kill either can happen. Either way the
+    // connection comes back, as a new client, and nothing is sent twice.
     Connection victim = connected(what: "victim");
     int64 id = match (victim.server()) { case Some(value: v): v.id(); case None: -1i64; };
     Connection killer = connected(what: "killer");
@@ -24,11 +26,12 @@ unsafe fn int32 failureTests() {
     Command ping = Command.of(name: "PING");
     Result<Value, RedisError> after = victim.call(command: ping);
     bool io = match (after) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
+    bool answered = match (after) { case Ok(value: v): true; case Err(error: e): false; };
     bool lostNotClosed = !victim.isClosed();
     string next = ask(c: victim, text: "PING");
     int64 newId = match (victim.server()) { case Some(value: v): v.id(); case None: -1i64; };
-    f = f + check(ok: killed == "1" && io && lostNotClosed && next == "PONG" && newId != id,
-                  what: "failure: CLIENT KILL: ${killed}, then an I/O error, then a redial: ${next}, id ${id} -> ${newId}");
+    f = f + check(ok: killed == "1" && (io || answered) && lostNotClosed && next == "PONG" && newId != id,
+                  what: "failure: CLIENT KILL: ${killed}, then an I/O error or nothing, then a new client: ${next}, id ${id} -> ${newId}");
 
     // What select and authenticate set outlives the redial.
     string aclPw = setting(name: "REDISTEST_ACL_PASSWORD");
@@ -39,7 +42,8 @@ unsafe fn int32 failureTests() {
     string killedKept = ask(c: killer, text: "CLIENT KILL ID ${keptId}");
     string lostKept = ask(c: kept, text: "PING");
     string info = ask(c: kept, text: "CLIENT INFO");
-    f = f + check(ok: killedKept == "1" && lostKept.startsWith(prefix: "(failed) ") && info.contains(substring: " db=5 ") && info.contains(substring: " user=kr_acl "),
+    int64 keptNewId = match (kept.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    f = f + check(ok: killedKept == "1" && keptNewId != keptId && info.contains(substring: " db=5 ") && info.contains(substring: " user=kr_acl "),
                   what: "failure: CLIENT KILL after select(db: 5) and authenticate(kr_acl): the redial is both: ${info}");
 
     // A server with no room left refuses a connection as it accepts it, then closes: each connect is that refusal, in
@@ -128,6 +132,30 @@ unsafe fn int32 failureTests() {
     Result<Value, RedisError> all = c.call(command: range);
     isize count = match (all) { case Ok(value: v): match (v) { case Array(items: xs): xs.length(); case _: -1; }; case Err(error: e): -1; };
     f = f + check(ok: count == 100000, what: "failure: an LRANGE of 100,000 elements: ${count}");
+
+    // A connection killed while it sat idle: the next call finds the close before it writes, makes the connection
+    // again and is answered, with no error. (The wait lets the close come through the container's port forwarder.)
+    Connection idle = connected(what: "idle victim");
+    int64 idleId = match (idle.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    Connection killer2 = connected(what: "killer 2");
+    string killedIdle = ask(c: killer2, text: "CLIENT KILL ID ${idleId}");
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    string unseen = ask(c: idle, text: "PING");
+    int64 idleNewId = match (idle.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    f = f + check(ok: killedIdle == "1" && unseen == "PONG" && idleNewId != idleId,
+                  what: "failure: CLIENT KILL while idle, then a call that never sees it: ${unseen}, id ${idleId} -> ${idleNewId}");
+
+    // The server's idle timeout (timeout 1) closes a connection that waits 2.5 s: its next call never sees it either.
+    // The setting is put back however it went.
+    string shortened = ask(c: killer2, text: "CONFIG SET timeout 1");
+    Connection sleeper = connected(what: "sleeper");
+    int64 sleeperId = match (sleeper.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    sleep(d: Duration.fromMillis(ms: 2500i64));
+    string woke = ask(c: sleeper, text: "PING");
+    int64 sleeperNewId = match (sleeper.server()) { case Some(value: v): v.id(); case None: -1i64; };
+    string untimed = ask(c: killer2, text: "CONFIG SET timeout 0");
+    f = f + check(ok: shortened == "OK" && woke == "PONG" && sleeperNewId != sleeperId && untimed == "OK",
+                  what: "failure: the server's idle timeout, then a call that never sees it: ${woke}, id ${sleeperId} -> ${sleeperNewId}; put back: ${untimed}");
     return f;
 }
 

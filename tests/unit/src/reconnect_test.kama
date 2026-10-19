@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::Protocol, redis::RedisError,
          redis::TxOutcome, redis::Dialer, redis::resp::Value,
          redis_unit_tests::check, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
-         commandOf, transaction, setThenIncr };
+         commandOf, transaction, setThenIncr, pushIn, connected };
 export { reconnectTests };
 
 
@@ -380,6 +380,144 @@ unsafe fn int32 paceTests() {
     return f;
 }
 
+// The check before a call writes (docs/ROADMAP.md, "Phase 7a", step 6): what came while the connection sat idle.
+unsafe fn int32 idleTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    DynamicArray<uint8> push = pushIn(b: reply(server: server(), kase: "message/3"));
+
+    // A link closed while idle (CLIENT KILL, the idle timeout): found before the call writes, so the call makes the
+    // link again and sends, and never sees the loss.
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> killed = welcome(server: server());
+    killed.add(item: Step::Hangup);
+    d1.add(item: Dial::Serve(steps: give killed));
+    DynamicArray<Step> next = again();
+    next.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d1.add(item: Dial::Serve(steps: give next));
+    Connection c1 = dialed(dials: give d1, config: plain, what: "closed while idle");
+    Result<Value, RedisError> p1 = send(c: c1, text: "PING");
+    string g1 = callOutcome(r: p1);
+    f = f + check(ok: isSimple(r: p1, text: "PONG"), what: "idle: a link closed while idle is found before the call writes, and the call never sees it: ${g1}");
+
+    // A push while idle is set aside, then the close behind it found: the call goes to a new link.
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    DynamicArray<Step> pushed = welcome(server: server());
+    pushed.add(item: Step::Send(bytes: copy push));
+    pushed.add(item: Step::Hangup);
+    d2.add(item: Dial::Serve(steps: give pushed));
+    DynamicArray<Step> next2 = again();
+    next2.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d2.add(item: Dial::Serve(steps: give next2));
+    Connection c2 = dialed(dials: give d2, config: plain, what: "push while idle");
+    Result<Value, RedisError> p2 = send(c: c2, text: "PING");
+    isize kept = c2.pendingPushes();
+    f = f + check(ok: isSimple(r: p2, text: "PONG") && kept == 1, what: "idle: a push while idle is set aside, and the close behind it found (${kept} kept)");
+
+    // A reply no call asked for is not taken for the next call's: the link is made again, and the call sent there.
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    DynamicArray<Step> stray = welcome(server: server());
+    stray.add(item: Step::Send(bytes: reply(server: server(), kase: "select1")));
+    d3.add(item: Dial::Serve(steps: give stray));
+    DynamicArray<Step> next3 = again();
+    next3.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d3.add(item: Dial::Serve(steps: give next3));
+    Connection c3 = dialed(dials: give d3, config: plain, what: "a stray reply");
+    Result<Value, RedisError> p3 = send(c: c3, text: "PING");
+    string g3 = callOutcome(r: p3);
+    f = f + check(ok: isSimple(r: p3, text: "PONG"), what: "idle: a reply no call asked for is never the next call's: a new link: ${g3}");
+
+    // Part of a reply no call asked for: the same.
+    DynamicArray<Dial> d4 = DynamicArray.empty();
+    DynamicArray<Step> half = welcome(server: server());
+    DynamicArray<uint8> big = reply(server: server(), kase: "get-hit/3");
+    DynamicArray<uint8> front = DynamicArray.empty();
+    front.addAll(items: big.view().slice(from: 0, count: big.length() - 3));
+    half.add(item: Step::Send(bytes: give front));
+    d4.add(item: Dial::Serve(steps: give half));
+    DynamicArray<Step> next4 = again();
+    next4.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d4.add(item: Dial::Serve(steps: give next4));
+    Connection c4 = dialed(dials: give d4, config: plain, what: "part of a reply");
+    Result<Value, RedisError> p4 = send(c: c4, text: "PING");
+    string g4 = callOutcome(r: p4);
+    f = f + check(ok: isSimple(r: p4, text: "PONG"), what: "idle: part of a reply no call asked for is never the next call's: a new link: ${g4}");
+
+    // Part of an array no call asked for (MGET's, cut short): the same.
+    DynamicArray<Dial> d4b = DynamicArray.empty();
+    DynamicArray<Step> halfArray = welcome(server: server());
+    DynamicArray<uint8> mget = reply(server: server(), kase: "mget/3");
+    DynamicArray<uint8> mgetFront = DynamicArray.empty();
+    mgetFront.addAll(items: mget.view().slice(from: 0, count: mget.length() - 3));
+    halfArray.add(item: Step::Send(bytes: give mgetFront));
+    d4b.add(item: Dial::Serve(steps: give halfArray));
+    DynamicArray<Step> next4b = again();
+    next4b.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d4b.add(item: Dial::Serve(steps: give next4b));
+    Connection c4b = dialed(dials: give d4b, config: plain, what: "part of an array");
+    Result<Value, RedisError> p4b = send(c: c4b, text: "PING");
+    string g4b = callOutcome(r: p4b);
+    f = f + check(ok: isSimple(r: p4b, text: "PONG"), what: "idle: part of an array no call asked for is never the next call's: a new link: ${g4b}");
+
+    // A push half come stays in the reader: the call writes, and its reply comes after the push's rest.
+    DynamicArray<Dial> d5 = DynamicArray.empty();
+    DynamicArray<Step> split = welcome(server: server());
+    DynamicArray<uint8> head = DynamicArray.empty();
+    head.addAll(items: push.view().slice(from: 0, count: push.length() - 4));
+    DynamicArray<uint8> rest = DynamicArray.empty();
+    rest.addAll(items: push.view().slice(from: push.length() - 4, count: 4));
+    DynamicArray<uint8> pong = reply(server: server(), kase: "ping");
+    rest.addAll(items: pong.view());
+    split.add(item: Step::Send(bytes: give head));
+    split.add(item: expect(command: "PING", answer: give rest));
+    d5.add(item: Dial::Serve(steps: give split));
+    Connection c5 = dialed(dials: give d5, config: plain, what: "a push half come");
+    Result<Value, RedisError> p5 = send(c: c5, text: "PING");
+    isize kept5 = c5.pendingPushes();
+    string g5 = callOutcome(r: p5);
+    f = f + check(ok: isSimple(r: p5, text: "PONG") && kept5 == 1, what: "idle: a push half come stays in the reader, and the call goes on: ${g5} (${kept5} kept)");
+
+    // A pipeline and a transaction find a closed link too; a WATCH in force is lost with it.
+    DynamicArray<Dial> d6 = DynamicArray.empty();
+    DynamicArray<Step> six = welcome(server: server());
+    six.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "select1")));
+    six.add(item: Step::Hangup);
+    d6.add(item: Dial::Serve(steps: give six));
+    d6.add(item: Dial::Serve(steps: committing()));
+    Connection c6 = dialed(dials: give d6, config: plain, what: "watch, then closed while idle");
+    Result<Value, RedisError> w6 = send(c: c6, text: "WATCH kr:w");
+    Pipeline tx = setThenIncr();
+    string t6 = fate(r: c6.transact(pipeline: tx));
+    string t7 = fate(r: c6.transact(pipeline: tx));
+    f = f + check(ok: t6 == "held back" && t7 == "committed", what: "idle: a WATCH lost while idle holds the next transaction back; the one after is sent: ${t6}, ${t7}");
+    DynamicArray<Dial> d7 = DynamicArray.empty();
+    DynamicArray<Step> seven = welcome(server: server());
+    seven.add(item: Step::Hangup);
+    d7.add(item: Dial::Serve(steps: give seven));
+    DynamicArray<Step> next7 = again();
+    next7.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    next7.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d7.add(item: Dial::Serve(steps: give next7));
+    Connection c7 = dialed(dials: give d7, config: plain, what: "pipeline, closed while idle");
+    Pipeline pings = Pipeline.make();
+    Command ping = Command.of(name: "PING");
+    pings.add(command: ping);
+    pings.add(command: ping);
+    Result<Replies, RedisError> rp = c7.run(pipeline: pings);
+    string g7 = match (rp) { case Ok(value: r): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: g7 == "ok", what: "idle: a pipeline finds a link closed while idle, and goes to a new one: ${g7}");
+
+    // Over a transport the caller opened there is nothing to make the link again with: the end of the stream is the
+    // call's error, as it would have been once the call wrote.
+    DynamicArray<Step> own = welcome(server: server());
+    own.add(item: Step::Hangup);
+    Connection c8 = connected(script: give own, url: "redis://", what: "connectOver, closed while idle");
+    Result<Value, RedisError> p8 = send(c: c8, text: "PING");
+    string g8 = callOutcome(r: p8);
+    f = f + check(ok: isIo(r: p8) && g8 == "Server closed the connection" && c8.isClosed(), what: "idle: over the caller's transport, a link closed while idle is the call's Io: ${g8}");
+    return f;
+}
+
 unsafe fn int32 reconnectTests() {
     int32 f = 0;
     f = f + redialTests();
@@ -387,5 +525,6 @@ unsafe fn int32 reconnectTests() {
     f = f + keptTests();
     f = f + watchTests();
     f = f + paceTests();
+    f = f + idleTests();
     return f;
 }

@@ -1,0 +1,106 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "expect": "idle: a link closed while idle is found"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "expect": "idle: a pipeline finds a link closed"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live && !this.canRedial()) { return Result::Err(error: RedisError::Closed); }\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "        if (!this.live && !this.canRedial()) { return Result::Err(error: RedisError::Closed); }\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "expect": "idle: a WATCH lost while idle"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (!push) { Value unused = give v; return Optional::Some",
+  "new": "                    if (true) { Value unused = give v; return Optional::Some",
+  "expect": "idle: a push while idle is set aside"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (!push) { Value unused = give v; return Optional::Some",
+  "new": "                    if (false) { Value unused = give v; return Optional::Some",
+  "expect": "idle: a reply no call asked for"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (kind == 0ui8 || kind == 62ui8) { return Optional::None; }",
+  "new": "                    if (true) { return Optional::None; }",
+  "expect": "idle: part of a reply no call asked for"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (kind == 0ui8 || kind == 62ui8) { return Optional::None; }",
+  "new": "                    if (kind == 0ui8) { return Optional::None; }",
+  "expect": "idle: a push half come stays in the reader"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Optional<RedisError> stray = this.sortIdle();",
+  "new": "        Optional<RedisError> stray = Optional::None;",
+  "expect": "idle: a reply no call asked for"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.canRedial()) { RedisError dropped = give e; return Result::Ok(value: Unit::Unit); }",
+  "new": "        if (true) { RedisError dropped = give e; return Result::Ok(value: Unit::Unit); }",
+  "expect": "idle: over the caller's transport"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "                    match (e.kind()) { case WouldBlock: { return Result::Ok(value: Unit::Unit); } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };\n                }\n            };\n            reads = reads + 1;",
+  "new": "                    match (e.kind()) { case WouldBlock: { return Result::Err(error: RedisError::Closed); } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };\n                }\n            };\n            reads = reads + 1;",
+  "expect": "idle: a push half come stays in the reader"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/resp/reader.kama",
+  "old": "        if (this.frames.length() > 1) { return this.frames[1].kind; }",
+  "new": "        if (this.frames.length() > 1) { return 62ui8; }",
+  "expect": "idle: part of an array no call asked for"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/resp/reader.kama",
+  "old": "        if (this.body != 0ui8) { return this.body; }",
+  "new": "        if (this.body != 0ui8) { return 62ui8; }",
+  "expect": "idle: part of a reply no call asked for"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            case Err(error: e): { Optional<RedisError> unused = give stray; this.lose(); return this.lostIdle(e: give e); }",
+  "new": "            case Err(error: e): { Optional<RedisError> unused = give stray; return Result::Ok(value: Unit::Unit); }",
+  "expect": "idle: a link closed while idle is found"
+ }
+]

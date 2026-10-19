@@ -240,6 +240,18 @@ type resource Reader implements Sendable {
             && this.start == this.end && this.vals.length() == 0;
     }
 
+    // The type byte of the value in progress, the outermost one ('>' for a push half come, '*' for an array, '$' for a
+    // string arriving); 0 when none is. A connection that finds part of something while no call waits keeps a push
+    // and refuses anything else.
+    public const fn uint8 pendingKind() {
+        if (this.frames.length() > 1) { return this.frames[1].kind; }
+        if (this.frames[0].attrs > 0i64) { return BAR; }
+        if (this.body != 0ui8) { return this.body; }
+        if (this.streaming) { return DOLLAR; }
+        if (this.start < this.end) { return this.buf[this.start]; }
+        return 0ui8;
+    }
+
     // What the reader holds for a reply in progress: its buffer and the string being built. Values already built
     // are not counted.
     public const fn int64 retainedBytes() {
