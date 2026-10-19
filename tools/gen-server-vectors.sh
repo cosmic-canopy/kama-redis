@@ -19,6 +19,12 @@
 #     it. An unsubscribe-all's order follows a hash Redis seeds at random in each process, so it is checked and then
 #     recorded in one order (canonical()). On two cluster nodes joined by hand (7.0 and later): CROSSSLOT, MOVED, and
 #     the server's own sunsubscribe when a slot leaves the node.
+#   - How a server lets a client go (phase 7a): CLIENT KILL of an idle client and of one in a BLPOP, SHUTDOWN NOSAVE
+#     for its caller and an idle client, a restart (the port refuses, then a new server answers HELLO), the idle
+#     timeout, a subscriber flooded past its output-buffer limit, maxclients, and a server reloading its dataset
+#     (key-load-delay, so the loader serves its event loop between keys). A server sends nothing as it drops a client,
+#     and the script requires that, and that each closed: the client's reconnection rests on it. Each server's
+#     `ACL CAT connection` too, for the commands a connection refuses or records.
 #   - Blocking commands: each server's `ACL CAT blocking`, sorted (the server lists them in hash order), and for each
 #     blocking command the server documents (7.0 and later), its arguments as COMMAND DOCS gives them, so the
 #     client's table of where each one's timeout is can be checked against every server.
@@ -96,6 +102,14 @@ esac
 start 7008 --tls-port 7009 --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no
 # Two cluster nodes, for sharded pub/sub's MOVED, CROSSSLOT and the server's own sunsubscribe (ask.pl joins them).
 for p in 7100 7101; do start $p --cluster-enabled yes --cluster-config-file /tmp/nodes-$p.conf --cluster-require-full-coverage no; done
+# How a server lets a client go (phase 7a): one to shut down and start again, one with an idle timeout, one whose
+# subscribers may hold 64 KiB unread, one that allows a single client, and one whose dataset is reloaded slowly.
+mkdir -p /tmp/load
+start 7010
+start 7011 --timeout 1
+start 7012 --client-output-buffer-limit pubsub 64kb 0 0   # separate words: 6.2 refuses one quoted
+start 7013 --maxclients 1
+start 7014 --dir /tmp/load --rdbcompression no
 redis-server --version | sed -n "s/.*[Ss]erver v=\([0-9.]*\) .*/\1/p"
 bin=$(readlink -f "$(command -v redis-server)")
 perl -0777 -ne 'my %c; $c{$1}++ while /\x00-([A-Z][A-Z0-9_]+) [\x21-\x7e]/g;
@@ -562,6 +576,146 @@ if ($up{7008}) {
     record('plaintext-at-tls', ['HELLO', '3'], $got);
     print "ending\tplaintext-at-tls\t", ($closed ? 'closed' : 'open'), "\n";
 }
+
+# ---- Phase 7a: how a server lets a client go ----
+# Each case records what the client read (nothing, for most) and how its connection ended. gen.pl checks both, since
+# the client's reconnection rests on them.
+sub drain_for {   # drain, with `$quiet` seconds of silence before it gives up
+    my ($c, $quiet) = @_; my $got = $c->{buf}; my $closed = 0;
+    $c->{buf} = ''; $c->{pos} = 0;
+    my $sel = IO::Select->new($c->{s});
+    while ($sel->can_read($quiet)) {
+        my $n = sysread($c->{s}, my $chunk, 65536);
+        if (!$n) { $closed = 1; last; }
+        $got .= $chunk;
+    }
+    return ($got, $closed);
+}
+# Start a server again, as run.sh's `start` does: what it prints before it daemonizes (Valkey's overcommit warning)
+# is not a reply.
+sub relaunch { system('sh', '-c', 'redis-server "$@" --save "" --appendonly no --daemonize yes >/dev/null 2>&1', 'sh', @_) == 0 or die "restart: $?\n"; }
+sub ending { my ($case, $closed) = @_; print "ending\t$case\t", ($closed ? 'closed' : 'open'), "\n"; }
+sub client_id { my $c = shift; my $id = call($c, 'CLIENT', 'ID'); $id =~ /\A:(\d+)\r\n\z/ or die "CLIENT ID: $id\n"; return $1; }
+# Wait until nothing listens on `$port`: a server that shut down has let its port go. True when it did.
+sub refused {
+    my $port = shift;
+    for (1 .. 100) {
+        my $s = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $port, Proto => 'tcp');
+        return 1 unless $s;
+        close $s; select(undef, undef, undef, 0.05);
+    }
+    return 0;
+}
+# CLIENT KILL from another connection: of an idle client, under each protocol, and of one waiting in a BLPOP.
+for my $proto (2, 3) {
+    my $a = open_to(7000); my $b = open_to(7000);
+    call($a, 'HELLO', '3') if $proto == 3;
+    my $id = client_id($a);
+    my $k = call($b, 'CLIENT', 'KILL', 'ID', $id); die "CLIENT KILL: $k\n" unless $k eq ":1\r\n";
+    my ($got, $closed) = drain_for($a, 2); close $a->{s}; close $b->{s};
+    record("killed/$proto", ['<nothing: another connection kills this one>'], $got, ['CLIENT KILL ID <its id>, from another connection']);
+    ending("killed/$proto", $closed);
+}
+{
+    my $a = open_to(7000); my $b = open_to(7000);
+    my $id = client_id($a);
+    print { $a->{s} } enc('BLPOP', 'kr:none', '0');
+    my $blocked = 0;
+    for (1 .. 200) { if (call($b, 'CLIENT', 'LIST', 'ID', $id) =~ /cmd=blpop/) { $blocked = 1; last; } select(undef, undef, undef, 0.05); }
+    die "the BLPOP never blocked\n" unless $blocked;
+    my $k = call($b, 'CLIENT', 'KILL', 'ID', $id); die "CLIENT KILL: $k\n" unless $k eq ":1\r\n";
+    my ($got, $closed) = drain_for($a, 2); close $a->{s}; close $b->{s};
+    record('killed-blocked', ['BLPOP', 'kr:none', '0'], $got, ['CLIENT KILL ID <its id>, from another connection, while it waits']);
+    ending('killed-blocked', $closed);
+}
+# SHUTDOWN NOSAVE: what the client that sends it reads, and what an idle client reads. Then the port refuses until the
+# server is started again, and the new server answers HELLO as any does.
+if ($up{7010}) {
+    my $a = open_to(7010); my $b = open_to(7010);
+    call($a, 'HELLO', '3');
+    print { $b->{s} } enc('SHUTDOWN', 'NOSAVE');
+    my ($got, $closed) = drain_for($b, 2); close $b->{s};
+    record('shutdown-caller', ['SHUTDOWN', 'NOSAVE'], $got);
+    ending('shutdown-caller', $closed);
+    ($got, $closed) = drain_for($a, 2); close $a->{s};
+    record('shutdown-idle', ['<nothing: another connection shuts the server down>'], $got, ['SHUTDOWN NOSAVE, from another connection']);
+    ending('shutdown-idle', $closed);
+    print "ending\trestart-refused\t", (refused(7010) ? 'refused' : 'open'), "\n";
+    relaunch('--port', '7010');
+    my $c = open_to(7010);
+    record('restart-hello3', ['HELLO', '3'], call($c, 'HELLO', '3'), ['SHUTDOWN NOSAVE, then the server started again']);
+    close $c->{s};
+}
+# The idle timeout (timeout 1), under each protocol: the server checks its clients in its cron, so this waits longer.
+if ($up{7011}) {
+    for my $proto (2, 3) {
+        my $c = open_to(7011);
+        call($c, 'HELLO', '3') if $proto == 3;
+        my ($got, $closed) = drain_for($c, 5); close $c->{s};
+        record("idle-timeout/$proto", ['<nothing, for longer than the server\'s timeout>'], $got, ['the server runs with timeout 1']);
+        ending("idle-timeout/$proto", $closed);
+    }
+}
+# A subscriber that does not read while another connection floods its channel: the server drops it once 64 KiB wait
+# for it (client-output-buffer-limit pubsub 64kb 0 0), and a PUBLISH then reaches no one. What came before the end
+# depends on the sockets' buffers, so the case keeps only the first message, after checking that it came whole.
+if ($up{7012}) {
+    for my $proto (2, 3) {
+        my $a = open_to(7012); my $b = open_to(7012);
+        call($a, 'HELLO', '3') if $proto == 3;
+        call($a, 'SUBSCRIBE', 'kr:flood');
+        my $payload = 'x' x 1024;
+        my ($sent, $gone) = (0, 0);
+        while (!$gone && $sent < 200000) {
+            print { $b->{s} } enc('PUBLISH', 'kr:flood', $payload) x 500;
+            for (1 .. 500) { $gone = 1 if reply($b) eq ":0\r\n"; }
+            $sent += 500;
+        }
+        die "the pubsub output-buffer limit never dropped the subscriber\n" unless $gone;
+        my ($got, $closed) = drain_for($a, 2); close $a->{s}; close $b->{s};
+        my $first = ($proto == 3 ? '>3' : '*3') . "\r\n\$7\r\nmessage\r\n\$8\r\nkr:flood\r\n\$1024\r\n$payload\r\n";
+        die "the flooded subscriber's first message is not whole\n" unless substr($got, 0, length($first)) eq $first;
+        record("obuf-pubsub/$proto", ['<nothing: another connection floods the channel it subscribed to>'], $first,
+               [['SUBSCRIBE', 'kr:flood'], 'PUBLISH kr:flood <1024 bytes>, from another connection, until it reaches no one (client-output-buffer-limit pubsub 64kb 0 0)']);
+        ending("obuf-pubsub/$proto", $closed);
+    }
+}
+# maxclients: a server with no room left says so as it accepts, and closes. Nothing is written first, since a write
+# into the closing connection could reset it before its error is read.
+if ($up{7013}) {
+    my $a = open_to(7013);
+    call($a, 'PING');
+    my $b = open_to(7013);
+    my ($got, $closed) = drain_for($b, 2); close $b->{s}; close $a->{s};
+    record('maxclients', ['<nothing: the connection is accepted with no room for it>'], $got, ['another connection holds the one client the server allows (maxclients 1)']);
+    ending('maxclients', $closed);
+}
+# LOADING: 40 values of 1 MiB, saved uncompressed, reloaded at 200 ms a key, so the loader serves its event loop
+# between keys (every 2 MB on 6.2, where the interval is fixed) for 8 seconds. A connection made then meets the
+# loading server: the handshake's commands are answered, PING and a read are refused.
+if ($up{7014}) {
+    my $c = open_to(7014);
+    my $mb = 'v' x 1048576;
+    call($c, 'SET', "kr:load:$_", $mb) for 1 .. 40;
+    my $saved = call($c, 'SAVE'); die "SAVE: $saved\n" unless $saved eq "+OK\r\n";
+    print { $c->{s} } enc('SHUTDOWN', 'NOSAVE'); drain_for($c, 2); close $c->{s};
+    die "the loading server did not let its port go\n" unless refused(7014);
+    relaunch('--port', '7014', '--dir', '/tmp/load', '--rdbcompression', 'no', '--key-load-delay', '200000');
+    my $l = open_to(7014);
+    for my $step (['loading-hello3', ['HELLO', '3']], ['loading-select1', ['SELECT', '1']],
+                  ['loading-setinfo-name', ['CLIENT', 'SETINFO', 'LIB-NAME', 'kama-redis']], ['loading-ping', ['PING']],
+                  ['loading-get', ['GET', 'kr:load:1']]) {
+        record($step->[0], $step->[1], call($l, @{ $step->[1] }), ['the server is loading its dataset (key-load-delay 200000)']);
+    }
+    close $l->{s};
+}
+# The connection category, sorted, so the client's table of what it refuses or records can be checked against it.
+{
+    my $c = open_to(7000);
+    my $cat = ask($c, 'ACL', 'CAT', 'connection');
+    print "connection\t", (ref $cat eq 'ARRAY' ? join(' ', sort @$cat) : '-'), "\n";
+    close $c->{s};
+}
 PERL
 
 "$ROOT/tools/gen-test-certs.sh" >/dev/null
@@ -582,7 +736,7 @@ use strict; use warnings;
 my ($tmp, $out) = @ARGV;
 
 # ---- the servers ----
-my (@versions, %codeServers, @replies, %seen, @blocking, @docs, %ending);
+my (@versions, %codeServers, @replies, %seen, @blocking, @docs, %ending, @connection);
 open my $f, '<', "$tmp/live.tsv" or die;
 while (<$f>) {
     chomp; my ($version, $what, @rest) = split /\t/, $_, -1;
@@ -594,8 +748,12 @@ while (<$f>) {
         next;
     }
     if ($what eq 'blocking') { push @blocking, [$version, $rest[0]]; next; }
+    if ($what eq 'connection') { push @connection, [$version, $rest[0]]; next; }
     if ($what eq 'docs') { push @docs, ["$version $rest[0]", $rest[1]]; next; }
     if ($what eq 'ending') { $ending{"$version $rest[0]"} = $rest[1]; next; }
+    # Anything else is a case: what it sent, its reply in hex, and its setup. A line that is not one (something a
+    # server printed) fails here rather than becoming a vector.
+    die "gen-server-vectors: $version printed a line that is not a case: $what\n" unless defined $rest[1] && $rest[1] =~ /\A[0-9a-f]*\z/;
     push @replies, ["$version $what", $rest[0], $rest[1], $rest[2] // ''];
 }
 my %count; $count{(split / /, $_->[0])[1]}++ for @replies;
@@ -628,6 +786,32 @@ for my $proto (2, 3) {
     }
 }
 die "gen-server-vectors: a server gave no blocking category\n" unless @blocking == @versions;
+# How a server lets a client go (phase 7a). The client's reconnection rests on each of these, so a server that starts
+# saying goodbye, or stops closing, fails this script rather than the client.
+for my $must (qw(killed/2 killed/3 killed-blocked shutdown-caller shutdown-idle restart-hello3 idle-timeout/2 idle-timeout/3
+                 obuf-pubsub/2 obuf-pubsub/3 maxclients loading-hello3 loading-select1 loading-setinfo-name loading-ping loading-get)) {
+    die "gen-server-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
+}
+my $maxclients = unpack('H*', "-ERR max number of clients reached\r\n");
+my $loading = unpack('H*', '-LOADING ');
+for my $r (@replies) {
+    my ($version, $case) = split / /, $r->[0];
+    my $end = $ending{$r->[0]} // '';
+    if ($case =~ m{^(killed/[23]|killed-blocked|shutdown-caller|shutdown-idle|idle-timeout/[23])$}) {
+        die "gen-server-vectors: $version sent something as it let a client go ($case: $r->[2])\n" unless $r->[2] eq '';
+        die "gen-server-vectors: $version left the connection open ($case)\n" unless $end eq 'closed';
+    }
+    die "gen-server-vectors: $version did not close the flooded subscriber\n" if $case =~ m{^obuf-pubsub/} && $end ne 'closed';
+    die "gen-server-vectors: $version answered maxclients with $r->[2] ($end)\n" if $case eq 'maxclients' && ($r->[2] ne $maxclients || $end ne 'closed');
+    die "gen-server-vectors: $version answered $case while loading with $r->[2]\n"
+        if ($case eq 'loading-ping' || $case eq 'loading-get') && index($r->[2], $loading) != 0;
+    die "gen-server-vectors: $version refused $case while loading ($r->[2])\n"
+        if ($case eq 'loading-hello3' || $case eq 'loading-select1') && $r->[2] =~ /^2d/;
+}
+for my $v (@versions) {
+    die "gen-server-vectors: ${v}'s port did not refuse while the server was down\n" unless ($ending{"$v restart-refused"} // '') eq 'refused';
+}
+die "gen-server-vectors: a server gave no connection category\n" unless @connection == @versions && !grep { $_->[1] eq '-' } @connection;
 my %docServers; $docServers{(split / /, $_->[0])[0]}++ for @docs;
 die "gen-server-vectors: no COMMAND DOCS from any server\n" unless %docServers;
 for my $code (qw(ERR WRONGTYPE NOAUTH WRONGPASS NOPERM NOPROTO MOVED ASK)) {
@@ -701,11 +885,17 @@ print $o <<"HEAD";
 //   - blockingServers / blockingNames: each server's `ACL CAT blocking`, sorted.
 //   - docsNames / docsArgs: "<server> <command>" for each blocking command a server documents (7.0 and later), and
 //     its arguments from COMMAND DOCS, each name:type:token:flags:children.
+//   - How a server lets a client go (killed/2, shutdown-idle, idle-timeout/3, maxclients, …): what the client read,
+//     nothing for most, and the script checked that each closed the connection. obuf-pubsub keeps only the flooded
+//     subscriber's first message. restart-hello3 is a server's HELLO after SHUTDOWN NOSAVE and a start, whose port
+//     refused while it was down; the loading-* cases ran while the server reloaded its dataset: the handshake's
+//     commands are answered, PING and a read are -LOADING.
+//   - connectionServers / connectionNames: each server's `ACL CAT connection`, sorted.
 //   - proxyNames / proxyHex: Envoy's redis proxy's answers to HELLO, read from its source (v1.32.0, v1.36.0,
 //     v1.39.0), with and without a password required.
 import { std::collections::DynamicArray };
 export { serverVersions, sentCodes, codeServers, replyNames, replyCommands, replyHex, replySetups, blockingServers,
-         blockingNames, docsNames, docsArgs, proxyNames, proxyHex };
+         blockingNames, docsNames, docsArgs, connectionServers, connectionNames, proxyNames, proxyHex };
 
 HEAD
 sub column {
@@ -726,6 +916,8 @@ column('blockingServers', map { lit($_->[0]) } @blocking);
 column('blockingNames', map { lit($_->[1]) } @blocking);
 column('docsNames', map { lit($_->[0]) } @docs);
 column('docsArgs', map { lit($_->[1]) } @docs);
+column('connectionServers', map { lit($_->[0]) } @connection);
+column('connectionNames', map { lit($_->[1]) } @connection);
 column('proxyNames', map { lit($_->[0]) } @proxy);
 column('proxyHex', map { lit($_->[1]) } @proxy);
 close $o;

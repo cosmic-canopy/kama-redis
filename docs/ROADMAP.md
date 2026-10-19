@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: step 0 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0 and 1 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -630,8 +630,22 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
    - KRD-9, filed when 0.9.675 refused the reader's slide.
    - `tools/mutate.sh`, ported from postgres. Its baseline mutation, `nextReply` no longer losing the connection, is
      CAUGHT by "call: a hangup mid-reply".
-1. **Vectors** (`tools/gen-server-vectors.sh`), on all eight servers, captured with `drain`. Two runs give the same
-   file.
+1. **Done (2026-10-19).** **Vectors** (`tools/gen-server-vectors.sh`), on all eight servers, captured with `drain`.
+   Two runs give the same file (1900 replies), and the existing cases' bytes did not move. What they showed:
+   - **Nothing is sent, and the connection closes, on all eight:** CLIENT KILL of an idle client (both protocols) and
+     of one in a BLPOP, SHUTDOWN NOSAVE for its caller and for an idle client, and the idle timeout. The script
+     requires it, so a server that starts saying goodbye fails the script, not the client.
+   - **A restart:** the port refuses while the server is down, and the new server's HELLO is an ordinary one.
+   - **A flooded subscriber** gets whole messages, then the end of the stream. What came before the end depends on
+     the sockets' buffers, so only the first message is kept.
+   - **maxclients** is `-ERR max number of clients reached`, then a close, word for word on all eight.
+   - **LOADING:** HELLO, SELECT and CLIENT SETINFO are answered; PING and GET are `-LOADING`. Redis says "Redis is
+     loading…" and Valkey "Valkey is loading…", the code the same. 6.2 refuses CLIENT SETINFO there as it always does.
+   - **`ACL CAT connection`:** 6.2 lists commands (`auth client command echo hello ping reset …`), and 7.0 and later
+     list subcommands too (`client|setname`, `client|no-evict`, Valkey's `client|capa` and `client|import-source`).
+   - **Found on the way:** 6.2 refuses `--client-output-buffer-limit "pubsub 64kb 0 0"` as one word, so it is
+     given as four. Valkey prints a warning before it daemonizes, so a server the script starts again is silenced,
+     and gen.pl now refuses any line that is not a case.
    - `CLIENT KILL`.
    - `SHUTDOWN NOSAVE`, both for an idle client and for the client that sends it.
    - A restart: a refused connect, then a fresh HELLO.
