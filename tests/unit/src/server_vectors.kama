@@ -27,7 +27,7 @@
 //     commands are answered, PING and a read are -LOADING.
 //   - connectionServers / connectionNames: each server's `ACL CAT connection`, sorted.
 //   - proxyNames / proxyHex: Envoy's redis proxy's answers to HELLO, read from its source (v1.32.0, v1.36.0,
-//     v1.39.0), with and without a password required.
+//     v1.39.0), with and without a password required, and to PING, which it answers itself.
 import { std::collections::DynamicArray };
 export { serverVersions, sentCodes, codeServers, replyNames, replyCommands, replyHex, replySetups, blockingServers,
          blockingNames, docsNames, docsArgs, connectionServers, connectionNames, proxyNames, proxyHex };
@@ -7981,14 +7981,17 @@ fn DynamicArray<string> connectionNames() {
 
 fn DynamicArray<string> proxyNames() {
     DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "envoy-1.32.0 PING");
     v.add(item: "envoy-1.32.0 HELLO 3");
     v.add(item: "envoy-1.32.0 HELLO 3, password required");
     v.add(item: "envoy-1.32.0 HELLO 3 AUTH kr_acl kr_acl_pw");
     v.add(item: "envoy-1.32.0 HELLO 3 AUTH kr_acl kr_acl_pw, password required");
+    v.add(item: "envoy-1.36.0 PING");
     v.add(item: "envoy-1.36.0 HELLO 3");
     v.add(item: "envoy-1.36.0 HELLO 3, password required");
     v.add(item: "envoy-1.36.0 HELLO 3 AUTH kr_acl kr_acl_pw");
     v.add(item: "envoy-1.36.0 HELLO 3 AUTH kr_acl kr_acl_pw, password required");
+    v.add(item: "envoy-1.39.0 PING");
     v.add(item: "envoy-1.39.0 HELLO 3");
     v.add(item: "envoy-1.39.0 HELLO 3, password required");
     v.add(item: "envoy-1.39.0 HELLO 3 AUTH kr_acl kr_acl_pw");
@@ -7998,14 +8001,17 @@ fn DynamicArray<string> proxyNames() {
 
 fn DynamicArray<string> proxyHex() {
     DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "2b504f4e470d0a");
     v.add(item: "2d756e737570706f7274656420636f6d6d616e64202748454c4c4f270d0a");
     v.add(item: "2d4e4f415554482041757468656e7469636174696f6e2072657175697265642e0d0a");
     v.add(item: "2d756e737570706f7274656420636f6d6d616e64202748454c4c4f270d0a");
     v.add(item: "2d4e4f415554482041757468656e7469636174696f6e2072657175697265642e0d0a");
+    v.add(item: "2b504f4e470d0a");
     v.add(item: "2d45525220756e6b6e6f776e20636f6d6d616e64202748454c4c4f272c2077697468206172677320626567696e6e696e6720776974683a20330d0a");
     v.add(item: "2d45525220756e6b6e6f776e20636f6d6d616e64202748454c4c4f272c2077697468206172677320626567696e6e696e6720776974683a20330d0a");
     v.add(item: "2d45525220756e6b6e6f776e20636f6d6d616e64202748454c4c4f272c2077697468206172677320626567696e6e696e6720776974683a20330d0a");
     v.add(item: "2d45525220756e6b6e6f776e20636f6d6d616e64202748454c4c4f272c2077697468206172677320626567696e6e696e6720776974683a20330d0a");
+    v.add(item: "2b504f4e470d0a");
     v.add(item: "2d4e4f50524f544f20756e737570706f727465642070726f746f636f6c2076657273696f6e0d0a");
     v.add(item: "2d4e4f415554482041757468656e7469636174696f6e2072657175697265642e0d0a");
     v.add(item: "2d4552522048454c4c4f206f7074696f6e73206c696b65204155544820616e64205345544e414d4520617265206e6f7420737570706f727465640d0a");

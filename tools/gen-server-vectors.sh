@@ -33,7 +33,7 @@
 #     each closed the connection. The script requires what the client relies on: silence, the connection left open,
 #     for the first (the server's inline parser looks for a newline with strchr, which stops at the ClientHello's
 #     NUL), and a close for the second.
-#   - Proxies: Envoy's redis proxy answers HELLO itself, differently in each release. Its messages are read from its
+#   - Proxies: Envoy's redis proxy answers HELLO and PING itself, HELLO differently in each release. Its messages are read from its
 #     source (command_splitter_impl.cc and .h at v1.32.0, v1.36.0 and v1.39.0, pinned by SHA256), and laid out in
 #     the order that source checks them, which the script verifies before using it. twemproxy has no entry: it
 #     closes the connection on a command it does not know (nc_redis.c), which is a hangup, not bytes.
@@ -851,6 +851,10 @@ for my $v (qw(v1.32.0 v1.36.0 v1.39.0)) {
         $answer = sub { my ($req, $locked) = @_; return $authRequired if $locked; return @$req > 2 ? $options : $noproto; };
     }
     (my $version = $v) =~ s/^v//;
+    # PING is answered by the proxy itself, as a simple string: the RESP2 path's round trip when it has nothing else
+    # to send.
+    my (undef, $pong) = at($cc, qr/Respond to PING locally\.\n[^\n]*\n\s*pong->type\(Common::Redis::RespType::SimpleString\);\n\s*pong->asString\(\) = "([^"]+)";/, 'PING answered locally');
+    push @proxy, ["envoy-$version PING", unpack('H*', "+$pong\r\n")];
     for my $req (@requests) {
         for my $locked (0, 1) {
             my $name = "envoy-$version " . join(' ', @$req) . ($locked ? ', password required' : '');
@@ -892,7 +896,7 @@ print $o <<"HEAD";
 //     commands are answered, PING and a read are -LOADING.
 //   - connectionServers / connectionNames: each server's `ACL CAT connection`, sorted.
 //   - proxyNames / proxyHex: Envoy's redis proxy's answers to HELLO, read from its source (v1.32.0, v1.36.0,
-//     v1.39.0), with and without a password required.
+//     v1.39.0), with and without a password required, and to PING, which it answers itself.
 import { std::collections::DynamicArray };
 export { serverVersions, sentCodes, codeServers, replyNames, replyCommands, replyHex, replySetups, blockingServers,
          blockingNames, docsNames, docsArgs, connectionServers, connectionNames, proxyNames, proxyHex };

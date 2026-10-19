@@ -86,6 +86,7 @@ unsafe fn int32 outcomeTests() {
     string g3 = ended(r: k3.transact(pipeline: p3));
     f = f + check(ok: g3 == "committed: simple,2", what: "transact: committed under RESP3: ${g3}");
     DynamicArray<Step> c2 = DynamicArray.empty();
+    c2.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
     transaction(s: c2, server: s, protocol: "2", exec: vector(server: s, kase: "exec-ok/2"));
     Connection k2 = connected(script: give c2, url: "redis://?protocol=2", what: "tx commit 2");
     Pipeline p2 = setThenIncr();
@@ -103,6 +104,7 @@ unsafe fn int32 outcomeTests() {
     Result<Value, RedisError> after = kn3.call(command: ping);
     f = f + check(ok: gn3 == "conflict" && isSimple(r: after, text: "PONG"), what: "transact: EXEC's null under RESP3 is a conflict, and the connection goes on: ${gn3}");
     DynamicArray<Step> n2 = DynamicArray.empty();
+    n2.add(item: expect(command: "PING", answer: vector(server: s, kase: "ping")));
     transaction(s: n2, server: s, protocol: "2", exec: vector(server: s, kase: "exec-null/2"));
     Connection kn2 = connected(script: give n2, url: "redis://?protocol=2", what: "tx null 2");
     Pipeline pn2 = setThenIncr();

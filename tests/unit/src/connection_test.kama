@@ -361,11 +361,13 @@ unsafe fn int32 fallbackTests() {
     while (i < envoys.length()) {
         string e = copy envoys[i];
 
-        // No password: the refusal, then the RESP2 path, which has nothing to send.
+        // No password: the refusal, then the RESP2 path, which has nothing else to send and sends PING, answered by
+        // the proxy itself.
         DynamicArray<Step> plain = steps();
         plain.add(item: expect(command: "HELLO 3", answer: proxy(name: e.concat(other: " HELLO 3"))));
         plain.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-name")));
         plain.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-ver")));
+        plain.add(item: expect(command: "PING", answer: proxy(name: e.concat(other: " PING"))));
         Result<Connection, RedisError> r = over(script: give plain, url: "redis://");
         string got = outcome(r: r);
         bool resp2 = match (r) { case Ok(value: c): c.protocol() == Protocol::Resp2 && match (c.server()) { case Some(value: v): false; case None: true; }; case Err(error: x): false; };
@@ -462,6 +464,110 @@ unsafe fn int32 hostileHandshakeTests() {
         string gk = outcome(r: rk);
         f = f + check(ok: gk != "ok", what: "hostile: a hangup after step ${k} of the handshake is an error: ${gk}");
         k = k + 1;
+    }
+    return f;
+}
+
+// ---- a server that refuses the connection itself, and one still loading ----
+
+// A server with no room left (maxclients) says so as it accepts, then closes. Whatever the handshake had sent, the
+// refusal is the error, in the server's words: never the close that follows, nor a connection.
+unsafe fn int32 refusedAtAcceptTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        DynamicArray<string> urls = DynamicArray.empty();
+        urls.add(item: "redis://"); urls.add(item: "redis://kr_acl:kr_acl_pw@"); urls.add(item: "redis:///1?client_name=kama-test");
+        urls.add(item: "redis://?protocol=3"); urls.add(item: "redis://?protocol=2");
+        isize u = 0;
+        while (u < urls.length()) {
+            string url = copy urls[u];
+            DynamicArray<Step> full = steps();
+            full.add(item: Step::Send(bytes: reply(server: s, kase: "maxclients")));
+            full.add(item: Step::Hangup);
+            Result<Connection, RedisError> r = over(script: give full, url: url);
+            string got = outcome(r: r);
+            f = f + check(ok: codeIs(r: r, code: "ERR") && got == "ERR max number of clients reached", what: "maxclients: ${s} ${url}: the refusal, not the close: ${got}");
+            u = u + 1;
+        }
+        // Identity off and nothing else to send: the RESP2 path's PING is the round trip that sees the close. (With
+        // protocol=2 above, it reads the refusal itself, as PING's reply.)
+        Config quiet = configOf(url: "redis://");
+        quiet.setIdentity(on: false);
+        DynamicArray<Step> bare = steps();
+        bare.add(item: Step::Send(bytes: reply(server: s, kase: "maxclients")));
+        bare.add(item: Step::Hangup);
+        Result<Connection, RedisError> rq = overConfig(script: give bare, config: quiet);
+        string quietGot = outcome(r: rq);
+        f = f + check(ok: codeIs(r: rq, code: "ERR") && quietGot == "ERR max number of clients reached", what: "maxclients: ${s} identity off: the refusal, not a connection: ${quietGot}");
+        // On a socket, the client's write into the connection the server closed draws a reset: the next read fails
+        // with ConnectionReset (the SETINFOs' replies), or the next write with BrokenPipe (the RESP2 path's PING).
+        DynamicArray<Step> reset = steps();
+        reset.add(item: Step::Send(bytes: reply(server: s, kase: "maxclients")));
+        reset.add(item: Step::Reset);
+        Result<Connection, RedisError> rr = over(script: give reset, url: "redis://");
+        string resetGot = outcome(r: rr);
+        f = f + check(ok: codeIs(r: rr, code: "ERR") && resetGot == "ERR max number of clients reached", what: "maxclients: ${s} reset, then a read: the refusal, not the reset: ${resetGot}");
+        Config quietReset = configOf(url: "redis://");
+        quietReset.setIdentity(on: false);
+        DynamicArray<Step> resetWrite = steps();
+        resetWrite.add(item: Step::Send(bytes: reply(server: s, kase: "maxclients")));
+        resetWrite.add(item: Step::Reset);
+        Result<Connection, RedisError> rw = overConfig(script: give resetWrite, config: quietReset);
+        string writeGot = outcome(r: rw);
+        f = f + check(ok: codeIs(r: rw, code: "ERR") && writeGot == "ERR max number of clients reached", what: "maxclients: ${s} reset, then a write: the refusal, not the broken pipe: ${writeGot}");
+        i = i + 1;
+    }
+    // A HELLO refused by a proxy that stays open, with nothing else sent: the RESP2 path's PING, answered.
+    Config plain = configOf(url: "redis://");
+    plain.setIdentity(on: false);
+    DynamicArray<Step> envoy = steps();
+    envoy.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3")));
+    envoy.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    Result<Connection, RedisError> re = overConfig(script: give envoy, config: plain);
+    bool resp2 = match (re) { case Ok(value: c): c.protocol() == Protocol::Resp2; case Err(error: x): false; };
+    string envoyGot = outcome(r: re);
+    f = f + check(ok: resp2, what: "maxclients: a HELLO refused with nothing else sent, then PING and PONG: the RESP2 path: ${envoyGot}");
+    return f;
+}
+
+// A server reloading its dataset answers the handshake's commands and refuses the rest with LOADING: the connect
+// succeeds, a command is `Server` with that code, and the connection goes on.
+unsafe fn int32 loadingTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        DynamicArray<Step> script = steps();
+        script.add(item: expect(command: "HELLO 3", answer: reply(server: s, kase: "loading-hello3")));
+        script.add(item: expect(command: "SELECT 1", answer: reply(server: s, kase: "loading-select1")));
+        // Both SETINFOs get the answer the first one got while loading (a server before 7.2 refuses either).
+        script.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: s, kase: "loading-setinfo-name")));
+        string version = libraryVersion();
+        script.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: s, kase: "loading-setinfo-name")));
+        script.add(item: expect(command: "GET kr:load:1", answer: reply(server: s, kase: "loading-get")));
+        script.add(item: expect(command: "PING", answer: reply(server: s, kase: "loading-ping")));
+        Result<Connection, RedisError> r = over(script: give script, url: "redis:///1");
+        string got = outcome(r: r);
+        f = f + check(ok: got == "ok", what: "loading: ${s}: the handshake succeeds while the server loads: ${got}");
+        match (give r) {
+            case Ok(value: c): {
+                Command get = Command.of(name: "GET");
+                get.arg(text: "kr:load:1");
+                Result<Value, RedisError> g = c.call(command: get);
+                bool loading = match (g) { case Err(error: e): match (e.serverCode()) { case Some(value: k): match (k) { case Loading: true; case _: false; }; case None: false; }; case Ok(value: v): false; };
+                f = f + check(ok: loading && !c.isClosed(), what: "loading: ${s}: a read is LOADING, and the connection goes on");
+                Command ping = Command.of(name: "PING");
+                Result<Value, RedisError> p = c.call(command: ping);
+                bool pingLoading = match (p) { case Err(error: e): match (e.serverCode()) { case Some(value: k): match (k) { case Loading: true; case _: false; }; case None: false; }; case Ok(value: v): false; };
+                f = f + check(ok: pingLoading && !c.isClosed(), what: "loading: ${s}: PING is LOADING too");
+            }
+            case Err(error: e): { }
+        };
+        i = i + 1;
     }
     return f;
 }
@@ -839,6 +945,8 @@ unsafe fn int32 connectionTests() {
     f = f + handshakeTests();
     f = f + fallbackTests();
     f = f + hostileHandshakeTests();
+    f = f + refusedAtAcceptTests();
+    f = f + loadingTests();
     f = f + callTests();
     f = f + pushTests();
     f = f + refusalTests();

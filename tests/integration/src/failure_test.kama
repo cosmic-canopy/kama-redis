@@ -1,7 +1,7 @@
 // Failures and sizes, live: a connection the server kills, errors by their codes, an error inside EXEC's reply, and
 // replies large in bytes and in elements.
-import { std::collections::DynamicArray, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
-         redis::resp::Value, redis_integration_tests::check, mainUrl, open, ask, codeOf, shown };
+import { std::collections::DynamicArray, std::collections::Map, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
+         redis::reply, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask, commandOf, codeOf, shown };
 export { failureTests };
 
 unsafe fn Connection connected(const ref string what) {
@@ -27,6 +27,22 @@ unsafe fn int32 failureTests() {
     string next = ask(c: victim, text: "PING");
     f = f + check(ok: killed == "1" && io && victim.isClosed() && next == "(failed) the connection is closed",
                   what: "failure: CLIENT KILL: ${killed}, then an I/O error, then: ${next}");
+
+    // A server with no room left refuses a connection as it accepts it, then closes: each connect is that refusal, in
+    // the server's words, whatever the handshake had sent. maxclients is put back however it went.
+    string aclPassword = setting(name: "REDISTEST_ACL_PASSWORD");
+    Connection admin = connected(what: "maxclients");
+    Command getLimit = commandOf(text: "CONFIG GET maxclients");
+    Result<Map<string, int64>, RedisError> limits = reply::<Map<string, int64>>(result: admin.call(command: getLimit));
+    int64 was = match (limits) { case Ok(value: m): match (m.get(key: "maxclients")) { case Some(value: n): n; case None: -1i64; }; case Err(error: e): -1i64; };
+    string lowered = ask(c: admin, text: "CONFIG SET maxclients 1");
+    string full3 = attempt(url: mainUrl(userinfo: "", tail: ""));
+    string full2 = attempt(url: mainUrl(userinfo: "", tail: "?protocol=2"));
+    string fullAuth = attempt(url: mainUrl(userinfo: "kr_acl:${aclPassword}@", tail: "/1?client_name=kama-test"));
+    string restored = ask(c: admin, text: "CONFIG SET maxclients ${was}");
+    string refusal = "ERR max number of clients reached";
+    f = f + check(ok: was > 1i64 && lowered == "OK" && full3 == refusal && full2 == refusal && fullAuth == refusal && restored == "OK",
+                  what: "failure: maxclients: the refusal is the connect's error (${was}, ${lowered}): ${full3} / ${full2} / ${fullAuth}; put back: ${restored}");
 
     // Errors by their codes; the connection goes on after each.
     Connection c = connected(what: "codes");

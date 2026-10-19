@@ -1,0 +1,58 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    if (closedLink(e: e)) { return RedisError::Server(error: give refused); }",
+  "new": "    if (false && closedLink(e: e)) { return RedisError::Server(error: give refused); }",
+  "expect": "the refusal, not the close"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (steps.length() == 0) {\n            Command ping = Command.of(name: \"PING\");",
+  "new": "        if (steps.length() == 0 && false) {\n            Command ping = Command.of(name: \"PING\");",
+  "expect": "identity off: the refusal, not a connection"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case UnexpectedEof: true; case BrokenPipe: true;",
+  "new": "case UnexpectedEof: false; case BrokenPipe: true;",
+  "expect": "the refusal, not the close"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (pong.isError()) { this.lose(); return Result::Err(error: RedisError::Server(error: serverError(v: pong))); }",
+  "new": "            if (pong.isError()) { this.lose(); return Result::Err(error: RedisError::Unexpected(detail: \"x\")); }",
+  "expect": "redis://?protocol=2: the refusal"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case BrokenPipe: true; case ConnectionReset: true; case _: false;",
+  "new": "case BrokenPipe: true; case ConnectionReset: false; case _: false;",
+  "expect": "reset, then a read: the refusal"
+ },
+ {
+  "id": "M6",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "case UnexpectedEof: true; case BrokenPipe: true;",
+  "new": "case UnexpectedEof: false; case BrokenPipe: true;",
+  "expect": "failure: maxclients"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true;",
+  "new": "case UnexpectedEof: true; case BrokenPipe: false; case ConnectionReset: true;",
+  "expect": "reset, then a write: the refusal"
+ }
+]

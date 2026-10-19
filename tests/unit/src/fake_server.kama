@@ -39,6 +39,10 @@ type enum Step implements Sendable {
     // The server closes the connection as soon as the script reaches this step, once the client has read what was
     // sent before it.
     Hangup,
+    // The server closes the connection as soon as the script reaches this step, and the client's next write into it
+    // draws a reset, as on a socket: that write is accepted, then what was sent before is still read, a read past it
+    // fails with ConnectionReset, and a write with BrokenPipe. No close_notify over TLS.
+    Reset,
     // The client's next command is answered with `reply`, but only after the client's next wait has come back empty.
     Late(DynamicArray<uint8> reply),
     // The client's next command is answered with `reply`, but only to a wait that allows at least `atLeastMs`, or one
@@ -91,7 +95,9 @@ type resource FakeServer implements Transport, Sendable {
     DynamicArray<uint8> outbox;
     DynamicArray<TlsStream<ServerSide>> engine;   // zero or one: a secure server's session
     bool established = false;
-    bool abrupt = false;   // a hangup with no close_notify (Step::Truncate)
+    bool abrupt = false;   // a hangup with no close_notify (Step::Truncate, Step::Reset)
+    bool resetting = false;  // the next write after the hangup draws a reset (Step::Reset)
+    bool reset = false;      // it did
     string sniWanted;   // the SNI the client must send: "" checks nothing, "-" none at all
     isize readAt = 0;
     Reader fromClient;
@@ -186,6 +192,7 @@ type resource FakeServer implements Transport, Sendable {
         this.handOn();
         isize available = this.toClient.length() - this.readAt;
         if (available == 0) {
+            if (this.hungUp && this.reset) { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionReset)); }
             if (this.hungUp) { return Result::Ok(value: 0); }
             return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock));
         }
@@ -200,9 +207,12 @@ type resource FakeServer implements Transport, Sendable {
 
     fn bool blocked() { return this.backlog >= 0 && this.toClient.length() - this.readAt > this.backlog; }
 
-    // After a hangup, what the client still sends is lost, as it is on a socket whose peer has gone.
+    // After a hangup, what the client still sends is lost, as it is on a socket whose peer has gone; after a reset,
+    // the write fails.
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
         this.handOn();
+        if (this.hungUp && this.reset) { return Result::Err(error: IoError.of(kind: IoErrorKind::BrokenPipe)); }
+        if (this.hungUp && this.resetting) { this.resetting = false; this.reset = true; }
         if (this.hungUp) { return Result::Ok(value: bytes.length()); }
         if (this.blocked()) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
         isize n = bytes.length();
@@ -357,6 +367,7 @@ type resource FakeServer implements Transport, Sendable {
             case Silent: { }
             case Close: { this.hungUp = true; return; }
             case Hangup: { this.hungUp = true; return; }
+            case Reset: { this.hungUp = true; this.resetting = true; this.abrupt = true; return; }
             case Late(reply: r): { this.held.addAll(items: r.view()); }
             case Pause: { }
             case Truncate(reply: r, keep: k): {
@@ -396,11 +407,12 @@ type resource FakeServer implements Transport, Sendable {
     // The steps that need no command: bytes sent of the server's own accord, a hangup, and a pause.
     unsafe fn void advance() {
         while (this.next < this.steps.length() && !this.hungUp && !this.pausing) {
-            bool own = match (this.steps[this.next]) { case Send(bytes: b): true; case Hangup: true; case Pause: true; case _: false; };
+            bool own = match (this.steps[this.next]) { case Send(bytes: b): true; case Hangup: true; case Reset: true; case Pause: true; case _: false; };
             if (!own) { return; }
             match (this.steps[this.next]) {
                 case Send(bytes: b): { this.outbox.addAll(items: b.view()); }
                 case Pause: { this.pausing = true; }
+                case Reset: { this.hungUp = true; this.resetting = true; this.abrupt = true; }
                 case _: { this.hungUp = true; }
             };
             this.next = this.next + 1;

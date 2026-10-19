@@ -69,7 +69,7 @@ fn int32 replyTests() {
     return f;
 }
 
-// Envoy's refusals: its own words, read by the same rule.
+// Envoy's refusals: its own words, read by the same rule; and its answer to PING.
 fn int32 proxyTests() {
     int32 f = 0;
     DynamicArray<string> names = proxyNames();
@@ -77,8 +77,14 @@ fn int32 proxyTests() {
     isize i = 0;
     while (i < names.length()) {
         DynamicArray<uint8> reply = unhex(text: hex[i]);
-        ServerError e = errorOf(reply: reply.view());
         string name = copy names[i];
+        // PING is the one thing the proxy answers itself without refusing it.
+        if (name.endsWith(suffix: " PING")) {
+            f = f + check(ok: reply.length() == 7 && reply[0] == 43ui8 && reply[1] == 80ui8 && reply[4] == 71ui8, what: "${name}: +PONG");
+            i = i + 1;
+            continue;
+        }
+        ServerError e = errorOf(reply: reply.view());
         string code = e.codeText();
         bool known = match (e.code()) { case Err: true; case NoAuth: true; case NoProto: true; case _: false; };
         bool envoyOld = name.startsWith(prefix: "envoy-1.32.0") && !name.endsWith(suffix: "password required");
@@ -89,7 +95,7 @@ fn int32 proxyTests() {
         }
         i = i + 1;
     }
-    f = f + check(ok: names.length() == 12, what: "proxy vectors: 12 answers");
+    f = f + check(ok: names.length() == 15, what: "proxy vectors: 15 answers");
     return f;
 }
 

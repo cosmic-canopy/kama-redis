@@ -20,10 +20,14 @@ fn string urlOf(int32 proto) {
     return "redis://";
 }
 
-// The handshake's steps: RESP3's HELLO and SETINFOs, or nothing at all for protocol=2 with no password, name or
-// database.
+// The handshake's steps: RESP3's HELLO and SETINFOs, or for protocol=2 with no password, name or database, the
+// PING that confirms the link.
 fn DynamicArray<Step> opening(const ref string server, int32 proto) {
-    if (proto == 2) { return DynamicArray.empty(); }
+    if (proto == 2) {
+        DynamicArray<Step> s = DynamicArray.empty();
+        s.add(item: expect(command: "PING", answer: reply(server: server, kase: "ping")));
+        return give s;
+    }
     return welcome(server: server);
 }
 

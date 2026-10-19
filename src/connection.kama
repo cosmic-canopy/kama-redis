@@ -19,7 +19,7 @@ export { Connection, libraryName, libraryVersion };
 //      failure is the connect's, and the next address is not tried (src/secure/).
 //   3. The handshake is one write and, normally, one round trip: HELLO 3 with AUTH and SETNAME, then SELECT and the
 //      two CLIENT SETINFOs that name this library. A server that refuses HELLO (a proxy) gets the RESP2 path on the
-//      same connection: AUTH, CLIENT SETNAME and SELECT. `protocol=2` goes straight to that path; `protocol=3`
+//      same connection: AUTH, CLIENT SETNAME and SELECT, or PING when none is needed. `protocol=2` goes straight to that path; `protocol=3`
 //      never takes it.
 //
 // After that, `call` sends one command and returns its reply, `run` sends a pipeline's commands in one write and
@@ -493,14 +493,20 @@ type resource Connection implements Sendable {
                 case _: required;
             };
             if (fatal) { this.lose(); return Result::Err(error: RedisError::Server(error: give refused)); }
-            // HELLO is not supported here: drop the rest of the write's replies, then the RESP2 path.
+            // HELLO is not supported here: drop the rest of the write's replies, then the RESP2 path. A server that
+            // closes on the way refused the connection itself (maxclients says so as it accepts, then closes), so its
+            // refusal is the error, not the close.
             isize k = 0;
             while (k < after) {
                 Result<Value, RedisError> dropped = this.wire.receive(deadline: deadline);
-                match (give dropped) { case Ok(value: v): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+                match (give dropped) { case Ok(value: v): { } case Err(error: e): { this.lose(); return Result::Err(error: refusedOr(e: give e, refused: give refused)); } };
                 k = k + 1;
             }
-            return this.resp2Handshake(config: config, deadline: deadline);
+            Result<Unit, RedisError> fell = this.resp2Handshake(config: config, deadline: deadline);
+            return match (give fell) {
+                case Ok(value: u): { ServerError unused = give refused; := Result::Ok(value: u); }
+                case Err(error: e): Result::Err(error: refusedOr(e: give e, refused: give refused));
+            };
         }
         Result<ServerInfo, RedisError> read = ServerInfo.fromHello(reply: give reply);
         ServerInfo info = match (give read) {
@@ -531,7 +537,10 @@ type resource Connection implements Sendable {
     }
 
     // The RESP2 path: AUTH, CLIENT SETNAME and SELECT, each only when needed, in one write; each must answer OK.
-    // No CLIENT SETINFO, because twemproxy closes the connection on any CLIENT command it was not asked for.
+    // No CLIENT SETINFO, because twemproxy closes the connection on any CLIENT command it was not asked for. With
+    // nothing to send, it sends PING, which twemproxy and Envoy answer themselves, so a connect always knows the link
+    // is open (Lettuce's `pingBeforeActivateConnection` on its RESP2 path): a server with no room left (maxclients)
+    // says so as it accepts, then closes, and only a round trip sees that.
     unsafe fn Result<Unit, RedisError> resp2Handshake(const ref Config config, Deadline deadline) {
         this.outbox.clear();
         DynamicArray<string> steps = DynamicArray.empty();
@@ -565,7 +574,20 @@ type resource Connection implements Sendable {
             steps.add(item: "SELECT");
         }
         this.speaking = Protocol::Resp2;
-        if (steps.length() == 0) { return Result::Ok(value: Unit::Unit); }
+        if (steps.length() == 0) {
+            Command ping = Command.of(name: "PING");
+            ping.encode(into: this.outbox);
+            Result<Unit, RedisError> pinged = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+            match (give pinged) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            Result<Value, RedisError> got = this.wire.receive(deadline: deadline);
+            Value pong = match (give got) { case Ok(value: x): give x; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (pong.isError()) { this.lose(); return Result::Err(error: RedisError::Server(error: serverError(v: pong))); }
+            if (!isStatus(v: pong, text: "PONG")) {
+                this.lose();
+                return Result::Err(error: RedisError::Unexpected(detail: "PING answered with something other than PONG"));
+            }
+            return Result::Ok(value: Unit::Unit);
+        }
         Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
         isize i = 0;
@@ -634,6 +656,21 @@ fn bool sameText(const ref DynamicArray<uint8> b, const ref string text) {
         i = i + 1;
     }
     return true;
+}
+
+// A failure after a refused HELLO. When it is the server closing the connection, the server refused the connection
+// itself (maxclients answers so as it accepts, then closes), and its refusal is the error.
+fn RedisError refusedOr(RedisError e, ServerError refused) {
+    if (closedLink(e: e)) { return RedisError::Server(error: give refused); }
+    return give e;
+}
+
+// Whether `e` is the server closing the connection: an end of stream, or a write or read the peer reset.
+fn bool closedLink(const ref RedisError e) {
+    return match (e) {
+        case Io(error: x): match (x.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+        case _: false;
+    };
 }
 
 // A hangup in answer to HELLO says what it most likely means.

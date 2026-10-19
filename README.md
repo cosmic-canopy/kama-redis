@@ -51,7 +51,10 @@ fn int32 main() {
 ```
 
 - **The handshake is one round trip.** `HELLO 3` carries `AUTH` and `SETNAME`, and `SELECT` and `CLIENT SETINFO`
-  go in the same write. A proxy that refuses `HELLO` gets the RESP2 path on the same connection.
+  go in the same write. A proxy that refuses `HELLO` gets the RESP2 path on the same connection: `AUTH`,
+  `CLIENT SETNAME` and `SELECT` as needed, or a `PING` when it needs none, so a connect always knows its link is
+  open. A server with no room left (`maxclients`) refuses the connection as it accepts it, and the connect fails
+  with that refusal, in the server's words.
 - **URL options.** Every option is honoured, and any other is refused. docs/ROADMAP.md has what the other clients
   call each one, and why these defaults.
 
