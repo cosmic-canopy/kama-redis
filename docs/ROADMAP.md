@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–7 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–8 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -781,13 +781,24 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
    - **Live:** `CLIENT KILL TYPE pubsub`, then `Reconnected` inside `next` and a later PUBLISH received, under both
      protocols.
    - 13 mutations, all caught.
-8. **Live hardening.**
-   - The restart loop in `start.sh`.
-   - `SHUTDOWN NOSAVE` during calls, a pipeline, a BLPOP in flight (its error, then OK), a subscriber and a TLS
-     connection.
-   - The pub/sub flood.
-   - The descriptors stay flat over 50 redials.
-   - `tools/redis.sh smoke` still passes.
+8. **Done (2026-10-19).** **Live hardening** (`tests/integration/src/restart_test.kama`, last in the program).
+   - `start.sh` runs the main server in a loop: `SHUTDOWN NOSAVE` from a connection stops it, and it is back half a
+     second later, empty; a TERM to the container ends the loop. The eight containers were made again, and `smoke`
+     passes on each.
+   - **Riding a restart:**
+     - a call (an INCR runs once, on the new server);
+     - a pipeline (each INCR once);
+     - a BLPOP in flight, which ends with the connection and is not sent again (a value pushed after the restart
+       stays in the list);
+     - a subscriber (`Reconnected` inside `next`, then a message);
+     - a TLS connection, over a new session.
+   - **Fifty redials** after CLIENT KILL leave the open descriptors (`/dev/fd`) as they were.
+   - **A subscriber flooded** past a lowered `client-output-buffer-limit pubsub` (put back after) reads what came,
+     then `Reconnected`, then a later message.
+   - **Found:** through podman's port forwarder a connect to a server that is down is never refused. The forwarder
+     accepts, then closes. So a live redial meets the closed-before-the-handshake transient, never `Connect` (the
+     unit tests prove `Connect`), and the step's live mutation targets the close.
+   - 3 live mutations, all caught.
 9. **Examples** (`examples/<name>/`):
    - quickstart, typed replies, a pipeline and a transaction, a pub/sub worker, a BLPOP job queue, TLS, SCAN and
      scripts;

@@ -1,7 +1,8 @@
 #!/bin/sh
 # The container's command (tools/redis.sh up). The PKI is mounted read-only from out/test-certs; the servers
-# read their copy in /run/kr/certs. The locked server runs in the background, and the main one in the
-# foreground, so the container lives as long as it does. redis-server is Valkey's name for its server too.
+# read their copy in /run/kr/certs. The locked server runs in the background. The main one runs in a loop, so a test
+# can stop it (SHUTDOWN NOSAVE, from a connection) and watch a client ride its restart (docs/ROADMAP.md, "Phase 7a");
+# a TERM to the container ends the loop, and the server with it. redis-server is Valkey's name for its server too.
 set -eu
 mkdir -p /run/kr/certs
 cp /certs/ca.crt /certs/server.crt /certs/server.key /run/kr/certs/
@@ -16,4 +17,14 @@ case "${1:-}" in
     Valkey) if [ "$2" -ge 9 ]; then by_cert="--tls-auth-clients-user CN"; fi ;;
 esac
 redis-server /kr/locked.conf --daemonize yes $by_cert
-exec redis-server /kr/redis.conf
+stopping=0
+pid=""
+trap 'stopping=1; [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null' TERM INT
+while [ "$stopping" = 0 ]; do
+    redis-server /kr/redis.conf &
+    pid=$!
+    wait "$pid" || true
+    pid=""
+    # A moment down, as a real restart has: the port refuses until the server is back.
+    [ "$stopping" = 0 ] && sleep 0.5
+done

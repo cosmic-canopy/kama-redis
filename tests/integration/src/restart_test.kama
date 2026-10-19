@@ -1,0 +1,222 @@
+// Restarts and floods, live (docs/ROADMAP.md, "Phase 7a", step 8). The main server is stopped with SHUTDOWN NOSAVE
+// from another connection, and tests/integration/server/start.sh starts it again half a second later, with nothing
+// in it: a client rides the restart, and nothing it sent is sent twice. These run last, since every other connection
+// to the server is lost with it.
+import { std::collections::DynamicArray, std::collections::ConstView, std::concurrent::Isolate, std::time::Duration,
+         std::time::sleep, std::time::monotonicNow, std::time::Instant, std::fs::readDir, std::io::IoError,
+         std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Command, redis::Pipeline,
+         redis::Replies, redis::RedisError, redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask, commandOf };
+export { restartTests };
+
+unsafe fn Connection reach(const ref string url, const ref string what) {
+    Result<Connection, RedisError> r = open(url: url);
+    Connection c = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); panic(msg: "restart_test: ${what}: ${m}"); return reach(url: url, what: what); }
+    };
+    return give c;
+}
+
+// Stop the main server, from `admin`, whose own connection goes with it; then wait for the close to come through
+// the container's port forwarder.
+unsafe fn void restart(ref Connection admin) {
+    string stopped = ask(c: admin, text: "SHUTDOWN NOSAVE");
+    sleep(d: Duration.fromMillis(ms: 300i64));
+}
+
+// A BLPOP with no timeout, in another isolate, on a connection of its own: the restart ends it.
+type resource Waiter implements Sendable {
+    Connection conn;
+    public ctor make(Connection conn) { this.conn = give conn; }
+    public unsafe fn void run() {
+        Command blpop = commandOf(text: "BLPOP kr:restart:queue 0");
+        Result<Value, RedisError> got = this.conn.call(command: blpop);
+        this.conn.close();
+    }
+}
+
+fn void waitInLine(Waiter job) { job.run(); }
+
+fn string text(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): "(not UTF-8)"; };
+}
+
+fn string said(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Err(error: e): { string m = e.message(); := "(error) ${m}"; }
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): match (give d) {
+                case Message(message: m): { string ch = text(b: m.channel()); string pl = text(b: m.payload()); := "message ${ch} ${pl}"; }
+                case Unsubscribed(kind: k, channel: c): { string name = text(b: c.view()); := "unsubscribed ${name}"; }
+                case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
+            };
+        };
+    };
+}
+
+// How many descriptors the process has open.
+unsafe fn isize openDescriptors() {
+    Result<DynamicArray<string>, IoError> r = readDir(path: "/dev/fd");
+    return match (r) { case Ok(value: names): names.length(); case Err(error: e): -1; };
+}
+
+unsafe fn int32 restartTests() {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: "");
+    Connection admin = reach(url: url, what: "admin");
+
+    // A call after the restart: found lost before it writes, made again once the server is back, sent once.
+    Connection c = reach(url: url, what: "caller");
+    string set = ask(c: c, text: "SET kr:restart:n 41");
+    restart(admin: admin);
+    Instant started = monotonicNow();
+    string counted = ask(c: c, text: "INCR kr:restart:n");
+    int64 ms = started.elapsed().asMillis();
+    f = f + check(ok: set == "OK" && counted == "1" && ms < 5000i64,
+                  what: "restart: a call rides the restart and runs once, on the new server (${counted}, after ${ms} ms)");
+
+    // A pipeline likewise.
+    restart(admin: admin);
+    Pipeline p = Pipeline.make();
+    Command incr = commandOf(text: "INCR kr:restart:p");
+    p.add(command: incr);
+    p.add(command: incr);
+    p.add(command: incr);
+    Result<Replies, RedisError> rp = c.run(pipeline: p);
+    isize replies = match (rp) { case Ok(value: r): r.length(); case Err(error: e): -1; };
+    string ran = "${replies}";
+    string total = ask(c: c, text: "GET kr:restart:p");
+    f = f + check(ok: total == "3", what: "restart: a pipeline rides the restart, each command once (${ran} replies, the count ${total})");
+
+    // A BLPOP waiting when the server stops ends with the connection, and is never sent again: a value pushed after
+    // the restart stays in the list.
+    Connection blocked = reach(url: url, what: "waiter");
+    Waiter job = Waiter.make(conn: give blocked);
+    Isolate worker = spawn waitInLine(job: give job);
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    restart(admin: admin);
+    string back = ask(c: admin, text: "PING");
+    string pushed = ask(c: admin, text: "RPUSH kr:restart:queue late");
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    string left = ask(c: admin, text: "LLEN kr:restart:queue");
+    worker.join();
+    f = f + check(ok: back == "PONG" && pushed == "1" && left == "1",
+                  what: "restart: a BLPOP in flight is not sent again after the restart (${pushed} pushed, ${left} left)");
+
+    // A subscriber: Reconnected inside next, then a message published after the restart.
+    Result<Config, RedisError> parsed = Config.parse(url: url);
+    Config config = match (give parsed) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "restart_test: config"); return 1; } };
+    Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
+    Subscriber sub = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "restart_test: subscriber: ${m}"); return 1; } };
+    DynamicArray<string> channel = DynamicArray.empty();
+    channel.add(item: "kr:restart:news");
+    Result<Unit, RedisError> subscribed = sub.subscribe(names: channel);
+    restart(admin: admin);
+    string gap = said(r: sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: 6i64))));
+    string published = ask(c: admin, text: "PUBLISH kr:restart:news after");
+    string news = said(r: sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: 3i64))));
+    f = f + check(ok: gap.startsWith(prefix: "reconnected: ") && published == "1" && news == "message kr:restart:news after",
+                  what: "restart: a subscriber says Reconnected, subscribed again, and receives: ${gap}; ${published}; ${news}");
+
+    // Over TLS, the session made again too.
+    string port = setting(name: "REDISTEST_TLS_PORT");
+    string dir = setting(name: "REDISTEST_CERTDIR");
+    string tlsUrl = "rediss://localhost:".concat(other: port).concat(other: "?tls_ca=").concat(other: dir).concat(other: "/ca.crt");
+    Connection secure = reach(url: tlsUrl, what: "tls");
+    restart(admin: admin);
+    string securePing = ask(c: secure, text: "PING");
+    bool secured = match (secure.tlsSession()) { case Some(value: s): true; case None: false; };
+    f = f + check(ok: securePing == "PONG" && secured, what: "restart: a TLS connection rides the restart, over a new TLS session: ${securePing}");
+
+    // Fifty redials leave no descriptor behind.
+    Connection churn = reach(url: url, what: "churn");
+    string warm = ask(c: churn, text: "PING");
+    isize before = openDescriptors();
+    isize k = 0;
+    isize answered = 0;
+    while (k < 50) {
+        int64 id = match (churn.server()) { case Some(value: v): v.id(); case None: -1i64; };
+        string killed = ask(c: admin, text: "CLIENT KILL ID ${id}");
+        sleep(d: Duration.fromMillis(ms: 20i64));
+        string pong = ask(c: churn, text: "PING");
+        if (pong == "PONG") { answered = answered + 1; }
+        k = k + 1;
+    }
+    string last = ask(c: churn, text: "PING");
+    isize after = openDescriptors();
+    f = f + check(ok: before > 0 && after == before && last == "PONG",
+                  what: "restart: fifty redials leave the open descriptors as they were (${before} -> ${after}; ${answered} answered at once)");
+
+    // A subscriber that falls behind a flood is dropped by the server past its pub/sub buffer limit: what came is
+    // read, then Reconnected, and messages flow again. The limit is lowered for this, and put back.
+    Command getLimit = commandOf(text: "CONFIG GET client-output-buffer-limit");
+    Result<Value, RedisError> limits = admin.call(command: getLimit);
+    string was = match (limits) {
+        case Ok(value: v): match (v) {
+            case Map(entries: xs): match (xs[1]) { case Bulk(bytes: b): text(b: b.view()); case _: ""; };
+            case Array(items: xs): match (xs[1]) { case Bulk(bytes: b): text(b: b.view()); case _: ""; };
+            case _: "";
+        };
+        case Err(error: e): "";
+    };
+    Command lower = Command.of(name: "CONFIG");
+    lower.arg(text: "SET"); lower.arg(text: "client-output-buffer-limit"); lower.arg(text: "pubsub 262144 0 0");
+    Result<Value, RedisError> lowered = admin.call(command: lower);
+    Result<Config, RedisError> parsed2 = Config.parse(url: url);
+    Config config2 = match (give parsed2) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "restart_test: config"); return 1; } };
+    Result<Subscriber, RedisError> made2 = Subscriber.connect(config: config2);
+    Subscriber slow = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "restart_test: slow subscriber: ${m}"); return 1; } };
+    DynamicArray<string> flood = DynamicArray.empty();
+    flood.add(item: "kr:restart:flood");
+    Result<Unit, RedisError> floodSub = slow.subscribe(names: flood);
+    string payload = "x";
+    isize w = 0;
+    while (w < 10) { payload = payload.concat(other: payload); w = w + 1; }
+    bool dropped = false;
+    isize sent = 0;
+    while (!dropped && sent < 200000) {
+        Pipeline burst = Pipeline.make();
+        isize b = 0;
+        while (b < 500) {
+            Command publish = Command.of(name: "PUBLISH");
+            publish.arg(text: "kr:restart:flood");
+            publish.arg(text: payload);
+            burst.add(command: publish);
+            b = b + 1;
+        }
+        Result<Replies, RedisError> answers = admin.run(pipeline: burst);
+        match (give answers) {
+            case Ok(value: r): {
+                isize i = 0;
+                while (i < r.length()) {
+                    Result<Value, RedisError> one = r.take(index: i);
+                    bool none = match (one) { case Ok(value: v): match (v) { case Integer(value: n): n == 0i64; case _: false; }; case Err(error: e): false; };
+                    if (none) { dropped = true; }
+                    i = i + 1;
+                }
+            }
+            case Err(error: e): { dropped = true; }
+        };
+        sent = sent + 500;
+    }
+    isize read = 0;
+    string ended = "";
+    while (ended.length() == 0 && read < 1000000) {
+        string d = said(r: slow.next(timeout: Optional::Some(value: Duration.fromSecs(s: 6i64))));
+        bool message = d.startsWith(prefix: "message ");
+        if (message) { read = read + 1; string seen = give d; } else { ended = give d; }
+    }
+    string afterFlood = ask(c: admin, text: "PUBLISH kr:restart:flood calm");
+    string calm = said(r: slow.next(timeout: Optional::Some(value: Duration.fromSecs(s: 3i64))));
+    Command putBack = Command.of(name: "CONFIG");
+    putBack.arg(text: "SET"); putBack.arg(text: "client-output-buffer-limit"); putBack.arg(text: was);
+    Result<Value, RedisError> restored = admin.call(command: putBack);
+    bool restoredOk = match (restored) { case Ok(value: v): true; case Err(error: e): false; };
+    f = f + check(ok: dropped && ended.startsWith(prefix: "reconnected: ") && afterFlood == "1" && calm == "message kr:restart:flood calm" && restoredOk,
+                  what: "restart: a subscriber dropped behind a flood reads what came (${read} messages), then ${ended}; then ${calm}; the limit put back: ${was}");
+    return f;
+}

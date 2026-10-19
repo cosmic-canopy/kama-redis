@@ -1,0 +1,26 @@
+[
+ {
+  "id": "M1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "expect": "restart: a call rides the restart"
+ },
+ {
+  "id": "M2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        case Io(error: x): closedKind(x: x);\n        case Tls(detail: d, cause: t)",
+  "new": "        case Io(error: x): false;\n        case Tls(detail: d, cause: t)",
+  "expect": "restart: a call rides the restart"
+ },
+ {
+  "id": "M3",
+  "suite": "integration",
+  "file": "src/subscriber.kama",
+  "old": "        if (this.held[0].isClosed()) { return Result::Err(error: this.takeCause()); }\n        Result<Unit, RedisError> up = this.linked();\n        match (give up) { case Ok(value: u): { } case Err(error: x): { return Result::Err(error: give x); } };\n        return Result::Ok(value: Optional::Some(value: this.dequeue()));",
+  "new": "        return Result::Err(error: this.takeCause());",
+  "expect": "restart: a subscriber says Reconnected"
+ }
+]
