@@ -6,10 +6,51 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.667**: the first tagged release with the fixes this package relies on (KAMA_GAPS.md) and with
-the `Deserializer` the reply reader implements (`peekKind`, `readNumberText`, `unknownField`, `atKeyedMap`).
+## [0.1.0] - 2026-10-19
+
+The first release: a complete client for one server. Needs **kama ≥ 0.9.667**: the first tagged release with the
+fixes this package relies on (KAMA_GAPS.md) and with the `Deserializer` the reply reader implements (`peekKind`,
+`readNumberText`, `unknownField`, `atKeyedMap`).
 
 ### Added
+- Reconnection (phase 7a). Nothing is ever sent twice: the call that meets a lost connection fails with what
+  happened, since its command may have run.
+  - The next call makes the connection again: every address of its configuration, the TLS files read again, the
+    handshake in the protocol it spoke, then a `PING`. While the server is down, restarting, full or loading, it keeps
+    trying, with a jittered backoff kept on the connection across calls, for up to `reconnect_timeout`. A wrong
+    password, a refused certificate or bytes that are not RESP end it at once.
+  - `RedisError::Reconnect(ReconnectError)`: the connection was lost earlier and could not be made again, so nothing
+    of the call was sent; it carries the last try's error and how many tries the call made.
+  - The URL options `reconnect` (`on` or `off`) and `reconnect_timeout` (seconds, 5 by default, 0 for no limit), and
+    `Config.setReconnect` and `setReconnectTimeout`. A `connectOver` connection, and one closed with `close()`, stay
+    closed.
+  - Before each call writes, what came while the connection sat idle is read: a close found there (a kill, the
+    server's idle timeout) is made good before anything is sent, and the call never sees it. Pushes are set aside; a
+    reply no call asked for loses the connection rather than becoming the next call's.
+  - A transaction whose `WATCH` was lost with the connection answers `WatchConflict` without being sent, so
+    `watched` runs its body again.
+  - `Connection.select(db:)` and `authenticate(user:, password:)`, which every reconnect keeps. `SELECT`, `AUTH`,
+    `CLIENT SETNAME`, `CLIENT SETINFO`, `CLIENT NO-EVICT`, `NO-TOUCH`, `CAPA` and `IMPORT-SOURCE`, `READONLY` and
+    `READWRITE` are refused by `call`, `run` and `transact`, each naming its way, since a reconnect would quietly
+    undo them; the table is checked against every server's `ACL CAT connection`.
+  - A server with no room left (`maxclients`) refuses the connection as it accepts it, and the connect fails with
+    that refusal, in the server's words. The RESP2 path sends `PING` when it has nothing else to send, so a connect
+    always knows its link is open.
+  - `RedisError` copies (its payloads gained copy constructors).
+  - A `Subscriber` makes its connection again too, by `next` (inside the call) or its next subscribe, unsubscribe or
+    ping, and subscribes again to every kept name: channels, patterns, then shard channels a slot at a time.
+    `Delivery::Reconnected(cause)` comes first, after what was already queued, so a caller knows messages were missed;
+    a name the server refuses then comes as `Unsubscribed`; an unsubscribe that failed with the connection is never
+    undone.
+- `examples/`: eight programs (quickstart, typed replies, transactions, a pub/sub worker, a reliable job queue, TLS,
+  SCAN, scripts), each its own project, built by `tools/test.sh` and run against every server by
+  `tools/check-examples.sh`.
+- `tools/mutate.sh` (from `@kama/postgres`): each mutation of the source must make the case it targets fail; every
+  step of phase 7a has a mutations file, and every mutation is caught.
+- `tools/gen-server-vectors.sh` captures how each server lets a client go: `CLIENT KILL`, `SHUTDOWN NOSAVE`, a
+  restart, the idle timeout, a full pub/sub buffer, `maxclients`, a server still loading its data, and
+  `ACL CAT connection`. The scripted server gained `Step::Reset`, and the live suite stops and restarts the server
+  (`tests/integration/server/start.sh` runs it in a loop).
 - TLS (phase 5), from `@kama/tls` ^0.1.3, which vendors Mbed TLS:
   - `rediss://` and `valkeys://` connect over TLS, verified by default: the certificate must chain to a trusted root
     (the system's bundle) and name the server, its host name among the DNS names or its IP address among the IP

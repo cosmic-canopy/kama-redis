@@ -3,8 +3,8 @@
 //
 // The shape of the package, as it fills in (docs/ROADMAP.md):
 //   redis            Connection (src/connection.kama), Config, TlsVerify and TlsVersion (src/config.kama),
-//                    TlsSession (src/session.kama), RedisError, ServerError and
-//                    ServerCode (src/error.kama), Command (src/command.kama), RedisArg and the `cmd"…"` tag
+//                    TlsSession (src/session.kama), RedisError, ServerError, ServerCode, ConnectError and
+//                    ReconnectError (src/error.kama), Command (src/command.kama), RedisArg and the `cmd"…"` tag
 //                    (src/arg.kama), `reply::<T>` and its kin (src/reply.kama), Pipeline and Replies
 //                    (src/pipeline.kama), TxOutcome and TxBody (src/transaction.kama), Script and ScriptCall
 //                    (src/script.kama), Scan (src/scan.kama), Subscriber, Delivery, Message and ChannelKind
@@ -15,8 +15,8 @@
 //                    server's integer grammar
 //   redis::secure    internal: TLS over any transport, and the TlsConfig each connect attempt builds
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
-//   redis::cluster   key slots (src/cluster/slot.kama); to come: the slot map and redirections
-//   redis::pool      a connection pool shared by isolates
+//   redis::cluster   key slots (src/cluster/slot.kama); to come (0.2.0): the slot map and redirections
+//   redis::pool      to come (0.3.0): a connection pool shared by isolates
 //
 // The rules every module holds:
 //   - Nothing from the server is trusted: every length is bounded before it is used, and a malformed reply
@@ -24,3 +24,5 @@
 //   - A data error is a `Result`; a contract violation (an index out of range) panics, exactly like an index
 //     out of range on a collection.
 //   - Non-blocking I/O with deadlines. A connection belongs to one isolate at a time and moves between them.
+//   - Nothing is sent twice: a lost connection is made again by its next call, and the call that met the loss
+//     fails with it, since its command may have run (docs/ROADMAP.md, "Phase 7a").

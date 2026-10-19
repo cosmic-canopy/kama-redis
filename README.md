@@ -4,10 +4,11 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS comes from
 [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: commands, pub/sub and TLS work; not yet published.** A connection authenticates, picks its protocol and
-> database, connects over TLS, and sends commands, pipelines, transactions and scripts with deadlines; replies read
-> into kama types. A subscriber listens to channels, patterns and shard channels. It is tested live on Redis 6.2–8.10
-> and Valkey 7.2–9.1. The first release, 0.1.0, adds reconnection; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
+> **Status: 0.1.0, a complete client for one server.** A connection authenticates, picks its protocol and database,
+> connects over TLS, and sends commands, pipelines, transactions and scripts with deadlines; replies read into kama
+> types. A subscriber listens to channels, patterns and shard channels. A lost connection is made again by its next
+> call, a subscriber's with every subscription, and nothing is sent twice. It is tested live on Redis 6.2–8.10 and
+> Valkey 7.2–9.1. Cluster and Sentinel come next; see the [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
 
@@ -299,6 +300,39 @@ fn int32 main() {
   `Pipeline.addScript` sends EVAL.
 - **SCAN, SSCAN, HSCAN and ZSCAN** a page at a time, with `matching`, `countHint`, `ofType` and `noValues`.
 
+## When the connection is lost
+
+A connection is lost when the server restarts, kills it (`CLIENT KILL`, its idle `timeout`, a full output buffer),
+or the network fails. The call that meets the loss fails with what happened, and nothing is ever sent again on its
+own: a command that may have run is yours to retry or not. The next call makes the connection again, as the first was
+made, then sends.
+- **Before each call writes,** it reads whatever came while the connection sat idle. A close found there (the usual
+  case after a kill or an idle timeout) means nothing was sent, so the call makes the connection again and sends,
+  and never sees the loss. A close can still land between that read and the write, so this is usual, not certain.
+- **Making it again** tries every address, reads the TLS files again (a renewed certificate is used), and runs the
+  handshake in the protocol the connection spoke, as the user and database that `authenticate` and `select` last
+  set, then a `PING`. While the server is down, restarting, full (`maxclients`) or still loading its data, the call
+  keeps trying, with a backoff (100 ms doubling to 1 s, jittered), for up to `reconnect_timeout` (5 s). A wrong
+  password, a refused certificate or bytes that are not RESP end it at once.
+- **A transaction whose `WATCH` was lost** with the connection answers `WatchConflict` and is not sent, so `watched`
+  runs its body again on the new connection.
+- **`reconnect=off`** leaves a lost connection closed (a pool that replaces its connections wants that), and so does
+  `close()`. A connection over a transport you opened (`connectOver`) has nothing to make it again with.
+
+Whether a failed call's command could have run:
+
+| error | sent? | what it means |
+|---|---|---|
+| `Usage`, `Value`, `Config` | no | refused before anything was written; the connection goes on |
+| `Reconnect` | no | the connection was lost earlier and could not be made again; `cause()` says why, and the next call tries again |
+| `Closed` | no | closed by `close()`, or lost with nothing to make it again with |
+| `Connect`, `Tls` while connecting | no | no connection was made |
+| `Server` | yes | the server answered with an error; `LOADING`, `BUSY`, `TRYAGAIN` and `MASTERDOWN` mean it did not run it |
+| `Io`, `Timeout`, `Protocol`, `Unexpected`, `Tls` during a call | maybe | the connection was lost with the command sent or half answered: it may have run |
+
+A [reliable queue](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/job_queue/src/main.kama) shows one way to
+live with "maybe": BLMOVE into a processing list, so a job that may have been taken is found again.
+
 ## Pub/sub
 
 ```kama
@@ -394,7 +428,12 @@ fn int32 main() {
   A shard channel the server unsubscribes on its own (its slot moved) comes as `Delivery::Unsubscribed`.
 - **Delivery is at most once**, as the server's own is. Unread messages wait in the socket and the server's buffer,
   and the server disconnects a subscriber that falls too far behind (`client-output-buffer-limit pubsub`).
-  Resubscribing after a reconnect comes with reconnection.
+- **A lost subscriber is made again**, by `next` itself (nothing of it was sent), or by the next subscribe,
+  unsubscribe or ping. Every channel, pattern and shard channel is subscribed again (shard channels a slot at a
+  time), and `Reconnected(cause)` comes first, after what was already queued: messages published meanwhile were
+  missed, and you are told so. A name the server refuses then (`NOPERM` after an ACL change, `MOVED`) comes as
+  `Unsubscribed`, and an unsubscribe that failed with the connection is never undone. TCP keepalive (on, 15 s)
+  finds a peer that went away silently; over your own dialer, or with `keepalive=0`, `ping()` is the check.
 - **Sharded pub/sub** (`SSUBSCRIBE`, `SPUBLISH`) needs Redis 7.0 or Valkey 7.2. Routing a shard channel to the node
   that serves its slot comes with cluster support (0.2.0).
 - **Pushes that are not pub/sub** (an invalidation another connection's `CLIENT TRACKING … REDIRECT` sends) are set
@@ -444,11 +483,29 @@ fn int32 main() {
   - RESP3 by default, and RESP2 for proxies such as twemproxy and Envoy;
   - `server()`, the server's own account of itself from `HELLO`.
 
-## What it will cover
+## Examples
+
+Each is a program of its own under [`examples/`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples), built by `tools/test.sh` and run against every
+server in the matrix by `tools/check-examples.sh`. Run one with `REDIS_URL=redis://127.0.0.1:6379 kama run
+examples/quickstart/kama.json`.
+- [`quickstart`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/quickstart/src/main.kama): connect, store and read a value, count, close.
+- [`typed_replies`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/typed_replies/src/main.kama): a struct from a hash, a list, MGET's Optionals,
+  a sorted set as a Map.
+- [`transactions`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/transactions/src/main.kama): a pipeline, and a transfer under WATCH that runs
+  again from fresh reads.
+- [`pubsub_worker`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/pubsub_worker/src/main.kama): a subscriber that handles every delivery,
+  `Reconnected` included, fed from another isolate.
+- [`job_queue`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/job_queue/src/main.kama): a reliable queue with BLMOVE and a processing list, so
+  that a call that failed after it was sent loses no job.
+- [`tls_connection`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/tls_connection/src/main.kama): TLS verified against a CA, and what the
+  handshake settled.
+- [`scan`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/scan/src/main.kama): keys a page at a time, with MATCH and COUNT.
+- [`scripts`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/scripts/src/main.kama): a rate limiter as a Lua script, by its SHA-1.
+
+## What comes next
 
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
-- **0.1.0, one server, complete:** what is here now (commands, pub/sub, sharded too, and TLS with verification,
-  client certificates and SNI), plus reconnection, and examples.
+- **0.1.0, one server, complete:** this release.
 - **0.2.0, topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
 - **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
 
@@ -463,6 +520,8 @@ tools/redis.sh up --server valkey-9.1               # start one (podman or docke
 tools/redis.sh smoke --server valkey-9.1            # one check per authentication case and transport, with the server's own redis-cli
 tools/redis.sh down --server valkey-9.1
 tools/check-readme.sh --server redis-8.10           # build this README's programs and run them against the server
+tools/check-examples.sh --server redis-8.10         # build examples/ and run them against the server
+tools/mutate.sh tools/mutations/7a-s5.json          # each mutation of the source must make the case it targets fail
 ```
 
 The unit tests need no server: a scripted server plays real servers' bytes to the connection, a byte at a time.
@@ -481,8 +540,8 @@ Its test certificates are generated into `out/` and never committed.
 
 `@kama/redis` is licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/cosmic-canopy/kama-redis/blob/main/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/cosmic-canopy/kama-redis/blob/main/LICENSE-MIT))
 
 at your option. It vendors nothing.
 

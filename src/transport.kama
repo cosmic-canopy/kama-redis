@@ -8,8 +8,13 @@ export { Transport, TcpTransport, UnixTransport, Dialer, DialTarget };
 // of a connection keep its deadline, and later lets a pipeline write and read at once. (@kama/postgres's shape,
 // which is libpq's and hiredis's: a non-blocking socket and poll with a deadline.)
 //
-// `Connection.connect` opens TCP, or a Unix-domain socket for a unix:// config. `Connection.connectOver` takes any
-// transport: a tunnel, a proxy, or a test's scripted server.
+// Before each call writes, the connection reads what the transport has without waiting (until `WouldBlock`), so a
+// close that came while it sat idle is found before anything is sent: `read` must answer `WouldBlock`, never block,
+// when nothing has come.
+//
+// `Connection.connect` opens TCP, or a Unix-domain socket for a unix:// config. `Connection.connectWith` takes a
+// `Dialer`, which a lost connection uses again to make itself again. `Connection.connectOver` takes any transport (a
+// tunnel, a proxy, or a test's scripted server), and a connection over one is not made again once lost.
 type contract Transport for resource implements Sendable {
     // The bytes available now, up to `into`'s length: the count, or 0 when the peer has closed its side.
     // `WouldBlock` when none are available.

@@ -1,9 +1,9 @@
 # Roadmap
 
-Where this is, 2026-10-19: phases 0 to 5 are done, on kama v0.9.667, and verified on v0.9.673. **The goal now is releasing 0.1.0**, a complete
-client for one server. "The release plan" below says what each release holds. Phase 7a (reconnection, examples,
-hardening, docs) is under way: its session plan, drawn up from primary sources, is "Phase 7a: where to start" below,
-and step 0 is done. Then 0.1.0.
+Where this is, 2026-10-19: phases 0 to 5 and 7a are done, on kama v0.9.667, and verified on v0.9.673. **0.1.0, a
+complete client for one server, is ready to release**: the CHANGELOG has it, and the checklist in "The release plan"
+holds but for the steps that are the maintainer's (the push, CI on it, the publish). Next is phase 6 (Cluster and
+Sentinel, 0.2.0), whose session plan is drawn up from primary sources at its start, as 7a's was.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -29,13 +29,22 @@ and step 0 is done. Then 0.1.0.
   roots), `tls_verify` `full`, `chain` or `none`, a CA, a client certificate, `tls_server_name`, over any transport,
   from `@kama/tls` 0.1.3. The unit suite runs Mbed TLS as the scripted server; the live suite checks each server's
   TLS ports, SNI on the wire, a silent handshake and both wrong ports.
-- Gates: `tools/test.sh` is green, debug and release, on kama 0.9.667 (the floor and CI's pin) and on v0.9.673 (the
-  newest tag, 2026-10-19, which needs nothing changed); `tools/test-integration.sh` on all eight servers on both;
-  `tools/redis.sh smoke` (19 checks) on all eight; the README's programs live; CI green on `03f3968`.
+- Reconnection is in (phase 7a): a lost connection is made again by its next call and nothing is sent twice; a call
+  finds a close that came while idle before it writes; a redial waits out a restart (`reconnect_timeout`); session
+  state is refused or recorded (`select`, `authenticate`); a lost WATCH holds the transaction back; a subscriber
+  subscribes again and says `Reconnected`. Live, a restart (`SHUTDOWN NOSAVE`, the server back half a second later),
+  kills and a pub/sub flood, on all eight servers; eight examples run on every one; every step proven by mutation
+  (`tools/mutate.sh`, 79 mutations, all caught).
+- Gates: `tools/test.sh` is green, debug and release, the examples built, on kama 0.9.667 (the floor and CI's pin)
+  and on v0.9.673 (the newest tag); `tools/test-integration.sh` on all eight servers; `tools/redis.sh smoke` (19
+  checks), the README's programs and the examples live on all eight; CI green on `03f3968`, the last push (phase 7a
+  is not pushed: that is the maintainer's word).
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
-- Open gaps here: KRD-9 (2026-10-19). cstar's untagged 0.9.675 refuses the reader's in-buffer slide, which every tag
-  builds; until it is fixed, the newest tag (v0.9.673) stands in for cstar's newest build in the gate. KRD-7, KRD-8
+- Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, cstar's untagged 0.9.675 refuses the
+  reader's in-buffer slide, which every tag builds, so until it is fixed the newest tag (v0.9.673) stands in for
+  cstar's newest build in the gate; KRD-10, an application named like a dependency's module breaks that dependency's
+  imports (an application named `tls` cannot use this package). KRD-7, KRD-8
   and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor and CI pin moved there, `RedisArg`
   gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone, and the reply reader implements
   0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
@@ -55,7 +64,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–9 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -75,7 +84,7 @@ Anything not in a release yet is refused clearly rather than half there. Today a
   - TLS (phase 5);
   - reconnection, examples, hardening and docs (phase 7a).
 
-  The order: phase 4 (done 2026-10-18), then 5 (done 2026-10-18), then 7a, then the release.
+  The order: phase 4 (done 2026-10-18), then 5 (done 2026-10-18), then 7a (done 2026-10-19), then the release.
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6).
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), and client-side caching
   (phase 4's research and decisions, kept below).
@@ -809,11 +818,21 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
      as a consumer's would. The package's own locks stay on its floor, 0.1.3.
    - **Found on the way:** KRD-10. The TLS example, named `tls`, would not build: a project's name is its root module,
      and it shadowed `@kama/tls`'s for `@kama/redis`'s own imports. It is `tls_connection` now.
-10. **Docs and 0.1.0.**
-    - The README: a Reconnection section, the "was it sent?" table, the examples, absolute links.
-    - The CHANGELOG as `[0.1.0]`, AGENTS.redis.md, this file, and the module headers.
-    - The checklist in "The release plan".
-    - Then stop: the maintainer pushes and publishes.
+10. **Done (2026-10-19).** **Docs and 0.1.0.**
+    - **The README:**
+      - its status, as of the release;
+      - "When the connection is lost", with the table of whether a failed call's command could have run;
+      - the subscriber's reconnecting;
+      - the examples;
+      - the new options;
+      - absolute links (the registry renders a relative link as plain text, and `docs/` is not shipped).
+    - **The rest:** the CHANGELOG's `[0.1.0] - 2026-10-19`, AGENTS.redis.md, this file, and the module headers
+      (`src/redis.kama`, connection, subscriber, config, the `Transport` contract).
+    - **The checklist:**
+      - `tools/test.sh` checks the version (`0.1.0` in kama.json and `libraryVersion()`);
+      - `kama publish kama.json --dry-run` lists no certificate and no agent file, and ships `examples/`;
+      - every gate is green.
+    - **What remains is the maintainer's:** push, watch CI on the pinned tag, and publish from `../kama-registry`.
 
 **If the session runs long:** steps 0–6, then 7, then 8–10.
 

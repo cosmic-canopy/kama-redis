@@ -34,8 +34,14 @@ first tagged compiler with everything this package relies on (users install tagg
 
 Verified on v0.9.673 (2026-10-19, the newest tag), which needs nothing changed, so the floor and the pin stay: `ci.yml`
 moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
-is under active work and has regressed before (KRD-8). Install a tag beside your own with cstar's `install.sh`
+is under active work and has regressed before (KRD-8, and KRD-9: its 0.9.675 refuses `Reader.spare`, so the newest tag,
+v0.9.673, stands in for it until that is fixed). Install a tag beside your own with cstar's `install.sh`
 (`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
+
+**Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
+live ones): each mutation of the source must make the case it names fail, or the test is not good yet. A step adds
+its file (`tools/mutations/7a-sN.json`); re-run the older files when their code changes, since a `BAD-PATTERN` means
+the source moved on. Run the live mutations after the matrix, not beside it: both use the same servers.
 
 ## What is true here and nowhere else
 
@@ -59,6 +65,22 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     close_notify. The unit tests read the PKI through `REDISTEST_CERTDIR`, which `tools/test.sh` sets after running
     `tools/gen-test-certs.sh` (OpenSSL or LibreSSL).
 
+- **A lost connection is made again by its next call, and nothing is ever sent twice** (docs/ROADMAP.md, "Phase
+  7a"). Keep it that way.
+  - Every call path goes `settle()` (what came while idle: a close found there is made good before anything is
+    written), then `ready()` (the link, or `redial()`), then writes. The call that meets a loss returns it.
+  - A redial is `reach` + `secure` + the handshake (`again: true`) + a PING. `transient()` decides what is tried
+    again within `reconnect_timeout`; its backoff lives on the connection across calls. The protocol is pinned in
+    the kept `Config` after the first handshake, and `select`/`authenticate` record what they set there.
+  - Through podman's (or docker's) port forwarder a server that is down is never refused: the forwarder accepts,
+    then closes. A live redial meets that close, not `Connect`.
+  - A WATCH lost with the link makes the next transaction `WatchConflict`, unsent.
+  - Commands that set what a connection is (SELECT, AUTH, CLIENT SETNAME, …) are refused in `call`; the table is
+    checked against every server's `ACL CAT connection`, so a new server's entry fails a test until it is placed.
+  - A `Subscriber` redials in `linked()`, queues `Reconnected(cause)`, and subscribes again from the kept sets
+    (sorted, shard channels a slot at a time). `RedisError` copies, so the cause is kept while the failed call returns
+    it.
+
 - **Two test programs, and neither is typed from memory.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug and
     release. Its scripted server (`fake_server.kama`) is an in-memory `Transport` that plays real servers' bytes from
@@ -69,6 +91,9 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
     - Its Unix-socket test listens on a socket of its own and relays to the server's TCP port, because macOS cannot
       reach the container's socket (as postgres's `socket_test` does).
     - It starts with FLUSHALL, so the debug and release runs share the server cleanly.
+    - `restart_test.kama` runs last: each restart loses every other connection to the server.
+    - Right after a CLIENT KILL, a call is either answered (the close was found before it wrote) or fails on I/O; a
+      test takes either, and checks that the connection came back as a new client.
   - The scripted server's steps include `ExpectBytes` (a command's binary arguments, byte for byte), `Patient`
     (a reply given only to a wait that allows a stated time, which shows how long a connection waited) and `Pause`
     (nothing more of the server's own accord until the client's next wait comes back empty, which splits a message
@@ -97,7 +122,13 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
       (nothing, and it stays open: the inline parser's strchr stops at the ClientHello's NUL), and what a TLS port
       does with a plaintext HELLO (closes). The script requires both, since the client's words rest on them;
     - Envoy's redis proxy's answers to HELLO at 1.32, 1.36 and 1.39, from its pinned source, in the order that
-      source checks them. The script verifies that order before it uses it.
+      source checks them. The script verifies that order before it uses it. And its own `+PONG` to PING, which the
+      RESP2 path sends when it has nothing else to send.
+    - how a server lets a client go (phase 7a): CLIENT KILL (idle, and in a BLPOP), SHUTDOWN NOSAVE (its caller and
+      an idle client), a restart, the idle timeout, a flooded subscriber, `maxclients`, a server reloading its data
+      (`key-load-delay` with 1 MiB values saved uncompressed, since 6.2 serves its event loop only every 2 MB while
+      it loads), and `ACL CAT connection`. The script requires no bytes and a close for each drop, the words of
+      maxclients, and LOADING's refusals; it also refuses any line that is not a case (a server that printed).
     - typed pairs (phase 3): each case under RESP2 and RESP3 on a fresh connection after FLUSHALL, with its setup
       written beside it (`replySetups`), so tests derive expected values from the setup; transactions, scripts,
       SCAN pages and BLPOP; each server's `ACL CAT blocking`, sorted, and COMMAND DOCS's arguments for each
@@ -115,12 +146,19 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
   - The unit program's run-time tests check properties instead: every split of an input reads the same, every
     prefix of a reply is incomplete, and what the writer writes reads back.
 
+- **The examples** (`examples/<name>/`, each its own project with a path dependency on the package) are built by
+  `tools/test.sh` and run live by `tools/check-examples.sh --server S`, as `tools/check-readme.sh` runs the README's
+  programs; CI's integration job runs both. They read `REDIS_URL` (and `REDIS_TLS_URL`) and check their own results.
+  Their `kama.lock`s pin the newest `@kama/tls` the package's range admits, as a consumer's would; the package's own
+  locks pin its floor. No example (nor any project using this package) may be named `tls`: KRD-10.
+
 - **`tools/redis.sh` is the server.**
   - It runs the official images under podman or docker: `redis:6.2`, `7.2`, `7.4`, `8.2` and `8.10`, and
     `valkey/valkey:7.2`, `8.1` and `9.1`. `tools/redis.sh list` names them, and `--server redis-7.4` picks one.
   - One container per server runs two servers, configured from `tests/integration/server/`:
     - the main server, in plaintext and over TLS (`tls-auth-clients optional`), and on a Unix socket in the
-      container;
+      container. `start.sh` runs it in a loop, so a live test can stop it (`SHUTDOWN NOSAVE`) and it is back, empty,
+      half a second later; a container made before that loop existed must be made again (`down`, then `up`);
     - the locked server, whose default user has a password, for NOAUTH and the single-argument AUTH, and over TLS
       requiring a client certificate (`tls-auth-clients yes`). `start.sh` gives it `tls-auth-clients-user CN` on
       the servers that have the setting (Redis 8.6+, Valkey 9.0+), so the client certificate logs in as `kr_cert`.
@@ -155,8 +193,9 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
   lets `DynamicArray<uint8>` be bytes (one argument) beside `<DynamicArray> when [T: RedisArg]` (an argument per
   element). An adapter must live in the contract's module (src/arg.kama).
 
-- **A `Subscriber` reaches its connection only through five private members `Connection` grants it, method by
-  method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`). Nothing on `Connection` is public for it. Pub/sub
+- **A `Subscriber` reaches its connection only through the private members `Connection` grants it, method by
+  method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, and for reconnecting `lost` and `ready`). Nothing on
+  `Connection` is public for it. Pub/sub
   frames are read by one classifier (`classify` in src/subscriber.kama) for both protocols; a push that is not pub/sub
   goes to the connection's bounded set-aside list, never to a subscriber's deliveries.
 
@@ -216,6 +255,10 @@ is under active work and has regressed before (KRD-8). Install a tag beside your
   - A `DynamicArray<uint8>` is `Equatable` but not `Hashable`: a std `Set` of byte names needs a small key type that
     hashes them (`Name` in src/subscriber.kama).
   - A `Deque` gives O(1) push and pop at both ends (`pushBack` is `unsafe`): the bounded queues use it.
+  - A field cannot be the `const ref` argument of a method that writes `this`: copy it into a local first
+    (`Config c = copy this.settings;`), as a redial does.
+  - A `Set` iterates its keys only when the key is `Copyable`: `Name` has a copy constructor for that.
+  - A project's name is its root module, and it shadows a dependency's module of the same name (KRD-10).
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates
