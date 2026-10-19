@@ -182,9 +182,13 @@ type resource Reader implements Sendable {
         if (this.buf.length() - this.end < need) {
             isize unread = this.end - this.start;
             isize size = this.buf.length();
-            // Slide only when the unread bytes and where they go do not overlap: each byte moved then frees one.
+            // Slide only when the unread bytes and where they go do not overlap: each byte moved then frees one. A byte
+            // at a time, one window at a time: a copy from one window of a buffer into another of the same buffer is
+            // refused (since kama 0.9.675), and std has no in-place copy yet (KAMA_GAPS.md, KRD-9). What is unread here
+            // is a line or a header at most, since a payload leaves the buffer as it arrives.
             if (unread + need <= size && unread <= this.start) {
-                this.buf.sliceMut(from: 0, count: unread).copyFrom(source: this.buf.slice(from: this.start, count: unread));
+                isize i = 0;
+                while (i < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }
             } else {
                 while (size < unread + need) { size = size * 2; }
                 FixedArray<uint8> grown = FixedArray.make(size: size);

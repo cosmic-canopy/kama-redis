@@ -34,8 +34,9 @@ first tagged compiler with everything this package relies on (users install tagg
 
 Verified on v0.9.673 (2026-10-19, the newest tag), which needs nothing changed, so the floor and the pin stay: `ci.yml`
 moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
-is under active work and has regressed before (KRD-8, and KRD-9: its 0.9.675 refuses `Reader.spare`, so the newest tag,
-v0.9.673, stands in for it until that is fixed). Install a tag beside your own with cstar's `install.sh`
+is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
+registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
+gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
 (`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the

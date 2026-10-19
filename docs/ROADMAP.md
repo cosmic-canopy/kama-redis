@@ -41,10 +41,11 @@ Sentinel, 0.2.0), whose session plan is drawn up from primary sources at its sta
   is not pushed: that is the maintainer's word).
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
-- Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, cstar's untagged 0.9.675 refuses the
-  reader's in-buffer slide, which every tag builds, so until it is fixed the newest tag (v0.9.673) stands in for
-  cstar's newest build in the gate; KRD-10, an application named like a dependency's module breaks that dependency's
-  imports (an application named `tls` cannot use this package). KRD-7, KRD-8
+- Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, std has no in-place copy, and cstar's
+  0.9.675 refuses the reader's copy between two windows of its buffer; the reader moves those bytes one at a time
+  until std has one, so the package builds on 0.9.675 too, which the registry checks with (its first publish stopped
+  there). KRD-10, an application named like a dependency's module breaks that dependency's imports (an application
+  named `tls` cannot use this package). KRD-7, KRD-8
   and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor and CI pin moved there, `RedisArg`
   gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone, and the reply reader implements
   0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
@@ -631,7 +632,8 @@ Each step ends green before its commit:
 - from step 1 on, the live matrix;
 - from step 2 on, the step's mutations, every one CAUGHT.
 
-While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest build, which refuses the reader.
+While KRD-9 was refusing the reader, the newest tag (`v0.9.673`) stood in for cstar's newest build; since the
+reader moves its bytes one at a time, cstar's 0.9.675 builds and passes it too.
 
 0. **Done (2026-10-19).**
    - This plan, from the sources above.

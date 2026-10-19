@@ -311,6 +311,31 @@ fn int32 pipelineTests() {
     return f;
 }
 
+// The buffer fills, and what is unread slides to its front, again and again: a stream four times the buffer reads
+// as it does whole. Small pieces never fill it (a reader that has read all it holds starts again at the front), so
+// pieces of 10000 and 5003 bytes, each ending inside a line, are what make it slide with part of a line unread.
+fn int32 slideTests() {
+    int32 f = 0;
+    // Integers that count up, so no two slides move the same bytes, and a byte left behind is a wrong one.
+    DynamicArray<uint8> all = DynamicArray.empty();
+    isize i = 0;
+    while (i < 8000) {
+        string line = ":${i}\r\n";
+        all.addAll(items: line.bytes());
+        i = i + 1;
+    }
+    string whole = readAll(input: all.view(), chunk: all.length(), limits: defaults());
+    string sevens = readAll(input: all.view(), chunk: 7, limits: defaults());
+    string ones = readAll(input: all.view(), chunk: 1, limits: defaults());
+    string large = readAll(input: all.view(), chunk: 10000, limits: defaults());
+    string odd = readAll(input: all.view(), chunk: 5003, limits: defaults());
+    f = f + check(ok: whole.endsWith(suffix: "|end") && sevens == whole && ones == whole,
+                  what: "resp slide: a stream four times the buffer, in pieces of 7 and of 1, reads as it does whole");
+    f = f + check(ok: large == whole && odd == whole,
+                  what: "resp slide: in pieces of 10000 and of 5003, each ending inside a line, it slides and reads as it does whole");
+    return f;
+}
+
 fn string nested(isize depth, const ref string open, const ref string leaf, const ref string close) {
     string s = "";
     isize i = 0;
@@ -965,6 +990,7 @@ fn int32 respTests() {
     f = f + splitTests();
     f = f + prefixTests();
     f = f + pipelineTests();
+    f = f + slideTests();
     f = f + depthTests();
     f = f + sizeTests();
     f = f + bulkTests();

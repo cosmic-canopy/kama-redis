@@ -29,7 +29,7 @@ the commit that made it pass.
 
 ## OPEN
 
-### KRD-9 · HIGH · 0.9.675 refuses copying between two windows of one buffer, and std has no in-place copy
+### KRD-9 · MED · 0.9.675 refuses copying between two windows of one buffer, and std has no in-place copy
 
 **Found** 2026-10-19, on cstar's `0.9.675+g4afcda97`, at its first build of this package. It is a regression of
 `ada8bd36` ("check: a `ref` argument that holds the receiver is refused, and a contract receiver is judged"). The
@@ -82,8 +82,12 @@ fn int32 main() {
 `copyWithin(from:, count:, to:)` (one `memmove`, overlap allowed), which this reader would use, and which a ring
 buffer or a codec also needs.
 
-**Workaround:** none taken. The package's floor and CI's pin (`v0.9.667`) and the newest tag (`v0.9.673`) build it.
-Until the fix, this package's gate uses `v0.9.673` in place of cstar's newest build.
+**Workaround, since 2026-10-19:** `Reader.spare` moves the unread bytes one at a time
+(`this.buf[i] = this.buf[this.start + i]`), one window at a time, so the package builds on 0.9.675 too, which the
+registry checks with. Refusing two windows of one buffer is defensible, so the ask is now the second reading's: a
+`copyWithin` (one `memmove`). When std has it, the loop goes, and the reader moves its bytes in one call again. A unit
+test (`resp slide`) makes the reader slide with part of a line unread, and a mutation of the loop fails it
+(`tools/mutations/krd9-slide.json`).
 
 ### KRD-10 · MED · An application named like a dependency's module breaks that dependency's imports
 

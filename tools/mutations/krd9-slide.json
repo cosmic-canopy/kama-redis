@@ -1,0 +1,10 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/resp/reader.kama",
+  "old": "                while (i < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }",
+  "new": "                while (i + 1 < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }",
+  "expect": "resp slide"
+ }
+]
