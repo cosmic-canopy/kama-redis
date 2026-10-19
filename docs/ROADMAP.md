@@ -55,7 +55,7 @@ does its discipline:
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
 | 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
-| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–6 done |
+| 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | in progress: steps 0–7 done |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | |
 
@@ -747,16 +747,40 @@ While KRD-9 is open, the newest tag (`v0.9.673`) stands in for cstar's newest bu
      - `connectOver`'s `Io`;
      - a close_notify over TLS.
    - 13 mutations, all caught.
-7. **The subscriber.**
-   - Unit, from phase 4's captures:
-     - the resubscribe order;
-     - `Reconnected` first, after what was queued;
-     - refused names;
-     - shard channels by slot;
-     - a failed unsubscribe not undone;
-     - a zero timeout that still redials;
-     - `release` of a lost subscriber.
-   - Live: a subscriber killed with CLIENT KILL.
+7. **Done (2026-10-19).** **The subscriber.** `linked()` stands before `next`, `ping` and each (un)subscribe. It
+   makes a lost link again (through two more grants from `Connection`, `ready` and `lost`), queues
+   `Delivery::Reconnected(cause)` after what was already queued, and subscribes again from the kept sets. What
+   building it settled:
+   - **`RedisError` copies:** `ServerError`, `ConnectAttempt`, `ConnectError` and `ReconnectError` gained copy
+     constructors, so a subscriber keeps a copy of what ended its link for the `Reconnected` its redial queues, while
+     the call that met the loss returns the error itself.
+   - **The order:** channels, then patterns, then shard channels, each command's names sorted by their bytes, and
+     shard channels one SSUBSCRIBE per slot, in slot order. So every run sends the same, and a cluster takes each.
+   - **The kept sets** are taken out before each command and put back by the confirmations:
+     - a refused command (NOPERM, MOVED) leaves its names out, each queued as `Unsubscribed`, of any kind now;
+     - a link lost again keeps every name not confirmed, for the next redial.
+   - **An unsubscribe that failed with the link** forgets what it named (or the whole kind, for an unsubscribe from
+     all), so it is never undone. One the server refused changes nothing.
+   - **`next`** meets a loss while it waits and makes the link again inside the call, since nothing of it was sent:
+     its answer is `Reconnected`, even with a zero timeout. A link over the caller's transport is the call's error,
+     as before.
+   - **`close()`** is the connection's `close()`, for good. `release()` on a lost subscriber hands the connection back
+     as it is, to be made again by its next call.
+   - **Unit:**
+     - the order;
+     - queued before `Reconnected`;
+     - NOPERM and MOVED as `Unsubscribed`;
+     - two slots;
+     - a failed unsubscribe, and a failed unsubscribe from all;
+     - a zero timeout;
+     - `release`;
+     - a failed redial keeping the names;
+     - lost again while subscribing again;
+     - a subscribe on a lost subscriber;
+     - RESP2.
+   - **Live:** `CLIENT KILL TYPE pubsub`, then `Reconnected` inside `next` and a later PUBLISH received, under both
+     protocols.
+   - 13 mutations, all caught.
 8. **Live hardening.**
    - The restart loop in `start.sh`.
    - `SHUTDOWN NOSAVE` during calls, a pipeline, a BLPOP in flight (its error, then OK), a subscriber and a TLS

@@ -1,0 +1,106 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        this.pending.pushBack(item: Delivery::Reconnected(cause: this.takeCause()));\n        this.costs.pushBack(item: 0i64);\n",
+  "new": "",
+  "expect": "then Reconnected"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        Result<Unit, RedisError> a = this.again(kind: ChannelKind::Channel);",
+  "new": "        Result<Unit, RedisError> a = this.again(kind: ChannelKind::Pattern);",
+  "expect": "every name subscribed again"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        sortSlots(slots: ref slots);\n",
+  "new": "",
+  "expect": "a slot at a time"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "                if (keySlot(key: names[k].view()) == slots[s]) { group.add(item: copy names[k]); }",
+  "new": "                group.add(item: copy names[k]);",
+  "expect": "a slot at a time"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "                if (!this.kept(kind: kind, name: names[k].view())) {",
+  "new": "                if (false) {",
+  "expect": "come as Unsubscribed after Reconnected"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "            while (k < names.length()) { this.keep(kind: kind, name: names[k].view()); k = k + 1; }\n        }\n        return give done;",
+  "new": "            k = k + 1;\n        }\n        return give done;",
+  "expect": "lost again while subscribing again keeps the names"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "            while (k < named.length()) { bool gone = this.forget(kind: kind, name: named[k].view()); k = k + 1; }",
+  "new": "            while (k < named.length()) { k = k + 1; }",
+  "expect": "an unsubscribe that failed with the link is not undone"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "            if (named.length() == 0) { this.dropKind(kind: kind); }",
+  "new": "",
+  "expect": "nor is an unsubscribe from all patterns"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        if (this.held[0].isClosed()) { return Result::Err(error: this.takeCause()); }\n        Result<Unit, RedisError> up = this.linked();\n        match (give up) { case Ok(value: u): { } case Err(error: x): { return Result::Err(error: give x); } };\n        return Result::Ok(value: Optional::Some(value: this.dequeue()));",
+  "new": "        return Result::Err(error: this.takeCause());",
+  "expect": "a link lost while next waits is made again inside next"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        if (this.held.length() > 0) { this.held[0].close(); }",
+  "new": "        if (this.held.length() > 0) { this.lostWith(e: RedisError::Closed); }",
+  "expect": "close() is for good"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        this.lostBy = DynamicArray.empty();\n        this.lostBy.add(item: give e);\n        this.held[0].lose();",
+  "new": "        this.held[0].lose();",
+  "expect": "then Reconnected, with what ended the old link"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        sortNames(names: ref names);\n",
+  "new": "",
+  "expect": "every name subscribed again"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        Result<Unit, RedisError> up = this.linked();\n        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };\n        Command command = Command.of(name: opCommand(op: op));",
+  "new": "        Command command = Command.of(name: opCommand(op: op));",
+  "expect": "a subscribe on a lost subscriber makes the link again first"
+ }
+]

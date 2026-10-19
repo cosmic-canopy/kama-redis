@@ -2,7 +2,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::collectio
          std::memory::Owned, std::memory::replace, std::time::Duration, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error,
          redis::Config, redis::Connection, redis::Dialer, redis::Protocol, redis::RedisError, redis::ServerError,
-         redis::RedisArg, redis::Command, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
+         redis::RedisArg, redis::Command, redis::cluster::keySlot, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
          redis::wire::serverError, redis::resp::Value };
 export { Subscriber, Delivery, Message, ChannelKind };
 
@@ -25,6 +25,11 @@ export { Subscriber, Delivery, Message, ChannelKind };
 //   - An error in place of confirmations (NOPERM, CROSSSLOT, MOVED, a server before 7.0 asked to SSUBSCRIBE) means the
 //     server refused the whole command: it is `Server`, and the subscriber goes on, its names unchanged. A
 //     confirmation or a PING's answer that does not come by `command_timeout` closes it, as a call's reply does.
+//   - A lost connection is made again (docs/ROADMAP.md, "Phase 7a"): by `next`, which redials inside the call since
+//     nothing of it was sent, or by the next subscribe, unsubscribe or ping. Every kept name is subscribed again,
+//     and `Reconnected` comes first, after what was already queued: messages published meanwhile were lost, and the
+//     caller is told so. A name the server refuses then (NOPERM, MOVED) comes as `Unsubscribed`. An unsubscribe that
+//     failed with the link is never undone. `close()` closes it for good.
 //   - Invalidations another connection's CLIENT TRACKING … REDIRECT sends here are not deliveries: they are set aside
 //     on the connection (`Connection.takePushes`), RESP2's form (a message on __redis__:invalidate whose payload is
 //     an array of keys, or a null) as RESP3's push is.
@@ -77,8 +82,12 @@ type enum Delivery implements Sendable {
     // A message to a channel, pattern or shard channel this subscriber is subscribed to.
     Message(Message message),
     // A subscription the server ended of its own accord: a shard channel whose slot left the node (a cluster
-    // resharding). It is no longer kept here; subscribe again where the slot went.
-    Unsubscribed(ChannelKind kind, DynamicArray<uint8> channel);
+    // resharding), or a name it refused when a lost connection subscribed again (NOPERM, MOVED). It is no longer
+    // kept here.
+    Unsubscribed(ChannelKind kind, DynamicArray<uint8> channel),
+    // The connection was lost, and has been made again, every kept name subscribed again: messages published in
+    // between were not received. `cause` is what ended the old connection.
+    Reconnected(RedisError cause);
 }
 
 type resource Subscriber implements Sendable {
@@ -93,6 +102,8 @@ type resource Subscriber implements Sendable {
     Set<Name> channels;
     Set<Name> patterns;
     Set<Name> shards;
+    // What ended the last connection, for `Reconnected`: zero or one.
+    DynamicArray<RedisError> lostBy;
 
     ctor fresh(int64 limit) {
         this.held = DynamicArray.empty();
@@ -102,6 +113,7 @@ type resource Subscriber implements Sendable {
         this.channels = Set.empty();
         this.patterns = Set.empty();
         this.shards = Set.empty();
+        this.lostBy = DynamicArray.empty();
     }
 
     // A subscriber over `connection`, whole. `release` hands it back.
@@ -153,7 +165,9 @@ type resource Subscriber implements Sendable {
     public unsafe fn Result<Optional<Delivery>, RedisError> next(Optional<Duration> timeout) {
         if (this.held.length() == 0) { return Result::Err(error: released()); }
         if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.dequeue())); }
-        if (this.held[0].isClosed()) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> up = this.linked();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.dequeue())); }
         if (this.subscriptions() == 0) {
             return Result::Err(error: RedisError::Usage(detail: "nothing is subscribed, so no message can come: subscribe first"));
         }
@@ -167,8 +181,7 @@ type resource Subscriber implements Sendable {
                 case Err(error: e): {
                     bool late = match (e) { case Timeout: true; case _: false; };
                     if (late) { return Result::Ok(value: Optional::None); }
-                    this.breakOff();
-                    return Result::Err(error: give e);
+                    return this.lostWaiting(e: give e);
                 }
             };
             Incoming frame = classify(v: give v, resp2: this.resp2());
@@ -194,6 +207,8 @@ type resource Subscriber implements Sendable {
     // way wait for `next`.
     public unsafe fn Result<Unit, RedisError> ping() {
         if (this.held.length() == 0) { return Result::Err(error: released()); }
+        Result<Unit, RedisError> up = this.linked();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Command command = Command.of(name: "PING");
         Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
         Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
@@ -227,17 +242,19 @@ type resource Subscriber implements Sendable {
     // failed is `Closed`; a second release is `Usage`.
     public unsafe fn Result<Connection, RedisError> release() {
         if (this.held.length() == 0) { return Result::Err(error: released()); }
-        bool closed = this.held[0].isClosed();
+        // A lost connection holds no subscription on the server: it is handed back as it is, to be made again by its
+        // next call.
+        bool closed = this.held[0].lost();
         if (!closed && this.channels.length() > 0) {
             Result<Unit, RedisError> done = this.changeAll(op: Op::Unsubscribe);
             match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         }
-        closed = this.held[0].isClosed();
+        closed = this.held[0].lost();
         if (!closed && this.patterns.length() > 0) {
             Result<Unit, RedisError> done = this.changeAll(op: Op::Punsubscribe);
             match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         }
-        closed = this.held[0].isClosed();
+        closed = this.held[0].lost();
         if (!closed && this.shards.length() > 0) {
             Result<Unit, RedisError> done = this.changeAll(op: Op::Sunsubscribe);
             match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
@@ -245,6 +262,7 @@ type resource Subscriber implements Sendable {
         this.pending = Deque.empty();
         this.costs = Deque.empty();
         this.pendingBytes = 0;
+        this.lostBy = DynamicArray.empty();
         Optional<Connection> last = this.held.pop();
         Connection c = match (give last) { case Some(value: x): give x; case None: { return Result::Err(error: released()); } };
         if (c.isClosed()) {
@@ -254,9 +272,9 @@ type resource Subscriber implements Sendable {
         return Result::Ok(value: give c);
     }
 
-    // Close the connection. Every later call answers `Closed`.
+    // Close the connection, for good: every later call answers `Closed`.
     public unsafe fn void close() {
-        if (this.held.length() > 0) { this.breakOff(); }
+        if (this.held.length() > 0) { this.held[0].close(); }
     }
 
     public const fn bool isClosed() { return this.held.length() == 0 || this.held[0].isClosed(); }
@@ -280,6 +298,8 @@ type resource Subscriber implements Sendable {
     // One (un)subscribe: one command, then every confirmation it causes.
     unsafe fn Result<Unit, RedisError> change(Op op, RedisArg names) {
         if (this.held.length() == 0) { return Result::Err(error: released()); }
+        Result<Unit, RedisError> up = this.linked();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Command command = Command.of(name: opCommand(op: op));
         command.add(value: names);
         Optional<RedisError> problem = command.problem();
@@ -298,8 +318,20 @@ type resource Subscriber implements Sendable {
         }
         Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
         Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
-        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        return this.settle(op: op, expected: named, deadline: deadline);
+        Result<Unit, RedisError> done = match (give sent) {
+            case Ok(value: u): this.settle(op: op, expected: named, deadline: deadline);
+            case Err(error: e): Result::Err(error: give e);
+        };
+        // An unsubscribe that failed with the link is never undone: what it named is not subscribed again. (One the
+        // server refused, it refused: nothing changes.)
+        bool lostOn = match (done) { case Err(error: e): this.held[0].lost(); case Ok(value: u): false; };
+        if (lostOn && !opAdds(op: op)) {
+            ChannelKind kind = opKind(op: op);
+            if (named.length() == 0) { this.dropKind(kind: kind); }
+            isize k = 0;
+            while (k < named.length()) { bool gone = this.forget(kind: kind, name: named[k].view()); k = k + 1; }
+        }
+        return give done;
     }
 
     // An unsubscribe from every name of a kind, as `release` sends it.
@@ -394,7 +426,7 @@ type resource Subscriber implements Sendable {
     // waits for an answer must have it.
     unsafe fn Result<Incoming, RedisError> arrival(Deadline deadline) {
         Result<Value, RedisError> got = this.read(deadline: deadline);
-        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { this.breakOff(); return Result::Err(error: give e); } };
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { this.lostWith(e: copy e); return Result::Err(error: give e); } };
         return Result::Ok(value: classify(v: give v, resp2: this.resp2()));
     }
 
@@ -423,13 +455,23 @@ type resource Subscriber implements Sendable {
 
     // The exchange broke: close the connection, and say why.
     unsafe fn Result<Unit, RedisError> fail(const ref string detail) {
-        this.breakOff();
-        return Result::Err(error: RedisError::Unexpected(detail: copy detail));
+        RedisError e = RedisError::Unexpected(detail: copy detail);
+        this.lostWith(e: copy e);
+        return Result::Err(error: give e);
     }
 
     unsafe fn Result<Optional<Delivery>, RedisError> unexpected(const ref string detail) {
-        this.breakOff();
-        return Result::Err(error: RedisError::Unexpected(detail: copy detail));
+        return this.lostWaiting(e: RedisError::Unexpected(detail: copy detail));
+    }
+
+    // `next` lost the link while it waited: nothing of it was sent, so it makes the link again at once and hands over
+    // `Reconnected`. A link that cannot be made again (over the caller's transport) is the call's error.
+    unsafe fn Result<Optional<Delivery>, RedisError> lostWaiting(RedisError e) {
+        this.lostWith(e: give e);
+        if (this.held[0].isClosed()) { return Result::Err(error: this.takeCause()); }
+        Result<Unit, RedisError> up = this.linked();
+        match (give up) { case Ok(value: u): { } case Err(error: x): { return Result::Err(error: give x); } };
+        return Result::Ok(value: Optional::Some(value: this.dequeue()));
     }
 
     // ---- the kept names ----
@@ -452,6 +494,36 @@ type resource Subscriber implements Sendable {
         };
     }
 
+    // The kept names of `kind`, sorted by their bytes, taken out: none is kept until confirmed again.
+    fn DynamicArray<DynamicArray<uint8>> takeKind(ChannelKind kind) {
+        DynamicArray<DynamicArray<uint8>> names = DynamicArray.empty();
+        match (kind) {
+            case Channel: { foreach (Name n in this.channels) { names.add(item: copy n.bytes); } }
+            case Pattern: { foreach (Name n in this.patterns) { names.add(item: copy n.bytes); } }
+            case Shard: { foreach (Name n in this.shards) { names.add(item: copy n.bytes); } }
+        };
+        this.dropKind(kind: kind);
+        sortNames(names: ref names);
+        return give names;
+    }
+
+    fn void dropKind(ChannelKind kind) {
+        match (kind) {
+            case Channel: { this.channels = Set.empty(); }
+            case Pattern: { this.patterns = Set.empty(); }
+            case Shard: { this.shards = Set.empty(); }
+        };
+    }
+
+    const fn bool kept(ChannelKind kind, ConstView<uint8> name) {
+        Name key = Name.of(bytes: name);
+        return match (kind) {
+            case Channel: this.channels.contains(key: key);
+            case Pattern: this.patterns.contains(key: key);
+            case Shard: this.shards.contains(key: key);
+        };
+    }
+
     const fn isize keptCount(ChannelKind kind) {
         return match (kind) {
             case Channel: this.channels.length();
@@ -463,10 +535,125 @@ type resource Subscriber implements Sendable {
     // ---- the connection (each the one way to reach its private side) ----
 
     unsafe fn Result<Unit, RedisError> write(const ref Command command, Deadline deadline) {
-        return this.held[0].transmit(command: command, deadline: deadline);
+        Result<Unit, RedisError> sent = this.held[0].transmit(command: command, deadline: deadline);
+        match (sent) { case Err(error: e): { this.lostWith(e: copy e); } case Ok(value: u): { } };
+        return give sent;
     }
     unsafe fn Result<Value, RedisError> read(Deadline deadline) { return this.held[0].receiveFrame(deadline: deadline); }
-    unsafe fn void breakOff() { this.held[0].lose(); }
+    // The link is lost, `e` the reason: kept for the `Reconnected` its redial queues.
+    unsafe fn void lostWith(RedisError e) {
+        this.lostBy = DynamicArray.empty();
+        this.lostBy.add(item: give e);
+        this.held[0].lose();
+    }
+
+    fn RedisError takeCause() {
+        Optional<RedisError> e = this.lostBy.pop();
+        return match (give e) { case Some(value: x): give x; case None: RedisError::Unexpected(detail: "the connection was lost"); };
+    }
+
+    // ---- reconnecting ----
+
+    // The link, ready: as it is, or made again once it was lost, every kept name subscribed again, with `Reconnected`
+    // queued first. `Closed` when it cannot be made again; `Reconnect` when making it failed (the next call tries
+    // again, the names still kept).
+    unsafe fn Result<Unit, RedisError> linked() {
+        if (!this.held[0].lost()) { return Result::Ok(value: Unit::Unit); }
+        Result<Unit, RedisError> up = this.held[0].ready();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        // It marks a gap, not a message: it is queued whatever the bound, and costs nothing against it.
+        this.pending.pushBack(item: Delivery::Reconnected(cause: this.takeCause()));
+        this.costs.pushBack(item: 0i64);
+        Result<Unit, RedisError> a = this.again(kind: ChannelKind::Channel);
+        match (give a) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> b = this.again(kind: ChannelKind::Pattern);
+        match (give b) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.again(kind: ChannelKind::Shard);
+    }
+
+    // Subscribe again to the kept names of `kind`, sorted, so each run sends the same: in one command, or for shard
+    // channels one command per slot, in slot order, as a cluster wants. The names are taken out first, and the
+    // confirmations put back the ones the server took.
+    unsafe fn Result<Unit, RedisError> again(ChannelKind kind) {
+        DynamicArray<DynamicArray<uint8>> names = this.takeKind(kind: kind);
+        if (names.length() == 0) { return Result::Ok(value: Unit::Unit); }
+        if (kind != ChannelKind::Shard) { return this.restore(kind: kind, names: give names); }
+        DynamicArray<isize> slots = DynamicArray.empty();
+        isize i = 0;
+        while (i < names.length()) {
+            isize slot = keySlot(key: names[i].view());
+            bool seen = false;
+            isize j = 0;
+            while (j < slots.length()) { if (slots[j] == slot) { seen = true; } j = j + 1; }
+            if (!seen) { slots.add(item: slot); }
+            i = i + 1;
+        }
+        sortSlots(slots: ref slots);
+        isize s = 0;
+        while (s < slots.length()) {
+            DynamicArray<DynamicArray<uint8>> group = DynamicArray.empty();
+            isize k = 0;
+            while (k < names.length()) {
+                if (keySlot(key: names[k].view()) == slots[s]) { group.add(item: copy names[k]); }
+                k = k + 1;
+            }
+            Result<Unit, RedisError> done = this.restore(kind: kind, names: give group);
+            match (give done) {
+                case Ok(value: u): { }
+                case Err(error: e): {
+                    // Lost again: what was not sent yet stays kept, for the next redial.
+                    isize r = s + 1;
+                    while (r < slots.length()) {
+                        isize q = 0;
+                        while (q < names.length()) {
+                            if (keySlot(key: names[q].view()) == slots[r]) { this.keep(kind: kind, name: names[q].view()); }
+                            q = q + 1;
+                        }
+                        r = r + 1;
+                    }
+                    return Result::Err(error: give e);
+                }
+            };
+            s = s + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // One command subscribing again to `names`. A refusal (NOPERM, MOVED) leaves each name not subscribed, and each is
+    // queued as `Unsubscribed`; the link lost again keeps every name not confirmed, for the next redial.
+    unsafe fn Result<Unit, RedisError> restore(ChannelKind kind, DynamicArray<DynamicArray<uint8>> names) {
+        Op op = addOf(kind: kind);
+        Command command = Command.of(name: opCommand(op: op));
+        isize i = 0;
+        while (i < names.length()) { command.argBytes(bytes: names[i].view()); i = i + 1; }
+        Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
+        Result<Unit, RedisError> sent = this.write(command: command, deadline: deadline);
+        Result<Unit, RedisError> done = match (give sent) {
+            case Ok(value: u): this.settle(op: op, expected: names, deadline: deadline);
+            case Err(error: e): Result::Err(error: give e);
+        };
+        bool refused = match (done) { case Err(error: e): match (e) { case Server(error: s): true; case _: false; }; case Ok(value: u): false; };
+        if (refused) {
+            RedisError why = match (give done) { case Err(error: e): give e; case Ok(value: u): RedisError::Closed; };
+            isize k = 0;
+            while (k < names.length()) {
+                if (!this.kept(kind: kind, name: names[k].view())) {
+                    int64 cost = cast<int64>(names[k].length());
+                    this.pending.pushBack(item: Delivery::Unsubscribed(kind: kind, channel: copy names[k]));
+                    this.costs.pushBack(item: cost);
+                    this.pendingBytes = this.pendingBytes + cost;
+                }
+                k = k + 1;
+            }
+            return Result::Ok(value: Unit::Unit);
+        }
+        bool lostAgain = match (done) { case Err(error: e): true; case Ok(value: u): false; };
+        if (lostAgain) {
+            isize k = 0;
+            while (k < names.length()) { this.keep(kind: kind, name: names[k].view()); k = k + 1; }
+        }
+        return give done;
+    }
     unsafe fn void keepAside(Value push) { this.held[0].setAside(push: give push); }
 }
 
@@ -501,6 +688,39 @@ fn ChannelKind opKind(Op op) {
         case Ssubscribe: ChannelKind::Shard;
         case Sunsubscribe: ChannelKind::Shard;
     };
+}
+
+// The command that adds names of `kind`.
+fn Op addOf(ChannelKind kind) {
+    return match (kind) { case Channel: Op::Subscribe; case Pattern: Op::Psubscribe; case Shard: Op::Ssubscribe; };
+}
+
+// Names in the order of their bytes, so that subscribing again sends the same command every time.
+fn void sortNames(ref DynamicArray<DynamicArray<uint8>> names) {
+    isize i = 1;
+    while (i < names.length()) {
+        isize j = i;
+        while (j > 0 && before(a: names[j].view(), b: names[j - 1].view())) { names.swap(i: j, j: j - 1); j = j - 1; }
+        i = i + 1;
+    }
+}
+
+fn bool before(ConstView<uint8> a, ConstView<uint8> b) {
+    isize i = 0;
+    while (i < a.length() && i < b.length()) {
+        if (a[i] != b[i]) { return a[i] < b[i]; }
+        i = i + 1;
+    }
+    return a.length() < b.length();
+}
+
+fn void sortSlots(ref DynamicArray<isize> slots) {
+    isize i = 1;
+    while (i < slots.length()) {
+        isize j = i;
+        while (j > 0 && slots[j] < slots[j - 1]) { slots.swap(i: j, j: j - 1); j = j - 1; }
+        i = i + 1;
+    }
 }
 
 fn bool opAdds(Op op) {
@@ -617,14 +837,19 @@ fn DynamicArray<uint8> takeBytes(ref DynamicArray<Value> items, isize at) {
     return match (give v) { case Bulk(bytes: b): give b; case _: DynamicArray.empty(); };
 }
 
-// A channel or pattern name as a set's key: its bytes, hashed with FNV-1a, as std hashes a string.
-type resource Name implements Hashable, Equatable<This>, Sendable {
+// A channel or pattern name as a set's key: its bytes, hashed with FNV-1a, as std hashes a string. It copies, so
+// that a set of them can be walked (a subscriber's resubscribing).
+type resource Name implements Hashable, Equatable<This>, Sendable, Copyable<This>(bare: give) {
     DynamicArray<uint8> bytes;
+
+    friend redis::Subscriber::takeKind[bytes];
 
     public ctor of(ConstView<uint8> bytes) {
         this.bytes = DynamicArray.empty();
         this.bytes.addAll(items: bytes);
     }
+
+    public ctor copy(ref Name source) { this.bytes = copy source.bytes; }
 
     public const fn uint64 hash() {
         uint64 h = 14695981039346656037ui64;

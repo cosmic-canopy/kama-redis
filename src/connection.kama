@@ -74,9 +74,12 @@ type resource Connection implements Sendable {
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
     friend redis::Subscriber::read[receiveFrame];
-    friend redis::Subscriber::breakOff[lose];
     friend redis::Subscriber::keepAside[setAside];
     friend redis::Subscriber::over[budget];
+    friend redis::Subscriber::linked[lost, ready];
+    friend redis::Subscriber::release[lost];
+    friend redis::Subscriber::change[lost];
+    friend redis::Subscriber::lostWith[lose];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -730,6 +733,9 @@ type resource Connection implements Sendable {
 
     // How much a subscriber may keep queued: the reader's `maxReplyBytes`, as for the set-aside pushes.
     const fn int64 budget() { return this.pushBudget; }
+
+    // Whether the link is lost: not live, whether or not it can be made again.
+    const fn bool lost() { return !this.live; }
 
     // The connection is unusable: stop the transport, and answer `Closed` from now on.
     unsafe fn void lose() {

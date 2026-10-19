@@ -2,9 +2,11 @@
 // call, and never resends the call that saw it lost. Each redial's script is everything the new link must carry,
 // in order: the handshake, the PING that ends a redial, then the next command, never the lost one. A command the
 // client should not send meets an Expect it does not match, and the call fails.
-import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::Instant, std::time::monotonicNow,
+import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned, std::time::Duration, std::time::Instant,
+         std::time::monotonicNow, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::Protocol, redis::RedisError,
-         redis::TxOutcome, redis::Dialer, redis::resp::Value,
+         redis::TxOutcome, redis::Dialer, redis::Subscriber, redis::Delivery, redis::ChannelKind, redis::cluster::keySlot,
+         redis::resp::Value, redis::resp::Reader, redis::resp::Read,
          redis_unit_tests::check, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
          commandOf, transaction, setThenIncr, pushIn, connected };
 export { reconnectTests };
@@ -518,6 +520,303 @@ unsafe fn int32 idleTests() {
     return f;
 }
 
+// ---- a subscriber's ----
+
+fn string utf8(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: x): give x; case Err(error: e): "?"; };
+}
+
+// What `next` handed over: "message kr:c1 hello", "unsubscribed shard kr:s1", "reconnected: <cause>", "none", or
+// "(error) <message>".
+fn string said(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Err(error: e): { string m = e.message(); := "(error) ${m}"; }
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): match (give d) {
+                case Message(message: m): { string ch = utf8(b: m.channel()); string pl = utf8(b: m.payload()); := "message ${ch} ${pl}"; }
+                case Unsubscribed(kind: k, channel: c): {
+                    string word = match (k) { case Channel: "channel"; case Pattern: "pattern"; case Shard: "shard"; };
+                    string name = utf8(b: c.view());
+                    := "unsubscribed ${word} ${name}";
+                }
+                case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
+            };
+        };
+    };
+}
+
+fn string done(Result<Unit, RedisError> r) {
+    return match (give r) { case Ok(value: u): "ok"; case Err(error: e): { string m = e.message(); := "(error) ${m}"; } };
+}
+
+// The capture for pub/sub case `kase` under RESP3 ("sub-one" -> "sub-one/3").
+fn DynamicArray<uint8> pub(const ref string kase) { return reply(server: server(), kase: kase.concat(other: "/3")); }
+
+// The `index`th whole value of a capture.
+fn DynamicArray<uint8> frameOf(const ref DynamicArray<uint8> b, isize index) {
+    Reader r = Reader.make();
+    r.feed(bytes: b.view());
+    isize start = 0;
+    isize k = 0;
+    while (start < b.length()) {
+        Read got = r.next();
+        isize end = b.length() - r.buffered();
+        if (k == index) {
+            DynamicArray<uint8> one = DynamicArray.empty();
+            one.addAll(items: b.view().slice(from: start, count: end - start));
+            return give one;
+        }
+        start = end;
+        k = k + 1;
+    }
+    panic(msg: "reconnect_test: no such frame");
+    return DynamicArray.empty();
+}
+
+fn DynamicArray<uint8> joined(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b) {
+    DynamicArray<uint8> all = DynamicArray.empty();
+    all.addAll(items: a.view());
+    all.addAll(items: b.view());
+    return give all;
+}
+
+fn DynamicArray<string> names(const ref string a, const ref string b) {
+    DynamicArray<string> list = DynamicArray.empty();
+    list.add(item: copy a);
+    if (b.length() > 0) { list.add(item: copy b); }
+    return give list;
+}
+
+unsafe fn Subscriber subscriberWith(DynamicArray<Dial> dials, const ref Config config, const ref string what) {
+    Owned<Dialer> d = new ScriptDialer.make(dials: give dials);
+    Result<Subscriber, RedisError> r = Subscriber.connectWith(dialer: give d, config: config);
+    Subscriber sub = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); panic(msg: "reconnect_test: ${what}: ${m}"); return subscriberWith(dials: DynamicArray.empty(), config: config, what: what); }
+    };
+    return give sub;
+}
+
+unsafe fn int32 subscriberTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    DynamicArray<uint8> hello = pub(kase: "message");
+
+    // Every kept name is subscribed again, channels, then patterns, then shard channels; `Reconnected` comes after
+    // what was already queued and before anything of the new link.
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> first = welcome(server: server());
+    first.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    DynamicArray<uint8> twoPatterns = pub(kase: "psub-two-after-one");
+    DynamicArray<uint8> withMessage = joined(a: frameOf(b: twoPatterns, index: 0), b: hello);
+    withMessage.addAll(items: frameOf(b: twoPatterns, index: 1).view());
+    first.add(item: expect(command: "PSUBSCRIBE kr:p* kr:q*", answer: give withMessage));
+    first.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "ssub-one")));
+    first.add(item: Step::Close);
+    d1.add(item: Dial::Serve(steps: give first));
+    DynamicArray<Step> second = again();
+    second.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    second.add(item: expect(command: "PSUBSCRIBE kr:p* kr:q*", answer: pub(kase: "psub-two")));
+    second.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "ssub-one")));
+    second.add(item: Step::Send(bytes: copy hello));
+    d1.add(item: Dial::Serve(steps: give second));
+    Subscriber s1 = subscriberWith(dials: give d1, config: plain, what: "resubscribe");
+    string a1 = done(r: s1.subscribe(names: names(a: "kr:c1", b: "")));
+    string a2 = done(r: s1.psubscribe(names: names(a: "kr:p*", b: "kr:q*")));
+    string a3 = done(r: s1.ssubscribe(names: names(a: "kr:s1", b: "")));
+    string pinged = done(r: s1.ping());
+    string n1 = said(r: s1.next(timeout: Optional::None));
+    string n2 = said(r: s1.next(timeout: Optional::None));
+    string n3 = said(r: s1.next(timeout: Optional::None));
+    f = f + check(ok: a1 == "ok" && a2 == "ok" && a3 == "ok" && pinged.startsWith(prefix: "(error) "), what: "subscriber: subscribed, then a PING meets the link lost: ${pinged}");
+    f = f + check(ok: n1 == "message kr:c1 hello", what: "subscriber: what was queued before the loss comes first: ${n1}");
+    f = f + check(ok: n2 == "reconnected: Server closed the connection", what: "subscriber: then Reconnected, with what ended the old link: ${n2}");
+    f = f + check(ok: n3 == "message kr:c1 hello" && s1.channelCount() == 1 && s1.patternCount() == 2 && s1.shardCount() == 1,
+                  what: "subscriber: every name subscribed again, channels, patterns, then shard channels, and the new link's message: ${n3}");
+
+    // A name the server refuses when it is subscribed again (NOPERM since the ACL changed, MOVED once the slot left)
+    // is no longer kept, and comes as Unsubscribed after Reconnected.
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    DynamicArray<Step> granted = welcome(server: server());
+    granted.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2", answer: pub(kase: "sub-two")));
+    granted.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "ssub-one")));
+    granted.add(item: Step::Close);
+    d2.add(item: Dial::Serve(steps: give granted));
+    DynamicArray<Step> denied = again();
+    denied.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2", answer: pub(kase: "sub-noperm")));
+    denied.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "cluster-moved")));
+    d2.add(item: Dial::Serve(steps: give denied));
+    Subscriber s2 = subscriberWith(dials: give d2, config: plain, what: "refused");
+    string b1 = done(r: s2.subscribe(names: names(a: "kr:c1", b: "kr:c2")));
+    string b2 = done(r: s2.ssubscribe(names: names(a: "kr:s1", b: "")));
+    string b3 = done(r: s2.ping());
+    string m1 = said(r: s2.next(timeout: Optional::None));
+    string m2 = said(r: s2.next(timeout: Optional::None));
+    string m3 = said(r: s2.next(timeout: Optional::None));
+    string m4 = said(r: s2.next(timeout: Optional::None));
+    string m5 = said(r: s2.next(timeout: Optional::None));
+    f = f + check(ok: m1.startsWith(prefix: "reconnected: ") && m2 == "unsubscribed channel kr:c1" && m3 == "unsubscribed channel kr:c2" && m4 == "unsubscribed shard kr:s1",
+                  what: "subscriber: names refused when subscribed again come as Unsubscribed after Reconnected: ${m1}; ${m2}; ${m3}; ${m4}");
+    f = f + check(ok: m5.startsWith(prefix: "(error) nothing is subscribed") && s2.channelCount() == 0 && s2.shardCount() == 0,
+                  what: "subscriber: then nothing is kept: ${m5}");
+
+    // Shard channels are subscribed again a slot at a time, in slot order, as a cluster wants them.
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    DynamicArray<Step> shards = welcome(server: server());
+    shards.add(item: expect(command: "SSUBSCRIBE kr:s1 kr:s7", answer: joined(a: pub(kase: "ssub-one"), b: pub(kase: "cluster-ssub-last"))));
+    shards.add(item: Step::Close);
+    d3.add(item: Dial::Serve(steps: give shards));
+    DynamicArray<Step> bySlot = again();
+    bool s1First = keySlot(key: "kr:s1".bytes()) < keySlot(key: "kr:s7".bytes());
+    if (s1First) {
+        bySlot.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "ssub-one")));
+        bySlot.add(item: expect(command: "SSUBSCRIBE kr:s7", answer: pub(kase: "cluster-ssub-last")));
+    } else {
+        bySlot.add(item: expect(command: "SSUBSCRIBE kr:s7", answer: pub(kase: "cluster-ssub-last")));
+        bySlot.add(item: expect(command: "SSUBSCRIBE kr:s1", answer: pub(kase: "ssub-one")));
+    }
+    d3.add(item: Dial::Serve(steps: give bySlot));
+    Subscriber s3 = subscriberWith(dials: give d3, config: plain, what: "by slot");
+    string c1 = done(r: s3.ssubscribe(names: names(a: "kr:s1", b: "kr:s7")));
+    string c2 = done(r: s3.ping());
+    string c3 = said(r: s3.next(timeout: Optional::None));
+    f = f + check(ok: c3.startsWith(prefix: "reconnected: ") && s3.shardCount() == 2, what: "subscriber: shard channels subscribed again a slot at a time: ${c3}");
+
+    // An unsubscribe that failed with the link is never undone; nor is an unsubscribe from all of a kind.
+    DynamicArray<Dial> d4 = DynamicArray.empty();
+    DynamicArray<Step> dropping = welcome(server: server());
+    dropping.add(item: expect(command: "SUBSCRIBE kr:c1 kr:c2", answer: pub(kase: "sub-two")));
+    dropping.add(item: expect(command: "PSUBSCRIBE kr:p*", answer: pub(kase: "psub-after-three")));
+    dropping.add(item: Step::Close);
+    d4.add(item: Dial::Serve(steps: give dropping));
+    DynamicArray<Step> kept = again();
+    kept.add(item: expect(command: "SUBSCRIBE kr:c2", answer: frameOf(b: pub(kase: "sub-two"), index: 1)));
+    kept.add(item: expect(command: "PSUBSCRIBE kr:p*", answer: pub(kase: "psub-one")));
+    kept.add(item: Step::Close);
+    d4.add(item: Dial::Serve(steps: give kept));
+    DynamicArray<Step> third = again();
+    third.add(item: expect(command: "SUBSCRIBE kr:c2", answer: frameOf(b: pub(kase: "sub-two"), index: 1)));
+    d4.add(item: Dial::Serve(steps: give third));
+    Subscriber s4 = subscriberWith(dials: give d4, config: plain, what: "failed unsubscribe");
+    string e1 = done(r: s4.subscribe(names: names(a: "kr:c1", b: "kr:c2")));
+    string e2 = done(r: s4.psubscribe(names: names(a: "kr:p*", b: "")));
+    string e3 = done(r: s4.unsubscribe(names: names(a: "kr:c1", b: "")));
+    string e4 = said(r: s4.next(timeout: Optional::None));
+    f = f + check(ok: e3.startsWith(prefix: "(error) ") && e4.startsWith(prefix: "reconnected: ") && s4.channelCount() == 1 && s4.patternCount() == 1,
+                  what: "subscriber: an unsubscribe that failed with the link is not undone: ${e3}; ${e4}");
+    DynamicArray<string> none = DynamicArray.empty();
+    string e5 = done(r: s4.punsubscribe(names: none));
+    string e6 = said(r: s4.next(timeout: Optional::Some(value: Duration.zero())));
+    f = f + check(ok: e5.startsWith(prefix: "(error) ") && e6.startsWith(prefix: "reconnected: ") && s4.patternCount() == 0 && s4.channelCount() == 1,
+                  what: "subscriber: nor is an unsubscribe from all patterns; a zero timeout still makes the link again: ${e5}; ${e6}");
+
+    // release() on a lost subscriber hands back the connection, which its next call makes again.
+    DynamicArray<Dial> d5 = DynamicArray.empty();
+    DynamicArray<Step> five = welcome(server: server());
+    five.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    five.add(item: Step::Close);
+    d5.add(item: Dial::Serve(steps: give five));
+    DynamicArray<Step> back = again();
+    back.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d5.add(item: Dial::Serve(steps: give back));
+    Subscriber s5 = subscriberWith(dials: give d5, config: plain, what: "release");
+    string g1 = done(r: s5.subscribe(names: names(a: "kr:c1", b: "")));
+    string g2 = done(r: s5.ping());
+    Result<Connection, RedisError> handed = s5.release();
+    string g3 = match (give handed) {
+        case Ok(value: conn): {
+            Command ping = Command.of(name: "PING");
+            Result<Value, RedisError> r = conn.call(command: ping);
+            := callOutcome(r: r);
+        }
+        case Err(error: e): e.message();
+    };
+    f = f + check(ok: g3 == "ok", what: "subscriber: release() hands back a lost connection, which its next call makes again: ${g3}");
+
+    // close() is for good; a redial that fails keeps the names for the next.
+    Config brief = configOf(url: "redis://127.0.0.1:6379?reconnect_timeout=0.05");
+    DynamicArray<Dial> d6 = DynamicArray.empty();
+    DynamicArray<Step> six = welcome(server: server());
+    six.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    six.add(item: Step::Close);
+    d6.add(item: Dial::Serve(steps: give six));
+    Subscriber s6 = subscriberWith(dials: give d6, config: brief, what: "failed redial");
+    string h1 = done(r: s6.subscribe(names: names(a: "kr:c1", b: "")));
+    string h2 = done(r: s6.ping());
+    string h3 = said(r: s6.next(timeout: Optional::None));
+    f = f + check(ok: h3.startsWith(prefix: "(error) the connection was lost, and reconnecting failed") && s6.channelCount() == 1 && !s6.isClosed(),
+                  what: "subscriber: a redial that fails is Reconnect, and the names stay kept: ${h3}");
+    s6.close();
+    string h4 = said(r: s6.next(timeout: Optional::None));
+    f = f + check(ok: h4 == "(error) the connection is closed" && s6.isClosed(), what: "subscriber: close() is for good: ${h4}");
+
+    // The link lost again while the names are subscribed again: they stay kept, and the next redial subscribes them.
+    DynamicArray<Dial> d8 = DynamicArray.empty();
+    DynamicArray<Step> eight = welcome(server: server());
+    eight.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    eight.add(item: Step::Close);
+    d8.add(item: Dial::Serve(steps: give eight));
+    DynamicArray<Step> brokenAgain = again();
+    brokenAgain.add(item: Step::Close);
+    d8.add(item: Dial::Serve(steps: give brokenAgain));
+    DynamicArray<Step> whole = again();
+    whole.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    whole.add(item: Step::Send(bytes: copy hello));
+    d8.add(item: Dial::Serve(steps: give whole));
+    Subscriber s8 = subscriberWith(dials: give d8, config: plain, what: "lost again");
+    string j1 = done(r: s8.subscribe(names: names(a: "kr:c1", b: "")));
+    string j2 = done(r: s8.ping());
+    string j3 = said(r: s8.next(timeout: Optional::None));
+    bool keptThrough = s8.channelCount() == 1;
+    string j4 = said(r: s8.next(timeout: Optional::None));
+    string j5 = said(r: s8.next(timeout: Optional::None));
+    string j6 = said(r: s8.next(timeout: Optional::None));
+    f = f + check(ok: j3.startsWith(prefix: "(error) ") && keptThrough && j4.startsWith(prefix: "reconnected: ") && j5.startsWith(prefix: "reconnected: ") && j6 == "message kr:c1 hello",
+                  what: "subscriber: the link lost again while subscribing again keeps the names, and the next redial subscribes them: ${j3}; ${j4}; ${j5}; ${j6}");
+
+    // A subscribe on a lost subscriber makes the link again first: what was kept, then the new name.
+    DynamicArray<Dial> d9 = DynamicArray.empty();
+    DynamicArray<Step> nine = welcome(server: server());
+    nine.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    nine.add(item: Step::Close);
+    d9.add(item: Dial::Serve(steps: give nine));
+    DynamicArray<Step> more = again();
+    more.add(item: expect(command: "SUBSCRIBE kr:c1", answer: pub(kase: "sub-one")));
+    more.add(item: expect(command: "SUBSCRIBE kr:c2", answer: frameOf(b: pub(kase: "sub-two"), index: 1)));
+    d9.add(item: Dial::Serve(steps: give more));
+    Subscriber s9 = subscriberWith(dials: give d9, config: plain, what: "subscribe when lost");
+    string q1 = done(r: s9.subscribe(names: names(a: "kr:c1", b: "")));
+    string q2 = done(r: s9.ping());
+    string q3 = done(r: s9.subscribe(names: names(a: "kr:c2", b: "")));
+    string q4 = said(r: s9.next(timeout: Optional::Some(value: Duration.zero())));
+    f = f + check(ok: q3 == "ok" && q4.startsWith(prefix: "reconnected: ") && s9.channelCount() == 2,
+                  what: "subscriber: a subscribe on a lost subscriber makes the link again first: ${q3}; ${q4}");
+
+    // Under RESP2: the RESP2 path's PING, then SUBSCRIBE again.
+    Config two = configOf(url: "redis://127.0.0.1:6379?protocol=2");
+    DynamicArray<Dial> d7 = DynamicArray.empty();
+    DynamicArray<Step> old = DynamicArray.empty();
+    old.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    old.add(item: expect(command: "SUBSCRIBE kr:c1", answer: reply(server: server(), kase: "sub-one/2")));
+    old.add(item: Step::Hangup);
+    d7.add(item: Dial::Serve(steps: give old));
+    DynamicArray<Step> old2 = DynamicArray.empty();
+    old2.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    old2.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    old2.add(item: expect(command: "SUBSCRIBE kr:c1", answer: reply(server: server(), kase: "sub-one/2")));
+    old2.add(item: Step::Send(bytes: reply(server: server(), kase: "message/2")));
+    d7.add(item: Dial::Serve(steps: give old2));
+    Subscriber s7 = subscriberWith(dials: give d7, config: two, what: "resp2");
+    string k1 = done(r: s7.subscribe(names: names(a: "kr:c1", b: "")));
+    string k2 = said(r: s7.next(timeout: Optional::None));
+    string k3 = said(r: s7.next(timeout: Optional::None));
+    f = f + check(ok: k2.startsWith(prefix: "reconnected: ") && k3 == "message kr:c1 hello" && s7.protocol() == Protocol::Resp2,
+                  what: "subscriber: under RESP2, a link lost while next waits is made again inside next: ${k2}; ${k3}");
+    return f;
+}
+
 unsafe fn int32 reconnectTests() {
     int32 f = 0;
     f = f + redialTests();
@@ -526,5 +825,6 @@ unsafe fn int32 reconnectTests() {
     f = f + watchTests();
     f = f + paceTests();
     f = f + idleTests();
+    f = f + subscriberTests();
     return f;
 }

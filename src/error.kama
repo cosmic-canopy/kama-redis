@@ -199,12 +199,14 @@ fn ServerCode codeNamed(const ref string text) {
 comptime isize CODE_WINDOW = 31;
 
 // An error reply, whole: what came after its `-` or `!`, which is the code, a space, then the message.
-type resource ServerError implements Sendable {
+type resource ServerError implements Sendable, Copyable<This>(bare: give) {
     DynamicArray<uint8> line;
     // Where the code ends, at the space after it; -1 when no space falls inside the server's window, in which case
     // the server counts the error as ERR.
     isize codeEnd = -1;
     ServerCode kind;
+
+    public ctor copy(ref ServerError source) { this.line = copy source.line; this.codeEnd = source.codeEnd; this.kind = source.kind; }
 
     // The error from the bytes of a `Value::Error`.
     public ctor of(ConstView<uint8> bytes) {
@@ -276,9 +278,11 @@ fn string hexByte(uint8 b) {
 // One place a connection was tried: a host's address and port, or a socket's path, and the I/O failure that ended
 // the attempt. Only I/O ends one: once a connection is made, the handshake's outcome is the connect's, not an
 // attempt's.
-type resource ConnectAttempt implements Sendable {
+type resource ConnectAttempt implements Sendable, Copyable<This>(bare: give) {
     string placeText;
     IoError failure;
+
+    public ctor copy(ref ConnectAttempt source) { this.placeText = copy source.placeText; this.failure = source.failure; }
 
     // `place` is how the attempt is named: "127.0.0.1:6379", "localhost at [::1]:6379", or a socket's path. A
     // connect that gave up on its deadline is a `TimedOut` error that no OS code backs.
@@ -314,9 +318,11 @@ fn bool isDeadline(IoError e) {
 
 // Why a lost connection could not be made again: the last try's error, and how many tries the call made (each with
 // every address of the host). Only the last try is kept, so this stays small however long a server is down.
-type resource ReconnectError implements Sendable {
+type resource ReconnectError implements Sendable, Copyable<This>(bare: give) {
     DynamicArray<RedisError> last;
     int32 count;
+
+    public ctor copy(ref ReconnectError source) { this.last = copy source.last; this.count = source.count; }
 
     public ctor of(RedisError cause, int32 tries) {
         this.last = DynamicArray.empty();
@@ -339,10 +345,11 @@ type resource ReconnectError implements Sendable {
 }
 
 // Every attempt of a failed connect, in the order made. There is at least one.
-type resource ConnectError implements Sendable {
+type resource ConnectError implements Sendable, Copyable<This>(bare: give) {
     DynamicArray<ConnectAttempt> tried;
 
     public ctor make() { this.tried = DynamicArray.empty(); }
+    public ctor copy(ref ConnectError source) { this.tried = copy source.tried; }
     public fn void add(ConnectAttempt attempt) { this.tried.add(item: give attempt); }
 
     public const fn isize count() { return this.tried.length(); }

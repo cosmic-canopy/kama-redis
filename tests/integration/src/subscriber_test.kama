@@ -55,6 +55,7 @@ fn string shown(Result<Optional<Delivery>, RedisError> r) {
             case Some(value: d): match (give d) {
                 case Message(message: m): shownMessage(m: m);
                 case Unsubscribed(kind: k, channel: c): { string name = text(b: c.view()); := "unsubscribed ${name}"; }
+                case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
             };
         };
     };
@@ -251,8 +252,39 @@ unsafe fn int32 shardTests(const ref string tail, const ref string protocol, con
     return f;
 }
 
+// A subscriber the server kills (CLIENT KILL TYPE pubsub, from another connection): its next `next` makes the
+// connection again inside the call, subscribes again, and hands over `Reconnected`; a message published after it
+// arrives.
+unsafe fn int32 killedTests(const ref string tail, const ref string protocol, const ref string pre) {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: tail);
+    Result<Subscriber, RedisError> made = subscriberFor(url: url);
+    Subscriber sub = match (give made) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "subscriber ${protocol}: killed: ${m}"); return f; }
+    };
+    Result<Connection, RedisError> other = open(url: mainUrl(userinfo: "", tail: ""));
+    Connection admin = match (give other) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "subscriber ${protocol}: killed: ${m}"); return f; }
+    };
+    string channel = pre.concat(other: "killed");
+    DynamicArray<string> one = DynamicArray.empty();
+    one.add(item: copy channel);
+    string subscribed = outcome(r: sub.subscribe(names: one));
+    string killed = ask(c: admin, text: "CLIENT KILL TYPE pubsub");
+    string gap = shown(r: sub.next(timeout: within(ms: 3000i64)));
+    string published = ask(c: admin, text: "PUBLISH ${channel} after");
+    string after = shown(r: sub.next(timeout: within(ms: 3000i64)));
+    f = f + check(ok: subscribed == "ok" && killed != "0" && gap.startsWith(prefix: "reconnected: ") && published == "1" && after == "message ${channel} after",
+                  what: "subscriber ${protocol}: killed, then Reconnected inside next, subscribed again: ${killed}; ${gap}; ${published}; ${after}");
+    return f;
+}
+
 unsafe fn int32 subscriberTests() {
     int32 f = 0;
+    f = f + killedTests(tail: "", protocol: "RESP3", pre: "kr:k3:");
+    f = f + killedTests(tail: "?protocol=2", protocol: "RESP2", pre: "kr:k2:");
     f = f + liveTests(tail: "", protocol: "RESP3", pre: "kr:ps3:");
     f = f + liveTests(tail: "?protocol=2", protocol: "RESP2", pre: "kr:ps2:");
     f = f + shardTests(tail: "", protocol: "RESP3", pre: "kr:sh3:");

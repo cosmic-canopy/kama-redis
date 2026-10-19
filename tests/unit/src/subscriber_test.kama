@@ -176,6 +176,7 @@ fn string shownDelivery(Delivery d) {
     return match (give d) {
         case Message(message: m): shownMessage(m: m);
         case Unsubscribed(kind: k, channel: c): { string name = textOf(b: c.view()); string word = kindWord(k: k); := "unsubscribed ${word} ${name}"; }
+        case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
     };
 }
 
