@@ -1,10 +1,8 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
-v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
-**Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-steps 0 to 12 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads, SCAN and pub/sub,
-hardened live. Step 13 (the docs, and 0.2.0) is what is left.**
+Where this is, 2026-10-20: phases 0 to 6 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
+the v0.9.690 tag. **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`). **0.2.0,
+Cluster and Sentinel, is ready but for its publish:** "Phase 6: where to start", just below, has what each step did.
 - cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` answers
   `Optional<isize>` (KRD-11: no form builds on both a tag and it). The tree now takes
   the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
@@ -45,10 +43,16 @@ hardened live. Step 13 (the docs, and 0.2.0) is what is left.**
   subscribes again and says `Reconnected`. Live, a restart (`SHUTDOWN NOSAVE`, the server back half a second later),
   kills and a pub/sub flood, on all eight servers; eight examples run on every one; every step proven by mutation
   (`tools/mutate.sh`, 79 mutations, all caught).
-- Gates: `tools/test.sh` is green, debug and release, the examples built, on kama 0.9.667 (the floor and CI's pin)
-  and on v0.9.673 (the newest tag); `tools/test-integration.sh` on all eight servers; `tools/redis.sh smoke` (19
-  checks), the README's programs and the examples live on all eight; CI green on `03f3968`, the last push (phase 7a
-  is not pushed: that is the maintainer's word).
+- Cluster and Sentinel are in (phase 6): a `Connection` and a `Subscriber` through sentinels (`redis-sentinel://`),
+  as Sentinel's client specification says; `Cluster` with routing by every server's own command table and tips,
+  MOVED, ASK and the waits, pipelines, transactions and `watched`, replica reads, a cluster SCAN and
+  `ClusterSubscriber`. `tools/redis.sh --topology cluster|sentinel` runs both on all eight servers; the vectors come
+  from `tools/gen-topology-vectors.sh` and `tools/gen-command-table.sh`; the live suite drives failovers, a sleeping
+  primary, restarts, resharding and the atomic migrations.
+- Gates (0.2.0): `tools/test.sh` is green, debug and release, the examples built, on kama 0.9.667 (the floor and CI's
+  pin), and on the v0.9.690 tag through KRD-11's scratch copy; `tools/test-integration.sh` on all eight servers, alone,
+  under Sentinel and as a cluster; the README's programs and the examples live. Every step proven by mutation
+  (`tools/mutate.sh`). Phase 6 is not pushed: that is the maintainer's word.
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
 - Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, std has no in-place copy, and cstar's
@@ -74,7 +78,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–12 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | done; publish pending |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -937,15 +941,21 @@ Each step ends green before its commit:
       nodes, and a summed DEL. `tools/check-examples.sh` starts the cluster topology and sets `REDIS_CLUSTER_URL`.
     - **2 live mutations, both caught:** MOVED not followed (the failover's calls never reach the new primary), and a
       failed redial not reading the map (the sleep's calls wait for the sleeper's MOVED).
-13. **Docs and 0.2.0:**
-    - the README;
-    - the CHANGELOG, with the breaks;
-    - AGENTS.redis.md, this file and the module headers;
-    - the version;
-    - the dry run;
-    - every gate, cstar's newest build included.
-
-    Then the push and the publish, each the maintainer's word.
+13. **Done (2026-10-20), but for the publish.** **Docs and 0.2.0.**
+    - **The README:** the status; Sentinel and Cluster sections, each with a complete program that
+      `tools/check-readme.sh` runs against the topologies (it now starts them and puts their URLs in); per-shard
+      atomicity said plainly; the URL forms and options; three rows in "could it have run" (`Sentinel`, a redirection
+      past `max_redirects`, a split command's failure); the examples; the tests' topologies and generators.
+    - **The CHANGELOG's 0.2.0**, with what a caller of 0.1.0 may need to change in one list.
+    - **The version** is 0.2.0 in `kama.json` and `libraryVersion()`.
+    - **The gates:** `tools/test.sh` on v0.9.667, debug and release, every example built; the live matrix on all eight
+      servers, debug and release; the examples and the README's programs on all eight. On the v0.9.690 tag, through
+      KRD-11's scratch copy, the unit program and every example. On cstar's newest build (0.9.707), the library checks
+      clean but builds only once `@kama/tls` has a release past its four unreachable statements and its `find`
+      (KRD-11, KRD-12): the registry's check waits on that.
+    - **`kama publish --dry-run`** lists no certificate and no agent file.
+    - **Left, each the maintainer's word:** the push and CI; a release of `@kama/tls` for cstar's newest build; the
+      publish; and whether the floor moves to v0.9.690 (KRD-11).
 
 **If the session runs long:** steps 0–6 (Sentinel complete), then 7–10, then 11–13.
 

@@ -6,7 +6,17 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to start"). In progress.
+## [0.2.0] - 2026-10-20
+
+Cluster and Sentinel (docs/ROADMAP.md, "Phase 6"). Tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under
+Sentinel and as a cluster, debug and release.
+
+What a caller of 0.1.0 may need to change:
+- a `match` on `RedisError`, `ServerCode` or `Delivery` needs `case _:`: each is `@nonExhaustive` now, and
+  `RedisError` gained `Sentinel`, `Delivery` gained `Moved`;
+- `redis://a,b` is a list of hosts now, which a `Connection` refuses: before, it was the one host `a,b`;
+- a `Scan` whose connection was made again ends with `Usage` instead of skipping keys;
+- the refusal of READONLY and READWRITE on a connection says something else (`read_from=replica`).
 
 ### Added
 - Several hosts in a URL, comma-separated (Lettuce's form, and libpq's): `redis://h1:7000,h2:7001`, a cluster's

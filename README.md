@@ -4,11 +4,14 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 `std::net`, as redis-rs, go-redis and Lettuce do. There is no hiredis and nothing to install. TLS comes from
 [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: 0.1.0, a complete client for one server.** A connection authenticates, picks its protocol and database,
+> **Status: 0.2.0: one server, Sentinel and Cluster.** A connection authenticates, picks its protocol and database,
 > connects over TLS, and sends commands, pipelines, transactions and scripts with deadlines; replies read into kama
 > types. A subscriber listens to channels, patterns and shard channels. A lost connection is made again by its next
-> call, a subscriber's with every subscription, and nothing is sent twice. It is tested live on Redis 6.2–8.10 and
-> Valkey 7.2–9.1. Cluster and Sentinel come next; see the [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
+> call, a subscriber's with every subscription, and nothing is sent twice. Through sentinels, a connection finds its
+> master, and every reconnect asks again. A cluster sends each command where its keys are, follows MOVED and ASK,
+> spreads a command over its nodes as the servers' own command tips say, and reads from replicas when asked. It is
+> tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under Sentinel and as a cluster. See the
+> [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
 
 ## Connecting
 
@@ -68,8 +71,14 @@ fn int32 main() {
   | `keepalive` | whole seconds, as hiredis sets it; `0` is off | 15 |
   | `reconnect` | `on` or `off` | `on` |
   | `reconnect_timeout` | seconds, to the millisecond; `0` is no limit | 5 |
+  | `master_name` | the name the sentinels monitor (`redis-sentinel://`, and needed there) | none |
+  | `role` | `master` or `replica` (`redis-sentinel://`) | `master` |
+  | `read_from` | `primary` or `replica` (a cluster's) | `primary` |
+  | `max_redirects` | how many MOVED and ASK one call follows, 0 to 100 (a cluster's) | 5 |
 
-  `Config.tcp`, `Config.unix` and typed setters do the same without a URL.
+  `Config.tcp`, `Config.unix`, `Config.sentinel` and typed setters do the same without a URL. Several hosts, comma
+  separated (`redis://h1:7000,h2:7001`), are a cluster's seeds, or sentinels; a connection takes one host, and refuses
+  several, or a cluster's options, naming what to use.
 - **Errors are values.** An error reply is `RedisError::Server`. Its code (`WRONGTYPE`, `NOAUTH`, `MOVED`, …) is a
   `ServerCode` to match, beside the server's message, and the connection goes on. A failure of the connection itself
   (I/O, bytes that are not RESP, a call past its deadline) loses it, and the next call makes it again.
@@ -138,6 +147,122 @@ fn int32 main() {
   port closes on a plaintext one, and `redis://` there is told to use `rediss://`.
 - **Not offered:** cipher choice (Mbed TLS's defaults), a CA directory, CRLs and session resumption, each refused as
   an unknown option.
+
+## Sentinel
+
+A connection, or a subscriber, through sentinels: `redis-sentinel://` (`rediss-sentinel://` for TLS to the sentinels
+and the servers both).
+
+```kama
+import { core::println, redis::Config, redis::Connection, redis::RedisError, redis::cmd, redis::reply };
+
+fn int32 main() {
+    // The sentinels (26379 unless one says otherwise), and the name they monitor the master by.
+    Result<Config, RedisError> parsed = Config.parse(url: "redis-sentinel://127.0.0.1:26379?master_name=mymaster");
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<int64, RedisError> n = reply::<int64>(result: conn.call(command: cmd"INCR visits"));
+    match (n) { case Ok(value: v): { println(s: "visits: ${v}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+    conn.close();
+    return 0;
+}
+```
+
+- **Finding the master is Sentinel's client specification, in full.** The sentinels are asked in turn, each within
+  `connect_timeout`, for the master's address (`GET-MASTER-ADDR-BY-NAME`). The one that answers is asked first from
+  then on, and the sentinels it knows (`SENTINEL SENTINELS`) join the list, at most 16. The server named must say it
+  is the master, in its `HELLO` (or `ROLE` under RESP2); one that does not, a sentinel still behind a failover, is
+  asked for again after a pause, within `reconnect_timeout`.
+- **A failover is followed by the next call.** A sentinel kills every client of the servers a failover reconfigures,
+  and every reconnect asks the sentinels again, so the next call reaches the new master. A call the failover cut off
+  fails, since it may have run. A write the old master refuses as `READONLY` never ran, so it is sent once more, on
+  the new master.
+- **`role=replica`** connects to a replica that is up, at random (`SENTINEL REPLICAS`), or to the master when none
+  is. A replica may be behind its master.
+- **Credentials.** The URL's user and password are the servers'. Sentinels that want their own get them in code,
+  `config.setSentinelAuth(user:, password:)`, never in a URL. `tls_server_name` names the servers' certificate; the
+  sentinels' are checked against the hosts in the URL.
+- **The errors:** no sentinel reached is `Connect`, an attempt per sentinel; sentinels that answered without an
+  address (none knows the name, a password they want), and a server that never confirms its role, are
+  `RedisError::Sentinel`, with what each said.
+
+## Cluster
+
+```kama
+import { core::println, redis::Config, redis::Cluster, redis::Pipeline, redis::TxOutcome, redis::RedisError,
+         redis::cmd, redis::reply, redis::resp::Value };
+
+fn int32 main() {
+    // Seeds, asked in turn for the map; each node's connection opens when a call first goes there.
+    Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:7000,127.0.0.1:7001");
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Result<Cluster, RedisError> opened = Cluster.connect(config: config);
+    Cluster cluster = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    // Keys in three slots: the MSET goes as a piece per slot, each to its node.
+    Result<string, RedisError> set = reply::<string>(result: cluster.call(command: cmd"MSET user:1 a user:2 b user:3 c"));
+    match (set) { case Ok(value: ok): { println(s: "MSET ${ok}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+    // One hash tag, one slot, one node: this transaction is all or nothing.
+    Pipeline tx = Pipeline.make();
+    tx.add(command: cmd"SET {cart:7}:items 3");
+    tx.add(command: cmd"INCR {cart:7}:version");
+    Result<TxOutcome, RedisError> ran = cluster.transact(pipeline: tx);
+    bool committed = match (ran) { case Ok(value: o): match (o) { case Committed(replies: rs): true; case WatchConflict: false; }; case Err(error: e): false; };
+    if (!committed) { return 1; }
+    println(s: "committed");
+    Result<int64, RedisError> gone = reply::<int64>(result: cluster.call(command: cmd"DEL user:1 user:2 user:3 {cart:7}:items {cart:7}:version"));
+    match (gone) { case Ok(value: n): { println(s: "deleted ${n}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+    cluster.close();
+    return 0;
+}
+```
+
+- **Where a command goes is the servers' own word.** A table read from every server's `COMMAND` (keys and command
+  tips) is checked against each one's `COMMAND GETKEYS`. A command goes to the primary of its keys' slot, and one
+  without keys to a primary. Keys in two slots are refused (`Usage`, naming a hash tag), as the server would refuse
+  them.
+- **A command the tips spread goes as they say.** `MGET`, `MSET`, `DEL`, `EXISTS`, `UNLINK`, `TOUCH` and `MSETEX` split
+  by slot, a piece per slot; `DBSIZE`, `KEYS`, `FLUSHALL`, `SCRIPT EXISTS`, `WAIT`, … go to every primary; `SCRIPT
+  LOAD`, `CONFIG SET`, … to every node. Their replies make one as the tips say: in the order of the keys, a sum, the
+  least, all OK.
+  - **A split command is atomic in each slot, not across the cluster.** When one piece fails, others may have run.
+    Give keys one hash tag (`{user:1}:name`, `{user:1}:email`) to keep a command whole.
+  - **A command each node answers for itself** (`INFO`, `RANDOMKEY`, `LATENCY`, `SCAN`) is refused, naming
+    `callEach(command:, on: ClusterTarget::Primaries)`, which gives every node's reply as it is (`NodeReply`). A
+    command the table does not know (a module's) is refused, naming `callFor(key:, command:)`, which sends it to the
+    node a key names.
+- **What the cluster answers on the way is followed.** `MOVED` goes into the map at once, and the map is read whole
+  again before the next call, at most once a second. `ASK` is `ASKING` and the command in one write. `TRYAGAIN`,
+  `CLUSTERDOWN`, `LOADING` and `MASTERDOWN` ran nothing, and are waited out, as is a node that cannot be reached: the
+  map is read again and the call goes where it now says, within `reconnect_timeout`. At most `max_redirects`.
+  Anything that may have run is the call's error, never sent again.
+- **Pipelines, transactions, `watched`.** `run` sends each node its commands in one write, every node's before any is
+  read, and gives the replies in the pipeline's order; a node lost on the way fails only its own commands.
+  `transact` and `watched` run at the node of their keys' slot, which they must share. A slot that moves while a
+  transaction queues sends it all again where it went; one half moved under its keys is waited out.
+- **Replica reads, when asked.** `read_from=replica` sends a command the servers flag readonly to a replica of its
+  slot, at random. A replica may be behind its primary, so a read there can miss a write just made: `WAIT` first
+  when it must not. A read the replica will not serve goes to the primary.
+- **`Scan.nextIn(cluster:)`** walks every primary in turn; SSCAN, HSCAN and ZSCAN go to their key's node.
+- **`ClusterSubscriber`** subscribes channels and patterns at one primary and shard channels at their slots'
+  primaries, and its `next` waits on every node at once. A shard channel whose slot moves is followed to the new
+  owner, and `Delivery::Moved` says that messages in between may be lost.
+- **Each node's connection is a `Connection`**, with what one has: TLS (each node's certificate checked against the
+  address it announces), the database (Valkey 9's `cluster-databases`; Redis refuses one at connect), and a reconnect
+  that never resends. `Cluster.connectWith(dialers:)` opens every connection through a dialer of yours (a tunnel, a
+  NAT's mapping of the nodes' addresses).
 
 ## Commands
 
@@ -329,6 +454,9 @@ Whether a failed call's command could have run:
 | `Connect`, `Tls` while connecting | no | no connection was made |
 | `Server` | yes | the server answered with an error; `LOADING`, `BUSY`, `TRYAGAIN` and `MASTERDOWN` mean it did not run it |
 | `Io`, `Timeout`, `Protocol`, `Unexpected`, `Tls` during a call | maybe | the connection was lost with the command sent or half answered: it may have run |
+| `Sentinel` | no | the sentinels gave no address, or the server they named never said it was the master |
+| a cluster's `Server` `MOVED` or `ASK` | no | past `max_redirects`: the node named was asked, and did not run it |
+| any error from a command a cluster split by slot | partly | `MSET`, `DEL` and their kin go as a piece per slot: the others may have run |
 
 A [reliable queue](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/job_queue/src/main.kama) shows one way to
 live with "maybe": BLMOVE into a processing list, so a job that may have been taken is found again.
@@ -436,8 +564,9 @@ fn int32 main() {
   missed, and you are told so. A name the server refuses then (`NOPERM` after an ACL change, `MOVED`) comes as
   `Unsubscribed`, and an unsubscribe that failed with the connection is never undone. TCP keepalive (on, 15 s)
   finds a peer that went away silently; over your own dialer, or with `keepalive=0`, `ping()` is the check.
-- **Sharded pub/sub** (`SSUBSCRIBE`, `SPUBLISH`) needs Redis 7.0 or Valkey 7.2. Routing a shard channel to the node
-  that serves its slot comes with cluster support (0.2.0).
+- **Sharded pub/sub** (`SSUBSCRIBE`, `SPUBLISH`) needs Redis 7.0 or Valkey 7.2. On a cluster, `ClusterSubscriber`
+  sends each shard channel to the node that serves its slot, and follows it when the slot moves (see Cluster).
+- **`Delivery` is `@nonExhaustive`**: a `match` on one needs `case _:`, since a later release may add a kind.
 - **Pushes that are not pub/sub** (an invalidation another connection's `CLIENT TRACKING … REDIRECT` sends) are set
   aside on the connection: `Connection.takePushes()` hands them over, at most 1024 and within `maxReplyBytes`, and
   `droppedPushes()` counts any past that. `CLIENT TRACKING` and `CLIENT CACHING` are refused until client-side
@@ -466,6 +595,9 @@ fn int32 main() {
   ```
   redis://[[user]:password@][host][:port][/db][?key=value&…]      also valkey://
   rediss://…                                                       TLS; also valkeys://
+  redis://[[user]:password@]h1:port,h2:port[/db][?…]               a cluster's seeds
+  redis-sentinel://[[user]:password@]s1[:port],s2…[/db]?master_name=NAME[&role=replica]
+  rediss-sentinel://…                                              TLS to the sentinels and the servers
   unix://[[user]:password@]/path/to/socket[?db=N&key=value&…]
   ```
 
@@ -475,8 +607,12 @@ fn int32 main() {
     this package refuses it and says how to write it.
   - `unix://` is the form redis-py and go-redis document.
   - A password in a URL can end up in logs and process listings, so prefer giving it separately where you can.
-- **`redis::cluster::keySlot`**, a key's hash slot with hash tags. It is checked against the cluster specification
-  and against `CLUSTER KEYSLOT` on every server.
+- **`redis::cluster`**, what a cluster client is made of, for use beside one:
+  - `keySlot`, a key's hash slot with hash tags, checked against the cluster specification and `CLUSTER KEYSLOT` on
+    every server;
+  - `CommandTable`, a command's keys (as `COMMAND GETKEYS` finds them) and slot, from every server's key
+    specifications;
+  - `SlotMap` and `ClusterNode`, a cluster's map from `CLUSTER SLOTS`; `Redirect`, what a `MOVED` or `ASK` says.
 
 - **`redis::Connection`**, `Config` and `RedisError`, as above:
   - TCP, TLS (`redis::secure`, internal, over any transport) and Unix-domain sockets, non-blocking, with connect and
@@ -503,12 +639,16 @@ examples/quickstart/kama.json`.
   handshake settled.
 - [`scan`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/scan/src/main.kama): keys a page at a time, with MATCH and COUNT.
 - [`scripts`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/scripts/src/main.kama): a rate limiter as a Lua script, by its SHA-1.
+- [`sentinel`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/sentinel/src/main.kama): the master found through sentinels, and what a
+  failover does to a call.
+- [`cluster`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/cluster/src/main.kama): a cluster from its seeds, a split MSET and MGET, a
+  transaction under one hash tag, a pipeline over the nodes.
 
 ## What comes next
 
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
-- **0.1.0, one server, complete:** this release.
-- **0.2.0, topologies:** Cluster (slots, `MOVED`/`ASK`, replica reads) and Sentinel.
+- **0.1.0, one server, complete.**
+- **0.2.0, topologies:** Cluster and Sentinel. This release.
 - **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
 
 ## Tests
@@ -520,6 +660,7 @@ tools/test-integration.sh --server valkey-9.1       # … on one
 tools/redis.sh list                                 # the servers in the matrix
 tools/redis.sh up --server valkey-9.1               # start one (podman or docker); its ports go to out/redistest-valkey-9.1.env
 tools/redis.sh smoke --server valkey-9.1            # one check per authentication case and transport, with the server's own redis-cli
+tools/redis.sh up --server valkey-9.1 --topology cluster   # … a cluster of six nodes; --topology sentinel for Sentinel
 tools/redis.sh down --server valkey-9.1
 tools/check-readme.sh --server redis-8.10           # build this README's programs and run them against the server
 tools/check-examples.sh --server redis-8.10         # build examples/ and run them against the server
@@ -528,7 +669,8 @@ tools/mutate.sh tools/mutations/7a-s5.json          # each mutation of the sourc
 
 The unit tests need no server: a scripted server plays real servers' bytes to the connection, a byte at a time.
 Their vectors come from upstream by script: `tools/gen-resp-vectors.sh`, `tools/gen-slot-vectors.sh`,
-`tools/gen-url-vectors.sh` and `tools/gen-server-vectors.sh`. Each pins its sources by SHA256 and asks the servers
+`tools/gen-url-vectors.sh`, `tools/gen-server-vectors.sh`, `tools/gen-topology-vectors.sh` (a cluster's nodes and
+Sentinel) and `tools/gen-command-table.sh` (every server's commands, keys and tips). Each pins its sources by SHA256 and asks the servers
 and CLIs in throwaway containers.
 
 Each test server is one container running two servers, configured from

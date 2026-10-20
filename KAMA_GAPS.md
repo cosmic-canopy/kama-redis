@@ -133,7 +133,10 @@ programs.
 
 **What would close it:**
 - accept `fn int32 main()` for a window, with a warning that names the new form; or
-- tag a release that carries 0.9.684, so a floor can move to it.
+- tag a release that carries 0.9.684, so a floor can move to it. **v0.9.690 is that tag** (2026-10-20): this
+  package's unit program and examples are green on it with `fn uint8 main()`. Moving the floor and CI's pin there,
+  and the ten `main`s, is the maintainer's call, since a consumer then needs v0.9.690. The channel `send` (0.9.680)
+  is in it too; `string.find` (0.9.706) is not.
 
 **Workaround, since 2026-10-20:** nothing in the tree. The gate on cstar's newest build runs on a scratch copy whose
 `main`s say `fn uint8 main()`, a one-line change in each, since every `main` here returns the literal 0 or 1. On that

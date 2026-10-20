@@ -32,8 +32,9 @@ first tagged compiler with everything this package relies on (users install tagg
   reader implements too, and `std::memory::replace`, which `ServerInfo` reads its HELLO reply with (v0.9.667's
   borrow rule refuses a borrow of a field across a call that may write it).
 
-Verified on v0.9.675 (2026-10-19, the newest tag, and the build the registry published 0.1.0 with), so the floor and the pin stay: `ci.yml`
-moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on v0.9.667 and on the
+v0.9.690 tag (2026-10-20, through KRD-11's scratch copy, since that tag refuses `fn int32 main()`), so the floor and
+the pin stay: `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
 gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
