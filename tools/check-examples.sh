@@ -2,8 +2,9 @@
 # check-examples.sh — build every program under examples/ against this package, and run it against a live server.
 # Each example is its own executable project (examples/<name>/kama.json, a path dependency on the package) and checks
 # its own results: one that does not build, or exits other than 0, fails. The examples read the server from
-# REDIS_URL, the TLS one from REDIS_TLS_URL, and the Sentinel one from REDIS_SENTINEL_URL, which this script sets to the
-# test server's ports and PKI, and to its sentinel topology's plain group.
+# REDIS_URL, the TLS one from REDIS_TLS_URL, the Sentinel one from REDIS_SENTINEL_URL and the cluster from
+# REDIS_CLUSTER_URL, which this script sets to the test server's ports and PKI, its sentinel topology's plain group, and
+# its cluster topology's seeds.
 #
 #   tools/check-examples.sh                  on redis-8.10
 #   tools/check-examples.sh --server S       on the server named (tools/redis.sh list)
@@ -30,7 +31,11 @@ REDIS_TLS_URL="rediss://localhost:$REDISTEST_TLS_PORT?tls_ca=$REDISTEST_CERTDIR/
 # shellcheck disable=SC1090
 . "$ROOT/out/redistest-sentinel-$SERVER.env"
 REDIS_SENTINEL_URL=$REDISTEST_SENTINEL_URL
-export REDIS_URL REDIS_TLS_URL REDIS_SENTINEL_URL
+"$ROOT/tools/redis.sh" up --server "$SERVER" --topology cluster >/dev/null
+# shellcheck disable=SC1090
+. "$ROOT/out/redistest-cluster-$SERVER.env"
+REDIS_CLUSTER_URL=$REDISTEST_CLUSTER_URL
+export REDIS_URL REDIS_TLS_URL REDIS_SENTINEL_URL REDIS_CLUSTER_URL
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 failed=""

@@ -153,7 +153,7 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
 
 - **The examples** (`examples/<name>/`, each its own project with a path dependency on the package) are built by
   `tools/test.sh` and run live by `tools/check-examples.sh --server S`, as `tools/check-readme.sh` runs the README's
-  programs; CI's integration job runs both. They read `REDIS_URL` (and `REDIS_TLS_URL`) and check their own results.
+  programs; CI's integration job runs both. They read `REDIS_URL` (and `REDIS_TLS_URL`, `REDIS_SENTINEL_URL`, `REDIS_CLUSTER_URL`) and check their own results.
   Their `kama.lock`s pin the newest `@kama/tls` the package's range admits, as a consumer's would; the package's own
   locks pin its floor. No example (nor any project using this package) may be named `tls`: KRD-10.
 

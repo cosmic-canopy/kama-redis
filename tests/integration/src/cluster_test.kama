@@ -10,7 +10,7 @@ import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
          redis::cluster::SlotMap,
          redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl,
          versionPrefix };
-export { clusterTests };
+export { clusterTests, reach, plainUrl, said, portOf, nodeAt, keysPerShard };
 
 unsafe fn Result<Cluster, RedisError> reach(const ref string url) {
     Result<Config, RedisError> c = Config.parse(url: url);

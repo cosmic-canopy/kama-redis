@@ -1,0 +1,18 @@
+[
+ {
+  "id": "M1",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "            case Moved: Recourse::Follow;",
+  "new": "            case Moved: Recourse::Fail;",
+  "expect": "failover: the calls end at the replica now primary"
+ },
+ {
+  "id": "M2",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "    if (transient(e: cause)) { return Recourse::Reread; }",
+  "new": "    if (false) { return Recourse::Reread; }",
+  "expect": "sleep: the calls end at the replica that took over, before the sleeper wakes"
+ }
+]

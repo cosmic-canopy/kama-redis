@@ -1,0 +1,65 @@
+// cluster: a Redis or Valkey cluster from its seeds, and what spreads a command over its nodes and what keeps one whole.
+//
+//   REDIS_CLUSTER_URL='redis://127.0.0.1:7000,127.0.0.1:7001' kama run examples/cluster/kama.json
+//
+// The URL's hosts are seeds, asked in turn for the map; each node's connection opens when a call first goes there.
+// A command goes where its keys' slot is, and one whose keys span slots goes as the servers' own command tips say: an
+// MSET or an MGET splits by slot (atomic in each slot, not across the cluster). A hash tag ({user:1}:name,
+// {user:1}:email) puts keys in one slot, so a transaction over them runs on one node, all or nothing. read_from=replica
+// in the URL sends reads to replicas.
+import { core::println, core::env, redis::Config, redis::Cluster, redis::Command, redis::Pipeline, redis::Replies,
+         redis::TxOutcome, redis::RedisError, redis::cmd, redis::reply, redis::replyOpt, redis::resp::Value };
+
+unsafe fn string clusterUrl() {
+    Optional<string> v = env(name: "REDIS_CLUSTER_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:7000,127.0.0.1:7001"; };
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: clusterUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Cluster, RedisError> opened = Cluster.connect(config: config);
+    Cluster cluster = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    isize nodes = cluster.topology().nodeCount();
+    isize shards = cluster.topology().shardCount();
+    println(s: "the map: ${nodes} nodes in ${shards} shards");
+
+    // Split by slot: each piece at its own node, the replies made one.
+    Command mset = cmd"MSET example:a 1 example:b 2 example:c 3";
+    Result<string, RedisError> stored = reply::<string>(result: cluster.call(command: mset));
+    match (stored) { case Ok(value: ok): { println(s: "MSET: ${ok}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+    Command mget = cmd"MGET example:a example:b example:c";
+    Result<Value, RedisError> values = cluster.call(command: mget);
+    isize got = match (values) { case Ok(value: v): match (v) { case Array(items: xs): xs.length(); case _: -1; }; case Err(error: e): -1; };
+    println(s: "MGET: ${got} values, in the keys' order");
+    if (got != 3) { return 1; }
+
+    // One hash tag, one slot, one node: the transaction is whole.
+    Pipeline tx = Pipeline.make();
+    tx.add(command: cmd"SET {example:user}:name kama");
+    tx.add(command: cmd"INCR {example:user}:visits");
+    Result<TxOutcome, RedisError> ran = cluster.transact(pipeline: tx);
+    bool committed = match (ran) { case Ok(value: o): match (o) { case Committed(replies: rs): true; case _: false; }; case Err(error: e): false; };
+    println(s: "a transaction under one hash tag: committed ${committed}");
+    if (!committed) { return 1; }
+
+    // A pipeline: a batch per node, every batch written before any is read, the replies in the pipeline's order.
+    Pipeline p = Pipeline.make();
+    p.add(command: cmd"GET example:a");
+    p.add(command: cmd"GET example:c");
+    p.add(command: cmd"GET {example:user}:name");
+    Result<Replies, RedisError> rs = cluster.run(pipeline: p);
+    Replies replies = match (give rs) { case Ok(value: x): give x; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<string>, RedisError> name = replyOpt::<string>(result: replies.take(index: 2));
+    string who = match (give name) { case Ok(value: o): match (give o) { case Some(value: s): give s; case None: "(none)"; }; case Err(error: e): e.message(); };
+    println(s: "a pipeline over the nodes: the name is ${who}");
+    if (who != "kama") { return 1; }
+
+    Command del = cmd"DEL example:a example:b example:c {example:user}:name {example:user}:visits";
+    Result<int64, RedisError> removed = reply::<int64>(result: cluster.call(command: del));
+    int64 n = match (removed) { case Ok(value: x): x; case Err(error: e): -1i64; };
+    println(s: "DEL: ${n} keys, summed over the nodes");
+    cluster.close();
+    if (n != 5i64) { return 1; }
+    return 0;
+}

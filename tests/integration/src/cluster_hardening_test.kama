@@ -1,0 +1,240 @@
+// The cluster under the events of its life, each while calls go on (docs/ROADMAP.md, "Phase 6", step 12): a manual
+// failover, a primary asleep past cluster-node-timeout (its replica takes over), a primary restarted, and the atomic
+// slot migrations of Redis 8.4 and Valkey 9.0. What is answered is right, nothing runs twice (each INCR answered is one
+// more than the last, or two after a call that failed), and the calls end on the new owner. Last among the cluster's
+// tests: each leaves other primaries than it found, and roles are read from the map, never assumed. Then the
+// descriptors the process holds are what they were.
+import { std::collections::DynamicArray, std::time::Duration, std::time::sleep, std::time::monotonicNow, std::time::Instant,
+         std::fmt::i64Str,
+         redis::Cluster, redis::Connection, redis::Command, redis::RedisError, redis::resp::Value, redis::cluster::keySlot,
+         redis_integration_tests::check, open, ask, shown, versionPrefix, productWanted, openDescriptors,
+         reach, plainUrl, said, portOf, nodeAt };
+export { hardeningTests };
+
+// What a run of INCRs saw: answers in order, failures, and whether each answer was the last plus one (or two, right
+// after a failure: that call may have run).
+type resource Counting {
+    int64 last = -1i64;
+    int32 failed = 0;
+    int32 streak = 0;
+    bool wrong = false;
+    string firstWrong = "";
+
+    public ctor make(int64 start) { this.last = start; }
+
+    public fn void answer(const ref string reply) {
+        int64 n = digitsOf(text: reply);
+        if (n < 0i64) { this.failed = this.failed + 1; this.streak = 0; return; }
+        bool ok = n == this.last + 1i64 || (this.streak == 0 && n == this.last + 2i64);
+        if (!ok && !this.wrong) {
+            this.wrong = true;
+            int64 was = this.last;
+            this.firstWrong = "${n} after ${was}";
+        }
+        this.last = n;
+        this.streak = this.streak + 1;
+    }
+
+    public const fn bool right() { return !this.wrong; }
+    public const fn int32 failures() { return this.failed; }
+    public const fn int32 run() { return this.streak; }
+    public const fn int64 value() { return this.last; }
+    public const fn string wrongText() { return copy this.firstWrong; }
+}
+
+fn int64 digitsOf(const ref string text) {
+    if (text.length() == 0 || text.length() > 18) { return -1i64; }
+    int64 n = 0i64;
+    isize i = 0;
+    while (i < text.length()) {
+        uint8 b = text.bytes()[i];
+        if (b < 48ui8 || b > 57ui8) { return -1i64; }
+        n = n * 10i64 + cast<int64>(b - 48ui8);
+        i = i + 1;
+    }
+    return n;
+}
+
+// INCR `key` every `everyMs` for up to `secs`, starting `event` (a command at the node on `port`) after `afterMs`, until
+// `wantRun` answers in a row once the slot's owner is not `owner` any more (when `moves`).
+unsafe fn Counting incrsAround(ref Cluster c, const ref string key, int64 everyMs, int64 secs, const ref string port,
+                               const ref string event, int64 afterMs, int32 wantRun, int32 ownerPort, bool moves) {
+    string start = said(c: c, text: "SET ${key} 0");
+    Counting seen = Counting.make(start: 0i64);
+    Instant began = monotonicNow();
+    Instant until = began + Duration.fromSecs(s: secs);
+    bool fired = false;
+    isize slot = keySlot(key: key.bytes());
+    while (monotonicNow() < until) {
+        if (!fired && monotonicNow() >= began + Duration.fromMillis(ms: afterMs)) {
+            fired = true;
+            Result<Connection, RedisError> admin = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=2&command_timeout=0.3"));
+            match (give admin) { case Ok(value: a): { Connection conn = give a; string done = ask(c: conn, text: event); } case Err(error: e): { } };
+        }
+        string r = said(c: c, text: "INCR ${key}");
+        seen.answer(reply: r);
+        if (fired && seen.run() >= wantRun) {
+            isize owner = c.topology().primaryOf(slot: slot);
+            bool elsewhere = owner >= 0 && c.topology().node(index: owner).port() != ownerPort;
+            if (!moves || elsewhere) { break; }
+        }
+        sleep(d: Duration.fromMillis(ms: everyMs));
+    }
+    return give seen;
+}
+
+fn int32 portNumber(const ref string port) { return truncate<int32>(digitsOf(text: port)); }
+
+// A manual failover (CLUSTER FAILOVER at the slot's replica) while INCRs go on every 50 ms.
+unsafe fn int32 failoverTests(ref Cluster c) {
+    int32 f = 0;
+    string key = "kr:{hardening}:failover";
+    isize slot = keySlot(key: key.bytes());
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    isize owner = c.topology().primaryOf(slot: slot);
+    DynamicArray<isize> replicas = c.topology().replicasOf(slot: slot);
+    if (owner < 0 || replicas.length() == 0) { return check(ok: false, what: "failover: the slot has a primary and a replica"); }
+    string ownerPort = portOf(c: c, index: owner);
+    string replicaPort = portOf(c: c, index: replicas[0]);
+    Counting seen = incrsAround(c: c, key: key, everyMs: 50i64, secs: 20i64, port: replicaPort, event: "CLUSTER FAILOVER",
+                                afterMs: 500i64, wantRun: 10, ownerPort: portNumber(port: ownerPort), moves: true);
+    isize now = c.topology().primaryOf(slot: slot);
+    bool moved = now >= 0 && c.topology().node(index: now).port() == portNumber(port: replicaPort);
+    int32 failures = seen.failures();
+    string wrongText = seen.wrongText();
+    f = f + check(ok: seen.right(), what: "failover: each INCR ran once (${failures} failed): ${wrongText}");
+    f = f + check(ok: moved && seen.run() >= 10, what: "failover: the calls end at the replica now primary, ten in a row");
+    return f;
+}
+
+// DEBUG SLEEP past cluster-node-timeout on the slot's primary: its replica takes over, and the calls, failing
+// meanwhile, end there.
+unsafe fn int32 sleepTests(ref Cluster c) {
+    int32 f = 0;
+    string key = "kr:{hardening}:asleep";
+    isize slot = keySlot(key: key.bytes());
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    isize owner = c.topology().primaryOf(slot: slot);
+    if (owner < 0) { return check(ok: false, what: "sleep: the slot has a primary"); }
+    string ownerPort = portOf(c: c, index: owner);
+    Instant began = monotonicNow();
+    Counting seen = incrsAround(c: c, key: key, everyMs: 100i64, secs: 40i64, port: ownerPort, event: "DEBUG SLEEP 12",
+                                afterMs: 300i64, wantRun: 10, ownerPort: portNumber(port: ownerPort), moves: true);
+    // Settled before the sleeper wakes: the calls found the new primary by reading the map, not by its MOVED once awake.
+    int64 took = (monotonicNow() - began).asMillis();
+    isize now = c.topology().primaryOf(slot: slot);
+    bool moved = now >= 0 && c.topology().node(index: now).port() != portNumber(port: ownerPort);
+    int32 failures = seen.failures();
+    string wrongText = seen.wrongText();
+    f = f + check(ok: seen.right(), what: "sleep: each INCR ran once (${failures} failed): ${wrongText}");
+    f = f + check(ok: moved && seen.run() >= 10 && took < 12300i64, what: "sleep: the calls end at the replica that took over, before the sleeper wakes (${failures} failed meanwhile, ${took} ms)");
+    // The sleeper wakes and rejoins, as a replica: wait for it, so the next test meets a whole cluster.
+    Instant woken = began + Duration.fromSecs(s: 14i64);
+    if (monotonicNow() < woken) { sleep(d: woken - monotonicNow()); }
+    return f;
+}
+
+// SHUTDOWN NOSAVE on the slot's primary: its loop brings it back, empty, half a second later, before the cluster would
+// fail it over. The calls ride it: at most a few fail, then they are answered again.
+unsafe fn int32 restartTests(ref Cluster c) {
+    int32 f = 0;
+    string key = "kr:{hardening}:restart";
+    isize slot = keySlot(key: key.bytes());
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    isize owner = c.topology().primaryOf(slot: slot);
+    if (owner < 0) { return check(ok: false, what: "restart: the slot has a primary"); }
+    string ownerPort = portOf(c: c, index: owner);
+    string start = said(c: c, text: "SET ${key} 0");
+    Result<Connection, RedisError> admin = open(url: "redis://127.0.0.1:".concat(other: ownerPort).concat(other: "?connect_timeout=2&command_timeout=1"));
+    match (give admin) { case Ok(value: a): { Connection conn = give a; string done = ask(c: conn, text: "SHUTDOWN NOSAVE"); } case Err(error: e): { } };
+    int32 failed = 0;
+    int32 streak = 0;
+    Instant until = monotonicNow() + Duration.fromSecs(s: 20i64);
+    while (monotonicNow() < until && streak < 10) {
+        string r = said(c: c, text: "SET ${key} x");
+        if (r == "OK") { streak = streak + 1; } else { failed = failed + 1; streak = 0; }
+        sleep(d: Duration.fromMillis(ms: 50i64));
+    }
+    string got = said(c: c, text: "GET ${key}");
+    f = f + check(ok: streak >= 10 && got == "x", what: "restart: the calls are answered again once the primary is back (${failed} failed): ${got}");
+    // Its replica resyncs from it, now empty: wait until the shard is whole again.
+    sleep(d: Duration.fromSecs(s: 3i64));
+    return f;
+}
+
+// The atomic migrations: Redis 8.4's CLUSTER MIGRATION IMPORT at the target, Valkey 9.0's CLUSTER MIGRATESLOTS at the
+// source. Writes pause, the slot moves whole, and the calls follow MOVED; each INCR runs once.
+unsafe fn int32 atomicTests(ref Cluster c) {
+    int32 f = 0;
+    string v = versionPrefix();
+    string product = productWanted();
+    bool redis84 = product == "redis" && (v.startsWith(prefix: "8.") && !v.startsWith(prefix: "8.0.") && !v.startsWith(prefix: "8.1.")
+                   && !v.startsWith(prefix: "8.2.") && !v.startsWith(prefix: "8.3."));
+    bool valkey9 = product == "valkey" && v.startsWith(prefix: "9.");
+    if (!redis84 && !valkey9) { return 0; }
+    string key = "kr:{hardening}:atomic";
+    isize slot = keySlot(key: key.bytes());
+    int64 s = cast<int64>(slot);
+    string slotText = i64Str(v: s);
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    isize owner = c.topology().primaryOf(slot: slot);
+    DynamicArray<isize> primaries = c.topology().primaries();
+    isize other = -1;
+    isize i = 0;
+    while (i < primaries.length()) { if (primaries[i] != owner && other < 0) { other = primaries[i]; } i = i + 1; }
+    if (owner < 0 || other < 0) { return check(ok: false, what: "atomic: the slot's primary and another"); }
+    string fromPort = portOf(c: c, index: owner);
+    string toPort = portOf(c: c, index: other);
+    string toId = idAt(port: toPort);
+    string fromId = idAt(port: fromPort);
+    string event = "CLUSTER MIGRATION IMPORT ${slotText} ${slotText}";
+    string at = copy toPort;
+    if (valkey9) { event = "CLUSTER MIGRATESLOTS SLOTSRANGE ${slotText} ${slotText} NODE ${toId}"; at = copy fromPort; }
+    Counting seen = incrsAround(c: c, key: key, everyMs: 20i64, secs: 20i64, port: at, event: event,
+                                afterMs: 300i64, wantRun: 20, ownerPort: portNumber(port: fromPort), moves: true);
+    isize now = c.topology().primaryOf(slot: slot);
+    bool moved = now >= 0 && c.topology().node(index: now).port() == portNumber(port: toPort);
+    int32 failures = seen.failures();
+    string wrongText = seen.wrongText();
+    string stored = said(c: c, text: "GET ${key}");
+    int64 last = seen.value();
+    string lastText = i64Str(v: last);
+    f = f + check(ok: seen.right() && stored == lastText, what: "atomic: each INCR ran once (${failures} failed): ${wrongText} ${stored}");
+    f = f + check(ok: moved, what: "atomic: the slot moved whole, and the calls followed it (${event})");
+    // And back, so the next run finds the slot where it was.
+    string back = "CLUSTER MIGRATION IMPORT ${slotText} ${slotText}";
+    string backAt = copy fromPort;
+    if (valkey9) { back = "CLUSTER MIGRATESLOTS SLOTSRANGE ${slotText} ${slotText} NODE ${fromId}"; backAt = copy toPort; }
+    Result<Connection, RedisError> admin = open(url: "redis://127.0.0.1:".concat(other: backAt).concat(other: "?connect_timeout=2"));
+    match (give admin) { case Ok(value: a): { Connection conn = give a; string done = ask(c: conn, text: back); } case Err(error: e): { } };
+    sleep(d: Duration.fromSecs(s: 2i64));
+    string wiped = said(c: c, text: "DEL ${key}");
+    return f;
+}
+
+unsafe fn string idAt(const ref string port) {
+    Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=2"));
+    return match (give r) { case Ok(value: x): { Connection c = give x; := ask(c: c, text: "CLUSTER MYID"); } case Err(error: e): ""; };
+}
+
+unsafe fn int32 hardeningTests() {
+    int32 f = 0;
+    isize before = openDescriptors();
+    {
+        Result<Cluster, RedisError> r = reach(url: plainUrl().concat(other: "&command_timeout=1"));
+        match (give r) {
+            case Ok(value: x): {
+                Cluster c = give x;
+                f = f + failoverTests(c: c);
+                f = f + sleepTests(c: c);
+                f = f + restartTests(c: c);
+                f = f + atomicTests(c: c);
+                c.close();
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "hardening: connect: ${m}"); }
+        };
+    }
+    isize after = openDescriptors();
+    f = f + check(ok: after == before, what: "hardening: the descriptors the process holds are what they were (${before}, then ${after})");
+    return f;
+}

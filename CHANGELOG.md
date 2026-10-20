@@ -23,6 +23,7 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
 - `RedisError::Sentinel(SentinelError)`: the sentinels were reached and none gave an address, or the server they named
   never confirmed its role. When none could be reached, the error is `Connect`, an attempt per sentinel.
 - `examples/sentinel`: the master found through sentinels, and what a failover does to a call.
+- `examples/cluster`: a cluster from its seeds, a split MSET and MGET, a transaction under one hash tag, a pipeline.
 - `Cluster`: a Redis or Valkey cluster, from its seeds (`Cluster.connect`, `connectWith` with `Dialers`, a dialer for
   each connection it opens). A connection per node, each opened when a call first goes there; the map from CLUSTER
   SLOTS. `call` sends a command where its keys' slot is, and spreads one as the servers' command tips say: MGET, MSET,

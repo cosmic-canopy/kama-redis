@@ -3,7 +3,8 @@
 Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-steps 0 to 11 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads, SCAN and pub/sub.**
+steps 0 to 12 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads, SCAN and pub/sub,
+hardened live. Step 13 (the docs, and 0.2.0) is what is left.**
 - cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` answers
   `Optional<isize>` (KRD-11: no form builds on both a tag and it). The tree now takes
   the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
@@ -73,7 +74,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–11 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–12 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -919,12 +920,23 @@ Each step ends green before its commit:
       6.2, which has no sharded pub/sub, runs the rest.
     - **9 mutations (8 unit, 1 live), all caught.** Not mutated: the sweep's turn (it shares the nodes' order fairly;
       no test sees an order), and the `Poller` against the in-turn wait (each delivers the same; only how soon differs).
-12. **The cluster live, hardened,** with `examples/cluster`:
-    - CLUSTER FAILOVER under calls;
-    - DEBUG SLEEP on a primary;
-    - a node restarted;
-    - the atomic migrations;
-    - descriptors unchanged after many failovers.
+12. **Done (2026-10-20).** **The cluster live, hardened,** with `examples/cluster`
+    (tests/integration/src/cluster_hardening_test.kama, after the cluster's other tests). Each event runs while INCRs go
+    on, and each answered INCR must be one more than the last, or two right after a call that failed:
+    - **CLUSTER FAILOVER** at the slot's replica: the calls end at it, ten in a row;
+    - **DEBUG SLEEP 12** on the slot's primary, past `cluster-node-timeout`: its replica takes over, and the calls
+      settle there before the sleeper wakes, so they found it by reading the map, not by its MOVED once awake;
+    - **SHUTDOWN NOSAVE** on a primary: its loop brings it back, empty, before the cluster would fail it over, and the
+      calls are answered again;
+    - **the atomic migrations**, Redis 8.4's `CLUSTER MIGRATION IMPORT` at the target and Valkey 9.0's
+      `CLUSTER MIGRATESLOTS` at the source (probed first on redis-8.10 and valkey-9.1: both finish in milliseconds,
+      `state completed` and `state success`): the slot moves whole, the calls follow MOVED, and the key holds the last
+      INCR's answer. Then it moves back;
+    - **the descriptors** the process holds are what they were once the cluster is closed.
+    - **`examples/cluster`:** the map, a split MSET and MGET, a transaction under one hash tag, a pipeline over the
+      nodes, and a summed DEL. `tools/check-examples.sh` starts the cluster topology and sets `REDIS_CLUSTER_URL`.
+    - **2 live mutations, both caught:** MOVED not followed (the failover's calls never reach the new primary), and a
+      failed redial not reading the map (the sleep's calls wait for the sleeper's MOVED).
 13. **Docs and 0.2.0:**
     - the README;
     - the CHANGELOG, with the breaks;
