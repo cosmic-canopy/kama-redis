@@ -391,6 +391,8 @@ fn int32 main() {
                         case Message(message: m): { println(s: describe(m: m)); }
                         case Unsubscribed(kind: k, channel: c): { println(s: "the server ended a subscription"); }
                         case Reconnected(cause: e): { println(s: "reconnected, and messages may have been missed"); }
+                        // A later release may add a kind of delivery (Delivery is @nonExhaustive).
+                        case _: { }
                     };
                 }
                 case None: { println(s: "nothing within a second"); }

@@ -2,7 +2,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::collectio
          std::memory::Owned, std::memory::replace, std::time::Duration, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error,
          redis::Config, redis::Connection, redis::Dialer, redis::Protocol, redis::RedisError, redis::ServerError,
-         redis::RedisArg, redis::Command, redis::cluster::keySlot, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
+         redis::RedisArg, redis::Command, redis::cluster::keySlot, redis::cluster::ClusterNode, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
          redis::wire::serverError, redis::resp::Value };
 export { Subscriber, Delivery, Message, ChannelKind };
 
@@ -77,7 +77,8 @@ fn Result<string, RedisError> textOf(ConstView<uint8> b, const ref string what) 
     };
 }
 
-// What `next` hands over.
+// What `next` hands over. Later releases may add a kind of delivery, so a `match` on one needs `case _:`.
+@nonExhaustive
 type enum Delivery implements Sendable {
     // A message to a channel, pattern or shard channel this subscriber is subscribed to.
     Message(Message message),
@@ -87,7 +88,10 @@ type enum Delivery implements Sendable {
     Unsubscribed(ChannelKind kind, DynamicArray<uint8> channel),
     // The connection was lost, and has been made again, every kept name subscribed again: messages published in
     // between were not received. `cause` is what ended the old connection.
-    Reconnected(RedisError cause);
+    Reconnected(RedisError cause),
+    // On a cluster (`ClusterSubscriber`): a shard channel whose slot moved to another node, now subscribed there, at
+    // `to`. Messages published to it in between may have been lost.
+    Moved(DynamicArray<uint8> channel, ClusterNode to);
 }
 
 type resource Subscriber implements Sendable {
@@ -104,6 +108,11 @@ type resource Subscriber implements Sendable {
     Set<Name> shards;
     // What ended the last connection, for `Reconnected`: zero or one.
     DynamicArray<RedisError> lostBy;
+
+    // A cluster's subscriber (src/cluster_subscriber.kama) moves a node's names elsewhere, and waits on many sockets.
+    friend redis::ClusterSubscriber::relocate[namesOf];
+    friend redis::ClusterSubscriber::sunsubscribe[namesOf];
+    friend redis::ClusterSubscriber::waitAny[rawHandle];
 
     ctor fresh(int64 limit) {
         this.held = DynamicArray.empty();
@@ -281,6 +290,25 @@ type resource Subscriber implements Sendable {
     public const fn Protocol protocol() {
         if (this.held.length() == 0) { return Protocol::Resp3; }
         return this.held[0].protocol();
+    }
+
+    // The names of `kind` it keeps, as the server confirmed them, sorted by their bytes: for a cluster's subscriber
+    // that moves them to another node.
+    fn DynamicArray<DynamicArray<uint8>> namesOf(ChannelKind kind) {
+        DynamicArray<DynamicArray<uint8>> names = DynamicArray.empty();
+        match (kind) {
+            case Channel: { foreach (Name n in this.channels) { names.add(item: copy n.bytes); } }
+            case Pattern: { foreach (Name n in this.patterns) { names.add(item: copy n.bytes); } }
+            case Shard: { foreach (Name n in this.shards) { names.add(item: copy n.bytes); } }
+        };
+        sortNames(names: ref names);
+        return give names;
+    }
+
+    // Its link's socket, when this client opened it; -1 otherwise, or when it is lost or released.
+    const fn isize rawHandle() {
+        if (this.held.length() == 0) { return -1; }
+        return this.held[0].rawHandle();
     }
 
     // How many channels, patterns and shard channels are subscribed, as the server confirmed them.
@@ -840,6 +868,7 @@ type resource Name implements Hashable, Equatable<This>, Sendable, Copyable<This
     DynamicArray<uint8> bytes;
 
     friend redis::Subscriber::takeKind[bytes];
+    friend redis::Subscriber::namesOf[bytes];
 
     public ctor of(ConstView<uint8> bytes) {
         this.bytes = DynamicArray.empty();

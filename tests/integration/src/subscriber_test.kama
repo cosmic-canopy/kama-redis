@@ -56,6 +56,8 @@ fn string shown(Result<Optional<Delivery>, RedisError> r) {
                 case Message(message: m): shownMessage(m: m);
                 case Unsubscribed(kind: k, channel: c): { string name = text(b: c.view()); := "unsubscribed ${name}"; }
                 case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
+                case Moved(channel: c, to: n): { string name = text(b: c.view()); string place = n.place(); := "moved ${name} ${place}"; }
+                case _: "?";
             };
         };
     };

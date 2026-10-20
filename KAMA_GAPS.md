@@ -10,9 +10,9 @@ also run on cstar's newest build, which the registry publishes with. The package
 (2026-10-19, the newest tag and cstar's newest build): unit and live gates green, debug and release; it needed
 KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` and `0.9.692` (2026-10-20) the library
 checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there. On
-`0.9.696` (a build of staged work, 2026-10-20) the library and both test programs check clean but for KRD-11, with
-KRD-12's workaround; what fails there is `@kama/tls` 0.1.5, which has four statements after a `while (true)` and needs
-a release of its own.
+`0.9.696` to `0.9.707` (2026-10-20) the library and both test programs check clean but for KRD-11, with KRD-12's
+workaround; what fails there is `@kama/tls` 0.1.5: four statements after a `while (true)`, and from 0.9.706 a
+`string.find` whose type changed (KRD-11). It needs a release of its own.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
@@ -161,8 +161,18 @@ fn int32 main() {
 | `v0.9.667`, `v0.9.675` | prints | refused: "`std.concurrent` does not export `Undelivered`" |
 | `0.9.692+gbc03abd0` | refused: "`std.concurrent` does not export `SendResult`" | prints |
 
-The same fix closes both: a window in which the old form is accepted with a word naming the new one, or a tag that
-carries 0.9.680 and 0.9.684. The scratch copy for cstar's newest build would edit the relay's two sends too, if the
+**A third, found 2026-10-20 on `0.9.707+ga9f325c3`:** `string.find` answers `Optional<isize>` since `a9f325c3` (0.9.706,
+"`find` answers `isize`"), where every tag answers `Optional<usize>`. This package does not call it, but `@kama/tls`
+0.1.5 does (`src/tls.kama:85`, `Optional<usize> dash = text.find(substring: " - ")`), so nothing that depends on it
+builds on 0.9.706 and later. Run on both, `fn uint8 main()` on 0.9.707:
+
+| | `Optional<usize> d = t.find(…)` | `Optional<isize> d = t.find(…)` |
+|---|---|---|
+| `v0.9.667` | prints | refused: "a local expects an `Optional<isize>`, so it cannot be given an `Optional<usize>`" |
+| `0.9.707+ga9f325c3` | refused: "a local expects an `Optional<usize>`, so it cannot be given an `Optional<isize>`" | prints |
+
+The same fix closes all three: a window in which the old form is accepted with a word naming the new one, or a tag
+that carries them. The scratch copy for cstar's newest build would edit the relay's two sends too, if the
 live program were gated there; today only the unit program and the examples are.
 
 ### KRD-12 · MED · A value-producing `match` arm that ends in `panic` has no form both kinds of compiler take

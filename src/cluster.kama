@@ -221,6 +221,9 @@ type resource Cluster implements Sendable {
 
     // A scan on a cluster (src/scan.kama) walks the primaries, or follows its key's slot.
     friend redis::Scan::nextIn[primaryPlaces, scanAt, scanFor];
+    // A cluster's subscriber (src/cluster_subscriber.kama) opens its own connection to each node it needs.
+    friend redis::ClusterSubscriber::subAt[openNode];
+    friend redis::ClusterSubscriber::follow[reconnectWindow];
 
     // Connect to the cluster `config` names: its hosts are seeds, asked in turn for the map until one gives it. A
     // Sentinel configuration, a unix:// one and reconnect=off are refused (`Config`), as is a server that is not in
@@ -997,6 +1000,14 @@ type resource Cluster implements Sendable {
         this.links[at].attach(connection: give c);
         return Result::Ok(value: Unit::Unit);
     }
+
+    // A connection of its own to the node at `host` and `port`, with the cluster's settings for a node.
+    unsafe fn Result<Connection, RedisError> openNode(const ref string host, int32 port) {
+        Config node = this.nodeConfig(host: host, port: port);
+        return this.dial(config: node);
+    }
+
+    const fn Duration reconnectWindow() { return this.settings.reconnectTimeout(); }
 
     unsafe fn Result<Connection, RedisError> dial(const ref Config config) {
         if (this.making.length() > 0) {

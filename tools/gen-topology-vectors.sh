@@ -11,7 +11,8 @@
 #     MSET, DBSIZE, KEYS, PING, SCRIPT EXISTS, each at its own node); MOVED from a primary and from a replica; CROSSSLOT; a redirection while queueing in MULTI, then
 #     EXEC's EXECABORT, and EXEC's own CROSSSLOT; a slot being migrated (ASK, TRYAGAIN, a transaction at its source,
 #     MOVED back without ASKING, ASKING for one command, ASKING then a transaction); READONLY and READWRITE on a replica; a slot not served and
-#     the map with its gap; the map and MOVED after a CLUSTER FAILOVER; the map and MOVED with hostnames and with an
+#     the map with its gap; the map and MOVED after a CLUSTER FAILOVER, and a shard channel's subscriber at the old
+#     primary then (the server's own sunsubscribe); the map and MOVED with hostnames and with an
 #     unknown endpoint (7.0 and later); MASTERDOWN; and the cluster down, in both words.
 #   - A sentinel group: a master (7200), two replicas (7201, 7202) and four sentinels (7300-7303) monitoring "kr",
 #     the last one with its default user off. What a client meets: HELLO 3; GET-MASTER-ADDR-BY-NAME, known and not
@@ -341,6 +342,17 @@ if ($product eq 'valkey' && ($major > 8 || ($major == 8 && $minor >= 1))) {
     until_true('the zones gone', 30, sub { index(tenc(one(7000, 'CLUSTER', 'SLOTS')), 'az-') < 0 });
 }
 
+# A shard channel of shard 1 subscribed at 7001 under each protocol: what that connection gets once 7004 has taken the
+# shard over is the server's own sunsubscribe, which a cluster's subscriber follows to the new owner.
+# Sharded pub/sub came with 7.0.
+my %ssub;
+if ($v7) {
+    for my $proto (2, 3) {
+        my $s = open_to(7001); tcall($s, 'HELLO', '3') if $proto == 3;
+        record("ssub-shard/$proto", ['SSUBSCRIBE', $kB], tenc(tcall($s, 'SSUBSCRIBE', $kB)));
+        $ssub{$proto} = $s;
+    }
+}
 # A manual failover: 7004 takes shard 1 over from 7001.
 one(7004, 'CLUSTER', 'FAILOVER');
 until_true('7004 taking shard 1 over', 30, sub {
@@ -353,6 +365,15 @@ until_true('7004 taking shard 1 over', 30, sub {
     }
     return 1;
 });
+if ($v7) {
+    for my $proto (2, 3) {
+        my ($got, $closed) = drain_for($ssub{$proto}, 2);
+        die "gen-topology-vectors: $product $version: no sunsubscribe at 7001 after the failover ($proto)\n" unless index($got, 'sunsubscribe') >= 0 && !$closed;
+        record("sunsubscribe-failover/$proto", ['SSUBSCRIBE', $kB], $got, ["SSUBSCRIBE $kB at 7001, then CLUSTER FAILOVER at 7004"]);
+        close $ssub{$proto}{s};
+    }
+    pair('ssub-shard-moved', 7004, [], ['SSUBSCRIBE', $kB]);
+}
 pair('slots-after-failover', 7000, [], ['CLUSTER', 'SLOTS']);
 pair('moved-after-failover', 7000, [], ['GET', $kB]);
 pair('moved-from-demoted', 7001, [], ['GET', $kB]);
@@ -554,6 +575,13 @@ my @every = qw(slots slots-empty slots-standalone slots-at-replica mget-a mget-b
 for my $must (@every) {
     for my $proto (2, 3) {
         die "gen-topology-vectors: case $must/$proto is not on every server\n" unless ($count{"$must/$proto"} // 0) == @versions;
+    }
+}
+# Sharded pub/sub, on every server from 7.0.
+for my $v (@versions) {
+    next if $v =~ /^redis-6\./;
+    for my $must (qw(ssub-shard sunsubscribe-failover ssub-shard-moved)) {
+        for my $proto (2, 3) { die "gen-topology-vectors: case $must/$proto is not on $v\n" unless exists $hex{"$v $must/$proto"}; }
     }
 }
 for my $must (qw(hello3-node sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted)) {

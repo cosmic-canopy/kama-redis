@@ -1,0 +1,74 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "            case Unsubscribed(kind: k, channel: c): k == ChannelKind::Shard && hasName(names: this.wanted, name: c);",
+  "new": "            case Unsubscribed(kind: k, channel: c): false;",
+  "expect": "cluster subscriber: a shard channel whose slot moved is followed"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "            bool elsewhere = owner >= 0 && !(this.cluster.topology().node(index: owner).host() == oldHost && this.cluster.topology().node(index: owner).port() == oldPort);",
+  "new": "            bool elsewhere = owner >= 0;",
+  "expect": "cluster subscriber: a shard channel whose slot moved is followed"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "            Result<Unit, RedisError> moved = this.relocate(at: at, cause: copy cause);\n            match (give moved) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };\n            return Result::Ok(value: Optional::Some(value: Delivery::Reconnected(cause: give cause)));",
+  "new": "            return Result::Err(error: give cause);",
+  "expect": "cluster subscriber: a node lost for good, its channels at another primary"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "            p = p + 1;",
+  "new": "            p = primaries.length();",
+  "expect": "cluster subscriber: a node lost for good, its channels at another primary"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "                if (ok) { isize k = 0; while (k < names.length()) { if (!hasName(names: this.wanted, name: names[k])) { this.wanted.add(item: copy names[k]); } k = k + 1; } }",
+  "new": "",
+  "expect": "cluster subscriber: a shard channel whose slot moved is followed"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "        return this.placeLost();\n    }",
+  "new": "        return Result::Ok(value: Unit::Unit);\n    }",
+  "expect": "cluster subscriber: a node lost for good, its channels at another primary"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "                        return Delivery::Moved(channel: give channel, to: give to);",
+  "new": "                        return Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: give channel);",
+  "expect": "cluster subscriber: a shard channel whose slot moved is followed"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/cluster_subscriber.kama",
+  "old": "                case Shard: this.subs[i].shardCount();",
+  "new": "                case Shard: 0;",
+  "expect": "cluster subscriber: a channel at a primary, a shard channel at its slot's"
+ },
+ {
+  "id": "M9",
+  "suite": "integration",
+  "file": "src/cluster_subscriber.kama",
+  "old": "            case Unsubscribed(kind: k, channel: c): k == ChannelKind::Shard && hasName(names: this.wanted, name: c);",
+  "new": "            case Unsubscribed(kind: k, channel: c): false;",
+  "expect": "subscriber: a shard channel whose slot moved is followed"
+ }
+]

@@ -1,0 +1,523 @@
+import { std::collections::DynamicArray, std::collections::Deque, std::memory::Owned, std::time::Duration,
+         std::time::monotonicNow, std::time::sleep, std::random::Rng, std::net::Poller, std::net::Interest, std::io::IoError,
+         redis::Cluster, redis::Config, redis::Dialers, redis::Connection, redis::Subscriber, redis::Delivery,
+         redis::ChannelKind, redis::RedisArg, redis::Command, redis::RedisError, redis::ReconnectError, redis::cluster::ClusterNode,
+         redis::cluster::keySlot, redis::wire::Deadline, redis::wire::backoffAfter };
+export { ClusterSubscriber };
+
+// Pub/sub on a cluster (docs/ROADMAP.md, "Phase 6"): a `Subscriber` per node it needs, each on a connection of its own,
+// and a `Cluster` of its own for the map.
+//   - Channels and patterns go to one primary: a PUBLISH reaches every node of the cluster, so any one hears them all.
+//   - Shard channels (SSUBSCRIBE) go to the primary of each one's slot, a command per slot, as a cluster wants.
+//   - `next` hands over what every node's subscriber has: first what has already arrived on any of them, in turn from
+//     the node after the last that gave something, then the next to arrive anywhere. It waits on every node's socket
+//     at once (std::net::Poller) when this client opened them all; over a caller's dialers, which give no socket to
+//     wait on, it waits on each in turn, a short slice at a time (SLICE_MS), so a message there comes up to a slice
+//     late for each node.
+//   - A node's subscriber keeps 7a's reconnect: a lost link is made again by its next wait, one try, and
+//     `Reconnected` says so. A node that cannot be reached again is let go: the map is read again, its names are
+//     subscribed where it now says, and `Reconnected` comes, since messages in between were lost. When no node can
+//     take them, the call fails, and the next call tries again, the names still kept.
+//   - A shard channel whose slot moves to another node (the server's own sunsubscribe) is followed: the map read
+//     again, SSUBSCRIBE at the new owner, and `Moved` first, since messages published in between may be lost. One the
+//     new owner refuses (NOPERM), or no new owner within reconnect_timeout, is `Unsubscribed`.
+// Delivery is at most once, as the server's own is.
+
+// How long a wait on one node lasts, in turn, when the nodes' sockets are not this client's to wait on together.
+comptime int64 SLICE_MS = 10i64;
+
+type resource ClusterSubscriber implements Sendable {
+    Cluster cluster;
+    // A subscriber per node, by its place.
+    DynamicArray<Subscriber> subs;
+    DynamicArray<string> hosts;
+    DynamicArray<int32> ports;
+    // The node holding the channels and patterns; -1 before one is needed.
+    isize everywhere = -1;
+    // The shard channels subscribed, whichever node holds each: a server's sunsubscribe of one of them is followed.
+    DynamicArray<DynamicArray<uint8>> wanted;
+    // Names a node that was let go held, waiting for a node to take them (the next call tries again).
+    DynamicArray<DynamicArray<uint8>> lostChannels;
+    DynamicArray<DynamicArray<uint8>> lostPatterns;
+    DynamicArray<DynamicArray<uint8>> lostShards;
+    Deque<Delivery> queued;
+    isize turn = 0;
+    int32 failures = 0;
+    Rng jitter;
+
+    // Pub/sub on the cluster `config` names (`Cluster.connect`).
+    public unsafe ctor Result<ClusterSubscriber, RedisError> connect(const ref Config config) {
+        Result<Cluster, RedisError> made = Cluster.connect(config: config);
+        return match (give made) {
+            case Ok(value: c): Result::Ok(value: ClusterSubscriber.over(cluster: give c));
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+
+    // The same, each connection's transports opened by a dialer from `dialers` (`Cluster.connectWith`).
+    public unsafe ctor Result<ClusterSubscriber, RedisError> connectWith(Owned<Dialers> dialers, const ref Config config) {
+        Result<Cluster, RedisError> made = Cluster.connectWith(dialers: give dialers, config: config);
+        return match (give made) {
+            case Ok(value: c): Result::Ok(value: ClusterSubscriber.over(cluster: give c));
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+
+    unsafe ctor over(Cluster cluster) {
+        this.cluster = give cluster;
+        this.subs = DynamicArray.empty();
+        this.hosts = DynamicArray.empty();
+        this.ports = DynamicArray.empty();
+        this.wanted = DynamicArray.empty();
+        this.lostChannels = DynamicArray.empty();
+        this.lostPatterns = DynamicArray.empty();
+        this.lostShards = DynamicArray.empty();
+        this.queued = Deque.empty();
+        this.jitter = Rng.fromEntropy();
+    }
+
+    // Subscribe to channels or patterns, at one primary (any one hears a PUBLISH): as `Subscriber.subscribe`.
+    public unsafe fn Result<Unit, RedisError> subscribe(RedisArg names) { return this.everywhereChange(kind: ChannelKind::Channel, add: true, names: names); }
+    public unsafe fn Result<Unit, RedisError> psubscribe(RedisArg names) { return this.everywhereChange(kind: ChannelKind::Pattern, add: true, names: names); }
+    public unsafe fn Result<Unit, RedisError> unsubscribe(RedisArg names) { return this.everywhereChange(kind: ChannelKind::Channel, add: false, names: names); }
+    public unsafe fn Result<Unit, RedisError> punsubscribe(RedisArg names) { return this.everywhereChange(kind: ChannelKind::Pattern, add: false, names: names); }
+
+    // Subscribe to shard channels, each at the primary of its slot, a command per slot. A MOVED (the map was behind) reads
+    // the map again and sends once more.
+    public unsafe fn Result<Unit, RedisError> ssubscribe(RedisArg names) {
+        if (this.cluster.isClosed()) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> placed = this.placeLost();
+        match (give placed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        DynamicArray<DynamicArray<uint8>> all = namesIn(names: names);
+        DynamicArray<DynamicArray<DynamicArray<uint8>>> groups = bySlot(names: all);
+        isize g = 0;
+        while (g < groups.length()) {
+            Result<Unit, RedisError> one = this.ssubscribeSlot(names: groups[g]);
+            match (give one) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            g = g + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Unsubscribe from shard channels, at whichever node holds each; an empty list unsubscribes from every one.
+    public unsafe fn Result<Unit, RedisError> sunsubscribe(RedisArg names) {
+        if (this.cluster.isClosed()) { return Result::Err(error: RedisError::Closed); }
+        DynamicArray<DynamicArray<uint8>> asked = namesIn(names: names);
+        bool every = asked.length() == 0;
+        isize k = 0;
+        while (k < asked.length()) { removeName(names: this.wanted, name: asked[k]); removeName(names: this.lostShards, name: asked[k]); k = k + 1; }
+        if (every) { this.wanted = DynamicArray.empty(); this.lostShards = DynamicArray.empty(); }
+        isize i = 0;
+        while (i < this.subs.length()) {
+            DynamicArray<DynamicArray<uint8>> held = this.subs[i].namesOf(kind: ChannelKind::Shard);
+            DynamicArray<DynamicArray<uint8>> group = DynamicArray.empty();
+            k = 0;
+            while (k < held.length()) { if (every || hasName(names: asked, name: held[k])) { group.add(item: copy held[k]); } k = k + 1; }
+            if (group.length() > 0) {
+                Result<Unit, RedisError> done = this.subs[i].sunsubscribe(names: group);
+                match (give done) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+            i = i + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The next delivery from any node: what has already arrived first, then the next to arrive within `timeout` (None
+    // waits as long as it takes; zero takes only what has already arrived). None when the time passes first. With
+    // nothing subscribed and nothing waiting, `Usage`.
+    public unsafe fn Result<Optional<Delivery>, RedisError> next(Optional<Duration> timeout) {
+        if (this.queued.length() > 0) { return Result::Ok(value: this.queued.popFront()); }
+        Result<Unit, RedisError> placed = this.placeLost();
+        match (give placed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (this.queued.length() > 0) { return Result::Ok(value: this.queued.popFront()); }
+        if (this.subscriptions() == 0) {
+            return Result::Err(error: RedisError::Usage(detail: "nothing is subscribed, so no message can come: subscribe first"));
+        }
+        bool negative = match (timeout) { case Some(value: t): t.isNegative(); case None: false; };
+        if (negative) { return Result::Err(error: RedisError::Usage(detail: "a timeout cannot be negative: None waits as long as it takes")); }
+        Deadline until = match (timeout) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
+        while (true) {
+            Result<Optional<Delivery>, RedisError> swept = this.sweep();
+            bool some = match (swept) { case Ok(value: o): match (o) { case Some(value: d): true; case None: false; }; case Err(error: e): true; };
+            if (some) { return give swept; }
+            if (until.isBounded() && !until.allows(at: monotonicNow())) { return Result::Ok(value: Optional::None); }
+            Result<Optional<Delivery>, RedisError> waited = this.waitAny(until: until);
+            bool came = match (waited) { case Ok(value: o): match (o) { case Some(value: d): true; case None: false; }; case Err(error: e): true; };
+            if (came) { return give waited; }
+        }
+    }
+
+    // PING every node's subscriber: a check that each link is alive.
+    public unsafe fn Result<Unit, RedisError> ping() {
+        isize i = 0;
+        while (i < this.subs.length()) {
+            Result<Unit, RedisError> one = this.subs[i].ping();
+            match (give one) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            i = i + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Close every node's connection, and the cluster's, for good.
+    public unsafe fn void close() {
+        isize i = 0;
+        while (i < this.subs.length()) { this.subs[i].close(); i = i + 1; }
+        this.cluster.close();
+    }
+
+    public const fn bool isClosed() { return this.cluster.isClosed(); }
+
+    // How many channels, patterns and shard channels are subscribed, as the servers confirmed them. Names a node that
+    // was let go held, waiting for another to take them, are not subscribed anywhere, and are not counted.
+    public const fn isize channelCount() { return this.counted(kind: ChannelKind::Channel); }
+    public const fn isize patternCount() { return this.counted(kind: ChannelKind::Pattern); }
+    public const fn isize shardCount() { return this.counted(kind: ChannelKind::Shard); }
+
+    // ---- inside ----
+
+    const fn isize counted(ChannelKind kind) {
+        isize n = 0;
+        isize i = 0;
+        while (i < this.subs.length()) {
+            isize one = match (kind) {
+                case Channel: this.subs[i].channelCount();
+                case Pattern: this.subs[i].patternCount();
+                case Shard: this.subs[i].shardCount();
+            };
+            n = n + one;
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // What is subscribed, or waits to be: a call has something to wait for.
+    const fn isize subscriptions() {
+        return this.channelCount() + this.patternCount() + this.shardCount() + this.lostChannels.length()
+               + this.lostPatterns.length() + this.lostShards.length();
+    }
+
+    // What has already arrived on any node, in turn from the node after the last that gave something.
+    unsafe fn Result<Optional<Delivery>, RedisError> sweep() {
+        isize n = this.subs.length();
+        isize k = 0;
+        while (k < n) {
+            isize i = (this.turn + k) % n;
+            k = k + 1;
+            if (this.held(at: i) == 0) { continue; }
+            Result<Optional<Delivery>, RedisError> r = this.subs[i].next(timeout: Optional::Some(value: Duration.zero()));
+            Result<Optional<Delivery>, RedisError> d = this.handled(at: i, r: give r);
+            bool some = match (d) { case Ok(value: o): match (o) { case Some(value: x): true; case None: false; }; case Err(error: e): true; };
+            if (some) { this.turn = i + 1; return give d; }
+        }
+        return Result::Ok(value: Optional::None);
+    }
+
+    // Wait for something to arrive on any node, by `until`: on every node's socket at once when this client opened them
+    // all, otherwise on each in turn, a slice at a time. What came is the next sweep's; a delivery read on the way in
+    // turn is handed back.
+    unsafe fn Result<Optional<Delivery>, RedisError> waitAny(Deadline until) {
+        DynamicArray<isize> handles = DynamicArray.empty();
+        bool all = true;
+        isize i = 0;
+        while (i < this.subs.length()) {
+            if (this.held(at: i) > 0) {
+                isize h = this.subs[i].rawHandle();
+                if (h < 0) { all = false; } else { handles.add(item: h); }
+            }
+            i = i + 1;
+        }
+        if (all && handles.length() > 0) {
+            Result<Poller, IoError> made = Poller.create();
+            bool polled = false;
+            match (give made) {
+                case Ok(value: p): {
+                    Poller poller = give p;
+                    isize k = 0;
+                    while (k < handles.length()) { poller.add(fd: handles[k], interest: Interest::Read); k = k + 1; }
+                    int32 ms = -1;
+                    if (until.isBounded()) { ms = until.remainingMs(); }
+                    Result<int32, IoError> waited = poller.wait(timeoutMs: ms);
+                    polled = match (waited) { case Ok(value: n): true; case Err(error: e): false; };
+                }
+                case Err(error: e): { }
+            };
+            if (polled) { return Result::Ok(value: Optional::None); }
+        }
+        isize n = this.subs.length();
+        isize k = 0;
+        while (k < n) {
+            isize at = (this.turn + k) % n;
+            k = k + 1;
+            if (this.held(at: at) == 0) { continue; }
+            int64 slice = SLICE_MS;
+            if (until.isBounded()) {
+                int64 left = cast<int64>(until.remainingMs());
+                if (left < slice) { slice = left; }
+                if (slice < 0i64) { slice = 0i64; }
+            }
+            Result<Optional<Delivery>, RedisError> r = this.subs[at].next(timeout: Optional::Some(value: Duration.fromMillis(ms: slice)));
+            Result<Optional<Delivery>, RedisError> d = this.handled(at: at, r: give r);
+            bool some = match (d) { case Ok(value: o): match (o) { case Some(value: x): true; case None: false; }; case Err(error: e): true; };
+            if (some) { this.turn = at + 1; return give d; }
+            if (until.isBounded() && !until.allows(at: monotonicNow())) { break; }
+        }
+        return Result::Ok(value: Optional::None);
+    }
+
+    // A node's answer to a wait: a delivery to hand over, a shard channel's slot that moved (followed), or a node that
+    // cannot be reached again (let go, its names placed again).
+    unsafe fn Result<Optional<Delivery>, RedisError> handled(isize at, Result<Optional<Delivery>, RedisError> r) {
+        bool failed = match (r) { case Ok(value: o): false; case Err(error: e): true; };
+        if (failed) {
+            RedisError cause = match (give r) { case Err(error: e): give e; case Ok(value: o): RedisError::Closed; };
+            Result<Unit, RedisError> moved = this.relocate(at: at, cause: copy cause);
+            match (give moved) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            return Result::Ok(value: Optional::Some(value: Delivery::Reconnected(cause: give cause)));
+        }
+        Optional<Delivery> got = match (give r) { case Ok(value: o): give o; case Err(error: e): Optional::None; };
+        Delivery d = match (give got) { case Some(value: x): give x; case None: { return Result::Ok(value: Optional::None); } };
+        bool shardLeft = match (d) {
+            case Unsubscribed(kind: k, channel: c): k == ChannelKind::Shard && hasName(names: this.wanted, name: c);
+            case _: false;
+        };
+        if (!shardLeft) { return Result::Ok(value: Optional::Some(value: give d)); }
+        DynamicArray<uint8> channel = match (give d) { case Unsubscribed(kind: k, channel: c): give c; case _: DynamicArray.empty(); };
+        return Result::Ok(value: Optional::Some(value: this.follow(channel: give channel, from: at)));
+    }
+
+    // A shard channel the node at `from` let go (its slot moved): the map read again until it names another owner, within
+    // reconnect_timeout, then SSUBSCRIBE there, and `Moved`. `Unsubscribed` when no owner takes it.
+    unsafe fn Delivery follow(DynamicArray<uint8> channel, isize from) {
+        removeName(names: this.wanted, name: channel);
+        isize slot = keySlot(key: channel.view());
+        string oldHost = copy this.hosts[from];
+        int32 oldPort = this.ports[from];
+        Deadline window = Deadline.within(span: this.cluster.reconnectWindow());
+        int32 tries = 0;
+        while (true) {
+            Result<Unit, RedisError> fetched = this.cluster.refreshTopology();
+            isize owner = this.cluster.topology().primaryOf(slot: slot);
+            bool elsewhere = owner >= 0 && !(this.cluster.topology().node(index: owner).host() == oldHost && this.cluster.topology().node(index: owner).port() == oldPort);
+            if (elsewhere) {
+                ClusterNode to = copy this.cluster.topology().node(index: owner);
+                Result<isize, RedisError> at = this.subAt(host: to.host(), port: to.port());
+                bool opened = match (at) { case Ok(value: x): true; case Err(error: e): false; };
+                if (opened) {
+                    isize i = match (give at) { case Ok(value: x): x; case Err(error: e): -1; };
+                    DynamicArray<DynamicArray<uint8>> one = DynamicArray.empty();
+                    one.add(item: copy channel);
+                    Result<Unit, RedisError> done = this.subs[i].ssubscribe(names: one);
+                    bool ok = match (done) { case Ok(value: u): true; case Err(error: e): false; };
+                    if (ok) {
+                        this.wanted.add(item: copy channel);
+                        return Delivery::Moved(channel: give channel, to: give to);
+                    }
+                    return Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: give channel);
+                }
+            }
+            tries = tries + 1;
+            Duration d = backoffAfter(failures: tries, jitter: ref this.jitter);
+            if (!window.allows(at: monotonicNow() + d)) { break; }
+            sleep(d: d);
+        }
+        return Delivery::Unsubscribed(kind: ChannelKind::Shard, channel: give channel);
+    }
+
+    // The node at `at` cannot be reached again: let it go, read the map, and place its names where it now says. Names
+    // no node takes now wait for the next call.
+    unsafe fn Result<Unit, RedisError> relocate(isize at, RedisError cause) {
+        DynamicArray<DynamicArray<uint8>> chans = this.subs[at].namesOf(kind: ChannelKind::Channel);
+        DynamicArray<DynamicArray<uint8>> pats = this.subs[at].namesOf(kind: ChannelKind::Pattern);
+        DynamicArray<DynamicArray<uint8>> shs = this.subs[at].namesOf(kind: ChannelKind::Shard);
+        Subscriber gone = this.subs.remove(index: at);
+        gone.close();
+        string goneHost = this.hosts.remove(index: at);
+        int32 gonePort = this.ports.remove(index: at);
+        if (this.everywhere == at) { this.everywhere = -1; } else if (this.everywhere > at) { this.everywhere = this.everywhere - 1; }
+        addAll(to: this.lostChannels, from: chans);
+        addAll(to: this.lostPatterns, from: pats);
+        addAll(to: this.lostShards, from: shs);
+        Result<Unit, RedisError> fetched = this.cluster.refreshTopology();
+        return this.placeLost();
+    }
+
+    // The names a node that was let go held, placed again: channels and patterns at a primary, shard channels at their
+    // slots' owners. Those placed leave the lost lists; the first failure is the call's, the rest still lost.
+    unsafe fn Result<Unit, RedisError> placeLost() {
+        if (this.lostChannels.length() > 0 || this.lostPatterns.length() > 0) {
+            Result<isize, RedisError> at = this.everywhereSub();
+            isize i = match (give at) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+            if (this.lostChannels.length() > 0) {
+                Result<Unit, RedisError> c = this.subs[i].subscribe(names: this.lostChannels);
+                match (give c) { case Ok(value: u): { this.lostChannels = DynamicArray.empty(); } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+            if (this.lostPatterns.length() > 0) {
+                Result<Unit, RedisError> p = this.subs[i].psubscribe(names: this.lostPatterns);
+                match (give p) { case Ok(value: u): { this.lostPatterns = DynamicArray.empty(); } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+        }
+        if (this.lostShards.length() > 0) {
+            DynamicArray<DynamicArray<DynamicArray<uint8>>> groups = bySlot(names: this.lostShards);
+            isize g = 0;
+            while (g < groups.length()) {
+                Result<Unit, RedisError> one = this.ssubscribeSlot(names: groups[g]);
+                match (give one) {
+                    case Ok(value: u): { isize k = 0; while (k < groups[g].length()) { removeName(names: this.lostShards, name: groups[g][k]); k = k + 1; } }
+                    case Err(error: e): { return Result::Err(error: give e); }
+                };
+                g = g + 1;
+            }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Channels or patterns, added or taken away, at the primary that holds them; a node that cannot be reached is let
+    // go and the change made again where its names go.
+    unsafe fn Result<Unit, RedisError> everywhereChange(ChannelKind kind, bool add, RedisArg names) {
+        if (this.cluster.isClosed()) { return Result::Err(error: RedisError::Closed); }
+        if (!add && this.everywhere < 0) { return Result::Ok(value: Unit::Unit); }
+        Result<Unit, RedisError> placed = this.placeLost();
+        match (give placed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        int32 tries = 0;
+        while (true) {
+            Result<isize, RedisError> found = this.everywhereSub();
+            isize at = match (give found) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+            Result<Unit, RedisError> r = Result::Err(error: RedisError::Closed);
+            if (kind == ChannelKind::Channel && add) { r = this.subs[at].subscribe(names: names); }
+            else if (kind == ChannelKind::Channel) { r = this.subs[at].unsubscribe(names: names); }
+            else if (add) { r = this.subs[at].psubscribe(names: names); }
+            else { r = this.subs[at].punsubscribe(names: names); }
+            bool unreachable = match (r) { case Err(error: e): match (e) { case Reconnect(error: x): true; case Closed: true; case _: false; }; case Ok(value: u): false; };
+            if (!unreachable || tries > 0) { return give r; }
+            tries = tries + 1;
+            RedisError cause = match (give r) { case Err(error: e): give e; case Ok(value: u): RedisError::Closed; };
+            Result<Unit, RedisError> moved = this.relocate(at: at, cause: copy cause);
+            match (give moved) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            this.queued.pushBack(item: Delivery::Reconnected(cause: give cause));
+        }
+    }
+
+    // SSUBSCRIBE `names` (one slot's) at that slot's primary; a MOVED reads the map again and sends once more there.
+    unsafe fn Result<Unit, RedisError> ssubscribeSlot(const ref DynamicArray<DynamicArray<uint8>> names) {
+        isize slot = keySlot(key: names[0].view());
+        int32 tries = 0;
+        while (true) {
+            isize owner = this.cluster.topology().primaryOf(slot: slot);
+            if (owner < 0) {
+                Result<Unit, RedisError> fetched = this.cluster.refreshTopology();
+                owner = this.cluster.topology().primaryOf(slot: slot);
+                if (owner < 0) { return Result::Err(error: RedisError::Unexpected(detail: "no node of the cluster serves the shard channel's slot")); }
+            }
+            string host = copy this.cluster.topology().node(index: owner).host();
+            int32 port = this.cluster.topology().node(index: owner).port();
+            Result<isize, RedisError> at = this.subAt(host: host, port: port);
+            isize i = match (give at) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+            Result<Unit, RedisError> r = this.subs[i].ssubscribe(names: names);
+            bool moved = match (r) {
+                case Err(error: e): match (e.serverCode()) { case Some(value: c): match (c) { case Moved: true; case _: false; }; case None: false; };
+                case Ok(value: u): false;
+            };
+            if (!moved || tries > 0) {
+                bool ok = match (r) { case Ok(value: u): true; case Err(error: e): false; };
+                if (ok) { isize k = 0; while (k < names.length()) { if (!hasName(names: this.wanted, name: names[k])) { this.wanted.add(item: copy names[k]); } k = k + 1; } }
+                return give r;
+            }
+            tries = tries + 1;
+            Result<Unit, RedisError> fetched = this.cluster.refreshTopology();
+        }
+    }
+
+    // The subscriber holding channels and patterns: the first primary that opens.
+    unsafe fn Result<isize, RedisError> everywhereSub() {
+        if (this.everywhere >= 0) { return Result::Ok(value: this.everywhere); }
+        DynamicArray<isize> primaries = this.cluster.topology().primaries();
+        Optional<RedisError> last = Optional::None;
+        isize p = 0;
+        while (p < primaries.length()) {
+            string host = copy this.cluster.topology().node(index: primaries[p]).host();
+            int32 port = this.cluster.topology().node(index: primaries[p]).port();
+            Result<isize, RedisError> at = this.subAt(host: host, port: port);
+            match (give at) {
+                case Ok(value: i): { this.everywhere = i; return Result::Ok(value: i); }
+                case Err(error: e): { Optional<RedisError> dropped = give last; last = Optional::Some(value: give e); }
+            };
+            p = p + 1;
+        }
+        return match (give last) {
+            case Some(value: e): Result::Err(error: give e);
+            case None: Result::Err(error: RedisError::Unexpected(detail: "the cluster's map names no primary"));
+        };
+    }
+
+    // The subscriber at the node at `host` and `port`, opened when there is none yet. Its error is the connect's.
+    unsafe fn Result<isize, RedisError> subAt(const ref string host, int32 port) {
+        isize i = 0;
+        while (i < this.subs.length()) {
+            if (this.ports[i] == port && this.hosts[i] == host) { return Result::Ok(value: i); }
+            i = i + 1;
+        }
+        Result<Connection, RedisError> made = this.cluster.openNode(host: host, port: port);
+        Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Subscriber, RedisError> s = Subscriber.over(connection: give c);
+        Subscriber sub = match (give s) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        this.subs.add(item: give sub);
+        this.hosts.add(item: copy host);
+        this.ports.add(item: port);
+        return Result::Ok(value: this.subs.length() - 1);
+    }
+
+    // How many names the subscriber at `at` holds.
+    const fn isize held(isize at) {
+        return this.subs[at].channelCount() + this.subs[at].patternCount() + this.subs[at].shardCount();
+    }
+}
+
+// Every name `names` writes, as arguments of a command.
+fn DynamicArray<DynamicArray<uint8>> namesIn(RedisArg names) {
+    Command list = Command.of(name: "NAMES");
+    list.add(value: names);
+    DynamicArray<DynamicArray<uint8>> all = DynamicArray.empty();
+    isize i = 1;
+    while (i < list.length()) {
+        DynamicArray<uint8> one = DynamicArray.empty();
+        one.addAll(items: list.part(index: i));
+        all.add(item: give one);
+        i = i + 1;
+    }
+    return give all;
+}
+
+// `names` grouped by slot, in the order each slot's first name comes.
+fn DynamicArray<DynamicArray<DynamicArray<uint8>>> bySlot(const ref DynamicArray<DynamicArray<uint8>> names) {
+    DynamicArray<isize> slots = DynamicArray.empty();
+    DynamicArray<DynamicArray<DynamicArray<uint8>>> groups = DynamicArray.empty();
+    isize i = 0;
+    while (i < names.length()) {
+        isize slot = keySlot(key: names[i].view());
+        isize g = 0;
+        while (g < slots.length() && slots[g] != slot) { g = g + 1; }
+        if (g == slots.length()) { slots.add(item: slot); groups.add(item: DynamicArray.empty()); }
+        groups[g].add(item: copy names[i]);
+        i = i + 1;
+    }
+    return give groups;
+}
+
+fn bool hasName(const ref DynamicArray<DynamicArray<uint8>> names, const ref DynamicArray<uint8> name) {
+    isize i = 0;
+    while (i < names.length()) { if (names[i].equals(other: name)) { return true; } i = i + 1; }
+    return false;
+}
+
+fn void removeName(ref DynamicArray<DynamicArray<uint8>> names, const ref DynamicArray<uint8> name) {
+    isize i = names.length();
+    while (i > 0) {
+        i = i - 1;
+        if (names[i].equals(other: name)) { DynamicArray<uint8> gone = names.remove(index: i); }
+    }
+}
+
+fn void addAll(ref DynamicArray<DynamicArray<uint8>> to, const ref DynamicArray<DynamicArray<uint8>> from) {
+    isize i = 0;
+    while (i < from.length()) { if (!hasName(names: to, name: from[i])) { to.add(item: copy from[i]); } i = i + 1; }
+}

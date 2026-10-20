@@ -542,6 +542,8 @@ fn string said(Result<Optional<Delivery>, RedisError> r) {
                     := "unsubscribed ${word} ${name}";
                 }
                 case Reconnected(cause: e): { string m = e.message(); := "reconnected: ${m}"; }
+                case Moved(channel: c, to: n): { string name = utf8(b: c.view()); string place = n.place(); := "moved ${name} ${place}"; }
+                case _: "?";
             };
         };
     };

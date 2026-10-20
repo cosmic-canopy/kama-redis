@@ -10,7 +10,7 @@
 //                    (src/script.kama), Scan (src/scan.kama), Subscriber, Delivery, Message and ChannelKind
 //                    (src/subscriber.kama), ServerInfo (src/server.kama), the Transport, Dialer and Dialers
 //                    contracts (src/transport.kama), RedisUrl (src/url.kama), Cluster, ClusterTarget and NodeReply
-//                    (src/cluster.kama)
+//                    (src/cluster.kama), ClusterSubscriber (src/cluster_subscriber.kama)
 //   redis::wire      internal: a deadline, RESP over a transport and what a value holds in memory, the commands a
 //                    connection does not carry and the blocking commands' timeouts (src/wire/known.kama), the
 //                    server's integer grammar, what Sentinel answers (src/wire/sentinel.kama), the table of commands

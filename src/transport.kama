@@ -96,6 +96,9 @@ type resource TcpTransport implements Transport, Sendable {
     Poller poller;
     isize handle = 0;
 
+    // A connection records its socket as it opens it, so a cluster's subscriber can wait on many at once.
+    friend redis::Opener::open[handle];
+
     unsafe ctor make(TcpStream stream, Poller poller) {
         this.handle = stream.rawHandle();
         this.stream = give stream;

@@ -95,6 +95,7 @@ type resource Connection implements Sendable {
     friend redis::Subscriber::release[lost];
     friend redis::Subscriber::change[lost];
     friend redis::Subscriber::lostWith[lose];
+    friend redis::Subscriber::rawHandle[rawHandle];
     friend redis::Scan::next[generation];
     // A cluster asks its live nodes for the map first (src/cluster.kama).
     friend redis::NodeLink::live[lost];
@@ -1057,6 +1058,12 @@ type resource Connection implements Sendable {
     // How many times the link was made again (a SCAN's cursor means nothing on a new server process).
     const fn int64 generation() { return this.links; }
 
+    // The link's socket, when this client opened it, for waiting on it beside others; -1 otherwise.
+    const fn isize rawHandle() {
+        if (!this.live) { return -1; }
+        return this.dialing.handle();
+    }
+
     // The connection is unusable: stop the transport, and answer `Closed` from now on.
     unsafe fn void lose() {
         if (!this.live) { return; }
@@ -1292,6 +1299,8 @@ type resource Opener implements Sendable {
     // redials, as Sentinel's client specification keeps them.
     DynamicArray<Place> sentinels;
     string foundAt;
+    // The socket of the link last opened, when this client opened it; -1 over a caller's dialer.
+    isize lastHandle = -1;
 
     public ctor builtIn(Duration keepAlive) {
         this.dialers = DynamicArray.empty();
@@ -1348,8 +1357,12 @@ type resource Opener implements Sendable {
     // Whether this can open a link again: false for a transport the caller opened.
     public const fn bool canDial() { return this.dials; }
 
+    // The socket of the link last opened, for waiting on it beside others (std::net::Poller); -1 when a dialer of the
+    // caller's opened it.
+    public const fn isize handle() { return this.lastHandle; }
+
     public unsafe fn Result<Owned<Transport>, IoError> open(const ref DialTarget target, int32 timeoutMs) {
-        if (this.dialers.length() > 0) { return this.dialers[0].dial(target: target, timeoutMs: timeoutMs); }
+        if (this.dialers.length() > 0) { this.lastHandle = -1; return this.dialers[0].dial(target: target, timeoutMs: timeoutMs); }
         if (target.isSocket()) {
             Result<Owned<UnixTransport>, IoError> local = new UnixTransport.connect(path: target.socketPath(), timeoutMs: timeoutMs);
             Owned<UnixTransport> unix = match (give local) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: e); } };
@@ -1364,6 +1377,7 @@ type resource Opener implements Sendable {
             Result<Unit, IoError> kept = tcp.keepAlive(idle: this.keepIdle);
             match (kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
         }
+        this.lastHandle = tcp.handle;
         Owned<Transport> transport = give tcp;
         return Result::Ok(value: give transport);
     }

@@ -3,14 +3,16 @@
 Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-steps 0 to 10 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads and SCAN.**
-- cstar's newest build is 0.9.705. Since 0.9.696 unreachable code is an error. The tree now takes
+steps 0 to 11 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads, SCAN and pub/sub.**
+- cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` answers
+  `Optional<isize>` (KRD-11: no form builds on both a tag and it). The tree now takes
   the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
   stops ends in `stop::<T>(msg:)` (KRD-12). It refuses `fn int32 main()`, which every tag requires (KRD-11), so it is
   gated on a scratch copy whose ten `main`s say `fn uint8 main()`; the live program's channel `send` changed in
-  0.9.680 too. **@kama/tls 0.1.5 does not build on 0.9.696 and later** (four statements after a `while (true)`), so
-  nothing that depends on it does: it needs a release before 0.2.0 can be checked there, which is the registry's check.
-  With those four removed in a scratch copy, the unit program is green on 0.9.705, debug and release.
+  0.9.680 too. **@kama/tls 0.1.5 does not build on 0.9.696 and later** (four statements after a `while (true)`, and
+  its one `find`), so nothing that depends on it does: it needs a release before 0.2.0 can be checked there, which is
+  the registry's check. With the four statements removed in a scratch copy, the unit program was green on 0.9.705,
+  debug and release; 0.9.707 reads dependencies from the shared store, so no scratch copy is patched now.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -71,7 +73,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–10 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–11 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -885,8 +887,38 @@ Each step ends green before its commit:
       - a SCAN finds all 60 keys across the three primaries;
       - CLIENT KILL on the scan's first primary, mid-scan, ends it.
     - **17 mutations (15 unit, 2 live), all caught.**
-11. **`ClusterSubscriber`.** Unit tests through the in-turn path; live through the Poller, a slot moved under a shard
-    subscription.
+11. **Done (2026-10-20).** **`ClusterSubscriber`** (src/cluster_subscriber.kama): a `Subscriber` per node it needs,
+    each on a connection of its own, and a `Cluster` of its own for the map.
+    - **Where names go:** channels and patterns to one primary (a PUBLISH reaches every node); shard channels to the
+      primary of each one's slot, a command per slot. A MOVED to an SSUBSCRIBE reads the map again and sends once more.
+    - **`next`:**
+      - first what has already arrived on any node (a zero wait each), in turn from the node after the last that gave
+        something;
+      - then a wait on every node's socket at once with `std::net::Poller`, when this client opened them all. The
+        `Opener` records each socket's handle as it opens it (`TcpTransport`'s, granted), so the `Transport` contract is
+        unchanged; a TLS link's buffered plaintext is found by the sweep, as R10 showed;
+      - over a caller's dialers, which give no socket, a wait on each node in turn, 10 ms at a time (`SLICE_MS`).
+    - **What moves under it:**
+      - a node's link lost is made again by its next wait (one try, as a cluster's nodes are), and its `Reconnected`
+        passes through;
+      - a node that cannot be reached again is let go: the map is read again, its names go where it now says, and
+        `Reconnected` comes. Names no node takes yet wait for the next call;
+      - a shard channel whose slot moved (the old owner's own sunsubscribe) is followed: the map read again until it
+        names another owner, within `reconnect_timeout`, SSUBSCRIBE there, and **`Delivery::Moved(channel, to)`**.
+        One the new owner refuses, or no new owner, is `Unsubscribed`.
+    - **`Delivery` is `@nonExhaustive`**, as `RedisError` is: `Moved` is the last variant to break a consumer's `match`.
+    - **The vectors gained** (two runs the same, 1410 replies): a shard channel of shard 1 subscribed at 7001, what
+      that connection gets when 7004 takes the shard over (the server's own sunsubscribe, required), and the same
+      SSUBSCRIBE at 7004, on every server from 7.0.
+    - **Unit tests** (through the in-turn wait: scripted nodes have no socket): a channel and a shard channel delivering
+      from two nodes; a shard channel followed across the failover, `Moved` first; the channels' node lost for good,
+      placed at another primary after one that would not open; nothing subscribed.
+    - **Live** (through the `Poller`), on all eight clusters: a channel, a pattern and shard channels on two shards,
+      every message received; a shard channel's slot moved by hand and back, each followed with `Moved` and a message
+      from the new owner; CLIENT KILL TYPE pubsub on the channels' node, then `Reconnected` and messages again. Redis
+      6.2, which has no sharded pub/sub, runs the rest.
+    - **9 mutations (8 unit, 1 live), all caught.** Not mutated: the sweep's turn (it shares the nodes' order fairly;
+      no test sees an order), and the `Poller` against the in-turn wait (each delivers the same; only how soon differs).
 12. **The cluster live, hardened,** with `examples/cluster`:
     - CLUSTER FAILOVER under calls;
     - DEBUG SLEEP on a primary;

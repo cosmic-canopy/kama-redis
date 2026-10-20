@@ -42,6 +42,10 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   its slot, at random, READONLY sent on every node's link as it is made; one the replica will not serve goes to the
   primary.
 - `Scan.nextIn(cluster:)`: SCAN across every primary in turn, and SSCAN, HSCAN and ZSCAN at their key's node.
+- `ClusterSubscriber`: pub/sub on a cluster, a `Subscriber` per node. Channels and patterns at one primary, shard
+  channels at their slots' primaries; `next` waits on every node at once. A node that cannot be reached again is let
+  go and its names placed where the map says (`Reconnected`); a shard channel whose slot moves is followed
+  (`Delivery::Moved`).
 - `redis::cluster`:
   - `CommandTable`: a command's keys (`keysOf`, as COMMAND GETKEYS finds them) and its slot (`slotOf`), from every
     server's key specifications, checked against every server's GETKEYS;
@@ -55,6 +59,7 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   dials. Before, `redis://a,b` was the one host `a,b`.
 - `RedisError` and `ServerCode` are `@nonExhaustive`: a `match` on either outside this package needs a `case _:`. This
   release adds a variant (`Sentinel`), and none will break a caller after it.
+- `Delivery` is `@nonExhaustive` too, and gains `Moved(channel, to)`, a cluster's shard channel followed to a new node.
 
 ### Fixed
 - A `Scan` across a reconnect sent its cursor to the new server process, which reads it as another place in its

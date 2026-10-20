@@ -5,9 +5,11 @@
 import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Connection, redis::Config, redis::Command,
          redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value, redis::cluster::keySlot,
-         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan,
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan, redis::ClusterSubscriber,
+         redis::Delivery, std::time::Duration, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::cluster::SlotMap,
-         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl };
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl,
+         versionPrefix };
 export { clusterTests };
 
 unsafe fn Result<Cluster, RedisError> reach(const ref string url) {
@@ -479,6 +481,136 @@ unsafe fn int32 scanTests() {
     return f;
 }
 
+fn string bytesText(const ref DynamicArray<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b.view());
+    return match (give r) { case Ok(value: t): give t; case Err(error: e): "(not UTF-8)"; };
+}
+
+// The next delivery as text, waiting up to `secs`: "message <channel> <payload>", "moved <channel> <port>",
+// "reconnected", "unsubscribed <channel>", "none", or the error.
+unsafe fn string nextOf(ref ClusterSubscriber sub, int64 secs) {
+    Result<Optional<Delivery>, RedisError> r = sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: secs)));
+    return match (give r) {
+        case Err(error: e): "(error) ".concat(other: e.message());
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): match (give d) {
+                case Message(message: m): {
+                    DynamicArray<uint8> ch = DynamicArray.empty(); ch.addAll(items: m.channel());
+                    DynamicArray<uint8> pl = DynamicArray.empty(); pl.addAll(items: m.payload());
+                    string a = bytesText(b: ch); string p = bytesText(b: pl);
+                    := "message ${a} ${p}";
+                }
+                case Moved(channel: c, to: n): { string a = bytesText(b: c); int32 port = n.port(); := "moved ${a} ${port}"; }
+                case Reconnected(cause: e): "reconnected";
+                case Unsubscribed(kind: k, channel: c): { string a = bytesText(b: c); := "unsubscribed ${a}"; }
+                case _: "?";
+            };
+        };
+    };
+}
+
+fn bool among(const ref DynamicArray<string> xs, const ref string x) {
+    isize i = 0;
+    while (i < xs.length()) { if (xs[i] == x) { return true; } i = i + 1; }
+    return false;
+}
+
+// Pub/sub on the cluster: every node's deliveries through the Poller; a shard channel followed when its slot is moved
+// by hand, and back; channels across their node's pub/sub clients killed. Sharded pub/sub is 7.0's: 6.2 skips it.
+unsafe fn int32 subscriberTests(ref Cluster c) {
+    int32 f = 0;
+    bool sharded = !versionPrefix().startsWith(prefix: "6.");
+    Result<Config, RedisError> parsed = Config.parse(url: plainUrl());
+    Config config = match (give parsed) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "subscriber: config"); } };
+    Result<ClusterSubscriber, RedisError> made = ClusterSubscriber.connect(config: config);
+    ClusterSubscriber sub = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "subscriber: connect: ${m}"); } };
+    DynamicArray<string> keys = keysPerShard(c: c);
+    string s0 = copy keys[0];
+    string s1 = copy keys[1];
+    Result<Unit, RedisError> a = sub.subscribe(names: "kr:live:c");
+    Result<Unit, RedisError> b = sub.psubscribe(names: "kr:live:p*");
+    bool ok = match (a) { case Ok(value: x): match (b) { case Ok(value: y): true; case Err(error: e): false; }; case Err(error: e): false; };
+    if (sharded) {
+        Result<Unit, RedisError> c0 = sub.ssubscribe(names: s0);
+        Result<Unit, RedisError> c1 = sub.ssubscribe(names: s1);
+        bool shardsOk = match (c0) { case Ok(value: x): match (c1) { case Ok(value: y): true; case Err(error: e): false; }; case Err(error: e): false; };
+        ok = ok && shardsOk;
+    }
+    f = f + check(ok: ok, what: "subscriber: a channel, a pattern and shard channels on two shards");
+    string p1 = said(c: c, text: "PUBLISH kr:live:c m1");
+    string p2 = said(c: c, text: "PUBLISH kr:live:p1 m2");
+    DynamicArray<string> want = DynamicArray.empty();
+    want.add(item: "message kr:live:c m1");
+    want.add(item: "message kr:live:p1 m2");
+    if (sharded) {
+        string p3 = said(c: c, text: "SPUBLISH ${s0} m3");
+        string p4 = said(c: c, text: "SPUBLISH ${s1} m4");
+        want.add(item: "message ${s0} m3");
+        want.add(item: "message ${s1} m4");
+    }
+    DynamicArray<string> got = DynamicArray.empty();
+    isize i = 0;
+    while (i < want.length()) { got.add(item: nextOf(sub: sub, secs: 3i64)); i = i + 1; }
+    bool every = true;
+    i = 0;
+    while (i < want.length()) { if (!among(xs: got, x: want[i])) { every = false; } i = i + 1; }
+    isize n = got.length();
+    string first = copy got[0];
+    f = f + check(ok: every, what: "subscriber: every node's messages, ${n} of them: ${first} …");
+
+    if (sharded) {
+        // The shard channel's slot moved by hand: the old owner's sunsubscribe is followed to the new owner.
+        string ch = "kr:{subscribed}:ch";
+        isize slot = keySlot(key: ch.bytes());
+        Result<Unit, RedisError> s = sub.ssubscribe(names: ch);
+        isize owner = c.topology().primaryOf(slot: slot);
+        DynamicArray<isize> primaries = c.topology().primaries();
+        isize other = -1;
+        i = 0;
+        while (i < primaries.length()) { if (primaries[i] != owner && other < 0) { other = primaries[i]; } i = i + 1; }
+        string fromPort = portOf(c: c, index: owner);
+        string toPort = portOf(c: c, index: other);
+        Result<Connection, RedisError> fa = nodeAt(port: fromPort);
+        Result<Connection, RedisError> ta = nodeAt(port: toPort);
+        match (give fa) {
+            case Ok(value: x): {
+                Connection from = give x;
+                match (give ta) {
+                    case Ok(value: y): {
+                        Connection to = give y;
+                        string begun = moveSlot(from: from, to: to, toPort: toPort, slot: slot);
+                        string done = finishMove(from: from, to: to, toPort: toPort, slot: slot);
+                        string moved = nextOf(sub: sub, secs: 5i64);
+                        f = f + check(ok: moved == "moved ${ch} ${toPort}", what: "subscriber: a shard channel whose slot moved is followed: ${begun} ${done} ${moved}");
+                        string pub = said(c: c, text: "SPUBLISH ${ch} there");
+                        string heard = nextOf(sub: sub, secs: 3i64);
+                        f = f + check(ok: heard == "message ${ch} there", what: "subscriber: then a message from the new owner: ${pub} ${heard}");
+                        string back = moveSlot(from: to, to: from, toPort: fromPort, slot: slot);
+                        string home = finishMove(from: to, to: from, toPort: fromPort, slot: slot);
+                        string returned = nextOf(sub: sub, secs: 5i64);
+                        f = f + check(ok: returned == "moved ${ch} ${fromPort}", what: "subscriber: and back: ${back} ${home} ${returned}");
+                    }
+                    case Err(error: e): { f = f + check(ok: false, what: "subscriber: connect to the new owner"); }
+                };
+            }
+            case Err(error: e): { Result<Connection, RedisError> unused = give ta; f = f + check(ok: false, what: "subscriber: connect to the owner"); }
+        };
+    }
+
+    // The channels' node kills its pub/sub clients: that link is made again, Reconnected, and messages go on.
+    DynamicArray<isize> primaries2 = c.topology().primaries();
+    Result<Connection, RedisError> killer = nodeAt(port: portOf(c: c, index: primaries2[0]));
+    string killed = match (give killer) { case Ok(value: x): { Connection k = give x; := ask(c: k, text: "CLIENT KILL TYPE pubsub"); } case Err(error: e): e.message(); };
+    string again = nextOf(sub: sub, secs: 3i64);
+    string p5 = said(c: c, text: "PUBLISH kr:live:c m5");
+    string after = nextOf(sub: sub, secs: 3i64);
+    while (after == "reconnected") { after = nextOf(sub: sub, secs: 3i64); }
+    f = f + check(ok: again == "reconnected" && after == "message kr:live:c m5", what: "subscriber: its node's pub/sub clients killed (${killed}): ${again}, then ${after}");
+    sub.close();
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
     Result<Cluster, RedisError> r = reach(url: plainUrl());
@@ -489,6 +621,7 @@ unsafe fn int32 clusterTests() {
             f = f + reshardTests(c: cl);
             f = f + replicaTests();
             f = f + scanTests();
+            f = f + subscriberTests(c: cl);
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster: connect: ${m}"); }
     };

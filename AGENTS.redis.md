@@ -220,7 +220,8 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
   element). An adapter must live in the contract's module (src/arg.kama).
 
 - **A `Subscriber` reaches its connection only through the private members `Connection` grants it, method by
-  method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, and for reconnecting `lost` and `ready`). Nothing on
+  method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, for reconnecting `lost` and `ready`, and
+  `rawHandle` for a `ClusterSubscriber`'s `Poller`). Nothing on
   `Connection` is public for it. Pub/sub
   frames are read by one classifier (`classify` in src/subscriber.kama) for both protocols; a push that is not pub/sub
   goes to the connection's bounded set-aside list, never to a subscriber's deliveries.

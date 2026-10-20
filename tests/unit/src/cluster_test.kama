@@ -7,6 +7,7 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Config, redis::Command, redis::RedisError,
          redis::Dialer, redis::Dialers, redis::Script, redis::ScriptCall, redis::libraryVersion, redis::resp::Value,
          redis::Connection, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan,
+         redis::ClusterSubscriber, redis::Delivery,
          redis::cluster::keySlot,
          redis_unit_tests::check, redis_unit_tests::stop, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex };
@@ -1304,6 +1305,114 @@ unsafe fn int32 clusterScanTests() {
     return f;
 }
 
+unsafe fn ClusterSubscriber subscribed(Opens o, const ref string what, ref int32 fails) {
+    Opens taken = give o;
+    Owned<Dialers> d = taken.dialers();
+    Config c = configOf(url: oneSeed());
+    Result<ClusterSubscriber, RedisError> r = ClusterSubscriber.connectWith(dialers: give d, config: c);
+    return match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): {
+            string m = e.message();
+            fails = fails + check(ok: false, what: "${what} (${m})");
+            Opens again = Opens.make();
+            again.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+            := subscribed(o: give again, what: what, fails: fails);
+        }
+    };
+}
+
+// A delivery as text: "message <channel> <payload>", "moved <channel> <host:port>", "reconnected", "unsubscribed
+// <channel>", "none", or the error.
+fn string deliveryOf(Result<Optional<Delivery>, RedisError> r) {
+    return match (give r) {
+        case Err(error: e): { string m = e.message(); := "(error) ${m}"; }
+        case Ok(value: o): match (give o) {
+            case None: "none";
+            case Some(value: d): match (give d) {
+                case Message(message: m): { string ch = textOf(b: m.channel()); string pl = textOf(b: m.payload()); := "message ${ch} ${pl}"; }
+                case Moved(channel: c, to: n): { string ch = textOf(b: c.view()); string at = n.place(); := "moved ${ch} ${at}"; }
+                case Reconnected(cause: e): "reconnected";
+                case Unsubscribed(kind: k, channel: c): { string ch = textOf(b: c.view()); := "unsubscribed ${ch}"; }
+                case _: "?";
+            };
+        };
+    };
+}
+
+fn Optional<Duration> aSecond() { return Optional::Some(value: Duration.fromSecs(s: 1i64)); }
+
+// Pub/sub on a cluster: channels at one primary, shard channels at their slots' primaries, every node's deliveries.
+unsafe fn int32 clusterSubscriberTests() {
+    int32 f = 0;
+    string b = keyAt(index: 2);
+
+    Opens o = Opens.make();
+    o.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    DynamicArray<Step> s0 = answering(command: "SUBSCRIBE kr:c1", answer: reply(server: server(), kase: "sub-one/3"));
+    s0.add(item: Step::Send(bytes: reply(server: server(), kase: "message/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    DynamicArray<Step> s1 = answering(command: "SSUBSCRIBE kr:s1", answer: reply(server: server(), kase: "ssub-one/3"));
+    s1.add(item: Step::Send(bytes: reply(server: server(), kase: "smessage/3")));
+    o.serve(place: "127.0.0.1:7001", script: give s1);
+    ClusterSubscriber cs = subscribed(o: give o, what: "cluster subscriber: connect", fails: f);
+    Result<Unit, RedisError> u1 = cs.subscribe(names: "kr:c1");
+    Result<Unit, RedisError> u2 = cs.ssubscribe(names: "kr:s1");
+    bool both = match (u1) { case Ok(value: x): match (u2) { case Ok(value: y): true; case Err(error: e): false; }; case Err(error: e): false; };
+    f = f + check(ok: both && cs.channelCount() == 1 && cs.shardCount() == 1, what: "cluster subscriber: a channel at a primary, a shard channel at its slot's");
+    string d1 = deliveryOf(r: cs.next(timeout: aSecond()));
+    string d2 = deliveryOf(r: cs.next(timeout: aSecond()));
+    f = f + check(ok: d1 == "message kr:c1 hello" && d2 == "message kr:s1 hello", what: "cluster subscriber: every node's messages: ${d1}; ${d2}");
+    string d3 = deliveryOf(r: cs.next(timeout: Optional::Some(value: Duration.zero())));
+    f = f + check(ok: d3 == "none", what: "cluster subscriber: nothing more, none: ${d3}");
+
+    // The shard channel's slot moves (a failover: 7001's own sunsubscribe): followed to 7004, and Moved first.
+    // The first reading of the map is behind (gossip has not reached 7000 yet): it is read again until it names 7004.
+    Opens m = Opens.make();
+    DynamicArray<Step> m0 = seed(slots: "slots/3");
+    m0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    m0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    m.serve(place: "127.0.0.1:7000", script: give m0);
+    DynamicArray<Step> m1 = answering(command: "SSUBSCRIBE ${b}", answer: topo(kase: "ssub-shard/3"));
+    m1.add(item: Step::Send(bytes: topo(kase: "sunsubscribe-failover/3")));
+    m.serve(place: "127.0.0.1:7001", script: give m1);
+    m.serve(place: "127.0.0.1:7004", script: answering(command: "SSUBSCRIBE ${b}", answer: topo(kase: "ssub-shard-moved/3")));
+    ClusterSubscriber cm = subscribed(o: give m, what: "cluster subscriber moved: connect", fails: f);
+    Result<Unit, RedisError> u3 = cm.ssubscribe(names: b);
+    string mv = deliveryOf(r: cm.next(timeout: aSecond()));
+    f = f + check(ok: mv == "moved ${b} 127.0.0.1:7004" && cm.shardCount() == 1, what: "cluster subscriber: a shard channel whose slot moved is followed: ${mv}");
+
+    // The channels' node lost for good (its one redial refused): the map read again, the channels at another primary
+    // (7000 will not open, 7001 does), and Reconnected.
+    Opens l = Opens.make();
+    DynamicArray<Step> l0 = seed(slots: "slots/3");
+    l0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    l.serve(place: "127.0.0.1:7000", script: give l0);
+    DynamicArray<Step> l1 = answering(command: "SUBSCRIBE kr:c1", answer: reply(server: server(), kase: "sub-one/3"));
+    l1.add(item: Step::Hangup);
+    l.serve(place: "127.0.0.1:7000", script: give l1);
+    l.refuse(place: "127.0.0.1:7000");
+    DynamicArray<Step> l2 = answering(command: "SUBSCRIBE kr:c1", answer: reply(server: server(), kase: "sub-one/3"));
+    l2.add(item: Step::Send(bytes: reply(server: server(), kase: "message/3")));
+    l.serve(place: "127.0.0.1:7001", script: give l2);
+    ClusterSubscriber cl = subscribed(o: give l, what: "cluster subscriber lost: connect", fails: f);
+    Result<Unit, RedisError> u4 = cl.subscribe(names: "kr:c1");
+    string g1 = deliveryOf(r: cl.next(timeout: aSecond()));
+    // Reconnected means subscribed again, already: at 7001.
+    isize placed = cl.channelCount();
+    string g2 = deliveryOf(r: cl.next(timeout: aSecond()));
+    f = f + check(ok: g1 == "reconnected" && placed == 1 && g2 == "message kr:c1 hello",
+                  what: "cluster subscriber: a node lost for good, its channels at another primary: ${g1} (${placed} subscribed); ${g2}");
+
+    // Nothing subscribed, nothing can come.
+    Opens n = Opens.make();
+    n.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    ClusterSubscriber cn = subscribed(o: give n, what: "cluster subscriber empty: connect", fails: f);
+    string e1 = deliveryOf(r: cn.next(timeout: aSecond()));
+    f = f + check(ok: e1.contains(substring: "nothing is subscribed"), what: "cluster subscriber: nothing subscribed is Usage: ${e1}");
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
     f = f + routingTests();
@@ -1318,5 +1427,6 @@ unsafe fn int32 clusterTests() {
     f = f + watchedTests();
     f = f + replicaTests();
     f = f + clusterScanTests();
+    f = f + clusterSubscriberTests();
     return f;
 }

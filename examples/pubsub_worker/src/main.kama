@@ -63,6 +63,8 @@ unsafe fn int32 work(ref Subscriber sub) {
             case Reconnected(cause: e): { string why = e.message(); println(s: "reconnected (${why}); messages may have been missed"); }
             // The server ended a subscription of its own accord.
             case Unsubscribed(kind: k, channel: c): { println(s: "no longer subscribed to a channel"); }
+            // A later release may add a kind of delivery (Delivery is @nonExhaustive).
+            case _: { }
         };
     }
 }
