@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–4 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–5 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -612,14 +612,53 @@ Each step ends green before its commit:
      Sentinel configuration over `connectOver` is refused too. `Connection.connect` refuses a Sentinel configuration
      until step 5 builds it.
    - 30 mutations, all caught.
-5. **Sentinel discovery** (unit):
-   - the order, ROLE, the responder moved to the front, and SENTINELS added;
-   - each error;
-   - READONLY sent again once;
-   - `role=replica`;
-   - a redial asks again;
-   - hostile replies;
-   - the Scan fix.
+5. **Done (2026-10-20).** **Sentinel discovery** (unit), in `Connection`, so a `Subscriber` works through sentinels
+   too.
+   - **`reach` asks the sentinels first** (`askSentinels`), each with `connect_timeout`, its own credentials and no
+     database:
+     - GET-MASTER-ADDR-BY-NAME, or for `role=replica` SENTINEL REPLICAS (those up, at random; the master when none is
+       up);
+     - the sentinel that answered moves to the front of a list kept in the `Opener` across redials;
+     - SENTINEL SENTINELS adds the sentinels it knows (at most 16);
+     - the answer is a configuration for the server named (`Config.forNode`, `forSentinel`).
+   - **The role is confirmed** from HELLO's `role` field under RESP3: no extra round trip, and HELLO is every user's,
+     where ROLE is `@dangerous`. Only the RESP2 path sends ROLE.
+     - A server that says otherwise is asked for again, with a redial's backoff, within `reconnect_timeout`, on a
+       first connect and a redial alike.
+     - Past that window it is `RedisError::Sentinel`, unconfirmed: "the sentinels named 127.0.0.1:7200 for master kr,
+       and its role is replica".
+   - **The errors:**
+     - no sentinel reached is `Connect`, with an attempt for each;
+     - sentinels that answered without an address (none knew the name, a NOAUTH, a reply that is not an address) are
+       `Sentinel`, with each one's answer.
+   - **`RedisError` and `ServerCode` are now `@nonExhaustive`** (checked across packages: a consumer's `match` needs
+     `case _:`). So 0.2.0's new variant is the last one to break a caller.
+   - **READONLY from a sentinel-found master:**
+     - in `call`, the link goes and the command is sent once more, since it never ran;
+     - in `run` and `transact` (while queueing or at EXEC), the replies or the error stand, and the link goes, so the
+       next call asks again.
+   - **The 0.1.0 Scan bug is fixed:** a scan whose connection was made again (`Connection.generation`) ends with
+     `Usage`, sends nothing more, and stays ended.
+   - **The vectors gained:**
+     - HELLO on a master, a replica and the demoted master;
+     - REPLICAS with every replica down;
+     - two waits, so that Sentinel's record of a replica is settled before the capture.
+   - **The scripted server's dialer can be keyed by address** (`ScriptDialer.byPlace`). A connection that dials
+     somewhere it should not then finds a closed port.
+   - **Unit tests:**
+     - each finding path;
+     - the list's order, and a learned sentinel;
+     - a replica named, first connect and redial;
+     - past the window;
+     - `role=replica`, and with none up;
+     - RESP2's ROLE;
+     - the two sets of credentials, and no SELECT to a sentinel;
+     - READONLY in a call, a pipeline and a transaction (both ways);
+     - the scan.
+
+     A failed connect in a test is a named failure, not a panic, so that a mutation shows which case caught it.
+   - 24 mutations, all caught. The guard against a port that is not a number is proven by its words: removing it
+     traps at the port's cast, a crash rather than a named failure.
 6. **Sentinel live,** with `examples/sentinel`:
    - SENTINEL FAILOVER under calls (each INCR runs once);
    - DEBUG SLEEP on the master;

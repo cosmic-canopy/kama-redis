@@ -3,8 +3,8 @@
   "id": "M1",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
-  "new": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "old": "    unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "    unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
   "expect": "idle: a link closed while idle is found"
  },
  {

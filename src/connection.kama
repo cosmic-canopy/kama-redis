@@ -2,11 +2,13 @@ import { std::collections::DynamicArray, std::collections::Deque, std::io::IoErr
          std::net::SocketAddr, std::net::resolve, std::time::Duration, std::time::Instant, std::time::monotonicNow, std::time::sleep,
          std::random::Rng,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
-         redis::ConnectError, redis::ConnectAttempt, redis::ReconnectError, redis::Transport, redis::TcpTransport, redis::UnixTransport,
+         redis::ConnectError, redis::ConnectAttempt, redis::ReconnectError, redis::SentinelError, redis::SentinelRole,
+         redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo, redis::TlsSession,
          redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig, tls::TlsError,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::watchEffect, redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
+         redis::wire::Place, redis::wire::Address, redis::wire::addressOf, redis::wire::instancesOf, redis::wire::roleOf, redis::wire::MAX_SENTINELS,
          redis::resp::Writer, redis::resp::Value, redis::resp::Read };
 export { Connection, libraryName, libraryVersion };
 
@@ -22,6 +24,16 @@ export { Connection, libraryName, libraryVersion };
 //      two CLIENT SETINFOs that name this library. A server that refuses HELLO (a proxy) gets the RESP2 path on the
 //      same connection: AUTH, CLIENT SETNAME and SELECT, or PING when none is needed. `protocol=2` goes straight to that path; `protocol=3`
 //      never takes it.
+//
+// Through sentinels (redis-sentinel://, Config.sentinel; docs/ROADMAP.md, "Phase 6"), step 1's address comes from them,
+// as Sentinel's client specification says: each sentinel in turn, within `connect_timeout`, is asked for the master
+// (GET-MASTER-ADDR-BY-NAME) or, for `role=replica`, for a replica that is up (SENTINEL REPLICAS), the master when none
+// is. The sentinel that answered moves to the front of the list, and the sentinels it knows (SENTINEL SENTINELS) join
+// it. The server named must then confirm its role: HELLO's `role`, or ROLE on the RESP2 path. One that says otherwise
+// is asked for again after a pause, within `reconnect_timeout`, since a sentinel can be behind a failover. Every
+// reconnect asks the sentinels again, and a failover kills every client of the servers it reconfigures, so the next
+// call finds the new master. A write a demoted master refuses (READONLY) never ran: the call asks again and sends it
+// once more.
 //
 // After that, `call` sends one command and returns its reply, `run` sends a pipeline's commands in one write and
 // returns their replies, and `transact` sends them as one transaction (src/transaction.kama). A command a connection cannot carry (SUBSCRIBE,
@@ -70,6 +82,8 @@ type resource Connection implements Sendable {
     int32 failedRedials = 0;
     Instant redialAfter;
     Rng jitter;
+    // How many times the link was made again: a SCAN's cursor means nothing on a new server process.
+    int64 links = 0;
 
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
@@ -80,6 +94,7 @@ type resource Connection implements Sendable {
     friend redis::Subscriber::release[lost];
     friend redis::Subscriber::change[lost];
     friend redis::Subscriber::lostWith[lose];
+    friend redis::Scan::next[generation];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -143,7 +158,8 @@ type resource Connection implements Sendable {
         Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
         Connection c = Connection.over(transport: give link, config: config, dialing: give opener);
         c.secured = give session;
-        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);
+        Result<Unit, RedisError> shaken = c.handshake(config: config, deadline: left, again: false);
+        Result<Unit, RedisError> done = c.confirmed(shaken: give shaken, config: config, deadline: left);
         return match (give done) {
             case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }
             case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
@@ -154,6 +170,11 @@ type resource Connection implements Sendable {
     // deadline its handshake has: each address has `connect_timeout` for all of it. An address that does not open is
     // an attempt in `Connect`, and the next is tried; once one opens, what follows is final.
     static unsafe fn Result<Owned<Transport>, RedisError> reach(const ref Config config, ref Opener opener, ref Deadline left, ref DynamicArray<TlsSession> session) {
+        if (config.viaSentinel()) {
+            Result<Config, RedisError> asked = Connection::askSentinels(config: config, opener: opener);
+            Config node = match (give asked) { case Ok(value: c): give c; case Err(error: e): { return Result::Err(error: give e); } };
+            return Connection::reach(config: node, opener: opener, left: left, session: session);
+        }
         ConnectError failures = ConnectError.make();
         DynamicArray<DialTarget> targets = Connection::targetsOf(config: config, failures: failures);
         isize i = 0;
@@ -170,6 +191,184 @@ type resource Connection implements Sendable {
             i = i + 1;
         }
         return Result::Err(error: RedisError::Connect(error: give failures));
+    }
+
+    // The server a Sentinel configuration names, from the sentinels: each in turn, each within `connect_timeout` for its
+    // connect and handshake (with the sentinels' own credentials, and no database), until one gives an address. The
+    // sentinel that answered moves to the front of `opener`'s list, and the sentinels it knows join it. The answer is a
+    // configuration for that server. `Connect` when no sentinel could be reached, `Sentinel` when none gave an address.
+    static unsafe fn Result<Config, RedisError> askSentinels(const ref Config config, ref Opener opener) {
+        opener.seedSentinels(config: config);
+        Optional<string> named = config.masterName();
+        string master = match (give named) { case Some(value: m): give m; case None: ""; };
+        SentinelError answers = SentinelError.of(master: copy master);
+        ConnectError unreachable = ConnectError.make();
+        bool answered = false;
+        isize i = 0;
+        while (i < opener.sentinelCount()) {
+            Place at = opener.sentinelAt(index: i);
+            string place = at.text();
+            Config asking = config.forSentinel(host: copy at.host(), port: at.port());
+            Deadline left = Deadline.none();
+            DynamicArray<TlsSession> session = DynamicArray.empty();
+            Result<Owned<Transport>, RedisError> reached = Connection::reach(config: asking, opener: opener, left: left, session: session);
+            bool connected = match (reached) { case Ok(value: t): true; case Err(error: e): false; };
+            if (!connected) {
+                RedisError e = match (give reached) { case Err(error: x): give x; case Ok(value: t): RedisError::Closed; };
+                answers.add(place: copy place, answer: e.message());
+                match (e) {
+                    case Connect(error: c): {
+                        isize k = 0;
+                        while (k < c.count()) { unreachable.add(attempt: copy c.attempt(index: k)); k = k + 1; }
+                    }
+                    case _: { answered = true; }
+                };
+                i = i + 1;
+                continue;
+            }
+            answered = true;
+            Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            Connection s = Connection.over(transport: give link, config: asking, dialing: Opener.none());
+            s.secured = give session;
+            Result<Unit, RedisError> shaken = s.handshake(config: asking, deadline: left, again: false);
+            bool spoke = match (shaken) { case Ok(value: u): true; case Err(error: e): false; };
+            if (!spoke) {
+                RedisError e = match (give shaken) { case Err(error: x): give x; case Ok(value: u): RedisError::Closed; };
+                answers.add(place: copy place, answer: e.message());
+                i = i + 1;
+                continue;
+            }
+            Address said = s.lookup(config: config, master: master);
+            match (give said) {
+                case At(place: p): {
+                    s.learnSentinels(opener: opener, master: master);
+                    s.close();
+                    opener.promote(index: i);
+                    opener.found(place: p.text());
+                    return Result::Ok(value: config.forNode(host: copy p.host(), port: p.port()));
+                }
+                case Unknown: { answers.add(place: copy place, answer: "it does not know master ".concat(other: master)); }
+                case Malformed(why: w): { answers.add(place: copy place, answer: give w); }
+            };
+            s.close();
+            i = i + 1;
+        }
+        if (!answered) { return Result::Err(error: RedisError::Connect(error: give unreachable)); }
+        return Result::Err(error: RedisError::Sentinel(error: give answers));
+    }
+
+    // What this connection, to a sentinel, says the server is: GET-MASTER-ADDR-BY-NAME for the master; for a replica,
+    // one of those SENTINEL REPLICAS shows up, at random, or the master when none is.
+    unsafe fn Address lookup(const ref Config config, const ref string master) {
+        if (config.role() == SentinelRole::Replica) {
+            Command replicas = Command.of(name: "SENTINEL");
+            replicas.arg(text: "REPLICAS");
+            replicas.arg(text: master);
+            Result<Value, RedisError> r = this.call(command: replicas);
+            bool listed = match (r) { case Ok(value: v): true; case Err(error: e): false; };
+            if (!listed) {
+                return match (give r) { case Err(error: e): Address::Malformed(why: e.message()); case Ok(value: v): Address::Unknown; };
+            }
+            Value v = match (give r) { case Ok(value: x): give x; case Err(error: e): Value::Null; };
+            DynamicArray<Place> up = instancesOf(v: v, upOnly: true);
+            if (up.length() > 0) {
+                isize k = this.jitter.below(n: up.length());
+                return Address::At(place: copy up[k]);
+            }
+        }
+        Command ask = Command.of(name: "SENTINEL");
+        ask.arg(text: "GET-MASTER-ADDR-BY-NAME");
+        ask.arg(text: master);
+        Result<Value, RedisError> r = this.call(command: ask);
+        return match (give r) {
+            case Ok(value: v): addressOf(v: v);
+            case Err(error: e): Address::Malformed(why: e.message());
+        };
+    }
+
+    // The sentinels this one knows (SENTINEL SENTINELS), added to `opener`'s list. A refusal changes nothing: the list
+    // is an aid.
+    unsafe fn void learnSentinels(ref Opener opener, const ref string master) {
+        Command known = Command.of(name: "SENTINEL");
+        known.arg(text: "SENTINELS");
+        known.arg(text: master);
+        Result<Value, RedisError> r = this.call(command: known);
+        match (give r) {
+            case Ok(value: v): {
+                DynamicArray<Place> more = instancesOf(v: v, upOnly: false);
+                isize k = 0;
+                while (k < more.length()) { opener.learn(place: copy more[k]); k = k + 1; }
+            }
+            case Err(error: e): { }
+        };
+    }
+
+    // After a handshake through sentinels: the server named must confirm its role. One that does not is asked for
+    // again after a pause, with a redial's backoff, within `reconnect_timeout`. A connection that is not through
+    // sentinels has nothing to confirm.
+    unsafe fn Result<Unit, RedisError> confirmed(Result<Unit, RedisError> shaken, const ref Config config, Deadline deadline) {
+        if (!config.viaSentinel()) { return give shaken; }
+        match (give shaken) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> checked = this.confirmRole(config: config, deadline: deadline);
+        bool behind = match (checked) { case Err(error: e): unconfirmed(e: e); case Ok(value: u): false; };
+        if (!behind) { return give checked; }
+        RedisError first = match (give checked) { case Err(error: e): give e; case Ok(value: u): RedisError::Closed; };
+        return this.rediscover(config: config, first: give first);
+    }
+
+    // The server a sentinel named is what was asked for: the master, or for `role=replica` a replica (or the master,
+    // when none is up). Its HELLO says its role; on the RESP2 path, which sends no HELLO, ROLE does. One that says
+    // otherwise loses the link, and is `Sentinel`, unconfirmed.
+    unsafe fn Result<Unit, RedisError> confirmRole(const ref Config config, Deadline deadline) {
+        string said = "";
+        if (this.identified.length() > 0) {
+            said = copy this.identified[0].role();
+        } else {
+            this.outbox.clear();
+            Command role = Command.of(name: "ROLE");
+            role.encode(into: this.outbox);
+            Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+            match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            Result<Value, RedisError> got = this.nextReply(deadline: deadline);
+            Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            if (v.isError()) { ServerError refused = serverError(v: v); this.lose(); return Result::Err(error: RedisError::Server(error: give refused)); }
+            said = roleOf(v: v);
+            if (said == "slave") { said = "replica"; }
+        }
+        bool wantReplica = config.role() == SentinelRole::Replica;
+        if (said == "master" || (wantReplica && said == "replica")) { return Result::Ok(value: Unit::Unit); }
+        this.lose();
+        Optional<string> named = config.masterName();
+        string master = match (give named) { case Some(value: m): give m; case None: ""; };
+        return Result::Err(error: RedisError::Sentinel(error: SentinelError.unconfirmed(master: give master, place: this.dialing.foundText(), role: give said)));
+    }
+
+    // A server that did not confirm its role, asked for again: tries paced as a redial's, until one confirms, one
+    // fails for good, or `reconnect_timeout` passes. Its error is the last try's.
+    unsafe fn Result<Unit, RedisError> rediscover(const ref Config config, RedisError first) {
+        Deadline window = Deadline.within(span: config.reconnectTimeout());
+        RedisError last = give first;
+        this.failedRedials = 1;
+        this.redialAfter = monotonicNow() + this.backoff();
+        while (window.allows(at: this.redialAfter)) {
+            this.pace(window: window);
+            RedisError before = give last;
+            Result<Unit, RedisError> once = this.redialOnce(config: config);
+            match (give once) {
+                case Ok(value: u): {
+                    this.failedRedials = 0;
+                    this.redialAfter = monotonicNow();
+                    return Result::Ok(value: Unit::Unit);
+                }
+                case Err(error: e): {
+                    this.failedRedials = this.failedRedials + 1;
+                    this.redialAfter = monotonicNow() + this.backoff();
+                    if (!transient(e: e)) { return Result::Err(error: give e); }
+                    last = give e;
+                }
+            };
+        }
+        return Result::Err(error: give last);
     }
 
     // `link`, secured first when `config` is a TLS one: the TLS handshake runs within `deadline`, its failure names
@@ -262,8 +461,23 @@ type resource Connection implements Sendable {
         return Result::Ok(value: Unit::Unit);
     }
 
-    // Send `command`, which the table of commands a connection cannot carry has passed, and return its reply.
+    // Send `command`, which the table of commands a connection cannot carry has passed, and return its reply. Through
+    // sentinels, a master that refuses it as READONLY was made a replica since the connection reached it: the command
+    // never ran, so the link is dropped, the sentinels are asked again by the redial, and it is sent once more.
     unsafe fn Result<Value, RedisError> exchange(const ref Command command) {
+        Result<Value, RedisError> first = this.exchangeOnce(command: command);
+        if (!this.settings.viaSentinel() || this.settings.role() != SentinelRole::Master) { return give first; }
+        bool demoted = match (first) {
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): match (c) { case ReadOnly: true; case _: false; }; case None: false; };
+            case Ok(value: v): false;
+        };
+        if (!demoted) { return give first; }
+        Result<Value, RedisError> dropped = give first;
+        this.lose();
+        return this.exchangeOnce(command: command);
+    }
+
+    unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {
         Result<Unit, RedisError> idle = this.settle();
         match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Result<Unit, RedisError> up = this.ready();
@@ -311,7 +525,25 @@ type resource Connection implements Sendable {
         }
         isize at = pipeline.watchIndex();
         if (at >= 0 && !values[at].isError()) { this.noteWatch(effect: pipeline.watchResult()); }
+        // Through sentinels, a READONLY means the master was made a replica: each reply stands, since others of the
+        // pipeline may have run, and the next call asks the sentinels again.
+        if (this.demotedIn(values: values)) { this.lose(); }
         return Result::Ok(value: Replies.of(values: give values));
+    }
+
+    // Whether, on a connection through sentinels to the master, a reply among `values` is READONLY.
+    fn bool demotedIn(const ref DynamicArray<Value> values) {
+        if (!this.settings.viaSentinel() || this.settings.role() != SentinelRole::Master) { return false; }
+        isize i = 0;
+        while (i < values.length()) {
+            if (values[i].isError()) {
+                ServerError e = serverError(v: values[i]);
+                bool readOnly = match (e.code()) { case ReadOnly: true; case _: false; };
+                if (readOnly) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
     }
 
     // Call a script (src/script.kama): EVALSHA, and if the server lacks the script (NOSCRIPT, so it never ran), EVAL,
@@ -392,6 +624,11 @@ type resource Connection implements Sendable {
         bool abandoned = match (refused) { case Some(value: e): true; case None: false; };
         if (abandoned) {
             Value dropped = give ended;
+            bool readOnly = match (refused) {
+                case Some(value: e): match (e.serverCode()) { case Some(value: c): match (c) { case ReadOnly: true; case _: false; }; case None: false; };
+                case None: false;
+            };
+            if (readOnly && this.settings.viaSentinel() && this.settings.role() == SentinelRole::Master) { this.lose(); }
             return match (give refused) {
                 case Some(value: e): Result::Err(error: give e);
                 case None: Result::Err(error: RedisError::Closed);
@@ -400,6 +637,8 @@ type resource Connection implements Sendable {
         if (ended.isError()) {
             ServerError failed = serverError(v: ended);
             Value dropped = give ended;
+            bool readOnly = match (failed.code()) { case ReadOnly: true; case _: false; };
+            if (readOnly && this.settings.viaSentinel() && this.settings.role() == SentinelRole::Master) { this.lose(); }
             return Result::Err(error: RedisError::Server(error: give failed));
         }
         if (ended.isNull()) {
@@ -747,6 +986,9 @@ type resource Connection implements Sendable {
     // Whether the link is lost: not live, whether or not it can be made again.
     const fn bool lost() { return !this.live; }
 
+    // How many times the link was made again (a SCAN's cursor means nothing on a new server process).
+    const fn int64 generation() { return this.links; }
+
     // The connection is unusable: stop the transport, and answer `Closed` from now on.
     unsafe fn void lose() {
         if (!this.live) { return; }
@@ -888,7 +1130,14 @@ type resource Connection implements Sendable {
         this.live = true;
         Result<Unit, RedisError> done = this.handshake(config: config, deadline: left, again: true);
         match (give done) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
-        return this.probe(deadline: left);
+        if (config.viaSentinel()) {
+            Result<Unit, RedisError> checked = this.confirmRole(config: config, deadline: left);
+            match (give checked) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        Result<Unit, RedisError> probed = this.probe(deadline: left);
+        match (give probed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.links = this.links + 1i64;
+        return Result::Ok(value: Unit::Unit);
     }
 
     // A server that took the handshake may still be loading its dataset: PING, and -LOADING is the redial's to wait
@@ -954,12 +1203,18 @@ fn bool closedKind(IoError x) {
 fn bool transient(const ref RedisError e) {
     return match (e) {
         case Connect(error: c): true;
+        case Sentinel(error: s): s.isUnconfirmed();
         case Timeout: true;
         case Io(error: x): closedKind(x: x);
         case Tls(detail: d, cause: t): match (t) { case Closed: true; case Io(error: x): closedKind(x: x); case _: false; };
         case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };
         case _: false;
     };
+}
+
+// Whether `e` is a server the sentinels named not confirming its role: a failover a sentinel had not seen yet.
+fn bool unconfirmed(const ref RedisError e) {
+    return match (e) { case Sentinel(error: s): s.isUnconfirmed(); case _: false; };
 }
 
 // A hangup in answer to HELLO says what it most likely means.
@@ -973,16 +1228,12 @@ fn RedisError helloFailure(RedisError e, bool tls) {
     return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. A server's TLS port closes a plaintext connection: connect to one with rediss://. ".concat(other: proxy));
 }
 
-// What `config` asks of one connection that it cannot give: a cluster's options, a cluster's seeds, or (until this
-// client asks sentinels for the server, docs/ROADMAP.md "Phase 6", step 5) a Sentinel configuration.
+// What `config` asks of one connection that it cannot give: a cluster's options, or a cluster's seeds.
 fn Optional<RedisError> oneServer(const ref Config config) {
     if (config.clusterOptions()) {
         return Optional::Some(value: RedisError::Config(detail: "read_from and max_redirects are a cluster's options: connect to a cluster with Cluster.connect"));
     }
-    if (config.viaSentinel()) {
-        return Optional::Some(value: RedisError::Config(detail: "connecting through sentinels is not built yet (docs/ROADMAP.md, \"Phase 6\", step 5)"));
-    }
-    if (config.hostCount() > 1) {
+    if (config.hostCount() > 1 && !config.viaSentinel()) {
         return Optional::Some(value: RedisError::Config(detail: "several hosts are a cluster's seeds, or sentinels: connect to a cluster with Cluster.connect, or through sentinels with redis-sentinel://; a connection takes one host"));
     }
     return Optional::None;
@@ -1001,14 +1252,62 @@ type resource Opener implements Sendable {
     DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
     Duration keepIdle;
     bool dials = true;                      // false for a transport the caller opened: there is nothing to dial with
+    // Through sentinels: the sentinels to ask, the one that last answered first, and the server it named. Kept across
+    // redials, as Sentinel's client specification keeps them.
+    DynamicArray<Place> sentinels;
+    string foundAt;
 
-    public ctor builtIn(Duration keepAlive) { this.dialers = DynamicArray.empty(); this.keepIdle = keepAlive; }
+    public ctor builtIn(Duration keepAlive) {
+        this.dialers = DynamicArray.empty();
+        this.keepIdle = keepAlive;
+        this.sentinels = DynamicArray.empty();
+        this.foundAt = "";
+    }
     public ctor through(Owned<Dialer> dialer) {
         this.dialers = DynamicArray.empty();
         this.dialers.add(item: give dialer);
         this.keepIdle = Duration.zero();
+        this.sentinels = DynamicArray.empty();
+        this.foundAt = "";
     }
-    public ctor none() { this.dialers = DynamicArray.empty(); this.keepIdle = Duration.zero(); this.dials = false; }
+    public ctor none() {
+        this.dialers = DynamicArray.empty();
+        this.keepIdle = Duration.zero();
+        this.dials = false;
+        this.sentinels = DynamicArray.empty();
+        this.foundAt = "";
+    }
+
+    // The sentinels `config` names, the first time it is asked; after that, the list as answers have ordered it.
+    public fn void seedSentinels(const ref Config config) {
+        if (this.sentinels.length() > 0) { return; }
+        isize i = 0;
+        while (i < config.hostCount()) {
+            this.sentinels.add(item: Place.make(host: config.hostAt(index: i), port: config.portAt(index: i)));
+            i = i + 1;
+        }
+    }
+    public const fn isize sentinelCount() { return this.sentinels.length(); }
+    public const fn Place sentinelAt(isize index) { return copy this.sentinels[index]; }
+    // The sentinel at `index` answered: it is asked first from now on.
+    public unsafe fn void promote(isize index) {
+        if (index <= 0 || index >= this.sentinels.length()) { return; }
+        Place p = this.sentinels.remove(index: index);
+        this.sentinels.insertAt(index: 0, item: give p);
+    }
+    // A sentinel another named, added at the end unless it is there already or the list is full.
+    public fn void learn(Place place) {
+        if (this.sentinels.length() >= MAX_SENTINELS) { return; }
+        isize i = 0;
+        while (i < this.sentinels.length()) {
+            if (this.sentinels[i].same(other: place)) { return; }
+            i = i + 1;
+        }
+        this.sentinels.add(item: give place);
+    }
+    // Where the sentinels last said the server is ("127.0.0.1:7200").
+    public fn void found(string place) { this.foundAt = give place; }
+    public const fn string foundText() { return copy this.foundAt; }
 
     // Whether this can open a link again: false for a transport the caller opened.
     public const fn bool canDial() { return this.dials; }

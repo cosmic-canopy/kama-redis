@@ -1,0 +1,194 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    opener.promote(index: i);\n",
+  "new": "                    \n",
+  "expect": "the sentinel that answered is asked first on the redial"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    s.learnSentinels(opener: opener, master: master);\n",
+  "new": "                    \n",
+  "expect": "a sentinel another named is asked once the given one is down"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (said == \"master\" || (wantReplica && said == \"replica\")) { return Result::Ok(value: Unit::Unit); }",
+  "new": "        if (true) { return Result::Ok(value: Unit::Unit); }",
+  "expect": "the call goes to the new master"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (said == \"master\" || (wantReplica && said == \"replica\")) { return Result::Ok(value: Unit::Unit); }",
+  "new": "        if (said == \"master\" || said == \"replica\") { return Result::Ok(value: Unit::Unit); }",
+  "expect": "a replica past reconnect_timeout is Sentinel, unconfirmed"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (said == \"slave\") { said = \"replica\"; }",
+  "new": "            if (false) { said = \"replica\"; }",
+  "expect": "under RESP2, a ROLE of slave is a replica"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!behind) { return give checked; }",
+  "new": "        if (true) { return give checked; }",
+  "expect": "a replica named is asked for again"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        case Sentinel(error: s): s.isUnconfirmed();\n        case Timeout: true;",
+  "new": "        case Sentinel(error: s): false;\n        case Timeout: true;",
+  "expect": "a redial that meets a replica asks again"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (config.viaSentinel()) {\n            Result<Unit, RedisError> checked = this.confirmRole(config: config, deadline: left);",
+  "new": "        if (false) {\n            Result<Unit, RedisError> checked = this.confirmRole(config: config, deadline: left);",
+  "expect": "a redial that meets a replica asks again"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (up.length() > 0) {",
+  "new": "            if (false) {",
+  "expect": "role=replica reaches the replica that is up"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!answered) { return Result::Err(error: RedisError::Connect(error: give unreachable)); }",
+  "new": "        if (false) { return Result::Err(error: RedisError::Connect(error: give unreachable)); }",
+  "expect": "no sentinel reached is Connect"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                case Unknown: { answers.add(place: copy place, answer: \"it does not know master \".concat(other: master)); }",
+  "new": "                case Unknown: { answers.add(place: copy place, answer: \"no address\"); }",
+  "expect": "none knowing the name is Sentinel"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!demoted) { return give first; }",
+  "new": "        if (true) { return give first; }",
+  "expect": "a READONLY write is sent once more"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.demotedIn(values: values)) { this.lose(); }",
+  "new": "        if (false) { this.lose(); }",
+  "expect": "the call after it asks the sentinels again"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (readOnly && this.settings.viaSentinel() && this.settings.role() == SentinelRole::Master) { this.lose(); }\n            return match (give refused) {",
+  "new": "            if (false) { this.lose(); }\n            return match (give refused) {",
+  "expect": "after a transaction's READONLY while queueing"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (readOnly && this.settings.viaSentinel() && this.settings.role() == SentinelRole::Master) { this.lose(); }\n            return Result::Err(error: RedisError::Server(error: give failed));",
+  "new": "            if (false) { this.lose(); }\n            return Result::Err(error: RedisError::Server(error: give failed));",
+  "expect": "after a transaction's READONLY at EXEC"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.links = this.links + 1i64;",
+  "new": "        this.links = this.links + 0i64;",
+  "expect": "scan: a cursor is not sent on a new link"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        while (i < config.hostCount()) {\n            this.sentinels.add",
+  "new": "        while (i < 1) {\n            this.sentinels.add",
+  "expect": "an unreachable sentinel is passed over"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        c.userName = copy this.sentinelUserName;",
+  "new": "        c.userName = copy this.userName;",
+  "expect": "the sentinels' credentials go to them"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        c.secret = copy this.sentinelSecret;",
+  "new": "        c.secret = copy this.secret;",
+  "expect": "the sentinels' credentials go to them"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        c.dbIndex = 0i64;",
+  "new": "        c.dbIndex = this.dbIndex;",
+  "expect": "the sentinels' credentials go to them"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/wire/sentinel.kama",
+  "old": "    if (upOnly && down) { return Optional::None; }",
+  "new": "    if (false) { return Optional::None; }",
+  "expect": "role=replica with none up takes the master"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/wire/sentinel.kama",
+  "old": "    if (b.length() == 0 || b.length() > 5) { return -1; }",
+  "new": "    if (b.length() == 0) { return -1; }\n    if (b[0] == 120ui8) { return 1; }",
+  "expect": "a sentinel's NOAUTH and an address with a bad port are answers"
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "        if (this.link >= 0i64 && now != this.link) {",
+  "new": "        if (false) {",
+  "expect": "scan: a cursor is not sent on a new link"
+ },
+ {
+  "id": "M24",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "            this.trouble = \"the connection was made again since this scan began, and the new server knows nothing of its cursor: start a new Scan\";\n            return Result::Err(error: RedisError::Usage(detail: copy this.trouble));",
+  "new": "            return Result::Err(error: RedisError::Usage(detail: \"the connection was made again\"));",
+  "expect": "an ended scan stays ended, and sends nothing"
+ }
+]

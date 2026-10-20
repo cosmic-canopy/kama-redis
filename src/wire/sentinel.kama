@@ -1,0 +1,171 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::resp::Value };
+export { Place, Address, MAX_SENTINELS, addressOf, instancesOf, roleOf };
+
+// What a sentinel says, read (docs/ROADMAP.md, "Phase 6"). Internal: a connection through sentinels is the only
+// reader. Every reply is checked as any server's is: a port is 1 to 65535, a host is text, and an entry that is not
+// an instance is passed over rather than trusted.
+
+// The most sentinels a configuration keeps: those it was given, and those the sentinels named (SENTINEL SENTINELS).
+comptime isize MAX_SENTINELS = 16;
+
+// The most instances read from one SENTINELS or REPLICAS reply.
+comptime isize MAX_INSTANCES = 256;
+
+// A server's address, as a sentinel names it: an IP address (a host name under announce-hostnames) and a port.
+type resource Place implements Sendable, Copyable<This>(bare: give) {
+    string hostText;
+    int32 portNumber;
+
+    public ctor make(string host, int32 port) { this.hostText = give host; this.portNumber = port; }
+    public ctor copy(ref Place source) { this.hostText = copy source.hostText; this.portNumber = source.portNumber; }
+
+    public const fn const ref string host() { return this.hostText; }
+    public const fn int32 port() { return this.portNumber; }
+    public const fn bool same(const ref Place other) { return this.portNumber == other.portNumber && this.hostText == other.hostText; }
+
+    // "host:port", an IPv6 address in brackets.
+    public const fn string text() {
+        int32 p = this.portNumber;
+        string h = copy this.hostText;
+        if (h.contains(substring: ":")) { h = "[".concat(other: h).concat(other: "]"); }
+        return "${h}:${p}";
+    }
+}
+
+// What GET-MASTER-ADDR-BY-NAME answered.
+type enum Address implements Sendable {
+    // The address.
+    At(Place place),
+    // A null: the sentinel does not know the name.
+    Unknown,
+    // Neither, and what it is instead.
+    Malformed(string why);
+}
+
+fn Address addressOf(const ref Value v) {
+    return match (v) {
+        case Null: Address::Unknown;
+        case Array(items: xs): pair(xs: xs);
+        case Attributed(parts: ps): addressOf(v: ps[ps.length() - 1]);
+        case _: Address::Malformed(why: "not an address and a port, nor a null");
+    };
+}
+
+fn Address pair(const ref DynamicArray<Value> xs) {
+    if (xs.length() != 2) { return Address::Malformed(why: "not an address and a port"); }
+    Optional<string> host = textOf(v: xs[0]);
+    string h = match (give host) { case Some(value: t): give t; case None: ""; };
+    if (h.length() == 0) { return Address::Malformed(why: "an address that is not text"); }
+    int32 port = portOf(v: xs[1]);
+    if (port < 0) { return Address::Malformed(why: "a port that is not a number from 1 to 65535"); }
+    return Address::At(place: Place.make(host: give h, port: port));
+}
+
+// The instances of a SENTINEL SENTINELS or SENTINEL REPLICAS reply, in the order given: each a map under RESP3, or a
+// flat array of fields and values under RESP2, with its `ip` and `port`. With `upOnly`, one whose `flags` say it is
+// down (s_down, o_down) or disconnected is left out, as go-redis and Lettuce leave it. An entry without an address
+// is passed over; at most MAX_INSTANCES are read.
+fn DynamicArray<Place> instancesOf(const ref Value v, bool upOnly) {
+    DynamicArray<Place> found = DynamicArray.empty();
+    match (v) {
+        case Array(items: xs): {
+            isize i = 0;
+            while (i < xs.length() && i < MAX_INSTANCES) {
+                Optional<Place> one = instanceOf(v: xs[i], upOnly: upOnly);
+                match (give one) { case Some(value: p): { found.add(item: give p); } case None: { } };
+                i = i + 1;
+            }
+        }
+        case Attributed(parts: ps): { return instancesOf(v: ps[ps.length() - 1], upOnly: upOnly); }
+        case _: { }
+    };
+    return give found;
+}
+
+fn Optional<Place> instanceOf(const ref Value v, bool upOnly) {
+    return match (v) {
+        case Map(entries: es): fields(es: es, upOnly: upOnly);
+        case Array(items: xs): fields(es: xs, upOnly: upOnly);
+        case _: Optional::None;
+    };
+}
+
+fn Optional<Place> fields(const ref DynamicArray<Value> es, bool upOnly) {
+    Optional<string> ip = Optional::None;
+    int32 port = -1;
+    bool down = false;
+    isize i = 0;
+    while (i + 1 < es.length()) {
+        Optional<string> key = textOf(v: es[i]);
+        string k = match (give key) { case Some(value: t): give t; case None: ""; };
+        if (k == "ip") { ip = textOf(v: es[i + 1]); }
+        else if (k == "port") { port = portOf(v: es[i + 1]); }
+        else if (k == "flags") {
+            Optional<string> f = textOf(v: es[i + 1]);
+            string flags = match (give f) { case Some(value: t): give t; case None: ""; };
+            down = flags.contains(substring: "s_down") || flags.contains(substring: "o_down") || flags.contains(substring: "disconnected");
+        }
+        i = i + 2;
+    }
+    if (upOnly && down) { return Optional::None; }
+    string h = match (give ip) { case Some(value: t): give t; case None: ""; };
+    if (h.length() == 0 || port < 0) { return Optional::None; }
+    return Optional::Some(value: Place.make(host: give h, port: port));
+}
+
+// ROLE's first element: "master", "slave" or "sentinel"; "" for a reply that is not one.
+fn string roleOf(const ref Value v) {
+    return match (v) {
+        case Array(items: xs): firstText(xs: xs);
+        case Attributed(parts: ps): roleOf(v: ps[ps.length() - 1]);
+        case _: "";
+    };
+}
+
+fn string firstText(const ref DynamicArray<Value> xs) {
+    if (xs.length() == 0) { return ""; }
+    Optional<string> t = textOf(v: xs[0]);
+    return match (give t) { case Some(value: s): give s; case None: ""; };
+}
+
+// A simple or bulk string's text; None for anything else, or bytes that are not UTF-8.
+fn Optional<string> textOf(const ref Value v) {
+    return match (v) {
+        case Bulk(bytes: b): utf8(b: b.view());
+        case Simple(bytes: b): utf8(b: b.view());
+        case _: Optional::None;
+    };
+}
+
+fn Optional<string> utf8(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): Optional::Some(value: give s); case Err(error: e): Optional::None; };
+}
+
+// A port: an integer, or a string of digits (GET-MASTER-ADDR-BY-NAME sends it so), 1 to 65535; -1 otherwise.
+fn int32 portOf(const ref Value v) {
+    return match (v) {
+        case Integer(value: n): inRange(n: n);
+        case Bulk(bytes: b): digitsOf(b: b.view());
+        case Simple(bytes: b): digitsOf(b: b.view());
+        case _: -1;
+    };
+}
+
+fn int32 inRange(int64 n) {
+    if (n < 1i64 || n > 65535i64) { return -1; }
+    return cast<int32>(n);
+}
+
+fn int32 digitsOf(ConstView<uint8> b) {
+    if (b.length() == 0 || b.length() > 5) { return -1; }
+    int64 n = 0i64;
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] < 48ui8 || b[i] > 57ui8) { return -1; }
+        n = n * 10i64 + cast<int64>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    return inRange(n: n);
+}

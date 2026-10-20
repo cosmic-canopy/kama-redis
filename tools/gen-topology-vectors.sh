@@ -156,6 +156,8 @@ sub drain_for {   # what comes, until `$quiet` seconds of silence or the end of 
     }
     return ($got, $closed);
 }
+# A HELLO's client id counts the sentinels' own connections too, so it is 0 in what is recorded.
+sub canon_hello { my $v = shift; my $it = $v->[1]; for (my $i = 0; $i + 1 < @$it; $i += 2) { $it->[$i + 1] = [':', 0] if (str($it->[$i]) // '') eq 'id'; } return $v; }
 sub until_true {   # until_true <what> <seconds> <test>
     my ($what, $secs, $test) = @_;
     for (1 .. $secs * 20) { return if $test->(); select(undef, undef, undef, 0.05); }
@@ -165,17 +167,26 @@ sub one { my ($port, @cmd) = @_; my $c = open_to($port); my $v = tcall($c, @cmd)
 sub text { my ($port, @cmd) = @_; my $v = one($port, @cmd); return str($v) // ''; }
 # A case under both protocols, each on a fresh connection: HELLO 3 first for RESP3, then the setup (replies
 # dropped), then the command, whose reply is `$shape`d (canonical values) and recorded.
+# A case right after a failover can lose its connection to the sentinels' own CLIENT KILL, which they send again as
+# they settle: it is asked again, on a new connection, a few times.
+sub again { my $do = shift; for my $n (1 .. 5) { my $ok = eval { $do->(); 1 }; return if $ok; die $@ unless $@ eq "eof\n" && $n < 5; select(undef, undef, undef, 0.5); } }
 sub pair {
     my ($case, $port, $setup, $cmd, $shape) = @_;
+    again(sub { pair_once($case, $port, $setup, $cmd, $shape); });
+}
+sub pair_once {
+    my ($case, $port, $setup, $cmd, $shape) = @_;
+    my @out;
     for my $proto (2, 3) {
         my $c = open_to($port);
         tcall($c, 'HELLO', '3') if $proto == 3;
         tcall($c, @$_) for @$setup;
         my $v = tcall($c, @$cmd);
         $v = $shape->($v) if $shape;
-        record("$case/$proto", $cmd, tenc($v), $setup);
+        push @out, ["$case/$proto", $cmd, tenc($v), $setup];
         close $c->{s};
     }
+    record(@$_) for @out;
 }
 
 # ---- The cluster, by hand ----
@@ -375,8 +386,6 @@ sub canon_role {
     } elsif ($kind eq 'slave') { $it->[4] = [':', 0]; }
     return $v;
 }
-# HELLO's client id counts the sentinels' own connections too, so it is 0 here.
-sub canon_hello { my $v = shift; my $it = $v->[1]; for (my $i = 0; $i + 1 < @$it; $i += 2) { $it->[$i + 1] = [':', 0] if (str($it->[$i]) // '') eq 'id'; } return $v; }
 {
     my $c = open_to(7300);
     record('sentinel-hello3', ['HELLO', '3'], tenc(canon_hello(tcall($c, 'HELLO', '3'))));
@@ -387,6 +396,12 @@ pair('get-master-addr-unknown', 7300, [], ['SENTINEL', 'GET-MASTER-ADDR-BY-NAME'
 pair('get-primary-addr', 7300, [], ['SENTINEL', 'GET-PRIMARY-ADDR-BY-NAME', 'kr']) if $product eq 'valkey' && $major >= 8;
 pair('sentinels', 7300, [], ['SENTINEL', 'SENTINELS', 'kr'], \&canon_list);
 pair('replicas', 7300, [], ['SENTINEL', 'REPLICAS', 'kr'], \&canon_list);
+# HELLO on a master and on a replica: its role is what confirms the server a sentinel named, under RESP3.
+for my $at ([7200, 'hello3-master'], [7201, 'hello3-replica']) {
+    my $c = open_to($at->[0]);
+    record($at->[1], ['HELLO', '3'], tenc(canon_hello(tcall($c, 'HELLO', '3'))));
+    close $c->{s};
+}
 pair('role-master', 7200, [], ['ROLE'], \&canon_role);
 pair('role-replica', 7201, [], ['ROLE'], \&canon_role);
 pair('role-sentinel', 7300, [], ['ROLE']);
@@ -441,6 +456,24 @@ for my $proto (2, 3) {
 pair('get-master-addr-after-failover', 7300, [], ['SENTINEL', 'GET-MASTER-ADDR-BY-NAME', 'kr']);
 pair('demoted-write', 7200, [], ['SET', 'kr:k', 'v']);
 pair('role-demoted', 7200, [], ['ROLE'], \&canon_role);
+again(sub {
+    my $c = open_to(7200);
+    my $v = tcall($c, 'HELLO', '3');
+    close $c->{s};
+    record('hello3-demoted', ['HELLO', '3'], tenc(canon_hello($v)));
+});
+# Every replica down: 7202 was stopped before the failover, and now 7200, the demoted master, stops too, once the
+# sentinels have seen it as 7201's replica (their record of it is what the reply shows).
+until_true('the sentinels seeing 7200 as a replica of 7201, linked to it', 30, sub {
+    !grep { field($_, 'port') eq '7200' && (field($_, 'role-reported') ne 'slave' || field($_, 'master-port') ne '7201'
+                                            || field($_, 'master-link-status') ne 'ok') } @{ sent(7300, 'SENTINEL', 'REPLICAS', 'kr')->[1] // [] };
+});
+{ my $c = open_to(7200); print { $c->{s} } enc('SHUTDOWN', 'NOSAVE'); drain_for($c, 2); close $c->{s}; }
+until_true('the sentinels flagging both replicas down', 30, sub {
+    my $r = sent(7300, 'SENTINEL', 'REPLICAS', 'kr');
+    return @{ $r->[1] // [] } == 2 && !grep { field($_, 'flags') !~ /s_down/ } @{ $r->[1] };
+});
+pair('replicas-all-down', 7300, [], ['SENTINEL', 'REPLICAS', 'kr'], \&canon_list);
 pair('role-promoted', 7201, [], ['ROLE'], \&canon_role);
 PERL
 
@@ -450,7 +483,8 @@ for server in $SERVERS; do
         redis-*)  image=docker.io/library/redis:${server#redis-} ;;
         valkey-*) image=docker.io/valkey/valkey:${server#valkey-} ;;
     esac
-    "$RT" run --rm -i --network none "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt"
+    "$RT" run --rm -i --network none "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt" ||
+        { echo "gen-topology-vectors: $server failed" >&2; exit 1; }
     number=$(head -n 1 "$tmp/one.txt")
     case "$number" in [0-9]*.[0-9]*) ;; *) echo "gen-topology-vectors: $server gave no version" >&2; cat "$tmp/one.txt" >&2; exit 1 ;; esac
     tail -n +2 "$tmp/one.txt" | sed "s/^/${server%%-*}-$number	/" >> "$tmp/live.tsv"
@@ -480,13 +514,13 @@ my @every = qw(slots slots-at-replica moved crossslot crossslot-one-node multi-m
     get-master-addr-unknown sentinels replicas role-master role-replica role-sentinel sentinel-select sentinel-setinfo
     sentinel-setname sentinel-ping locked-sentinel-ping locked-sentinel-auth locked-sentinel-auth-wrong replicas-one-down
     subscribe-switch-master switch-master promoted-let-go demoted-let-go get-master-addr-after-failover demoted-write
-    role-demoted role-promoted);
+    role-demoted role-promoted replicas-all-down);
 for my $must (@every) {
     for my $proto (2, 3) {
         die "gen-topology-vectors: case $must/$proto is not on every server\n" unless ($count{"$must/$proto"} // 0) == @versions;
     }
 }
-for my $must (qw(sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop)) {
+for my $must (qw(sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted)) {
     die "gen-topology-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 # What the client's design rests on, checked on every server rather than taken from the docs.
@@ -502,6 +536,10 @@ sub expect {
 }
 for my $v (@versions) {
     my $at = sub { my $c = shift; my $h = $hex{"$v $c"}; die "gen-topology-vectors: $v has no $c\n" unless defined $h; return bytes($h); };
+    # A server's HELLO says its role: what confirms the master a sentinel named, under RESP3.
+    expect($v, 'hello3-master', qr/role\r\n.6\r\nmaster\r\n/, "the master's HELLO does not say role master");
+    expect($v, 'hello3-replica', qr/role\r\n.7\r\nreplica\r\n/, "a replica's HELLO does not say role replica");
+    expect($v, 'hello3-demoted', qr/role\r\n.7\r\nreplica\r\n/, "the demoted master's HELLO does not say role replica");
     for my $proto (2, 3) {
         expect($v, "moved/$proto", qr/\A-MOVED \d+ 127\.0\.0\.1:7001\r\n\z/, "MOVED from a primary does not name 7001");
         expect($v, "replica-get/$proto", qr/\A-MOVED \d+ 127\.0\.0\.1:7000\r\n\z/, "a replica does not send MOVED to its primary");

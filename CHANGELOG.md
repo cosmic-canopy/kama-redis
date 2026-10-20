@@ -15,10 +15,23 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
 - `redis-sentinel://` and `rediss-sentinel://`, with `master_name` and `role`, and `Config.sentinel`,
   `setSentinelRole` and `setSentinelAuth` (the sentinels' own credentials, set in code only); `SentinelRole`.
 - A cluster's options, `read_from` (`ReadFrom`) and `max_redirects`, with `Config.setReadFrom` and `setMaxRedirects`.
+- Sentinel: a `Connection` (and a `Subscriber`) through sentinels, as Sentinel's client specification says. The
+  sentinels are asked in turn for the master, or a replica that is up for `role=replica`. The one that answered is
+  asked first from then on, and the sentinels it knows join the list. The server named must confirm its role (HELLO's
+  `role`, or ROLE under RESP2), and one that does not is asked for again within `reconnect_timeout`. Every reconnect
+  asks again. A write a demoted master refuses as READONLY is sent once more, since it never ran.
+- `RedisError::Sentinel(SentinelError)`: the sentinels were reached and none gave an address, or the server they named
+  never confirmed its role. When none could be reached, the error is `Connect`, an attempt per sentinel.
 
 ### Changed
 - A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it
   dials. Before, `redis://a,b` was the one host `a,b`.
+- `RedisError` and `ServerCode` are `@nonExhaustive`: a `match` on either outside this package needs a `case _:`. This
+  release adds a variant (`Sentinel`), and none will break a caller after it.
+
+### Fixed
+- A `Scan` across a reconnect sent its cursor to the new server process, which reads it as another place in its
+  table and skips keys without a word. It now ends with `Usage` ("start a new Scan").
 
 ## [0.1.0] - 2026-10-19
 

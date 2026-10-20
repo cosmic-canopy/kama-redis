@@ -12,7 +12,9 @@ export { Scan };
 //   }
 //
 // Each `next` is one round trip, and returns that page's items, an empty page included, so no call makes an unbounded
-// number of them. The scan is done when the server answers cursor 0. The cursor is the server's bytes, kept as they
+// number of them. A cursor belongs to the server process that gave it: once the connection is made again (a restart,
+// a failover), the scan ends with `Usage`, rather than sending its cursor to a server that would read it as another
+// place, skipping keys without a word. Start a new scan then. The scan is done when the server answers cursor 0. The cursor is the server's bytes, kept as they
 // came. As the server documents, an item may come more than once, and one added or removed while the scan runs may
 // or may not come; an item there from start to end comes at least once.
 type resource Scan implements Sendable {
@@ -22,6 +24,8 @@ type resource Scan implements Sendable {
     DynamicArray<uint8> cursor;
     bool done = false;
     string trouble = "";
+    // The connection's link the scan's cursor came from (Connection.generation); -1 before the first page.
+    int64 link = -1;
 
     public ctor keys() { return Scan.named(name: "SCAN"); }
     public ctor setMembers(RedisArg key) {
@@ -89,6 +93,13 @@ type resource Scan implements Sendable {
         c.argBytes(bytes: this.cursor.view());
         c.appendFrom(other: this.options);
         Result<Value, RedisError> r = conn.call(command: c);
+        int64 now = conn.generation();
+        if (this.link >= 0i64 && now != this.link) {
+            Result<Value, RedisError> dropped = give r;
+            this.trouble = "the connection was made again since this scan began, and the new server knows nothing of its cursor: start a new Scan";
+            return Result::Err(error: RedisError::Usage(detail: copy this.trouble));
+        }
+        this.link = now;
         Value v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
         DynamicArray<Value> parts = match (give v) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
         if (parts.length() != 2) { return Result::Err(error: notAPage(name: this.name)); }

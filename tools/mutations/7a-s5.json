@@ -11,8 +11,8 @@
   "id": "M2",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "        case Connect(error: c): true;\n        case Timeout: true;",
-  "new": "        case Connect(error: c): false;\n        case Timeout: true;",
+  "old": "        case Connect(error: c): true;\n        case Sentinel(error: s): s.isUnconfirmed();",
+  "new": "        case Connect(error: c): false;\n        case Sentinel(error: s): s.isUnconfirmed();",
   "expect": "refused three times, then served"
  },
  {
@@ -51,8 +51,8 @@
   "id": "M7",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "        return this.probe(deadline: left);",
-  "new": "        return Result::Ok(value: Unit::Unit);",
+  "old": "        Result<Unit, RedisError> probed = this.probe(deadline: left);\n        match (give probed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };",
+  "new": "        Result<Unit, RedisError> probed = Result::Ok(value: Unit::Unit);\n        match (give probed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };",
   "expect": "LOADING is waited out"
  },
  {
@@ -67,8 +67,8 @@
   "id": "M9",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);\n        return match (give done) {\n            case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }",
-  "new": "        Result<Unit, RedisError> done = c.handshake(config: config, deadline: left, again: false);\n        return match (give done) {\n            case Ok(value: u): { := Result::Ok(value: give c); }",
+  "old": "        Result<Unit, RedisError> done = c.confirmed(shaken: give shaken, config: config, deadline: left);\n        return match (give done) {\n            case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }",
+  "new": "        Result<Unit, RedisError> done = c.confirmed(shaken: give shaken, config: config, deadline: left);\n        return match (give done) {\n            case Ok(value: u): { := Result::Ok(value: give c); }",
   "expect": "RESP3 stays RESP3"
  },
  {
@@ -139,8 +139,8 @@
   "id": "M18",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "            this.pace(window: window);\n",
-  "new": "",
+  "old": "        while (true) {\n            this.pace(window: window);\n            tries = tries + 1;",
+  "new": "        while (true) {\n            tries = tries + 1;",
   "expect": "pace: a call right after"
  },
  {

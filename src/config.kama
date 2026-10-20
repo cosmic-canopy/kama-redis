@@ -155,6 +155,9 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     Optional<ReadFrom> readChoice;
     Optional<int32> redirectChoice;
 
+    // A connection through sentinels asks each one with `forSentinel`, and reaches the server it names with `forNode`.
+    friend redis::Connection::askSentinels[forSentinel, forNode];
+
     ctor blank(UrlTransport kind) {
         this.kind = kind;
         this.hostText = "127.0.0.1";
@@ -583,6 +586,36 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public const fn string tlsServerName() { return match (this.serverNameText) { case Some(value: n): copy n; case None: copy this.hostText; }; }
     public const fn TlsVersion tlsMinVersion() { return this.minVersion; }
     public const fn TlsVersion tlsMaxVersion() { return this.maxVersion; }
+
+    // This configuration for asking the sentinel at `host` and `port`: one host, the sentinels' own credentials, no
+    // database (a sentinel has none), and the TLS name the sentinel's own (tls_server_name is the server's).
+    const fn Config forSentinel(string host, int32 port) {
+        Config c = copy this;
+        c.hostText = give host;
+        c.portNumber = port;
+        c.moreHosts = DynamicArray.empty();
+        c.morePorts = DynamicArray.empty();
+        c.viaSentinels = false;
+        c.master = Optional::None;
+        c.userName = copy this.sentinelUserName;
+        c.secret = copy this.sentinelSecret;
+        c.sentinelUserName = Optional::None;
+        c.sentinelSecret = Optional::None;
+        c.dbIndex = 0i64;
+        c.serverNameText = Optional::None;
+        return give c;
+    }
+
+    // This configuration for the server the sentinels named at `host` and `port`: one host, everything else as given.
+    const fn Config forNode(string host, int32 port) {
+        Config c = copy this;
+        c.hostText = give host;
+        c.portNumber = port;
+        c.moreHosts = DynamicArray.empty();
+        c.morePorts = DynamicArray.empty();
+        c.viaSentinels = false;
+        return give c;
+    }
 
     fn Optional<RedisError> tlsOnly() {
         if (this.kind == UrlTransport::Tls) { return Optional::None; }

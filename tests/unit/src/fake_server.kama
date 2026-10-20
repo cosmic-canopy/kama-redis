@@ -493,15 +493,36 @@ type enum Dial implements Sendable {
     ServeTls(DynamicArray<Step> steps, TlsConfig config, string sni);
 }
 
-// A `Dialer` that answers each dial with the next entry; with none left, it refuses as a closed port would.
+// A `Dialer` that answers each dial with the next entry; with none left, it refuses as a closed port would. Made
+// `byPlace`, each entry belongs to a place ("127.0.0.1:7200", as `DialTarget.place()` names it), and a dial takes the
+// first entry left for its target's place, or is refused: a connection that dials somewhere it should not finds a
+// closed port.
 type resource ScriptDialer implements Dialer, Sendable {
     DynamicArray<Dial> dials;
+    DynamicArray<string> places;   // empty: in order, wherever the dial goes
 
-    public ctor make(DynamicArray<Dial> dials) { this.dials = give dials; }
+    public ctor make(DynamicArray<Dial> dials) { this.dials = give dials; this.places = DynamicArray.empty(); }
+    public ctor byPlace(DynamicArray<string> places, DynamicArray<Dial> dials) {
+        if (places.length() != dials.length()) { panic(msg: "ScriptDialer.byPlace: a place for every dial"); }
+        this.dials = give dials;
+        this.places = give places;
+    }
 
     public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
         if (this.dials.length() == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
-        Dial d = this.dials.remove(index: 0);
+        isize at = 0;
+        if (this.places.length() > 0) {
+            string place = target.place();
+            at = -1;
+            isize i = 0;
+            while (i < this.places.length()) {
+                if (this.places[i] == place) { at = i; break; }
+                i = i + 1;
+            }
+            if (at < 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
+            string unused = this.places.remove(index: at);
+        }
+        Dial d = this.dials.remove(index: at);
         match (give d) {
             case Refuse: { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
             case TimeOut: { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }

@@ -1,0 +1,489 @@
+// Through sentinels (docs/ROADMAP.md, "Phase 6"): a connection that asks sentinels for its server, over a scripted
+// dialer whose dials are keyed by address, so a connection that dials a place it should not finds a closed port. What
+// the sentinels and the servers say are real replies: redis-8.10.2's, from topology_vectors.kama (the sentinel group:
+// master 7200, replicas 7201 and 7202, sentinels 7300-7303) and server_vectors.kama (a standalone server's HELLO).
+import { std::collections::DynamicArray, std::memory::Owned,
+         redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Dialer,
+         redis::Scan, redis::TxOutcome, redis::libraryVersion, redis::resp::Value,
+         redis_unit_tests::check, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
+         commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport };
+export { sentinelTests };
+
+fn string server() { return "redis-8.10.2"; }
+
+// What redis-8.10.2's sentinel group answered to `kase` ("get-master-addr/3").
+fn DynamicArray<uint8> topo(const ref string kase) {
+    string name = server().concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = topologyNames();
+    DynamicArray<string> hex = topologyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: hex[i]); }
+        i = i + 1;
+    }
+    panic(msg: "sentinel_test: no topology vector ${name}");
+    return DynamicArray.empty();
+}
+
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// A sentinel's side of the handshake: HELLO 3, then the two SETINFOs, as a sentinel answers them.
+fn DynamicArray<Step> sentinelHello() {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3", answer: topo(kase: "sentinel-hello3")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: topo(kase: "sentinel-setinfo/3")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: topo(kase: "sentinel-setinfo/3")));
+    return give s;
+}
+
+// A sentinel that names `address` (its GET-MASTER-ADDR-BY-NAME reply), then lists the sentinels it knows (7301-7303).
+fn DynamicArray<Step> naming(DynamicArray<uint8> address) {
+    DynamicArray<Step> s = sentinelHello();
+    s.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: give address));
+    s.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/3")));
+    return give s;
+}
+fn DynamicArray<Step> names7200() { return naming(address: topo(kase: "get-master-addr/3")); }
+fn DynamicArray<Step> names7201() { return naming(address: topo(kase: "get-master-addr-after-failover/3")); }
+
+// A sentinel that does not know the name: a null, and nothing more is asked of it.
+fn DynamicArray<Step> unknowing() {
+    DynamicArray<Step> s = sentinelHello();
+    s.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: topo(kase: "get-master-addr-unknown/3")));
+    return give s;
+}
+
+// A server's handshake under RESP3: its HELLO says master (a standalone server's), or replica.
+fn DynamicArray<Step> asMaster() { return welcome(server: server()); }
+fn DynamicArray<Step> asReplica() {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3", answer: topo(kase: "hello3-replica")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server(), kase: "setinfo-ver")));
+    return give s;
+}
+
+// `script`, then a PING answered: what a call of PING meets, or what ends a redial.
+fn DynamicArray<Step> thenPing(DynamicArray<Step> script) {
+    DynamicArray<Step> s = give script;
+    s.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    return give s;
+}
+
+// The dials of a test, each at its place.
+type resource Dials {
+    DynamicArray<string> places;
+    DynamicArray<Dial> dials;
+    public ctor make() { this.places = DynamicArray.empty(); this.dials = DynamicArray.empty(); }
+    public fn void serve(string place, DynamicArray<Step> script) { this.places.add(item: give place); this.dials.add(item: Dial::Serve(steps: give script)); }
+    public fn void refuse(string place) { this.places.add(item: give place); this.dials.add(item: Dial::Refuse); }
+    // A dialer that answers each place with its dials, in the order given.
+    public unsafe fn Owned<Dialer> dialer() {
+        DynamicArray<string> where = DynamicArray.empty();
+        DynamicArray<Dial> answers = DynamicArray.empty();
+        while (this.places.length() > 0) {
+            where.add(item: this.places.remove(index: 0));
+            answers.add(item: this.dials.remove(index: 0));
+        }
+        Owned<Dialer> d = new ScriptDialer.byPlace(places: give where, dials: give answers);
+        return give d;
+    }
+}
+
+unsafe fn Result<Connection, RedisError> through(Dials d, const ref Config config) {
+    Dials taken = give d;
+    Owned<Dialer> dialer = taken.dialer();
+    return Connection.connectWith(dialer: give dialer, config: config);
+}
+
+unsafe fn Result<Connection, RedisError> at(Dials d, const ref string url) {
+    Config c = configOf(url: url);
+    return through(d: give d, config: c);
+}
+
+// Two sentinels, 7300 then 7301, a second each to connect and handshake, and a second to wait out a role.
+fn string twoSentinels() { return "redis-sentinel://127.0.0.1:7300,127.0.0.1:7301?master_name=kr&connect_timeout=1&reconnect_timeout=1"; }
+
+fn string outcome(const ref Result<Connection, RedisError> r) {
+    return match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+}
+
+unsafe fn Result<Value, RedisError> ping(ref Connection c) {
+    Command p = Command.of(name: "PING");
+    return c.call(command: p);
+}
+
+// The connection a check needs. When it cannot be made, the check `what` fails here (counted in `fails`), and a
+// stand-in, a connection to a server that answers nothing past its handshake, lets the test go on to its end.
+unsafe fn Connection connected(Dials d, const ref string url, const ref string what, ref int32 fails) {
+    Result<Connection, RedisError> r = at(d: give d, url: url);
+    return match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); fails = fails + check(ok: false, what: "${what} (${m})"); := standIn(); }
+    };
+}
+
+unsafe fn Connection standIn() {
+    Owned<Transport> fake = new FakeServer.make(steps: welcome(server: server()), chunk: 1, writeLimit: 3);
+    Config config = configOf(url: "redis://");
+    Result<Connection, RedisError> r = Connection.connectOver(transport: give fake, config: config);
+    return match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): { panic(msg: "sentinel_test: the stand-in connection"); := standIn(); }
+    };
+}
+
+unsafe fn int32 findingTests() {
+    int32 f = 0;
+
+    // The first sentinel names the master, which confirms its role in its HELLO: then the call goes there.
+    Dials one = Dials.make();
+    one.serve(place: "127.0.0.1:7300", script: names7200());
+    one.serve(place: "127.0.0.1:7200", script: thenPing(script: asMaster()));
+    Connection c1 = connected(d: give one, url: twoSentinels(), what: "sentinel: the first sentinel names the master, and the call goes there", fails: f);
+    Result<Value, RedisError> p1 = ping(c: c1);
+    f = f + check(ok: isSimple(r: p1, text: "PONG"), what: "sentinel: the first sentinel names the master, and the call goes there");
+
+    // A sentinel that cannot be reached, or does not know the name, is passed over for the next.
+    Dials two = Dials.make();
+    two.refuse(place: "127.0.0.1:7300");
+    two.serve(place: "127.0.0.1:7301", script: names7200());
+    two.serve(place: "127.0.0.1:7200", script: thenPing(script: asMaster()));
+    Connection c2 = connected(d: give two, url: twoSentinels(), what: "sentinel: an unreachable sentinel is passed over", fails: f);
+    f = f + check(ok: isSimple(r: ping(c: c2), text: "PONG"), what: "sentinel: an unreachable sentinel is passed over");
+    Dials three = Dials.make();
+    three.serve(place: "127.0.0.1:7300", script: unknowing());
+    three.serve(place: "127.0.0.1:7301", script: names7200());
+    three.serve(place: "127.0.0.1:7200", script: thenPing(script: asMaster()));
+    Connection c3 = connected(d: give three, url: twoSentinels(), what: "sentinel: a sentinel that does not know the name is passed over", fails: f);
+    f = f + check(ok: isSimple(r: ping(c: c3), text: "PONG"), what: "sentinel: a sentinel that does not know the name is passed over");
+
+    // No sentinel reached: Connect, an attempt for each.
+    Dials none = Dials.make();
+    none.refuse(place: "127.0.0.1:7300");
+    none.refuse(place: "127.0.0.1:7301");
+    Result<Connection, RedisError> r4 = at(d: give none, url: twoSentinels());
+    isize attempts = match (r4) { case Err(error: e): match (e) { case Connect(error: x): x.count(); case _: -1; }; case Ok(value: c): -1; };
+    f = f + check(ok: attempts == 2, what: "sentinel: no sentinel reached is Connect, an attempt for each");
+
+    // Every sentinel reached, none knowing the name: Sentinel, with what each said.
+    Dials blank = Dials.make();
+    blank.serve(place: "127.0.0.1:7300", script: unknowing());
+    blank.serve(place: "127.0.0.1:7301", script: unknowing());
+    Result<Connection, RedisError> r5 = at(d: give blank, url: twoSentinels());
+    string m5 = outcome(r: r5);
+    isize said = match (r5) { case Err(error: e): match (e) { case Sentinel(error: x): x.count(); case _: -1; }; case Ok(value: c): -1; };
+    f = f + check(ok: said == 2 && m5.contains(substring: "no sentinel gave the address of master kr") && m5.contains(substring: "127.0.0.1:7301: it does not know master kr"),
+                  what: "sentinel: none knowing the name is Sentinel, with each one's answer (${m5})");
+
+    // A sentinel that wants a password, and a reply that is not an address, are answers too.
+    Dials locked = Dials.make();
+    DynamicArray<Step> noauth = steps();
+    noauth.add(item: expect(command: "HELLO 3", answer: topo(kase: "locked-sentinel-ping/3")));
+    locked.serve(place: "127.0.0.1:7300", script: give noauth);
+    DynamicArray<Step> garbled = sentinelHello();
+    garbled.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: bytesOf(text: "*2\r\n$9\r\n127.0.0.1\r\n$1\r\nx\r\n")));
+    locked.serve(place: "127.0.0.1:7301", script: give garbled);
+    Result<Connection, RedisError> r6 = at(d: give locked, url: twoSentinels());
+    string m6 = outcome(r: r6);
+    f = f + check(ok: m6.contains(substring: "7300: NOAUTH") && m6.contains(substring: "7301: a port that is not a number"),
+                  what: "sentinel: a sentinel's NOAUTH and an address with a bad port are answers (${m6})");
+    return f;
+}
+
+unsafe fn int32 listTests() {
+    int32 f = 0;
+    // The sentinel that answered is asked first from then on. A redial has one try (reconnect_timeout of 10 ms): if it
+    // asked 7300 first, it would be sent to 7201, which nothing serves, and the call would fail.
+    string once = "redis-sentinel://127.0.0.1:7300,127.0.0.1:7301?master_name=kr&connect_timeout=1&reconnect_timeout=0.01";
+    Dials d = Dials.make();
+    d.refuse(place: "127.0.0.1:7300");
+    d.serve(place: "127.0.0.1:7301", script: names7200());
+    DynamicArray<Step> lost = asMaster();
+    lost.add(item: Step::Close);
+    d.serve(place: "127.0.0.1:7200", script: give lost);
+    d.serve(place: "127.0.0.1:7300", script: names7201());
+    d.serve(place: "127.0.0.1:7301", script: names7200());
+    d.serve(place: "127.0.0.1:7200", script: thenPing(script: thenPing(script: asMaster())));
+    Connection c = connected(d: give d, url: once, what: "sentinel: the sentinel that answered is asked first on the redial", fails: f);
+    Result<Value, RedisError> gone = ping(c: c);
+    Result<Value, RedisError> back = ping(c: c);
+    string b = callOutcome(r: back);
+    f = f + check(ok: !isSimple(r: gone, text: "PONG") && isSimple(r: back, text: "PONG"), what: "sentinel: the sentinel that answered is asked first on the redial (${b})");
+
+    // The sentinels it names join the list: a configuration that names only 7300 reaches 7301 once 7300 is down.
+    string alone = "redis-sentinel://127.0.0.1:7300?master_name=kr&connect_timeout=1&reconnect_timeout=0.01";
+    Dials e = Dials.make();
+    e.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> lost2 = asMaster();
+    lost2.add(item: Step::Close);
+    e.serve(place: "127.0.0.1:7200", script: give lost2);
+    e.refuse(place: "127.0.0.1:7300");
+    e.serve(place: "127.0.0.1:7301", script: names7200());
+    e.serve(place: "127.0.0.1:7200", script: thenPing(script: thenPing(script: asMaster())));
+    Connection c2 = connected(d: give e, url: alone, what: "sentinel: a sentinel another named is asked once the given one is down", fails: f);
+    Result<Value, RedisError> gone2 = ping(c: c2);
+    Result<Value, RedisError> back2 = ping(c: c2);
+    string b2 = callOutcome(r: back2);
+    f = f + check(ok: isSimple(r: back2, text: "PONG"), what: "sentinel: a sentinel another named is asked once the given one is down (${b2})");
+    return f;
+}
+
+unsafe fn int32 roleTests() {
+    int32 f = 0;
+    // The server named says it is a replica (a sentinel behind a failover): asked for again after a pause, the next
+    // answer is the new master, whose redial ends with a PING.
+    Dials d = Dials.make();
+    d.serve(place: "127.0.0.1:7300", script: names7200());
+    d.serve(place: "127.0.0.1:7200", script: asReplica());
+    d.serve(place: "127.0.0.1:7300", script: names7201());
+    d.serve(place: "127.0.0.1:7201", script: thenPing(script: thenPing(script: asMaster())));
+    Result<Connection, RedisError> r = at(d: give d, url: twoSentinels());
+    string m = outcome(r: r);
+    f = f + check(ok: m == "ok", what: "sentinel: a replica named is asked for again, and the new master taken (${m})");
+    match (give r) {
+        case Ok(value: c): { Connection conn = give c; f = f + check(ok: isSimple(r: ping(c: conn), text: "PONG"), what: "sentinel: the call goes to the new master"); }
+        case Err(error: e): { }
+    };
+
+    // The same on a redial: the link lost, the next call's redial meets a replica, and asks again.
+    Dials rd2 = Dials.make();
+    rd2.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> lostLink = asMaster();
+    lostLink.add(item: Step::Close);
+    rd2.serve(place: "127.0.0.1:7200", script: give lostLink);
+    rd2.serve(place: "127.0.0.1:7300", script: names7200());
+    rd2.serve(place: "127.0.0.1:7200", script: thenPing(script: asReplica()));
+    rd2.serve(place: "127.0.0.1:7300", script: names7201());
+    rd2.serve(place: "127.0.0.1:7201", script: thenPing(script: thenPing(script: asMaster())));
+    Connection again = connected(d: give rd2, url: twoSentinels(), what: "sentinel: a redial that meets a replica asks again", fails: f);
+    Result<Value, RedisError> lostCall = ping(c: again);
+    Result<Value, RedisError> redialed = ping(c: again);
+    string rm = callOutcome(r: redialed);
+    f = f + check(ok: isSimple(r: redialed, text: "PONG"), what: "sentinel: a redial that meets a replica asks again (${rm})");
+
+    // One that stays a replica past reconnect_timeout: Sentinel, unconfirmed, naming it and its role.
+    string brief = "redis-sentinel://127.0.0.1:7300?master_name=kr&connect_timeout=1&reconnect_timeout=0.3";
+    Dials stuck = Dials.make();
+    isize i = 0;
+    while (i < 6) {
+        stuck.serve(place: "127.0.0.1:7300", script: names7200());
+        stuck.serve(place: "127.0.0.1:7200", script: asReplica());
+        i = i + 1;
+    }
+    Result<Connection, RedisError> r2 = at(d: give stuck, url: brief);
+    string m2 = outcome(r: r2);
+    bool unconfirmed = match (r2) { case Err(error: e): match (e) { case Sentinel(error: x): x.isUnconfirmed(); case _: false; }; case Ok(value: c): false; };
+    f = f + check(ok: unconfirmed && m2 == "the sentinels named 127.0.0.1:7200 for master kr, and its role is replica",
+                  what: "sentinel: a replica past reconnect_timeout is Sentinel, unconfirmed (${m2})");
+
+    // role=replica: a replica that is up, at random among them (here one is: 7202 is down), confirmed as a replica.
+    string replica = "redis-sentinel://127.0.0.1:7300?master_name=kr&role=replica&connect_timeout=1&reconnect_timeout=1";
+    Dials rd = Dials.make();
+    DynamicArray<Step> listing = sentinelHello();
+    listing.add(item: expect(command: "SENTINEL REPLICAS kr", answer: topo(kase: "replicas-one-down/3")));
+    listing.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/3")));
+    rd.serve(place: "127.0.0.1:7300", script: give listing);
+    rd.serve(place: "127.0.0.1:7201", script: thenPing(script: asReplica()));
+    Connection rc = connected(d: give rd, url: replica, what: "sentinel: role=replica reaches the replica that is up", fails: f);
+    f = f + check(ok: isSimple(r: ping(c: rc), text: "PONG"), what: "sentinel: role=replica reaches the replica that is up");
+
+    // role=replica with every replica down: the master, which confirms as one.
+    Dials md = Dials.make();
+    DynamicArray<Step> down = sentinelHello();
+    down.add(item: expect(command: "SENTINEL REPLICAS kr", answer: topo(kase: "replicas-all-down/3")));
+    down.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: topo(kase: "get-master-addr/3")));
+    down.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/3")));
+    md.serve(place: "127.0.0.1:7300", script: give down);
+    md.serve(place: "127.0.0.1:7200", script: thenPing(script: asMaster()));
+    Connection mc = connected(d: give md, url: replica, what: "sentinel: role=replica with none up takes the master", fails: f);
+    f = f + check(ok: isSimple(r: ping(c: mc), text: "PONG"), what: "sentinel: role=replica with none up takes the master");
+    return f;
+}
+
+unsafe fn int32 resp2Tests() {
+    int32 f = 0;
+    // protocol=2 sends no HELLO, so ROLE confirms: PING ends each RESP2 handshake that has nothing else to send.
+    string url = "redis-sentinel://127.0.0.1:7300?master_name=kr&protocol=2&connect_timeout=1&reconnect_timeout=0.01";
+    Dials d = Dials.make();
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "PING", answer: topo(kase: "sentinel-ping/2")));
+    s.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: topo(kase: "get-master-addr/2")));
+    s.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/2")));
+    d.serve(place: "127.0.0.1:7300", script: give s);
+    DynamicArray<Step> m = steps();
+    m.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    m.add(item: expect(command: "ROLE", answer: topo(kase: "role-master/2")));
+    d.serve(place: "127.0.0.1:7200", script: thenPing(script: give m));
+    Connection c = connected(d: give d, url: url, what: "sentinel: under RESP2, ROLE confirms the master", fails: f);
+    f = f + check(ok: isSimple(r: ping(c: c), text: "PONG"), what: "sentinel: under RESP2, ROLE confirms the master");
+
+    Dials r = Dials.make();
+    DynamicArray<Step> s2 = steps();
+    s2.add(item: expect(command: "PING", answer: topo(kase: "sentinel-ping/2")));
+    s2.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: topo(kase: "get-master-addr/2")));
+    s2.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/2")));
+    r.serve(place: "127.0.0.1:7300", script: give s2);
+    DynamicArray<Step> m2 = steps();
+    m2.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    m2.add(item: expect(command: "ROLE", answer: topo(kase: "role-replica/2")));
+    r.serve(place: "127.0.0.1:7200", script: give m2);
+    Result<Connection, RedisError> got = at(d: give r, url: url);
+    string why = outcome(r: got);
+    f = f + check(ok: why.contains(substring: "its role is replica"), what: "sentinel: under RESP2, a ROLE of slave is a replica (${why})");
+    return f;
+}
+
+unsafe fn int32 credentialTests() {
+    int32 f = 0;
+    // The URL's user, password and database are the server's; the sentinels' own credentials are set apart, and each
+    // goes only to its own. A sentinel has no database: it is sent no SELECT.
+    Config c = configOf(url: "redis-sentinel://kr_acl:kr_acl_pw@127.0.0.1:7303/2?master_name=kr&connect_timeout=1");
+    Result<Unit, RedisError> set = c.setSentinelAuth(user: Optional::Some(value: "kr_sentinel"), password: "kr_sentinel_pw");
+    Dials d = Dials.make();
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3 AUTH kr_sentinel kr_sentinel_pw", answer: topo(kase: "locked-sentinel-hello3-auth")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: topo(kase: "sentinel-setinfo/3")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: topo(kase: "sentinel-setinfo/3")));
+    s.add(item: expect(command: "SENTINEL GET-MASTER-ADDR-BY-NAME kr", answer: topo(kase: "get-master-addr/3")));
+    s.add(item: expect(command: "SENTINEL SENTINELS kr", answer: topo(kase: "sentinels/3")));
+    d.serve(place: "127.0.0.1:7303", script: give s);
+    DynamicArray<Step> m = steps();
+    m.add(item: expect(command: "HELLO 3 AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "hello3-auth")));
+    m.add(item: expect(command: "SELECT 2", answer: reply(server: server(), kase: "select1")));
+    m.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    m.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server(), kase: "setinfo-ver")));
+    d.serve(place: "127.0.0.1:7200", script: thenPing(script: give m));
+    Result<Connection, RedisError> r = through(d: give d, config: c);
+    string got = outcome(r: r);
+    f = f + check(ok: got == "ok", what: "sentinel: the sentinels' credentials go to them, the URL's to the server (${got})");
+    return f;
+}
+
+unsafe fn int32 readOnlyTests() {
+    int32 f = 0;
+    // A write the master refuses as READONLY (it was made a replica) never ran: the link goes, the sentinels are asked
+    // again, and it is sent once more, to the new master.
+    Dials d = Dials.make();
+    d.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> demoted = asMaster();
+    demoted.add(item: expect(command: "SET kr:k v", answer: topo(kase: "demoted-write/3")));
+    d.serve(place: "127.0.0.1:7200", script: give demoted);
+    d.serve(place: "127.0.0.1:7300", script: names7201());
+    DynamicArray<Step> promoted = thenPing(script: asMaster());
+    promoted.add(item: expect(command: "SET kr:k v", answer: reply(server: server(), kase: "setname")));
+    d.serve(place: "127.0.0.1:7201", script: give promoted);
+    Connection c = connected(d: give d, url: twoSentinels(), what: "sentinel: a READONLY write is sent once more, to the new master", fails: f);
+    Command set = commandOf(text: "SET kr:k v");
+    Result<Value, RedisError> w = c.call(command: set);
+    string wrote = callOutcome(r: w);
+    f = f + check(ok: isSimple(r: w, text: "OK"), what: "sentinel: a READONLY write is sent once more, to the new master (${wrote})");
+
+    // In a pipeline the replies stand (another command of it may have run); the next call asks the sentinels again.
+    Dials p = Dials.make();
+    p.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> old = asMaster();
+    old.add(item: expect(command: "SET kr:k v", answer: topo(kase: "demoted-write/3")));
+    p.serve(place: "127.0.0.1:7200", script: give old);
+    p.serve(place: "127.0.0.1:7300", script: names7201());
+    p.serve(place: "127.0.0.1:7201", script: thenPing(script: thenPing(script: asMaster())));
+    Connection pc = connected(d: give p, url: twoSentinels(), what: "sentinel: a pipeline's READONLY reply stands", fails: f);
+    Pipeline pl = Pipeline.make();
+    pl.add(command: set);
+    Result<Replies, RedisError> rs = pc.run(pipeline: pl);
+    bool refused = match (give rs) {
+        case Ok(value: replies): {
+            Replies rr = give replies;
+            Result<Value, RedisError> first = rr.take(index: 0);
+            := match (first) { case Err(error: e): e.message().contains(substring: "READONLY"); case Ok(value: v): false; };
+        }
+        case Err(error: e): false;
+    };
+    f = f + check(ok: refused, what: "sentinel: a pipeline's READONLY reply stands");
+    f = f + check(ok: isSimple(r: ping(c: pc), text: "PONG"), what: "sentinel: the call after it asks the sentinels again");
+
+    // A transaction refused as READONLY, while queueing or at EXEC, is its error; the next call asks again.
+    f = f + check(ok: afterTransaction(queued: false), what: "sentinel: after a transaction's READONLY while queueing, the next call asks the sentinels again");
+    f = f + check(ok: afterTransaction(queued: true), what: "sentinel: after a transaction's READONLY at EXEC, the next call asks the sentinels again");
+    return f;
+}
+
+// A transaction on the master the sentinels named, refused as READONLY: while queueing (SET answered READONLY, then
+// EXECABORT), or at EXEC (SET QUEUED, EXEC READONLY). Whether its error is READONLY's, and the next call reaches the
+// new master.
+unsafe fn bool afterTransaction(bool queued) {
+    Dials t = Dials.make();
+    t.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> old = asMaster();
+    old.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    if (queued) {
+        old.add(item: expect(command: "SET kr:k v", answer: reply(server: server(), kase: "queued/3")));
+        old.add(item: expect(command: "EXEC", answer: topo(kase: "demoted-write/3")));
+    } else {
+        old.add(item: expect(command: "SET kr:k v", answer: topo(kase: "demoted-write/3")));
+        old.add(item: expect(command: "EXEC", answer: reply(server: server(), kase: "execabort")));
+    }
+    t.serve(place: "127.0.0.1:7200", script: give old);
+    t.serve(place: "127.0.0.1:7300", script: names7201());
+    t.serve(place: "127.0.0.1:7201", script: thenPing(script: thenPing(script: asMaster())));
+    int32 none = 0;
+    Connection c = connected(d: give t, url: twoSentinels(), what: "sentinel: a transaction through sentinels", fails: none);
+    Pipeline tx = Pipeline.make();
+    Command set = commandOf(text: "SET kr:k v");
+    tx.add(command: set);
+    Result<TxOutcome, RedisError> r = c.transact(pipeline: tx);
+    bool readOnly = match (r) { case Err(error: e): e.message().contains(substring: "READONLY"); case Ok(value: o): false; };
+    return none == 0 && readOnly && isSimple(r: ping(c: c), text: "PONG");
+}
+
+// A connection to one server over `dials`, in order; the stand-in, and a failed check, when it cannot be made.
+unsafe fn Connection plain(DynamicArray<Dial> dials, ref int32 fails) {
+    Owned<Dialer> dialer = new ScriptDialer.make(dials: give dials);
+    Config config = configOf(url: "redis://127.0.0.1:6379");
+    Result<Connection, RedisError> made = Connection.connectWith(dialer: give dialer, config: config);
+    return match (give made) {
+        case Ok(value: v): give v;
+        case Err(error: e): { string m = e.message(); fails = fails + check(ok: false, what: "scan: the connection (${m})"); := standIn(); }
+    };
+}
+
+// A scan's cursor belongs to the server process that gave it: once the connection is made again, the scan ends.
+unsafe fn int32 scanTests() {
+    int32 f = 0;
+    DynamicArray<Dial> dials = DynamicArray.empty();
+    DynamicArray<Step> first = welcome(server: server());
+    first.add(item: expect(command: "SCAN 0", answer: bytesOf(text: "*2\r\n$2\r\n17\r\n*1\r\n$1\r\na\r\n")));
+    first.add(item: Step::Hangup);
+    dials.add(item: Dial::Serve(steps: give first));
+    DynamicArray<Step> second = thenPing(script: welcome(server: server()));
+    second.add(item: expect(command: "SCAN 17", answer: bytesOf(text: "*2\r\n$1\r\n0\r\n*1\r\n$1\r\nb\r\n")));
+    second.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    dials.add(item: Dial::Serve(steps: give second));
+    Connection c = plain(dials: give dials, fails: f);
+    Scan scan = Scan.keys();
+    Result<Value, RedisError> p1 = scan.next(conn: c);
+    Result<Value, RedisError> p2 = scan.next(conn: c);
+    Result<Value, RedisError> p3 = scan.next(conn: c);
+    bool firstPage = match (p1) { case Ok(value: v): true; case Err(error: e): false; };
+    string ended = callOutcome(r: p2);
+    f = f + check(ok: firstPage && ended.contains(substring: "made again"), what: "scan: a cursor is not sent on a new link: the scan ends (${ended})");
+    // Ended, it sends nothing more: the next command the server reads is the PING.
+    f = f + check(ok: callOutcome(r: p3).contains(substring: "made again") && isSimple(r: ping(c: c), text: "PONG"),
+                  what: "scan: an ended scan stays ended, and sends nothing");
+    return f;
+}
+
+unsafe fn int32 sentinelTests() {
+    int32 f = 0;
+    f = f + findingTests();
+    f = f + listTests();
+    f = f + roleTests();
+    f = f + resp2Tests();
+    f = f + credentialTests();
+    f = f + readOnlyTests();
+    f = f + scanTests();
+    return f;
+}

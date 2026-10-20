@@ -1,12 +1,16 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::io::IoError, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error, tls::TlsError, redis::resp::ProtocolError };
-export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, ReconnectError };
+export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, ReconnectError, SentinelError };
 
 // What can go wrong talking to Redis or Valkey. A data error is one of these; a contract violation (an index out of
 // range) panics, as one does on a collection.
 //
 // Wherever hiredis or redis-cli has words for a failure, the message uses them ("Server closed the connection",
 // "Could not connect to …"), so a log line from this client reads the same as one from the server's own tools.
+//
+// It is `@nonExhaustive`: a later release may add a kind of failure, so a `match` on it outside this package has a
+// `case _:`, and adding one breaks no caller (0.2.0 added `Sentinel`).
+@nonExhaustive
 type enum RedisError implements Error, Sendable {
     // A setting that cannot be used: a URL that does not parse, an option this client does not know, a value out
     // of range.
@@ -43,7 +47,11 @@ type enum RedisError implements Error, Sendable {
     // The connection had been lost, and making it again failed, so nothing of this call was sent: `cause()` is why the
     // last try failed (`Connect` while the server is down, WRONGPASS when its password changed, …). The next call
     // tries again.
-    Reconnect(ReconnectError error);
+    Reconnect(ReconnectError error),
+    // The sentinels were reached, and none gave the server's address (none knew the name, or each refused), or the
+    // server they named would not confirm its role. Each sentinel's answer is kept. When no sentinel could be reached
+    // at all, the error is `Connect`, with an attempt per sentinel.
+    Sentinel(SentinelError error);
 
     public const fn string message() {
         return match (this) {
@@ -59,6 +67,7 @@ type enum RedisError implements Error, Sendable {
             case Value(detail: d): copy d;
             case Usage(detail: d): copy d;
             case Reconnect(error: r): r.message();
+            case Sentinel(error: s): s.message();
         };
     }
 
@@ -82,7 +91,9 @@ fn string ioMessage(const ref IoError e) {
 
 // The code an error reply starts with. There is a variant for every code the servers in the test matrix can send
 // (tests/unit/src/server_vectors.kama reads them out of each server's binary), and `Other` for the rest: a module's,
-// a script's, a proxy's. `ServerError.codeText()` has the code as sent, whichever it is.
+// a script's, a proxy's. `ServerError.codeText()` has the code as sent, whichever it is. It is `@nonExhaustive`: a new
+// server's code gets a variant of its own in a later release, so a `match` on it outside this package has a `case _:`.
+@nonExhaustive
 type enum ServerCode implements Sendable {
     Err,            // ERR: the generic error
     WrongType,      // WRONGTYPE: an operation against a key holding the wrong kind of value
@@ -364,6 +375,73 @@ type resource ConnectError implements Sendable, Copyable<This>(bare: give) {
         while (i < this.tried.length()) {
             if (i > 0) { text = text.concat(other: "\n"); }
             text = text.concat(other: this.tried[i].message());
+            i = i + 1;
+        }
+        return text;
+    }
+}
+
+// Why no server came from the sentinels: each sentinel asked, in order, and what it answered; or the server they named
+// and the role it gave instead of the one asked for.
+type resource SentinelError implements Sendable, Copyable<This>(bare: give) {
+    string masterText;
+    DynamicArray<string> places;
+    DynamicArray<string> answers;
+    // The server the sentinels named and the role it said it has, when it was not the one asked for: "" otherwise.
+    string namedPlace;
+    string namedRole;
+
+    public ctor of(string master) {
+        this.masterText = give master;
+        this.places = DynamicArray.empty();
+        this.answers = DynamicArray.empty();
+        this.namedPlace = "";
+        this.namedRole = "";
+    }
+
+    // The sentinels named `place` for `master`, and its role is `role`, not the one asked for.
+    public ctor unconfirmed(string master, string place, string role) {
+        this.masterText = give master;
+        this.places = DynamicArray.empty();
+        this.answers = DynamicArray.empty();
+        this.namedPlace = give place;
+        this.namedRole = give role;
+    }
+
+    public ctor copy(ref SentinelError source) {
+        this.masterText = copy source.masterText;
+        this.places = copy source.places;
+        this.answers = copy source.answers;
+        this.namedPlace = copy source.namedPlace;
+        this.namedRole = copy source.namedRole;
+    }
+
+    // What the sentinel at `place` ("127.0.0.1:26379") answered, in words.
+    public fn void add(string place, string answer) { this.places.add(item: give place); this.answers.add(item: give answer); }
+
+    // The name the sentinels were asked about (master_name).
+    public const fn const ref string master() { return this.masterText; }
+    public const fn isize count() { return this.places.length(); }
+    public const fn const ref string place(isize index) { return this.places[index]; }
+    public const fn const ref string answer(isize index) { return this.answers[index]; }
+    // Whether the sentinels named a server whose role was not the one asked for: during a failover, a sentinel can be
+    // behind, and asking again finds the new one.
+    public const fn bool isUnconfirmed() { return this.namedPlace.length() > 0; }
+
+    // "no sentinel gave the address of master kr:" and a line per sentinel, or "the sentinels named 127.0.0.1:7200 as
+    // master kr, and its role is replica".
+    public const fn string message() {
+        string name = copy this.masterText;
+        if (this.isUnconfirmed()) {
+            string place = copy this.namedPlace;
+            string role = copy this.namedRole;
+            if (role.length() == 0) { role = "not given"; }
+            return "the sentinels named ${place} for master ${name}, and its role is ${role}";
+        }
+        string text = "no sentinel gave the address of master ${name}:";
+        isize i = 0;
+        while (i < this.places.length()) {
+            text = text.concat(other: "\n").concat(other: this.places[i]).concat(other: ": ").concat(other: this.answers[i]);
             i = i + 1;
         }
         return text;
