@@ -6,6 +6,20 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to start"). In progress.
+
+### Added
+- Several hosts in a URL, comma-separated (Lettuce's form, and libpq's): `redis://h1:7000,h2:7001`, a cluster's
+  seeds. On redis://, rediss://, valkey:// and valkeys:// the first host names its port, as redis-cli reads only it.
+  `RedisUrl.hostCount`, `hostAt` and `portAt`; `Config.hostCount`, `hostAt`, `portAt` and `addHost`.
+- `redis-sentinel://` and `rediss-sentinel://`, with `master_name` and `role`, and `Config.sentinel`,
+  `setSentinelRole` and `setSentinelAuth` (the sentinels' own credentials, set in code only); `SentinelRole`.
+- A cluster's options, `read_from` (`ReadFrom`) and `max_redirects`, with `Config.setReadFrom` and `setMaxRedirects`.
+
+### Changed
+- A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it
+  dials. Before, `redis://a,b` was the one host `a,b`.
+
 ## [0.1.0] - 2026-10-19
 
 The first release: a complete client for one server. Needs **kama ≥ 0.9.667**: the first tagged release with the

@@ -149,9 +149,50 @@ fn int32 ownRuleTests() {
     return f;
 }
 
+// Several hosts and the sentinel schemes, this package's own forms (src/url.kama's header): the vectors check that the
+// first host is read as redis-cli reads it.
+fn string hosts(const ref string text) {
+    Result<RedisUrl, UrlError> r = parse(text: text);
+    return match (r) { case Err(error: e): "refused"; case Ok(value: u): listed(u: u); };
+}
+
+fn string listed(const ref RedisUrl u) {
+    string s = "";
+    if (u.isSentinel()) { s = "sentinels"; }
+    isize i = 0;
+    while (i < u.hostCount()) {
+        string h = u.hostAt(index: i);
+        string p = match (u.portAt(index: i)) { case Some(value: v): i64Str(v: cast<int64>(v)); case None: "-"; };
+        s = s.concat(other: " ${h}:${p}");
+        i = i + 1;
+    }
+    return s;
+}
+
+fn int32 hostListTests() {
+    int32 f = 0;
+    f = f + check(ok: hosts(text: "redis://h1:7000,h2:7001,h3") == " h1:7000 h2:7001 h3:-", what: "url hosts: a list, a later host with no port");
+    f = f + check(ok: hosts(text: "rediss://[::1]:7000,[2001:db8::1],h") == " ::1:7000 2001:db8::1:- h:-", what: "url hosts: IPv6 in brackets");
+    f = f + check(ok: hosts(text: "redis://") == "" && hosts(text: "redis://h") == " h:-", what: "url hosts: none, and one");
+    f = f + check(ok: hosts(text: "redis-sentinel://s1,s2:26380?master_name=kr") == "sentinels s1:- s2:26380", what: "url sentinel: the first need not name its port");
+    f = f + check(ok: hosts(text: "REDISS-SENTINEL://s1") == "sentinels s1:-", what: "url sentinel: rediss-sentinel, in any case");
+    f = f + check(ok: summary(text: "rediss-sentinel://u:p@s1/2?master_name=kr") == "tls host=s1 port=<none> path= user=u password=p db=2 master_name=kr",
+                  what: "url sentinel: TLS, the server's credentials and database, the query for Config");
+    f = f + check(ok: refusedSaying(text: "redis://h1,h2:7001", words: "the first names its port"), what: "url hosts: the first names its port");
+    f = f + check(ok: refusedSaying(text: "redis://h1:1,,h2:2", words: "an empty host") && refusedSaying(text: "redis://,h1:1", words: "an empty host")
+                      && refusedSaying(text: "redis-sentinel://s1,", words: "an empty host"),
+                  what: "url hosts: an empty host anywhere in the list");
+    f = f + check(ok: refusedSaying(text: "redis://h1:1,h2:x", words: "port is a number"), what: "url hosts: a later host's port is checked too");
+    f = f + check(ok: refusedSaying(text: "redis-sentinel://", words: "names its sentinels") && refusedSaying(text: "redis-sentinel://u:p@/0", words: "names its sentinels"),
+                  what: "url sentinel: no sentinels");
+    f = f + check(ok: refusedSaying(text: "sentinel://s1", words: "redis-sentinel://"), what: "url scheme: the refusal names the sentinel schemes");
+    return f;
+}
+
 fn int32 urlTests() {
     int32 f = 0;
     f = f + vectorTests();
     f = f + ownRuleTests();
+    f = f + hostListTests();
     return f;
 }

@@ -89,6 +89,15 @@ SCHEME://user:pass@example.invalid:6390
 SCHEME:/host
 SCHEME:host
 nosuch://host
+SCHEME://127.0.0.1:7100,127.0.0.1:7101
+SCHEME://user:pass@127.0.0.1:7100,localhost:7101/2
+SCHEME://127.0.0.1:7100,[::1]:7101
+SCHEME://[::1]:7100,127.0.0.1:7101
+SCHEME://127.0.0.1,127.0.0.1:7101
+SCHEME://127.0.0.1:7100,
+SCHEME://127.0.0.1:7100,,127.0.0.1:7101
+SCHEME://,127.0.0.1:7100
+SCHEME://127.0.0.1:7100,127.0.0.1:x
 EOF
 
 # Runs in the container as `perl /tmp/drive.pl <cli>`, with the URLs, one per line in hex, in its __DATA__. For
@@ -221,6 +230,28 @@ sub misread {
             return "a user or password that is not UTF-8" unless utf8::decode($d);
         }
     }
+    # Several hosts, comma-separated (an IPv6 address has none of its own): the CLI reads the first alone, since atoi
+    # stops its port at the comma, and only when the first names its port; this package reads each.
+    my @entries = split /,/, $hostport, -1;
+    @entries = ('') unless @entries;
+    if (@entries > 1) {
+        return "an empty host in a list of hosts" if grep { $_ eq '' } @entries;
+        return "the CLI reads a list whose first host names no port as one host" unless $entries[0] =~ /\]:|^[^\[][^:]*:/;
+        for my $e (@entries[1 .. $#entries]) {
+            my $why = one_host($e);
+            return "the CLI reads only the first of several hosts, and a later one $why" if defined $why;
+        }
+        $hostport = $entries[0];
+    }
+    my $why = one_host($hostport);
+    return $why if defined $why;
+    return "the CLI reads a database with atoi" if defined $path && $path ne '' && ($path !~ /^\d+$/ || bigger($path, '9223372036854775807'));
+    return undef;
+}
+
+# The rules for one host and its port; undef when the CLI reads it as written.
+sub one_host {
+    my ($hostport) = @_;
     my $port;
     if ($hostport =~ /^\[/) {
         return "an IPv6 address the CLI does not close" unless $hostport =~ /^\[([^\]]+)\](.*)$/;
@@ -232,7 +263,6 @@ sub misread {
         $port = $2;
     }
     return "the CLI reads a port with atoi" if defined $port && ($port !~ /^\d+$/ || $port < 1 || $port > 65535);
-    return "the CLI reads a database with atoi" if defined $path && $path ne '' && ($path !~ /^\d+$/ || bigger($path, '9223372036854775807'));
     return undef;
 }
 

@@ -1,6 +1,6 @@
 import { std::collections::ConstView, std::collections::DynamicArray, std::time::Duration, redis::RedisUrl,
          redis::UrlTransport, redis::UrlError, redis::RedisError, redis::resp::Limits };
-export { Config, Protocol, TlsVerify, TlsVersion, socketPathMax };
+export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socketPathMax };
 
 // How to reach a server and what to ask of it: from a URL (`Config.parse`), or from a host or a socket and typed
 // settings (`Config.tcp`, `Config.unix`, then the setters). Every setting is honoured or refused. A URL option this
@@ -22,6 +22,17 @@ export { Config, Protocol, TlsVerify, TlsVersion, socketPathMax };
 //                         make a lost connection again, while the server is down or restarting.
 // The database is the URL's path (redis://host/2), or ?db= on unix://, as RedisUrl reads it.
 //
+// Several hosts, comma-separated (docs/ROADMAP.md, "Phase 6"), are a cluster's seeds, for `Cluster.connect`, or on
+// redis-sentinel:// and rediss-sentinel:// the sentinels to ask for the server (each on 26379 unless it says otherwise).
+// A `Connection` refuses several hosts on any other URL.
+//   master_name=NAME      redis-sentinel:// only, and needed there: the name the sentinels monitor the server by
+//   role=master|replica   redis-sentinel:// only: the master (the default), or one of its replicas, to read from
+//   read_from=primary|replica   a cluster's (Cluster.connect): where a read goes. primary (the default): the slot's
+//                         primary; replica: one of its replicas, which may be behind it, or the primary when it has none
+//   max_redirects=N       a cluster's: how many MOVED and ASK one call follows, 0 to 100. Default 5.
+// The URL's user and password are the server's. The sentinels' own, when they want one, are set in code
+// (`setSentinelAuth`), never in a URL.
+//
 // Over TLS (rediss://, valkeys://) as well (docs/ROADMAP.md, "Phase 5"); each is refused on redis:// and unix://:
 //   tls_verify=full|chain|none   full (the default): the certificate chains to a trusted root and names the server;
 //                         chain: it chains, and its names are not compared; none: nothing is checked
@@ -38,6 +49,29 @@ type enum Protocol implements Sendable {
 
     // 2 or 3, as HELLO takes it.
     public const fn int32 number() { return match (this) { case Resp2: 2; case Resp3: 3; }; }
+}
+
+// Which server a Sentinel configuration asks the sentinels for.
+type enum SentinelRole implements Sendable {
+    // The master: GET-MASTER-ADDR-BY-NAME, confirmed with ROLE.
+    Master,
+    // One of the master's replicas, chosen at random among those the sentinels see up (SENTINEL REPLICAS), for reads.
+    Replica;
+
+    // As the role option spells it.
+    public const fn string text() { return match (this) { case Master: "master"; case Replica: "replica"; }; }
+}
+
+// Where a cluster sends a command that only reads.
+type enum ReadFrom implements Sendable {
+    // The primary that serves the slot. The default, as every peer client's is.
+    Primary,
+    // A replica of that primary, chosen at random, or the primary when it has none up. A replica may be behind its
+    // primary, so a read there can miss a write the caller just made.
+    Replica;
+
+    // As the read_from option spells it.
+    public const fn string text() { return match (this) { case Primary: "primary"; case Replica: "replica"; }; }
 }
 
 // How a TLS connection checks the server it reached.
@@ -70,6 +104,9 @@ type enum TlsVersion implements Sendable {
 @compileFor(!OS_MACOS) fn isize socketPathMax() { return 107; }
 
 comptime int32 DEFAULT_PORT = 6379;
+comptime int32 DEFAULT_SENTINEL_PORT = 26379;
+comptime int32 DEFAULT_MAX_REDIRECTS = 5;
+comptime int32 MOST_REDIRECTS = 100;
 comptime int64 DEFAULT_TIMEOUT_SECS = 5i64;
 comptime int64 DEFAULT_KEEPALIVE_SECS = 15i64;
 // TCP_KEEPIDLE's ceiling on Linux (MAX_TCP_KEEPIDLE), the strictest of the platforms.
@@ -105,6 +142,18 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     TlsVersion maxVersion;
     bool reconnecting = true;
     Duration reconnectLimit;
+    // The hosts after the first (hostText, portNumber), with their ports: a cluster's seeds, or the sentinels.
+    DynamicArray<string> moreHosts;
+    DynamicArray<int32> morePorts;
+    // Sentinel: the hosts are sentinels, to ask for the server monitored as `master`.
+    bool viaSentinels = false;
+    Optional<string> master;
+    SentinelRole sentinelRole;
+    Optional<string> sentinelUserName;
+    Optional<string> sentinelSecret;
+    // A cluster's options, set or not, so a `Connection` can refuse them.
+    Optional<ReadFrom> readChoice;
+    Optional<int32> redirectChoice;
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -134,6 +183,15 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.maxVersion = TlsVersion::Tls13;
         this.reconnecting = true;
         this.reconnectLimit = Duration.fromSecs(s: DEFAULT_TIMEOUT_SECS);
+        this.moreHosts = DynamicArray.empty();
+        this.morePorts = DynamicArray.empty();
+        this.viaSentinels = false;
+        this.master = Optional::None;
+        this.sentinelRole = SentinelRole::Master;
+        this.sentinelUserName = Optional::None;
+        this.sentinelSecret = Optional::None;
+        this.readChoice = Optional::None;
+        this.redirectChoice = Optional::None;
     }
 
     public ctor copy(ref Config source) {
@@ -164,10 +222,19 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.maxVersion = source.maxVersion;
         this.reconnecting = source.reconnecting;
         this.reconnectLimit = source.reconnectLimit;
+        this.moreHosts = copy source.moreHosts;
+        this.morePorts = copy source.morePorts;
+        this.viaSentinels = source.viaSentinels;
+        this.master = copy source.master;
+        this.sentinelRole = source.sentinelRole;
+        this.sentinelUserName = copy source.sentinelUserName;
+        this.sentinelSecret = copy source.sentinelSecret;
+        this.readChoice = source.readChoice;
+        this.redirectChoice = source.redirectChoice;
     }
 
-    // A connection URL: redis://, valkey://, rediss://, valkeys:// or unix:// (src/url.kama says how each is read),
-    // with the options above.
+    // A connection URL: redis://, valkey://, rediss://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://
+    // (src/url.kama says how each is read), with the options above.
     public ctor Result<Config, RedisError> parse(const ref string url) {
         Result<RedisUrl, UrlError> read = RedisUrl.parse(text: url);
         RedisUrl u = match (give read) {
@@ -176,6 +243,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         };
         UrlTransport kind = u.transport();
         Config c = Config.blank(kind: kind);
+        c.viaSentinels = u.isSentinel();
+        if (c.viaSentinels) { c.portNumber = DEFAULT_SENTINEL_PORT; }
         if (kind == UrlTransport::Unix) {
             string path = u.socketPath();
             Optional<RedisError> bad = checkPath(path: path);
@@ -186,6 +255,15 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             match (give h) { case Some(value: v): { c.hostText = give v; } case None: { } };
             Optional<int32> p = u.port();
             match (p) { case Some(value: v): { c.portNumber = v; } case None: { } };
+            int32 fallback = DEFAULT_PORT;
+            if (c.viaSentinels) { fallback = DEFAULT_SENTINEL_PORT; }
+            isize k = 1;
+            while (k < u.hostCount()) {
+                c.moreHosts.add(item: u.hostAt(index: k));
+                int32 port = match (u.portAt(index: k)) { case Some(value: v): v; case None: fallback; };
+                c.morePorts.add(item: port);
+                k = k + 1;
+            }
         }
         c.userName = u.user();
         c.secret = u.password();
@@ -201,6 +279,10 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         }
         Optional<RedisError> unpaired = c.tlsAgreement();
         match (give unpaired) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        bool named = match (c.master) { case Some(value: m): true; case None: false; };
+        if (c.viaSentinels && !named) {
+            return Result::Err(error: RedisError::Config(detail: "a Sentinel URL names the master the sentinels monitor: ?master_name=mymaster"));
+        }
         return Result::Ok(value: give c);
     }
 
@@ -220,6 +302,19 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         Result<Config, RedisError> made = Config.tcp(host: give host, port: port);
         Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
         c.kind = UrlTransport::Tls;
+        return Result::Ok(value: give c);
+    }
+
+    // The server the sentinels at `host` and `port` monitor as `masterName`, found through them (Sentinel's client
+    // specification); more sentinels with `addHost`. `tls` makes every connection TLS, the sentinels' and the
+    // server's, until the setters below say otherwise.
+    public ctor Result<Config, RedisError> sentinel(string masterName, string host, int32 port, bool tls) {
+        if (masterName.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the master's name is empty: give the name the sentinels monitor it by")); }
+        Result<Config, RedisError> made = Config.tcp(host: give host, port: port);
+        Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (tls) { c.kind = UrlTransport::Tls; }
+        c.viaSentinels = true;
+        c.master = Optional::Some(value: give masterName);
         return Result::Ok(value: give c);
     }
 
@@ -291,6 +386,45 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public fn Result<Unit, RedisError> setReconnectTimeout(Duration timeout) {
         if (timeout.isNegative()) { return Result::Err(error: RedisError::Config(detail: "reconnect_timeout cannot be negative: 0 is no limit")); }
         this.reconnectLimit = timeout;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Another host, after those already named: a cluster's seed, or a sentinel. A configuration over a socket has one.
+    public fn Result<Unit, RedisError> addHost(string host, int32 port) {
+        if (this.kind == UrlTransport::Unix) { return Result::Err(error: RedisError::Config(detail: "a configuration over a Unix-domain socket has one place to connect to: add a host to a TCP or TLS one")); }
+        if (host.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the host is empty: give a name or an address")); }
+        if (port < 1 || port > 65535) { return Result::Err(error: RedisError::Config(detail: "the port is a number from 1 to 65535")); }
+        this.moreHosts.add(item: give host);
+        this.morePorts.add(item: port);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Which server to ask the sentinels for (role). Refused on a configuration that is not Sentinel's.
+    public fn Result<Unit, RedisError> setSentinelRole(SentinelRole role) {
+        if (!this.viaSentinels) { return Result::Err(error: RedisError::Config(detail: "role is a Sentinel setting: connect through sentinels with redis-sentinel:// or Config.sentinel")); }
+        this.sentinelRole = role;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The sentinels' own user and password, apart from the server's: AUTH to each sentinel. With no user, the password
+    // is the sentinels' `default` user's. Refused on a configuration that is not Sentinel's.
+    public fn Result<Unit, RedisError> setSentinelAuth(Optional<string> user, string password) {
+        if (!this.viaSentinels) { return Result::Err(error: RedisError::Config(detail: "the sentinels' credentials are a Sentinel setting: connect through sentinels with redis-sentinel:// or Config.sentinel")); }
+        if (password.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the sentinels' password is empty: an empty password authenticates no one, so leave it out")); }
+        bool emptyUser = match (user) { case Some(value: u): u.length() == 0; case None: false; };
+        if (emptyUser) { return Result::Err(error: RedisError::Config(detail: "the sentinels' user is empty: give a user, or none for their default user")); }
+        this.sentinelUserName = give user;
+        this.sentinelSecret = Optional::Some(value: give password);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Where a cluster sends a command that only reads (read_from). `Connection.connect` refuses it.
+    public fn void setReadFrom(ReadFrom from) { this.readChoice = Optional::Some(value: from); }
+
+    // How many MOVED and ASK one cluster call follows (max_redirects), 0 to 100. `Connection.connect` refuses it.
+    public fn Result<Unit, RedisError> setMaxRedirects(int32 count) {
+        if (count < 0 || count > MOST_REDIRECTS) { return Result::Err(error: maxRedirectsRefused()); }
+        this.redirectChoice = Optional::Some(value: count);
         return Result::Ok(value: Unit::Unit);
     }
 
@@ -387,9 +521,36 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
 
     // TCP, TLS over TCP, or a Unix-domain socket.
     public const fn UrlTransport transport() { return this.kind; }
-    // The host as given, without brackets ("127.0.0.1" when none was); "" for a socket.
+    // The host as given, without brackets ("127.0.0.1" when none was); "" for a socket. With several, the first.
     public const fn const ref string host() { return this.hostText; }
     public const fn int32 port() { return this.portNumber; }
+    // How many hosts there are: 1, or more for a cluster's seeds or the sentinels; 1 over a socket.
+    public const fn isize hostCount() { return 1 + this.moreHosts.length(); }
+    // Host `index` (0 is `host()`) and its port.
+    public const fn string hostAt(isize index) {
+        if (index == 0) { return copy this.hostText; }
+        return copy this.moreHosts[index - 1];
+    }
+    public const fn int32 portAt(isize index) {
+        if (index == 0) { return this.portNumber; }
+        return this.morePorts[index - 1];
+    }
+    // Whether the hosts are sentinels, to ask for the server (redis-sentinel://, rediss-sentinel://, Config.sentinel).
+    public const fn bool viaSentinel() { return this.viaSentinels; }
+    // The name the sentinels monitor the server by; None when the hosts are not sentinels.
+    public const fn Optional<string> masterName() { return copy this.master; }
+    public const fn SentinelRole role() { return this.sentinelRole; }
+    public const fn Optional<string> sentinelUser() { return copy this.sentinelUserName; }
+    public const fn Optional<string> sentinelPassword() { return copy this.sentinelSecret; }
+    // A cluster's read_from and max_redirects; their defaults when they were not set.
+    public const fn ReadFrom readFrom() { return match (this.readChoice) { case Some(value: r): r; case None: ReadFrom::Primary; }; }
+    public const fn int32 maxRedirects() { return match (this.redirectChoice) { case Some(value: n): n; case None: DEFAULT_MAX_REDIRECTS; }; }
+    // Whether either cluster option was set: a `Connection` refuses them.
+    public const fn bool clusterOptions() {
+        bool r = match (this.readChoice) { case Some(value: x): true; case None: false; };
+        bool m = match (this.redirectChoice) { case Some(value: x): true; case None: false; };
+        return r || m;
+    }
     // The socket's path; "" for TCP.
     public const fn const ref string socketPath() { return this.pathText; }
     public const fn Optional<string> user() { return copy this.userName; }
@@ -477,11 +638,34 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         }
         // RedisUrl has read a unix:// URL's database already.
         if (key == "db" && this.kind == UrlTransport::Unix) { return Optional::None; }
+        if (key == "master_name" || key == "role") {
+            if (!this.viaSentinels) { return refused(m: key.concat(other: " is a Sentinel option: connect through sentinels with redis-sentinel:// or rediss-sentinel://")); }
+            if (key == "master_name") {
+                if (value.length() == 0) { return refused(m: "master_name is empty: give the name the sentinels monitor the server by"); }
+                this.master = Optional::Some(value: copy value);
+                return Optional::None;
+            }
+            if (value == "master") { this.sentinelRole = SentinelRole::Master; return Optional::None; }
+            if (value == "replica") { this.sentinelRole = SentinelRole::Replica; return Optional::None; }
+            return refused(m: "role is master or replica: role=replica");
+        }
+        if (key == "read_from") {
+            if (value == "primary") { this.readChoice = Optional::Some(value: ReadFrom::Primary); return Optional::None; }
+            if (value == "replica") { this.readChoice = Optional::Some(value: ReadFrom::Replica); return Optional::None; }
+            return refused(m: "read_from is primary or replica: read_from=replica");
+        }
+        if (key == "max_redirects") {
+            Optional<int64> n = wholeSeconds(b: value.bytes());
+            int64 count = match (n) { case Some(value: v): v; case None: -1i64; };
+            if (count < 0i64 || count > cast<int64>(MOST_REDIRECTS)) { return Optional::Some(value: maxRedirectsRefused()); }
+            this.redirectChoice = Optional::Some(value: cast<int32>(count));
+            return Optional::None;
+        }
         if (key == "tls_verify" || key == "tls_ca" || key == "tls_cert" || key == "tls_key" || key == "tls_server_name") {
             if (this.kind != UrlTransport::Tls) { return refused(m: key.concat(other: " is a TLS option: connect over rediss:// or valkeys://")); }
             return this.tlsOption(key: key, value: value);
         }
-        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name"));
+        return refused(m: "unknown URL option \"".concat(other: key).concat(other: "\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout; a cluster's read_from and max_redirects; Sentinel's master_name and role; and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name"));
     }
 
     // One TLS option, on a TLS URL. tls_cert and tls_key are checked together, and tls_ca against tls_verify, once
@@ -511,6 +695,10 @@ fn Optional<RedisError> refused(const ref string m) { return Optional::Some(valu
 
 fn RedisError unusedTrust() {
     return RedisError::Config(detail: "a CA (tls_ca) is not used when nothing is verified (tls_verify=none): leave the CA out, or verify");
+}
+
+fn RedisError maxRedirectsRefused() {
+    return RedisError::Config(detail: "max_redirects is a whole number from 0 to 100: max_redirects=5");
 }
 
 fn RedisError keepAliveRefused() {

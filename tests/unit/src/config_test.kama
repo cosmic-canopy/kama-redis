@@ -1,8 +1,9 @@
 // redis::Config. The URL's own reading is RedisUrl's (url_test.kama); these are the options this package decides
 // (src/config.kama's header, docs/ROADMAP.md "Phase 2"), each honoured or refused, and the typed setters.
 import { core::println, std::collections::DynamicArray, std::time::Duration, redis::Config, redis::Protocol,
-         redis::RedisError, redis::UrlTransport, redis::TlsVerify, redis::TlsVersion, redis::socketPathMax,
-         redis_unit_tests::check };
+         redis::RedisError, redis::UrlTransport, redis::TlsVerify, redis::TlsVersion, redis::SentinelRole, redis::ReadFrom,
+         redis::Connection, redis::Subscriber, redis::Transport, redis::socketPathMax, std::memory::Owned,
+         redis_unit_tests::check, FakeServer, Step };
 export { configTests };
 
 fn string refusal(const ref string url) {
@@ -90,7 +91,7 @@ fn int32 optionTests() {
 fn int32 refusalTests() {
     int32 f = 0;
     string unknown = refusal(url: "redis://host?socket_timeout=1");
-    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout, and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name",
+    f = f + check(ok: unknown == "unknown URL option \"socket_timeout\": the options are protocol, connect_timeout, command_timeout, client_name, keepalive, reconnect and reconnect_timeout; a cluster's read_from and max_redirects; Sentinel's master_name and role; and over TLS tls_verify, tls_ca, tls_cert, tls_key and tls_server_name",
                   what: "refused: an unknown option: ${unknown}");
     f = f + check(ok: !accepted(url: "redis://host?dial_timeout=1") && !accepted(url: "redis://host?timeout=1"), what: "refused: other clients' names");
     string maybe = refusal(url: "redis://host?reconnect=yes");
@@ -285,12 +286,136 @@ fn int32 tlsTests() {
     return f;
 }
 
-fn int32 configTests() {
+// Several hosts (docs/ROADMAP.md, "Phase 6"): a cluster's seeds, or the sentinels.
+fn int32 hostsTests() {
+    int32 f = 0;
+    Config one = parsed(url: "redis://h:7000");
+    f = f + check(ok: one.hostCount() == 1 && one.hostAt(index: 0) == "h" && one.portAt(index: 0) == 7000, what: "hosts: one");
+    Config seeds = parsed(url: "redis://u:p@h1:7000,h2,[::1]:7002/2");
+    f = f + check(ok: seeds.hostCount() == 3 && seeds.host() == "h1" && seeds.port() == 7000, what: "hosts: the first is host() and port()");
+    f = f + check(ok: seeds.hostAt(index: 1) == "h2" && seeds.portAt(index: 1) == 6379 && seeds.hostAt(index: 2) == "::1" && seeds.portAt(index: 2) == 7002,
+                  what: "hosts: each later one with its port, 6379 when it names none, an IPv6 one without brackets");
+    f = f + check(ok: orDash(s: seeds.user()) == "u" && seeds.database() == 2i64 && !seeds.viaSentinel(), what: "hosts: one user and database for all");
+    Config twin = copy seeds;
+    f = f + check(ok: twin.hostCount() == 3 && twin.hostAt(index: 2) == "::1" && twin.portAt(index: 1) == 6379, what: "hosts: copy keeps every host");
+    f = f + check(ok: refusal(url: "redis://h1,h2:7001").contains(substring: "the first names its port"), what: "hosts: the first names its port");
+    f = f + check(ok: refusal(url: "redis://h1:7000,").contains(substring: "an empty host") && refusal(url: "redis://h1:7000,,h2:7001").contains(substring: "an empty host"),
+                  what: "hosts: an empty host is refused");
+    Result<Config, RedisError> made = Config.tcp(host: "h1", port: 7000);
+    Config built = match (give made) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "hosts: Config.tcp"); } };
+    Result<Unit, RedisError> added = built.addHost(host: "h2", port: 7001);
+    Result<Unit, RedisError> noPort = built.addHost(host: "h3", port: 0);
+    Result<Unit, RedisError> noHost = built.addHost(host: "", port: 7003);
+    f = f + check(ok: !refusedSetting(r: added) && built.hostCount() == 2 && built.portAt(index: 1) == 7001, what: "addHost: a seed");
+    f = f + check(ok: refusedSetting(r: noPort) && refusedSetting(r: noHost) && built.hostCount() == 2, what: "addHost: a bad port or an empty host, refused");
+    Result<Config, RedisError> sock = Config.unix(path: "/tmp/r.sock");
+    Config local = match (give sock) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "hosts: Config.unix"); } };
+    Result<Unit, RedisError> onSocket = local.addHost(host: "h", port: 1);
+    f = f + check(ok: refusedSetting(r: onSocket) && local.hostCount() == 1, what: "addHost: refused over a Unix-domain socket");
+    return f;
+}
+
+// Sentinel's settings: the scheme, master_name, role and the sentinels' own credentials.
+fn int32 sentinelTests() {
+    int32 f = 0;
+    Config s = parsed(url: "redis-sentinel://kr_acl:kr_acl_pw@s1,s2:26380,s3/1?master_name=kr&role=replica");
+    f = f + check(ok: s.viaSentinel() && s.transport() == UrlTransport::Tcp && s.hostCount() == 3, what: "sentinel: three sentinels over TCP");
+    f = f + check(ok: s.port() == 26379 && s.portAt(index: 1) == 26380 && s.portAt(index: 2) == 26379, what: "sentinel: 26379 unless a port is named");
+    f = f + check(ok: orDash(s: s.masterName()) == "kr" && s.role() == SentinelRole::Replica, what: "sentinel: master_name and role");
+    f = f + check(ok: orDash(s: s.user()) == "kr_acl" && s.database() == 1i64 && orDash(s: s.sentinelPassword()) == "-",
+                  what: "sentinel: the URL's credentials and database are the server's, the sentinels' unset");
+    Config tls = parsed(url: "rediss-sentinel://s1?master_name=kr&tls_verify=chain");
+    f = f + check(ok: tls.viaSentinel() && tls.transport() == UrlTransport::Tls && tls.tlsVerify() == TlsVerify::Chain && tls.role() == SentinelRole::Master,
+                  what: "sentinel: rediss-sentinel is TLS, with TLS options, the master by default");
+    f = f + check(ok: refusal(url: "redis-sentinel://s1").contains(substring: "master_name"), what: "sentinel: master_name is needed");
+    f = f + check(ok: refusal(url: "redis-sentinel://s1?master_name=").contains(substring: "master_name is empty"), what: "sentinel: an empty master_name");
+    f = f + check(ok: refusal(url: "redis-sentinel://s1?master_name=kr&role=primary").contains(substring: "master or replica"), what: "sentinel: role is master or replica");
+    f = f + check(ok: refusal(url: "redis://h?master_name=kr").contains(substring: "Sentinel option") && refusal(url: "redis://h?role=replica").contains(substring: "Sentinel option"),
+                  what: "sentinel: master_name and role are refused elsewhere");
+    f = f + check(ok: refusal(url: "redis-sentinel://?master_name=kr").contains(substring: "names its sentinels"), what: "sentinel: a URL with no sentinels");
+    Result<Unit, RedisError> auth = s.setSentinelAuth(user: Optional::Some(value: "kr_sentinel"), password: "pw");
+    Result<Unit, RedisError> emptyPw = s.setSentinelAuth(user: Optional::None, password: "");
+    Result<Unit, RedisError> emptyUser = s.setSentinelAuth(user: Optional::Some(value: ""), password: "pw");
+    f = f + check(ok: !refusedSetting(r: auth) && orDash(s: s.sentinelUser()) == "kr_sentinel" && orDash(s: s.sentinelPassword()) == "pw",
+                  what: "setSentinelAuth: the sentinels' own user and password");
+    f = f + check(ok: refusedSetting(r: emptyPw) && refusedSetting(r: emptyUser) && orDash(s: s.sentinelPassword()) == "pw", what: "setSentinelAuth: an empty password or user, refused");
+    Config twin = copy s;
+    f = f + check(ok: twin.viaSentinel() && orDash(s: twin.masterName()) == "kr" && twin.role() == SentinelRole::Replica
+                      && orDash(s: twin.sentinelUser()) == "kr_sentinel" && orDash(s: twin.sentinelPassword()) == "pw",
+                  what: "copy: the Sentinel settings too");
+    Config plain = parsed(url: "redis://h");
+    Result<Unit, RedisError> roleElsewhere = plain.setSentinelRole(role: SentinelRole::Replica);
+    Result<Unit, RedisError> authElsewhere = plain.setSentinelAuth(user: Optional::None, password: "pw");
+    f = f + check(ok: refusedSetting(r: roleElsewhere) && refusedSetting(r: authElsewhere), what: "sentinel: its setters are refused elsewhere");
+    Result<Config, RedisError> made = Config.sentinel(masterName: "kr", host: "s1", port: 26379, tls: true);
+    Config built = match (give made) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "Config.sentinel"); } };
+    Result<Unit, RedisError> more = built.addHost(host: "s2", port: 26380);
+    Result<Unit, RedisError> role = built.setSentinelRole(role: SentinelRole::Replica);
+    f = f + check(ok: built.viaSentinel() && built.transport() == UrlTransport::Tls && built.hostCount() == 2 && built.role() == SentinelRole::Replica
+                      && !refusedSetting(r: more) && !refusedSetting(r: role),
+                  what: "Config.sentinel: TLS, another sentinel, a replica");
+    Result<Config, RedisError> noName = Config.sentinel(masterName: "", host: "s1", port: 26379, tls: false);
+    f = f + check(ok: refusedConfig(r: noName), what: "Config.sentinel: an empty master name");
+    return f;
+}
+
+// A cluster's options, honoured by Config and refused by a single connection.
+fn int32 clusterOptionTests() {
+    int32 f = 0;
+    Config d = parsed(url: "redis://h1:7000,h2:7001");
+    f = f + check(ok: d.readFrom() == ReadFrom::Primary && d.maxRedirects() == 5 && !d.clusterOptions(), what: "cluster: defaults, primary and 5");
+    Config c = parsed(url: "redis://h1:7000?read_from=replica&max_redirects=0");
+    f = f + check(ok: c.readFrom() == ReadFrom::Replica && c.maxRedirects() == 0 && c.clusterOptions(), what: "cluster: read_from and max_redirects");
+    f = f + check(ok: refusal(url: "redis://h?read_from=any").contains(substring: "primary or replica"), what: "cluster: read_from is primary or replica");
+    f = f + check(ok: refusal(url: "redis://h?max_redirects=101").contains(substring: "0 to 100") && refusal(url: "redis://h?max_redirects=-1").contains(substring: "0 to 100")
+                      && refusal(url: "redis://h?max_redirects=x").contains(substring: "0 to 100"),
+                  what: "cluster: max_redirects is 0 to 100");
+    Config twin = copy c;
+    f = f + check(ok: twin.readFrom() == ReadFrom::Replica && twin.maxRedirects() == 0 && twin.clusterOptions(), what: "copy: the cluster options too");
+    Result<Unit, RedisError> most = d.setMaxRedirects(count: 100);
+    Result<Unit, RedisError> past = d.setMaxRedirects(count: 101);
+    d.setReadFrom(from: ReadFrom::Replica);
+    f = f + check(ok: !refusedSetting(r: most) && refusedSetting(r: past) && d.maxRedirects() == 100 && d.readFrom() == ReadFrom::Replica,
+                  what: "setMaxRedirects and setReadFrom");
+    return f;
+}
+
+fn string connectRefusal(const ref string url) {
+    Config c = parsed(url: url);
+    Result<Connection, RedisError> r = Connection.connect(config: c);
+    return match (r) { case Ok(value: x): "connected"; case Err(error: e): e.message(); };
+}
+
+// What a single connection refuses, before it dials anything.
+unsafe fn int32 connectionRefusalTests() {
+    int32 f = 0;
+    f = f + check(ok: connectRefusal(url: "redis://127.0.0.1:1,127.0.0.1:2").contains(substring: "Cluster.connect"), what: "connect: several hosts are a cluster's");
+    f = f + check(ok: connectRefusal(url: "redis://127.0.0.1:1?read_from=replica").contains(substring: "a cluster's options")
+                      && connectRefusal(url: "redis://127.0.0.1:1?max_redirects=3").contains(substring: "a cluster's options"),
+                  what: "connect: a cluster's options are refused");
+    Config s = parsed(url: "redis://127.0.0.1:1,127.0.0.1:2");
+    Result<Subscriber, RedisError> sub = Subscriber.connect(config: s);
+    bool subRefused = match (sub) { case Ok(value: x): false; case Err(error: e): e.message().contains(substring: "Cluster.connect"); };
+    f = f + check(ok: subRefused, what: "Subscriber.connect: several hosts are refused too");
+    Config viaSentinels = parsed(url: "redis-sentinel://127.0.0.1:1?master_name=kr");
+    DynamicArray<Step> none = DynamicArray.empty();
+    Owned<Transport> fake = new FakeServer.make(steps: give none, chunk: 1, writeLimit: 3);
+    Result<Connection, RedisError> over = Connection.connectOver(transport: give fake, config: viaSentinels);
+    bool overRefused = match (over) { case Ok(value: x): false; case Err(error: e): e.message().contains(substring: "a transport the caller opened"); };
+    f = f + check(ok: overRefused, what: "connectOver: a Sentinel configuration is refused");
+    return f;
+}
+
+unsafe fn int32 configTests() {
     int32 f = 0;
     f = f + defaultTests();
     f = f + optionTests();
     f = f + refusalTests();
     f = f + setterTests();
     f = f + tlsTests();
+    f = f + hostsTests();
+    f = f + sentinelTests();
+    f = f + clusterOptionTests();
+    f = f + connectionRefusalTests();
     return f;
 }

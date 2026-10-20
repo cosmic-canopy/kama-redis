@@ -99,12 +99,16 @@ type resource Connection implements Sendable {
 
     // Connect to the server `config` names, over a socket of this client's.
     public unsafe ctor Result<Connection, RedisError> connect(const ref Config config) {
+        Optional<RedisError> wrong = oneServer(config: config);
+        match (give wrong) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
         Opener opener = Opener.builtIn(keepAlive: config.keepAlive());
         return Connection.establish(config: config, opener: give opener);
     }
 
     // `connect`, with each address's transport opened by `dialer` (a tunnel, a proxy) rather than by this client.
     public unsafe ctor Result<Connection, RedisError> connectWith(Owned<Dialer> dialer, const ref Config config) {
+        Optional<RedisError> wrong = oneServer(config: config);
+        match (give wrong) { case Some(value: e): { Owned<Dialer> unused = give dialer; return Result::Err(error: give e); } case None: { } };
         Opener opener = Opener.through(dialer: give dialer);
         return Connection.establish(config: config, opener: give opener);
     }
@@ -112,6 +116,12 @@ type resource Connection implements Sendable {
     // The handshake over a transport the caller opened: TLS first, when `config` is a TLS one. `config` supplies
     // everything but where to connect; `connect_timeout` bounds the handshake.
     public unsafe ctor Result<Connection, RedisError> connectOver(Owned<Transport> transport, const ref Config config) {
+        Optional<RedisError> wrong = oneServer(config: config);
+        if (config.viaSentinel()) {
+            Optional<RedisError> unused = give wrong;
+            wrong = Optional::Some(value: RedisError::Config(detail: "a Sentinel configuration finds its server through the sentinels, so it cannot run over a transport the caller opened: connect with Connection.connect or connectWith"));
+        }
+        match (give wrong) { case Some(value: e): { Owned<Transport> unused = give transport; return Result::Err(error: give e); } case None: { } };
         Deadline deadline = Deadline.within(span: config.connectTimeout());
         DynamicArray<TlsSession> session = DynamicArray.empty();
         Result<Owned<Transport>, RedisError> secured = Connection::secure(link: give transport, config: config, place: hostAndPort(config: config), deadline: deadline, session: session);
@@ -961,6 +971,21 @@ fn RedisError helloFailure(RedisError e, bool tls) {
     // Every server in the matrix closes its TLS port on a plaintext HELLO without a byte (tools/gen-server-vectors.sh,
     // plaintext-at-tls).
     return RedisError::Unexpected(detail: "Server closed the connection in answer to HELLO. A server's TLS port closes a plaintext connection: connect to one with rediss://. ".concat(other: proxy));
+}
+
+// What `config` asks of one connection that it cannot give: a cluster's options, a cluster's seeds, or (until this
+// client asks sentinels for the server, docs/ROADMAP.md "Phase 6", step 5) a Sentinel configuration.
+fn Optional<RedisError> oneServer(const ref Config config) {
+    if (config.clusterOptions()) {
+        return Optional::Some(value: RedisError::Config(detail: "read_from and max_redirects are a cluster's options: connect to a cluster with Cluster.connect"));
+    }
+    if (config.viaSentinel()) {
+        return Optional::Some(value: RedisError::Config(detail: "connecting through sentinels is not built yet (docs/ROADMAP.md, \"Phase 6\", step 5)"));
+    }
+    if (config.hostCount() > 1) {
+        return Optional::Some(value: RedisError::Config(detail: "several hosts are a cluster's seeds, or sentinels: connect to a cluster with Cluster.connect, or through sentinels with redis-sentinel://; a connection takes one host"));
+    }
+    return Optional::None;
 }
 
 // "host:port", the host in brackets when it is an IPv6 address.

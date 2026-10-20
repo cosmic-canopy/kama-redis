@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–2 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–4 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -583,15 +583,35 @@ Each step ends green before its commit:
        sides.
      - **Valkey 8.1 keeps zones out of CLUSTER SLOTS, and 9.1 puts them in.** Zones travel by gossip, so the script
        waits for all six or none, and for them to go again.
-3. **Shared shapes, with no change in behaviour,** as 7a's step 3:
-   - `Replies` holding results, and `Pipeline`'s offsets;
-   - `generation`, `readyOnce` and the grants;
-   - `Config.forNode`, READONLY and ROLE in the handshake;
-   - the scripted server's dialer keyed by address.
-
-   Every test passes unchanged.
-4. **URLs and Config:** several hosts, the sentinel schemes, `master_name`, `role`, the sentinels' credentials,
-   `read_from` and `max_redirects`. Each refusal is worded, and the URL vectors are regenerated.
+3. **Folded into the steps that use each piece (2026-10-20).** Each piece lands beside its first caller, so its tests
+   exercise it through the public API rather than leaving unused code:
+   - `generation`, with the Scan fix (step 5);
+   - ROLE in the handshake, with Sentinel (step 5);
+   - READONLY in the handshake, with replica reads (step 10);
+   - `readyOnce` and the grants, with the cluster's core (step 8);
+   - `Replies` holding results and `Pipeline`'s offsets, with the cluster's pipelines (step 9);
+   - the scripted server's dialer keyed by address, with the first test that dials two places (step 5).
+4. **Done (2026-10-20).** **URLs and Config.**
+   - **`RedisUrl`:**
+     - several hosts, comma-separated, each with its own port (`hostCount`, `hostAt`, `portAt`; `host()` and
+       `port()` are the first);
+     - `redis-sentinel://` and `rediss-sentinel://` (`isSentinel()`);
+     - an empty host in the list refused, as is a list whose first host names no port on redis://, rediss://,
+       valkey:// and valkeys://. redis-cli, asked, reads `redis://127.0.0.1,127.0.0.1:7101` as the one host
+       "127.0.0.1,127.0.0.1", and `redis://127.0.0.1:7100,127.0.0.1:7101` as its first host, since `atoi` stops at
+       the comma.
+     The URL vectors gained nine comma forms. The CLI's reading of each is the expectation, or the refusal's
+     reason.
+   - **`Config`:**
+     - the hosts, with 26379 for a sentinel that names no port, and `addHost`;
+     - Sentinel: the schemes and `Config.sentinel(masterName:, host:, port:, tls:)`, `master_name` (needed), `role`
+       (`SentinelRole::Master|Replica`), and `setSentinelAuth`. Each is refused off a Sentinel configuration;
+     - a cluster's `read_from` (`ReadFrom::Primary|Replica`) and `max_redirects` (0 to 100, default 5);
+     - the copy constructor copying every new field.
+   - **A `Connection` refuses what is not its own,** before it dials: several hosts, and a cluster's options. A
+     Sentinel configuration over `connectOver` is refused too. `Connection.connect` refuses a Sentinel configuration
+     until step 5 builds it.
+   - 30 mutations, all caught.
 5. **Sentinel discovery** (unit):
    - the order, ROLE, the responder moved to the front, and SENTINELS added;
    - each error;

@@ -1,0 +1,242 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "                if (several && i == from) {",
+  "new": "                if (false && several && i == from) {",
+  "expect": "url hosts: an empty host anywhere in the list"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "        if (this.hostList.length() > 1 && !this.sentinels && !firstPort) {",
+  "new": "        if (false && this.hostList.length() > 1 && !this.sentinels && !firstPort) {",
+  "expect": "url hosts: the first names its port"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "        else if (scheme == \"redis-sentinel\") { this.kind = UrlTransport::Tcp; this.sentinels = true; }",
+  "new": "        else if (scheme == \"redis-sentinel\") { this.kind = UrlTransport::Tcp; this.sentinels = false; }",
+  "expect": "url sentinel: the first need not name its port"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "        else if (scheme == \"rediss-sentinel\") { this.kind = UrlTransport::Tls; this.sentinels = true; }",
+  "new": "        else if (scheme == \"rediss-sentinel\") { this.kind = UrlTransport::Tcp; this.sentinels = true; }",
+  "expect": "url sentinel: TLS"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "            if (this.sentinels && this.hostList.length() == 0) {",
+  "new": "            if (false && this.sentinels && this.hostList.length() == 0) {",
+  "expect": "url sentinel: no sentinels"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/url.kama",
+  "old": "        if (this.hostList.length() == 0) {\n            this.hostName = Optional::Some(value: copy host);",
+  "new": "        if (true) {\n            this.hostName = Optional::Some(value: copy host);",
+  "expect": "hosts: the first is host() and port()"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (c.viaSentinels) { c.portNumber = DEFAULT_SENTINEL_PORT; }",
+  "new": "        if (false) { c.portNumber = DEFAULT_SENTINEL_PORT; }",
+  "expect": "sentinel: 26379 unless a port is named"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "            if (c.viaSentinels) { fallback = DEFAULT_SENTINEL_PORT; }",
+  "new": "            if (false) { fallback = DEFAULT_SENTINEL_PORT; }",
+  "expect": "sentinel: 26379 unless a port is named"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (c.viaSentinels && !named) {",
+  "new": "        if (false && c.viaSentinels && !named) {",
+  "expect": "sentinel: master_name is needed"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "            if (!this.viaSentinels) { return refused(m: key.concat(other: \" is a Sentinel option",
+  "new": "            if (false) { return refused(m: key.concat(other: \" is a Sentinel option",
+  "expect": "sentinel: master_name and role are refused elsewhere"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "            if (value == \"replica\") { this.sentinelRole = SentinelRole::Replica; return Optional::None; }",
+  "new": "            if (value == \"replica\") { this.sentinelRole = SentinelRole::Master; return Optional::None; }",
+  "expect": "sentinel: master_name and role"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "                if (value.length() == 0) { return refused(m: \"master_name is empty",
+  "new": "                if (false) { return refused(m: \"master_name is empty",
+  "expect": "sentinel: an empty master_name"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.moreHosts = copy source.moreHosts;",
+  "new": "        this.moreHosts = DynamicArray.empty();",
+  "expect": "hosts: copy keeps every host"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.viaSentinels = source.viaSentinels;",
+  "new": "        this.viaSentinels = false;",
+  "expect": "copy: the Sentinel settings too"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.master = copy source.master;",
+  "new": "        this.master = Optional::None;",
+  "expect": "copy: the Sentinel settings too"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.sentinelRole = source.sentinelRole;",
+  "new": "        this.sentinelRole = SentinelRole::Master;",
+  "expect": "copy: the Sentinel settings too"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.sentinelSecret = copy source.sentinelSecret;",
+  "new": "        this.sentinelSecret = Optional::None;",
+  "expect": "copy: the Sentinel settings too"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.readChoice = source.readChoice;",
+  "new": "        this.readChoice = Optional::None;",
+  "expect": "copy: the cluster options too"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.redirectChoice = source.redirectChoice;",
+  "new": "        this.redirectChoice = Optional::None;",
+  "expect": "copy: the cluster options too"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "            if (count < 0i64 || count > cast<int64>(MOST_REDIRECTS)) { return Optional::Some(value: maxRedirectsRefused()); }",
+  "new": "            if (count < 0i64 || count > 1000i64) { return Optional::Some(value: maxRedirectsRefused()); }",
+  "expect": "cluster: max_redirects is 0 to 100"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (count < 0 || count > MOST_REDIRECTS) { return Result::Err(error: maxRedirectsRefused()); }",
+  "new": "        if (count < 0) { return Result::Err(error: maxRedirectsRefused()); }",
+  "expect": "setMaxRedirects and setReadFrom"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "            if (value == \"replica\") { this.readChoice = Optional::Some(value: ReadFrom::Replica); return Optional::None; }",
+  "new": "            if (value == \"replica\") { this.readChoice = Optional::Some(value: ReadFrom::Primary); return Optional::None; }",
+  "expect": "cluster: read_from and max_redirects"
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (this.kind == UrlTransport::Unix) { return Result::Err(error: RedisError::Config(detail: \"a configuration over a Unix-domain socket has one place",
+  "new": "        if (false) { return Result::Err(error: RedisError::Config(detail: \"a configuration over a Unix-domain socket has one place",
+  "expect": "addHost: refused over a Unix-domain socket"
+ },
+ {
+  "id": "M24",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (port < 1 || port > 65535) { return Result::Err(error: RedisError::Config(detail: \"the port is a number from 1 to 65535\")); }\n        this.moreHosts.add",
+  "new": "        if (false) { return Result::Err(error: RedisError::Config(detail: \"the port is a number from 1 to 65535\")); }\n        this.moreHosts.add",
+  "expect": "addHost: a bad port or an empty host, refused"
+ },
+ {
+  "id": "M25",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (!this.viaSentinels) { return Result::Err(error: RedisError::Config(detail: \"the sentinels' credentials are a Sentinel setting",
+  "new": "        if (false) { return Result::Err(error: RedisError::Config(detail: \"the sentinels' credentials are a Sentinel setting",
+  "expect": "sentinel: its setters are refused elsewhere"
+ },
+ {
+  "id": "M26",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (!this.viaSentinels) { return Result::Err(error: RedisError::Config(detail: \"role is a Sentinel setting",
+  "new": "        if (false) { return Result::Err(error: RedisError::Config(detail: \"role is a Sentinel setting",
+  "expect": "sentinel: its setters are refused elsewhere"
+ },
+ {
+  "id": "M27",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (masterName.length() == 0) { return Result::Err",
+  "new": "        if (false) { return Result::Err",
+  "expect": "Config.sentinel: an empty master name"
+ },
+ {
+  "id": "M28",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    if (config.clusterOptions()) {",
+  "new": "    if (false) {",
+  "expect": "connect: a cluster's options are refused"
+ },
+ {
+  "id": "M29",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    if (config.hostCount() > 1) {",
+  "new": "    if (false) {",
+  "expect": "connect: several hosts are a cluster's"
+ },
+ {
+  "id": "M30",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (config.viaSentinel()) {\n            Optional<RedisError> unused = give wrong;",
+  "new": "        if (false) {\n            Optional<RedisError> unused = give wrong;",
+  "expect": "connectOver: a Sentinel configuration is refused"
+ }
+]

@@ -7,6 +7,7 @@ export { RedisUrl, UrlTransport, UrlError };
 //   redis://[[user]:password@][host][:port][/db][?key=value&…]      also valkey://
 //   rediss://…                                                       TLS; also valkeys://
 //   unix://[[user]:password@]/path/to/socket[?db=N&key=value&…]
+//   redis-sentinel://[[user]:password@]host[:port][,host[:port]…][/db]?master_name=NAME[&…]    rediss-sentinel:// for TLS
 //
 // redis:// and rediss:// mean what they mean to redis-cli 8.10 (`-u`), and valkey:// and valkeys:// what they mean
 // to valkey-cli: tests/unit/src/url_vectors.kama is redis-cli and valkey-cli asked live, URL by URL
@@ -15,6 +16,13 @@ export { RedisUrl, UrlTransport, UrlError };
 //
 // Redis defines no unix:// URL (redis-cli takes a socket with -s), so this one is decided here: the form redis-py
 // and go-redis both document. The socket path is percent-decoded, and the database comes only from `?db=`.
+//
+// Several hosts are written with commas, Lettuce's form and libpq's (docs/ROADMAP.md, "Phase 6"): a cluster's seeds
+// (redis://h1:7000,h2:7001), or the sentinels (redis-sentinel://s1,s2,s3?master_name=mymaster, each on 26379 unless it
+// says otherwise). redis-cli reads only the first of them: `atoi` stops its port at the comma. So on redis://, rediss://,
+// valkey:// and valkeys:// the first host names its port, without which redis-cli would read `h1,h2:7001` as the one
+// host "h1,h2", and an empty host in the list is refused. redis-sentinel:// and rediss-sentinel:// are this package's
+// own, as Lettuce spells them: redis-cli has no Sentinel URL.
 //
 // Where redis-cli would read a URL into something other than what it says (`atoi` turning a port of `6379x` into
 // 6379 and a database of `x` into 0, the first `@` ending the password even past the host, `user:@` silently
@@ -38,8 +46,12 @@ type enum UrlError implements Error, Sendable {
 
 type resource RedisUrl implements Sendable {
     UrlTransport kind;
+    bool sentinels = false;
     Optional<string> hostName;
     Optional<int32> portNumber;
+    // Every host the URL names, the first included, and each one's port; empty when it names none.
+    DynamicArray<string> hostList;
+    DynamicArray<Optional<int32>> portList;
     string socket;
     Optional<string> userName;
     Optional<string> secret;
@@ -49,8 +61,11 @@ type resource RedisUrl implements Sendable {
 
     ctor empty() {
         this.kind = UrlTransport::Tcp;
+        this.sentinels = false;
         this.hostName = Optional::None;
         this.portNumber = Optional::None;
+        this.hostList = DynamicArray.empty();
+        this.portList = DynamicArray.empty();
         this.socket = "";
         this.userName = Optional::None;
         this.secret = Optional::None;
@@ -70,10 +85,18 @@ type resource RedisUrl implements Sendable {
 
     // TCP, TLS over TCP, or a Unix-domain socket.
     public const fn UrlTransport transport() { return this.kind; }
-    // The host, without brackets; None when the URL names none (the default is 127.0.0.1). None for unix://.
+    // Whether the hosts are sentinels, to ask for the server (redis-sentinel://, rediss-sentinel://).
+    public const fn bool isSentinel() { return this.sentinels; }
+    // The host, without brackets; None when the URL names none (the default is 127.0.0.1). None for unix://. With
+    // several hosts, the first.
     public const fn Optional<string> host() { return copy this.hostName; }
-    // The port; None when the URL names none (the default is 6379).
+    // The port; None when the URL names none (the default is 6379). With several hosts, the first one's.
     public const fn Optional<int32> port() { return this.portNumber; }
+    // How many hosts the URL names: 0 when none, more than 1 for a cluster's seeds or the sentinels.
+    public const fn isize hostCount() { return this.hostList.length(); }
+    // Host `index` (0 is the first), without brackets, and its port; None when it names none.
+    public const fn string hostAt(isize index) { return copy this.hostList[index]; }
+    public const fn Optional<int32> portAt(isize index) { return this.portList[index]; }
     // The socket's path, for unix://; empty otherwise.
     public const fn string socketPath() { return copy this.socket; }
     public const fn Optional<string> user() { return copy this.userName; }
@@ -98,13 +121,15 @@ type resource RedisUrl implements Sendable {
         isize n = b.length();
         isize sep = find(b: b, from: 0, upTo: n, c: 58ui8);
         if (sep < 0 || sep + 2 >= n || b[sep + 1] != 47ui8 || b[sep + 2] != 47ui8) {
-            return invalid(m: "not a URL: it should begin redis://, rediss://, valkey://, valkeys:// or unix://");
+            return invalid(m: "not a URL: it should begin redis://, rediss://, valkey://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://");
         }
         string scheme = lowerAscii(b: b.slice(from: 0, count: sep));
         if (scheme == "redis" || scheme == "valkey") { this.kind = UrlTransport::Tcp; }
         else if (scheme == "rediss" || scheme == "valkeys") { this.kind = UrlTransport::Tls; }
         else if (scheme == "unix") { this.kind = UrlTransport::Unix; }
-        else { return invalid(m: "unknown scheme \"".concat(other: scheme).concat(other: "\": use redis://, rediss://, valkey://, valkeys:// or unix://")); }
+        else if (scheme == "redis-sentinel") { this.kind = UrlTransport::Tcp; this.sentinels = true; }
+        else if (scheme == "rediss-sentinel") { this.kind = UrlTransport::Tls; this.sentinels = true; }
+        else { return invalid(m: "unknown scheme \"".concat(other: scheme).concat(other: "\": use redis://, rediss://, valkey://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://")); }
         isize start = sep + 3;
         // The authority runs to the first `/` or `?`; the query starts at the first `?`.
         isize question = find(b: b, from: start, upTo: n, c: 63ui8);
@@ -135,8 +160,11 @@ type resource RedisUrl implements Sendable {
             Result<string, UrlError> path = percentDecoded(b: b.slice(from: slash, count: queryAt - slash), what: "the socket path");
             match (give path) { case Ok(value: p): { this.socket = give p; } case Err(error: x): { return Optional::Some(value: give x); } };
         } else {
-            Optional<UrlError> e = this.readHostPort(b: b.slice(from: hostStart, count: authEnd - hostStart));
+            Optional<UrlError> e = this.readHosts(b: b.slice(from: hostStart, count: authEnd - hostStart));
             match (give e) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+            if (this.sentinels && this.hostList.length() == 0) {
+                return invalid(m: "a Sentinel URL names its sentinels: redis-sentinel://host:26379,host:26380?master_name=mymaster");
+            }
             if (slash >= 0) {
                 Optional<UrlError> d = this.readDatabase(b: b.slice(from: slash + 1, count: queryAt - slash - 1));
                 match (give d) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
@@ -173,16 +201,44 @@ type resource RedisUrl implements Sendable {
         };
     }
 
+    // One host, or several separated by commas (an IPv6 address has none of its own).
+    fn Optional<UrlError> readHosts(ConstView<uint8> b) {
+        isize n = b.length();
+        if (n == 0) { return Optional::None; }
+        isize from = 0;
+        isize i = 0;
+        while (i <= n) {
+            if (i == n || b[i] == 44ui8) {
+                bool several = i < n || from > 0;
+                if (several && i == from) {
+                    return invalid(m: "an empty host in a list of hosts: write redis://host1:7000,host2:7001");
+                }
+                Optional<UrlError> e = this.readHostPort(b: b.slice(from: from, count: i - from));
+                match (give e) { case Some(value: x): { return Optional::Some(value: give x); } case None: { } };
+                from = i + 1;
+            }
+            i = i + 1;
+        }
+        bool firstPort = match (this.portList[0]) { case Some(value: p): true; case None: false; };
+        if (this.hostList.length() > 1 && !this.sentinels && !firstPort) {
+            return invalid(m: "with several hosts, the first names its port, or redis-cli would read redis://h1,h2:7001 as the one host \"h1,h2\": write redis://h1:6379,h2:7001");
+        }
+        return Optional::None;
+    }
+
+    // One host and its port, added to the list; the first is also `host()` and `port()`.
     fn Optional<UrlError> readHostPort(ConstView<uint8> b) {
         isize n = b.length();
         if (n == 0) { return Optional::None; }
+        Optional<string> name = Optional::None;
+        Optional<int32> number = Optional::None;
         isize portFrom = -1;
         if (b[0] == 91ui8) {
             isize close = find(b: b, from: 1, upTo: n, c: 93ui8);
             if (close < 0) { return invalid(m: "an IPv6 address with no closing ']': write [::1]:6379"); }
             if (close == 1) { return invalid(m: "an empty IPv6 address: write [::1]:6379"); }
             Result<string, UrlError> h = textOf(b: b.slice(from: 1, count: close - 1), what: "the host");
-            match (give h) { case Ok(value: v): { this.hostName = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
+            match (give h) { case Ok(value: v): { name = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
             if (close + 1 < n) {
                 if (b[close + 1] != 58ui8) { return invalid(m: "something after an IPv6 address's ']' that is not a port: write [::1]:6379"); }
                 portFrom = close + 2;
@@ -193,15 +249,22 @@ type resource RedisUrl implements Sendable {
             if (hostEnd < 0) { hostEnd = n; }
             if (hostEnd == 0) { return invalid(m: "a port with no host before it: write redis://localhost:6379"); }
             Result<string, UrlError> h = textOf(b: b.slice(from: 0, count: hostEnd), what: "the host");
-            match (give h) { case Ok(value: v): { this.hostName = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
+            match (give h) { case Ok(value: v): { name = Optional::Some(value: give v); } case Err(error: x): { return Optional::Some(value: give x); } };
             if (colon >= 0) { portFrom = colon + 1; }
         }
         if (portFrom >= 0) {
             Optional<int64> p = digits(b: b.slice(from: portFrom, count: n - portFrom));
             int64 port = match (p) { case Some(value: v): v; case None: -1i64; };
             if (port < 1i64 || port > 65535i64) { return invalid(m: "the port is a number from 1 to 65535: redis://host:6379"); }
-            this.portNumber = Optional::Some(value: cast<int32>(port));
+            number = Optional::Some(value: cast<int32>(port));
         }
+        string host = match (give name) { case Some(value: v): give v; case None: ""; };
+        if (this.hostList.length() == 0) {
+            this.hostName = Optional::Some(value: copy host);
+            this.portNumber = number;
+        }
+        this.hostList.add(item: give host);
+        this.portList.add(item: number);
         return Optional::None;
     }
 
