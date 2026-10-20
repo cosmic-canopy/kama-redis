@@ -1,0 +1,54 @@
+// What a cluster's nodes and Sentinel answer (topology_vectors.kama, tools/gen-topology-vectors.sh), before anything
+// here reads them: each reply is one whole RESP value, the generator's re-encoding of what moves from run to run
+// included, and each error among them has a code of its own. The cluster's and Sentinel's own tests replay them.
+import { std::collections::DynamicArray, redis::ServerError, redis::ServerCode, redis::resp::Reader, redis::resp::Read,
+         redis_unit_tests::check, unhex, errorOf, topologyVersions, topologyNames, topologyHex, topologyEndingNames,
+         topologyEndings };
+export { topologyTests };
+
+fn bool named(ServerCode c) { return match (c) { case Other: false; case _: true; }; }
+
+fn int32 topologyTests() {
+    int32 f = 0;
+    DynamicArray<string> names = topologyNames();
+    DynamicArray<string> hex = topologyHex();
+    isize errors = 0;
+    isize silent = 0;
+    isize i = 0;
+    while (i < names.length()) {
+        DynamicArray<uint8> reply = unhex(text: hex[i]);
+        string name = copy names[i];
+        if (reply.length() == 0) {
+            // A client Sentinel let go read nothing; the generator recorded that, and that the link closed.
+            silent = silent + 1;
+        } else {
+            Reader r = Reader.make();
+            r.feed(bytes: reply.view());
+            Read got = r.next();
+            bool whole = match (give got) { case Complete(value: v): true; case _: false; };
+            f = f + check(ok: whole && r.isIdle(), what: "topology ${name}: one whole value, and nothing after it");
+            if (reply[0] == 45ui8) {
+                ServerError e = errorOf(reply: reply.view());
+                string text = e.message();
+                f = f + check(ok: named(c: e.code()), what: "topology ${name}: a named code (${text})");
+                errors = errors + 1;
+            }
+        }
+        i = i + 1;
+    }
+    isize servers = topologyVersions().length();
+    f = f + check(ok: servers == 8, what: "topology vectors: all eight servers");
+    f = f + check(ok: errors > 40 * servers, what: "topology vectors: more than 40 error replies a server");
+    // promoted-let-go and demoted-let-go under both protocols, on every server: nothing, then the close.
+    f = f + check(ok: silent >= 4 * servers, what: "topology vectors: the clients Sentinel let go read nothing");
+    DynamicArray<string> ends = topologyEndingNames();
+    DynamicArray<string> how = topologyEndings();
+    isize closed = 0;
+    isize k = 0;
+    while (k < ends.length()) {
+        if (how[k] == "closed") { closed = closed + 1; }
+        k = k + 1;
+    }
+    f = f + check(ok: closed >= 4 * servers, what: "topology vectors: Sentinel closed the clients it let go");
+    return f;
+}

@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–1 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–2 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -536,19 +536,53 @@ Each step ends green before its commit:
        TLS. A reply over TLS has the same shape as one in plaintext, and the port it names is checked live (smoke,
        then the integration suite).
      - **COMMAND INFO, DOCS and GETKEYS move to step 7,** where the table they check is generated.
-2. **Vectors** (`tools/gen-topology-vectors.sh`), in throwaway `--network none` containers. Two runs must be the same.
-   - **The cluster:**
-     - CLUSTER SLOTS under both protocols, with the hostname and unknown-endpoint forms;
-     - every redirection, and every CLUSTERDOWN;
-     - a redirection while queueing and one at EXEC, and ASKING then MULTI;
-     - a replica's MOVED, READONLY and MASTERDOWN;
-     - the atomic migrations.
-   - **Sentinel:**
-     - every SENTINEL reply, under both protocols, and an unknown name;
+2. **Done (2026-10-20).** **Vectors** (`tools/gen-topology-vectors.sh` → `tests/unit/src/topology_vectors.kama`): 984
+   replies, under both protocols, from throwaway `--network none` containers of all eight images. Two full runs
+   give the same file.
+   - **The cluster** is six nodes built by hand (`ADDSLOTS` in thirds, `MEET`, `REPLICATE`), so it comes out the
+     same every run. What was captured:
+     - CLUSTER SLOTS, at a primary and at a replica;
+     - MOVED from a primary and from a replica, and CROSSSLOT across shards and within one;
+     - MULTI meeting MOVED, then EXECABORT, and EXEC's own CROSSSLOT;
+     - a migration: ASK, served, TRYAGAIN, MOVED back without ASKING, ASKING for one command, ASKING then a
+       transaction;
+     - READONLY and READWRITE, and a keyless write's READONLY;
+     - a slot not served, and the map with its gap;
+     - the map and MOVED after a CLUSTER FAILOVER;
+     - hostnames and an unknown endpoint (7.0 and later);
+     - Valkey's zones;
+     - MASTERDOWN;
+     - the cluster down, in both of its words.
+   - **Sentinel** is a group of a master, two replicas and four sentinels, one wanting a password. What was captured:
+     - HELLO 3, GET-MASTER-ADDR-BY-NAME known and unknown, and Valkey's GET-PRIMARY-ADDR-BY-NAME;
+     - SENTINELS and REPLICAS, and REPLICAS with one down;
      - ROLE three ways;
-     - HELLO in sentinel mode;
-     - `+switch-master`;
-     - the kill at reconfiguration.
+     - SELECT, CLIENT SETINFO and SETNAME on a sentinel;
+     - the password refused;
+     - a SENTINEL FAILOVER: `+switch-master` under both protocols, the promoted replica's and the old master's
+       clients let go, a BLPOP cut off, the new address, and the old master's READONLY and ROLE.
+   - **What moves from run to run is made canonical:**
+     - node ids become their ports;
+     - Sentinel's times, offsets and run ids become 0 or the port, its lists are sorted by address, and HELLO's client
+       id is 0;
+     - ROLE's offsets become 0.
+
+     The file's re-encoding keeps each value's RESP form, and a unit test (`topology_test.kama`) reads every reply
+     as one whole value, each error a named code.
+   - **What the servers showed:**
+     - **6.2's source answers a half-migrated MGET with ASK,** where 7.0 and later answer TRYAGAIN. The target's
+       TRYAGAIN after ASKING is every server's. So a client must follow an ASK even for a command whose keys are
+       partly on the source, and may then meet TRYAGAIN.
+     - **A 6.2 replica whose link is down answers a READONLY read with MOVED to its dead primary.** The others answer
+       MASTERDOWN (`replica-serve-stale-data no`).
+     - **Sentinel's kill lands before the unblock.** The old master's BLPOP client gets no bytes and a close on all
+       eight servers, not `-UNBLOCKED`. So do the idle clients of the old master and of the promoted replica.
+     - **A sentinel accepts CLIENT SETINFO on 7.2 and later.** 6.2 refuses it, as the handshake already allows.
+       SELECT is an unknown command there, in 6.2's backquoted words too.
+     - **`CLUSTER SETSLOT … NODE` naming another node leaves the importing node importing.** `STABLE` clears both
+       sides.
+     - **Valkey 8.1 keeps zones out of CLUSTER SLOTS, and 9.1 puts them in.** Zones travel by gossip, so the script
+       waits for all six or none, and for them to go again.
 3. **Shared shapes, with no change in behaviour,** as 7a's step 3:
    - `Replies` holding results, and `Pipeline`'s offsets;
    - `generation`, `readyOnce` and the grants;
