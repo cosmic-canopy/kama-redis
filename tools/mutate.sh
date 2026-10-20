@@ -20,7 +20,8 @@
 #   BAD-PATTERN       `old` is not in the file exactly once (the source moved on: update the mutation);
 #   BUILD-FAILED      the mutation does not compile.
 # It exits 1 unless every mutation run is CAUGHT. `kama` is $KAMA or the PATH; an integration run needs the server up
-# (tools/redis.sh up --server S) and reads its out/redistest-S.env. Run the integration mutations after the matrix,
+# (tools/redis.sh up --server S) and reads its out/redistest-S.env, and its topologies' out/redistest-<topology>-S.env
+# when they are up. Run the integration mutations after the matrix,
 # not beside it: both use the same servers.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -57,11 +58,16 @@ only = set(sys.argv[7:])
 tree = os.path.join(tmp, "tree")
 env = dict(os.environ, REDISTEST_CERTDIR=certs)
 if envfile:
-    for line in open(envfile):
-        line = line.strip()
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            env[k] = v
+    # The server's settings, and its topologies' beside them when they are up (tools/redis.sh --topology).
+    files = [envfile] + [envfile.replace("/redistest-", "/redistest-%s-" % t) for t in ("sentinel", "cluster")]
+    for settings in files:
+        if not os.path.exists(settings):
+            continue
+        for line in open(settings):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env.setdefault(k, v) if k in ("REDISTEST_SERVER", "REDISTEST_HOST", "REDISTEST_CERTDIR") else env.__setitem__(k, v)
 missed = 0
 for m in json.load(open(path)):
     if only and m["id"] not in only:

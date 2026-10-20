@@ -1,0 +1,304 @@
+// Through sentinels, live (docs/ROADMAP.md, "Phase 6", step 6), on tools/redis.sh's sentinel topology: two groups of a
+// master, two replicas and three sentinels monitoring "kr", one in plaintext and one over TLS whose sentinels want
+// kr_sentinel's password. A failover here is one a test starts (SENTINEL FAILOVER) or causes (DEBUG SLEEP on the
+// master), and each test waits for its group to settle before it ends: the next test, and the release run after the
+// debug one, use the same group, with whatever master it has by then.
+import { core::println, std::collections::DynamicArray, std::time::Duration, std::time::sleep, std::time::monotonicNow,
+         std::time::Instant, std::fmt::i64Str,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::Subscriber, redis::Delivery,
+         redis::resp::Value,
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown };
+export { sentinelTests };
+
+// The first of a comma-separated list of ports ("18103,18104,18105").
+fn string firstOf(const ref string list) {
+    isize i = 0;
+    while (i < list.length() && list.bytes()[i] != 44ui8) { i = i + 1; }
+    return list.substring(start: 0, end: i);
+}
+
+fn DynamicArray<string> portsOf(const ref string list) {
+    DynamicArray<string> ports = DynamicArray.empty();
+    isize start = 0;
+    isize i = 0;
+    while (i <= list.length()) {
+        if (i == list.length() || list.bytes()[i] == 44ui8) { ports.add(item: list.substring(start: start, end: i)); start = i + 1; }
+        i = i + 1;
+    }
+    return give ports;
+}
+
+unsafe fn string plainUrl(const ref string options) { return setting(name: "REDISTEST_SENTINEL_URL").concat(other: options); }
+
+unsafe fn Result<Connection, RedisError> through(const ref string url) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Connection.connect(config: config);
+}
+
+// What the plain group's first sentinel says the master's port is; "" when it cannot be asked.
+unsafe fn string masterPort() {
+    string port = firstOf(list: setting(name: "REDISTEST_SENTINEL_PORTS"));
+    Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=1&command_timeout=1"));
+    return match (give r) {
+        case Ok(value: c): { Connection s = give c; string a = ask(c: s, text: "SENTINEL GET-MASTER-ADDR-BY-NAME kr"); := portOfAddress(a: a); }
+        case Err(error: e): "";
+    };
+}
+
+// "[127.0.0.1, 18101]" → "18101".
+fn string portOfAddress(const ref string a) {
+    if (!a.startsWith(prefix: "[127.0.0.1, ") || !a.endsWith(suffix: "]")) { return ""; }
+    return a.substring(start: 12, end: a.length() - 1);
+}
+
+// Tell a sentinel of the plain group to fail the master over.
+unsafe fn string failOver() {
+    string port = firstOf(list: setting(name: "REDISTEST_SENTINEL_PORTS"));
+    Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=1"));
+    return match (give r) {
+        case Ok(value: c): { Connection s = give c; := ask(c: s, text: "SENTINEL FAILOVER kr"); }
+        case Err(error: e): e.message();
+    };
+}
+
+// The plain group settled, within `secs`: every sentinel names the same master, its ROLE says master, and each of
+// the other two says slave with its link to the master up.
+unsafe fn bool settled(int64 secs) {
+    Instant until = monotonicNow() + Duration.fromSecs(s: secs);
+    while (monotonicNow() < until) {
+        if (settledNow()) { return true; }
+        sleep(d: Duration.fromMillis(ms: 250i64));
+    }
+    return false;
+}
+
+unsafe fn bool settledNow() {
+    DynamicArray<string> sentinels = portsOf(list: setting(name: "REDISTEST_SENTINEL_PORTS"));
+    string master = "";
+    isize i = 0;
+    while (i < sentinels.length()) {
+        Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: sentinels[i]).concat(other: "?connect_timeout=1&command_timeout=1"));
+        string p = match (give r) {
+            case Ok(value: c): { Connection s = give c; := portOfAddress(a: ask(c: s, text: "SENTINEL GET-MASTER-ADDR-BY-NAME kr")); }
+            case Err(error: e): "";
+        };
+        if (p.length() == 0 || (master.length() > 0 && p != master)) { return false; }
+        master = give p;
+        i = i + 1;
+    }
+    DynamicArray<string> data = portsOf(list: setting(name: "REDISTEST_SENTINEL_DATA_PORTS"));
+    isize k = 0;
+    while (k < data.length()) {
+        Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: data[k]).concat(other: "?connect_timeout=1&command_timeout=1"));
+        bool fine = match (give r) {
+            case Ok(value: c): {
+                Connection d = give c;
+                string role = ask(c: d, text: "ROLE");
+                bool right = role.startsWith(prefix: "[master,");
+                if (data[k] != master) { right = role.startsWith(prefix: "[slave,") && ask(c: d, text: "INFO replication").contains(substring: "master_link_status:up"); }
+                := right;
+            }
+            case Err(error: e): false;
+        };
+        if (!fine) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+unsafe fn int32 findTests() {
+    int32 f = 0;
+    // The plain group: the master, found and confirmed.
+    Result<Connection, RedisError> r = through(url: plainUrl(options: ""));
+    match (give r) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            string set = ask(c: conn, text: "SET kr:sentinel:k v");
+            string role = ask(c: conn, text: "ROLE");
+            f = f + check(ok: set == "OK" && ask(c: conn, text: "GET kr:sentinel:k") == "v", what: "sentinel: a write and a read on the master the sentinels name (${set})");
+            f = f + check(ok: role.startsWith(prefix: "[master,"), what: "sentinel: the server reached is the master (${role})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sentinel: connect through the plain group: ${m}"); }
+    };
+
+    // role=replica: a replica, which refuses a write as READONLY and does not send it again.
+    Result<Connection, RedisError> rr = through(url: plainUrl(options: "&role=replica"));
+    match (give rr) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            string role = ask(c: conn, text: "ROLE");
+            string write = ask(c: conn, text: "SET kr:sentinel:k w");
+            f = f + check(ok: role.startsWith(prefix: "[slave,"), what: "sentinel: role=replica reaches a replica (${role})");
+            f = f + check(ok: write.startsWith(prefix: "(error) READONLY"), what: "sentinel: a replica's READONLY is the call's error (${write})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sentinel: role=replica: ${m}"); }
+    };
+
+    // The TLS group: the sentinels want kr_sentinel's password, set apart from the server's credentials.
+    string certs = setting(name: "REDISTEST_CERTDIR");
+    string tlsUrl = setting(name: "REDISTEST_SENTINEL_TLS_URL").concat(other: "&tls_ca=").concat(other: certs).concat(other: "/ca.crt");
+    Result<Config, RedisError> tc = Config.parse(url: tlsUrl);
+    match (give tc) {
+        case Ok(value: config): {
+            Config bare = copy config;
+            Result<Connection, RedisError> refused = Connection.connect(config: bare);
+            string why = match (refused) { case Err(error: e): e.message(); case Ok(value: c): "connected"; };
+            f = f + check(ok: why.contains(substring: "NOAUTH") || why.contains(substring: "WRONGPASS"),
+                          what: "sentinel tls: sentinels that want a password, and none given, are each one's answer (${why})");
+            Config withAuth = copy config;
+            Result<Unit, RedisError> set = withAuth.setSentinelAuth(user: Optional::Some(value: setting(name: "REDISTEST_SENTINEL_USER")),
+                                                                    password: setting(name: "REDISTEST_SENTINEL_PASSWORD"));
+            Result<Connection, RedisError> ok = Connection.connect(config: withAuth);
+            match (give ok) {
+                case Ok(value: c): {
+                    Connection conn = give c;
+                    string role = ask(c: conn, text: "ROLE");
+                    bool tls = match (conn.tlsSession()) { case Some(value: s): true; case None: false; };
+                    f = f + check(ok: role.startsWith(prefix: "[master,") && tls, what: "sentinel tls: the master, over TLS, through sentinels that took kr_sentinel (${role})");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sentinel tls: connect: ${m}"); }
+            };
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sentinel tls: the URL: ${m}"); }
+    };
+    return f;
+}
+
+// DEBUG SLEEP on the master holds it past down-after-milliseconds: the sentinels fail it over, and a connection
+// through them, its calls failing meanwhile, ends up on the new master.
+unsafe fn int32 sleepTests() {
+    int32 f = 0;
+    f = f + check(ok: settled(secs: 30i64), what: "sentinel: the plain group settled before DEBUG SLEEP");
+    string old = masterPort();
+    Result<Connection, RedisError> r = through(url: plainUrl(options: "&connect_timeout=1&command_timeout=1&reconnect_timeout=2"));
+    Connection conn = match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); return f + check(ok: false, what: "sentinel sleep: connect: ${m}"); }
+    };
+    string before = ask(c: conn, text: "INCR kr:sentinel:sleep");
+    Result<Connection, RedisError> direct = open(url: "redis://127.0.0.1:".concat(other: old).concat(other: "?command_timeout=0.3"));
+    match (give direct) {
+        case Ok(value: d): { Connection m = give d; string slept = ask(c: m, text: "DEBUG SLEEP 9"); }
+        case Err(error: e): { }
+    };
+    Instant until = monotonicNow() + Duration.fromSecs(s: 40i64);
+    bool moved = false;
+    isize failures = 0;
+    while (monotonicNow() < until && !moved) {
+        string got = ask(c: conn, text: "INCR kr:sentinel:sleep");
+        if (got.startsWith(prefix: "(failed)") || got.startsWith(prefix: "(error)")) { failures = failures + 1; }
+        else {
+            string now = masterPort();
+            string role = ask(c: conn, text: "ROLE");
+            moved = now.length() > 0 && now != old && role.startsWith(prefix: "[master,");
+        }
+        sleep(d: Duration.fromMillis(ms: 200i64));
+    }
+    f = f + check(ok: moved, what: "sentinel: after DEBUG SLEEP on the master, calls reach the new master (${failures} failed meanwhile)");
+    f = f + check(ok: settled(secs: 40i64), what: "sentinel: the plain group settled after DEBUG SLEEP");
+    return f;
+}
+
+// SENTINEL FAILOVER under calls: each INCR answered is one increment more than the last, or two when a call between
+// failed (it may have run): so nothing was sent twice. The connection ends up on the new master.
+unsafe fn int32 failoverTests() {
+    int32 f = 0;
+    f = f + check(ok: settled(secs: 30i64), what: "sentinel: the plain group settled before SENTINEL FAILOVER");
+    string old = masterPort();
+    Result<Connection, RedisError> r = through(url: plainUrl(options: "&command_timeout=2&reconnect_timeout=10"));
+    Connection conn = match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); return f + check(ok: false, what: "sentinel failover: connect: ${m}"); }
+    };
+    string cleared = ask(c: conn, text: "DEL kr:sentinel:n");
+    int64 last = 0i64;
+    bool failedSince = false;
+    bool once = true;
+    isize answered = 0;
+    isize failed = 0;
+    isize afterMove = 0;
+    string asked = "";
+    Instant until = monotonicNow() + Duration.fromSecs(s: 40i64);
+    while (monotonicNow() < until && afterMove < 10) {
+        if (answered == 10 && asked.length() == 0) { asked = failOver(); }
+        Command incr = commandOf(text: "INCR kr:sentinel:n");
+        Result<Value, RedisError> got = conn.call(command: incr);
+        match (give got) {
+            case Ok(value: v): {
+                int64 n = match (v) { case Integer(value: x): x; case _: -1i64; };
+                bool step = n == last + 1i64 || (failedSince && n == last + 2i64);
+                if (!step) { once = false; }
+                last = n;
+                failedSince = false;
+                answered = answered + 1;
+                if (asked.length() > 0 && masterPort() != old) { afterMove = afterMove + 1; }
+            }
+            case Err(error: e): { failed = failed + 1; failedSince = true; }
+        };
+        sleep(d: Duration.fromMillis(ms: 50i64));
+    }
+    f = f + check(ok: asked == "OK", what: "sentinel failover: SENTINEL FAILOVER was taken (${asked})");
+    f = f + check(ok: afterMove >= 10, what: "sentinel failover: calls go on, on the new master (${answered} answered, ${failed} failed)");
+    f = f + check(ok: once, what: "sentinel failover: no INCR ran twice");
+    f = f + check(ok: settled(secs: 40i64), what: "sentinel: the plain group settled after SENTINEL FAILOVER");
+    return f;
+}
+
+// A subscriber through sentinels, across a failover: Sentinel lets its connection go, and it comes back as Reconnected,
+// subscribed again, and receives what is published after.
+unsafe fn int32 subscriberTests() {
+    int32 f = 0;
+    f = f + check(ok: settled(secs: 30i64), what: "sentinel: the plain group settled before the subscriber's failover");
+    Result<Config, RedisError> c = Config.parse(url: plainUrl(options: "&reconnect_timeout=10"));
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "sentinel subscriber: the URL"); } };
+    Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
+    Subscriber sub = match (give made) {
+        case Ok(value: s): give s;
+        case Err(error: e): { string m = e.message(); return f + check(ok: false, what: "sentinel subscriber: connect: ${m}"); }
+    };
+    Result<Unit, RedisError> on = sub.subscribe(names: "kr:sentinel:ch");
+    string asked = failOver();
+    bool reconnected = false;
+    Instant until = monotonicNow() + Duration.fromSecs(s: 30i64);
+    while (monotonicNow() < until && !reconnected) {
+        Result<Optional<Delivery>, RedisError> d = sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: 1i64)));
+        reconnected = match (give d) {
+            case Ok(value: o): match (give o) { case Some(value: x): match (give x) { case Reconnected(cause: e): true; case _: false; }; case None: false; };
+            case Err(error: e): false;
+        };
+    }
+    f = f + check(ok: asked == "OK" && reconnected, what: "sentinel subscriber: the failover lets it go, and it comes back Reconnected (${asked})");
+    f = f + check(ok: settled(secs: 40i64), what: "sentinel: the plain group settled after the subscriber's failover");
+    Result<Connection, RedisError> p = through(url: plainUrl(options: ""));
+    bool heard = false;
+    match (give p) {
+        case Ok(value: x): {
+            Connection pub = give x;
+            string sent = ask(c: pub, text: "PUBLISH kr:sentinel:ch hello");
+            Result<Optional<Delivery>, RedisError> d = sub.next(timeout: Optional::Some(value: Duration.fromSecs(s: 5i64)));
+            heard = match (give d) {
+                case Ok(value: o): match (give o) {
+                    case Some(value: x2): match (give x2) {
+                        case Message(message: m): match (m.text()) { case Ok(value: t): t == "hello"; case Err(error: e): false; };
+                        case _: false;
+                    };
+                    case None: false;
+                };
+                case Err(error: e): false;
+            };
+        }
+        case Err(error: e): { }
+    };
+    f = f + check(ok: heard, what: "sentinel subscriber: a message published after the failover is received");
+    return f;
+}
+
+unsafe fn int32 sentinelTests() {
+    int32 f = 0;
+    f = f + findTests();
+    f = f + sleepTests();
+    f = f + failoverTests();
+    f = f + subscriberTests();
+    return f;
+}

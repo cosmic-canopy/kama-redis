@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–5 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–6 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -659,12 +659,30 @@ Each step ends green before its commit:
      A failed connect in a test is a named failure, not a panic, so that a mutation shows which case caught it.
    - 24 mutations, all caught. The guard against a port that is not a number is proven by its words: removing it
      traps at the port's cast, a crash rather than a named failure.
-6. **Sentinel live,** with `examples/sentinel`:
-   - SENTINEL FAILOVER under calls (each INCR runs once);
-   - DEBUG SLEEP on the master;
-   - a subscriber across a failover;
-   - `role=replica`;
-   - TLS.
+6. **Done (2026-10-20).** **Sentinel live,** with `examples/sentinel`, on all eight servers, debug and release
+   (`tests/integration/src/sentinel_test.kama`, after the TLS tests and before the restarts). Each test waits for its
+   group to settle (one master named by all three sentinels, ROLE right on each server, replicas linked), since the
+   next test and the release run use the same group.
+   - **Found:**
+     - the master;
+     - `role=replica` reaching a replica, whose READONLY is the call's error;
+     - the TLS group, through sentinels that want `kr_sentinel` and refuse a connection without it.
+   - **DEBUG SLEEP 9 on the master:** the sentinels fail it over, the connection's calls fail meanwhile (about twenty
+     on redis-8.10), and then reach the new master.
+   - **SENTINEL FAILOVER under INCRs every 50 ms:** each answered INCR is one more than the last, or two after a call
+     that failed. So nothing ran twice, and ten calls in a row then succeed on the new master.
+   - **A subscriber across a failover:** Sentinel's kill of pub/sub clients comes back as `Reconnected`, and a message
+     published after it is received.
+   - **The topology's `failover-timeout` is 3 s now.** A sentinel starts no failover of its own within twice that of
+     the last one, and the release run's DEBUG SLEEP comes seconds after the debug run's SENTINEL FAILOVER. The
+     containers were made again.
+   - **The tools:** `tools/test-integration.sh` starts the sentinel topology and reads its settings, as do
+     `tools/check-examples.sh` (`REDIS_SENTINEL_URL`) and `tools/mutate.sh` (each topology's env file, when it is up).
+   - 4 live mutations, all caught:
+     - not asking the sentinels;
+     - `role=replica` not looking for a replica;
+     - the sentinels given the server's credentials;
+     - a redial that does not ask again.
 7. **`redis::cluster`'s pure layers** (unit):
    - the slot map, hostile and bounded;
    - the MOVED and ASK parser;

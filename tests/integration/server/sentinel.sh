@@ -11,7 +11,9 @@
 #            (sentinel sentinel-user). The data servers keep the standalone server's users, so a client's
 #            credentials for the data servers and for the sentinels differ, as a deployment's do.
 # Each server and sentinel runs in a loop, as the standalone server does (start.sh). A test fails a master over with
-# SENTINEL FAILOVER, or by holding it past down-after-milliseconds with DEBUG SLEEP.
+# SENTINEL FAILOVER, or by holding it past down-after-milliseconds (2 s) with DEBUG SLEEP. A sentinel starts no failover
+# of its own within twice failover-timeout of the last one, so that is 3 s: a DEBUG SLEEP of 9 s right after a
+# SENTINEL FAILOVER still sees its failover.
 set -eu
 : "${KR_PLAIN_DATA:?}" "${KR_PLAIN_SENTINELS:?}" "${KR_TLS_DATA:?}" "${KR_TLS_SENTINELS:?}"
 mkdir -p /run/kr/certs /run/kr/sentinel
@@ -74,7 +76,7 @@ logfile /run/kr/sentinel/sentinel-$1.log
 sentinel announce-ip 127.0.0.1
 sentinel monitor kr 127.0.0.1 $2 2
 sentinel down-after-milliseconds kr 2000
-sentinel failover-timeout kr 6000
+sentinel failover-timeout kr 3000
 sentinel parallel-syncs kr 1
 EOF
 }

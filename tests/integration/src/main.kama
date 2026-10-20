@@ -1,7 +1,7 @@
 // The live tests: one program, run against each server in the matrix by tools/test-integration.sh, which starts the
 // server (tools/redis.sh) and exports its REDISTEST_* settings. A failing case prints its name. When cases fail, run
 // `tools/redis.sh smoke --server S` first: it tells a misconfigured server from a wrong client.
-import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests, argTests, replyTests, pipelineTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, restartTests };
+import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests, argTests, replyTests, pipelineTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, restartTests, sentinelTests };
 export { check, setting };
 
 fn int32 check(bool ok, string what) {
@@ -33,6 +33,8 @@ fn int32 main() {
     failed = failed + scanTests();
     failed = failed + subscriberTests();
     failed = failed + tlsTests();
+    // Through sentinels, on the sentinel topology's containers (tools/redis.sh --topology sentinel).
+    failed = failed + sentinelTests();
     // Last: each restart loses every other connection to the server.
     failed = failed + restartTests();
     string server = setting(name: "REDISTEST_SERVER");

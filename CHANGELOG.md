@@ -22,6 +22,7 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   asks again. A write a demoted master refuses as READONLY is sent once more, since it never ran.
 - `RedisError::Sentinel(SentinelError)`: the sentinels were reached and none gave an address, or the server they named
   never confirmed its role. When none could be reached, the error is `Connect`, an attempt per sentinel.
+- `examples/sentinel`: the master found through sentinels, and what a failover does to a call.
 
 ### Changed
 - A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it

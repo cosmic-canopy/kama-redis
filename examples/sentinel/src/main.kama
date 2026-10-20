@@ -1,0 +1,63 @@
+// sentinel: find the master through sentinels, write and read there, and know what a failover does to a call.
+//
+//   REDIS_SENTINEL_URL='redis-sentinel://127.0.0.1:26379,127.0.0.1:26380?master_name=mymaster' kama run examples/sentinel/kama.json
+//
+// The URL names the sentinels (26379 unless one says otherwise) and the name they monitor the master by. Its user and
+// password are the master's; sentinels that want a password of their own get it in code (setSentinelAuth, here from
+// REDIS_SENTINEL_PASSWORD), never in a URL. rediss-sentinel:// is TLS to both.
+//
+// Every reconnect asks the sentinels again, so after a failover the next call reaches the new master. A call the
+// failover cut off fails with its error, since it may have run; a write the old master refused as READONLY never ran,
+// and is sent once more on its own. role=replica in the URL connects to a replica instead, for reads.
+import { core::println, core::env, redis::Config, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo, redis::cmd,
+         redis::reply, redis::replyOpt };
+
+unsafe fn string sentinelUrl() {
+    Optional<string> v = env(name: "REDIS_SENTINEL_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis-sentinel://127.0.0.1:26379?master_name=mymaster"; };
+}
+
+fn int32 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: sentinelUrl());
+    Config config = match (give parsed) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Optional<string> sentinelPassword = env(name: "REDIS_SENTINEL_PASSWORD");
+    match (give sentinelPassword) {
+        case Some(value: p): {
+            Result<Unit, RedisError> set = config.setSentinelAuth(user: Optional::None, password: give p);
+            match (set) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+        }
+        case None: { }
+    };
+
+    // The sentinels in turn, until one names the master, which must say in its HELLO that it is one. When none can be
+    // reached the error is Connect, an attempt per sentinel; when they answer but give no address (a wrong name, a
+    // password they want), it is Sentinel, with what each one said.
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) {
+        case Ok(value: c): give c;
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    Optional<ServerInfo> info = conn.server();
+    string role = match (info) { case Some(value: i): copy i.role(); case None: "unknown"; };
+    println(s: "the sentinels named the ${role}");
+    if (role != "master") { return 1; }
+
+    string key = "example:sentinel";
+    string value = "written through the sentinels";
+    Command set = cmd"SET ${key} ${value}";
+    Result<string, RedisError> stored = reply::<string>(result: conn.call(command: set));
+    match (stored) { case Ok(value: ok): { println(s: "SET: ${ok}"); } case Err(error: e): { println(s: e.message()); return 1; } };
+    Command get = cmd"GET ${key}";
+    Result<Optional<string>, RedisError> read = replyOpt::<string>(result: conn.call(command: get));
+    string got = match (give read) {
+        case Ok(value: o): match (give o) { case Some(value: v): give v; case None: "(none)"; };
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    println(s: "GET: ${got}");
+    if (got != value) { return 1; }
+    conn.close();
+    return 0;
+}

@@ -1,0 +1,34 @@
+[
+ {
+  "id": "M1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (config.viaSentinel()) {\n            Result<Config, RedisError> asked = Connection::askSentinels(config: config, opener: opener);",
+  "new": "        if (false) {\n            Result<Config, RedisError> asked = Connection::askSentinels(config: config, opener: opener);",
+  "expect": "sentinel: connect through the plain group"
+ },
+ {
+  "id": "M2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (config.role() == SentinelRole::Replica) {\n            Command replicas = Command.of(name: \"SENTINEL\");",
+  "new": "        if (false) {\n            Command replicas = Command.of(name: \"SENTINEL\");",
+  "expect": "sentinel: role=replica reaches a replica"
+ },
+ {
+  "id": "M3",
+  "suite": "integration",
+  "file": "src/config.kama",
+  "old": "        c.secret = copy this.sentinelSecret;",
+  "new": "        c.secret = copy this.secret;",
+  "expect": "sentinel tls: connect"
+ },
+ {
+  "id": "M4",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (config.viaSentinel()) {\n            Result<Config, RedisError> asked = Connection::askSentinels(config: config, opener: opener);",
+  "new": "        if (config.viaSentinel() && opener.foundText().length() == 0) {\n            Result<Config, RedisError> asked = Connection::askSentinels(config: config, opener: opener);",
+  "expect": "sentinel: after DEBUG SLEEP on the master, calls reach the new master"
+ }
+]
