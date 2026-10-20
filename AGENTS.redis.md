@@ -38,6 +38,10 @@ is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refus
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
 gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
 (`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
+- **KRD-11, since cstar's 0.9.684:** it refuses `fn int32 main()`, which every tag requires, and every tag refuses `fn uint8
+  main()`. The library is unaffected. Gate the newest build on a scratch copy whose ten `main`s (`tests/*/src/main.kama`,
+  `examples/*/src/main.kama`) say `fn uint8 main()`. When a tag carries the rule, the floor, CI's pin and the `main`s
+  move in one commit.
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
 live ones): each mutation of the source must make the case it names fail, or the test is not good yet. A step adds

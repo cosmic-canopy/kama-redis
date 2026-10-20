@@ -1,9 +1,12 @@
 # Roadmap
 
-Where this is, 2026-10-19: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
-v0.9.675 (the newest tag, and the build the registry publishes with). **0.1.0, a complete client for one server, is
-published** (2026-10-19, from `146a4d8`). **Next is phase 6, Cluster and Sentinel, for 0.2.0: "Phase 6: an outline",
-just below, is where the next session starts.**
+Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
+v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
+**Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
+step 0 is done.**
+- cstar's newest build is 0.9.690. It checks the library clean, which is what the registry runs. But it refuses `fn
+  int32 main()`, which every tag requires (KRD-11), so it is gated on a scratch copy whose ten `main`s say `fn uint8
+  main()`. There everything is green.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -64,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SHARDS` (`CLUSTER SLOTS` before 7.0), `MOVED` and `ASK`, multi-key commands on one slot, reads from replicas. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0** | |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | step 0 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -117,73 +120,462 @@ Anything not in a release yet is refused clearly rather than half there. Today a
     done, and S3, a pool shared by isolates, is next. 0.3.0's pool here (phase 7b) follows it.
   - `@kama/http` is seeded, with nothing usable yet. The UI packages (`ui`, `rmlui`, `freetype`) do not touch this one.
 
-## Phase 6: an outline (drawn up at its start)
+## Phase 6: where to start
 
-**The next session starts here.** Draw up the session plan from primary sources, as 7a's was ("Phase 7a: where to
-start" is the shape: sources, what they showed, proposed decisions, the session's steps). Put the questions that are
-the maintainer's to them, with what the peers do and a recommendation. Confirm the kama facts by repro on CI's tag and
-on cstar's newest build, which the registry publishes with. Then build step by step: each step green before its
-commit, proven by mutation (`tools/mutations/6-sN.json`), and CI watched after each push.
+The session plan, drawn up on 2026-10-19 from primary sources, for 0.2.0.
+- **The maintainer chose four of its decisions:**
+  - commands that span nodes follow the server's own command tips;
+  - several hosts are written with commas;
+  - a shard channel whose slot moves is followed;
+  - a Sentinel failover is followed on the next connect.
 
-**The sources to read:**
-- **The specifications:**
-  - the Redis Cluster specification: slots, `MOVED`, `ASK` and `ASKING`, `TRYAGAIN`, `CLUSTERDOWN`, `CROSSSLOT`,
-    `READONLY`/`READWRITE`;
-  - `CLUSTER SHARDS` (7.0 and later) and `CLUSTER SLOTS` (6.2);
-  - the Sentinel documentation and its client guidelines: `SENTINEL GET-MASTER-ADDR-BY-NAME`, `SENTINEL SENTINELS`
-    and `REPLICAS`, `ROLE` to confirm a master, and the `+switch-master` event;
-  - Valkey's cluster additions: several databases in cluster mode (9.0), atomic slot migration (9.0), and
-    `CLUSTERSCAN`, with string cursors (9.1).
-- **The servers' own source,** at the matrix's tags: Redis 8.10.2's and Valkey 9.1.2's `cluster.c` and
-  `cluster_legacy.c` (how a node answers a key it does not serve, during a migration and after a failover), and
-  `sentinel.c`.
+  The rest are this plan's recommendation.
+- **A review of the draft against this code** (cited H1–H22 below) changed several of them.
+
+The sources:
+- **The servers,** at the matrix's tags:
+  - Redis 8.10.2, with 7.2.16, 7.0.0 and 6.2.24 where they differ, and Valkey 9.1.2;
+  - the files: `cluster.c`, `cluster_legacy.c`, `server.c`, `sentinel.c`, `replication.c`, `blocked.c`,
+    `networking.c`, `pubsub.c`, `commands.def` and `src/commands/*.json`.
+- **The documentation:** the cluster specification, the Sentinel documentation and its client specification
+  (`sentinel-clients.md`), and `command-tips.md` and `key-specs.md`.
 - **The peers, at their current tags:**
-  - go-redis: `osscluster.go` (`ClusterClient`, its slot state and reloads, `MaxRedirects`, `ReadOnly`,
-    `RouteByLatency`) and `sentinel.go` (`FailoverClient`);
-  - redis-py: `cluster.py` (`RedisCluster`, `NodesManager`) and `sentinel.py`;
-  - redis-rs: `cluster_async/`, `cluster_routing.rs` and `sentinel.rs`;
-  - Lettuce: `RedisClusterClient`, `ClusterTopologyRefreshOptions`, `MasterReplica` and `SentinelConnector`;
-  - rueidis: `cluster.go` and `sentinel.go`;
-  - redis-cli's `-c`, and its `--cluster` tooling for the test topology.
-- **The model:** postgres's hosts list and `target_session_attrs` (its phase 7). A cluster client is built on this
-  package's 7a: never resend what may have run, and a node's lost connection is made again by its next call.
+  - go-redis v9.23.0: `osscluster.go`, `osscluster_router.go`, `sentinel.go`;
+  - redis-py 8.1.0: `cluster.py`, `sentinel.py`, `_parsers/commands.py`;
+  - redis-rs 1.7.1: `cluster_handling/` and `sentinel.rs` (the cluster files the outline named are gone);
+  - Lettuce 7.9.0: `RedisClusterClient`, `ClusterTopologyRefreshOptions`, `ClusterDistributionChannelWriter`,
+    `SentinelConnector`, `SentinelTopologyRefresh`;
+  - rueidis v1.0.79: `cluster.go`, `sentinel.go`;
+  - hiredis v1.5.0 and redis-cli 8.10.2.
+- **The model:** @kama/postgres's hosts list (libpq's comma-separated URL), and this package's 7a.
 
-**What the session must settle** (each a proposal to research, not a decision yet):
-- **The shape:** a `Cluster` type over a connection per node (go-redis's `ClusterClient`, Lettuce's
-  `RedisClusterClient`), owned by one isolate as a `Connection` is, or routing inside `Connection`. What a URL with
-  several hosts means, since every peer spells seed nodes differently; accepted or refused.
-- **The slot map:**
-  - read from `CLUSTER SHARDS`, or `CLUSTER SLOTS` on 6.2;
-  - when it is read again: on `MOVED`, on a node's lost connection, on a timer or never;
-  - what is kept of each node: its address, its role, its TLS name.
-- **Routing:**
-  - a command's keys from `COMMAND INFO`'s key specs, generated by script from every server as the blocking table
-    was, with a command that has no key going to any node;
-  - multi-key commands on one slot, a `CROSSSLOT` refused before it is sent or left to the server;
-  - pipelines split by node and their replies put back in order;
-  - transactions and `WATCH` on one slot;
-  - scripts by their keys;
-  - `SCAN` across every primary (or Valkey 9.1's `CLUSTERSCAN`);
-  - pub/sub: `SSUBSCRIBE` and `SPUBLISH` to the slot's node, and phase 4's `Unsubscribed` hook when a slot moves.
-- **Redirections:**
-  - `MOVED`: the map is read again and the command sent again, which is safe since a `MOVED` command never ran;
-  - `ASK`: `ASKING`, then the command at the target, once;
-  - `TRYAGAIN` (a multi-key command during a migration) and `CLUSTERDOWN`, with a backoff;
-  - a bound on redirections.
-- **Replicas:** `READONLY` reads, opt-in, with what it costs in consistency said plainly.
-- **Failover:** a promoted replica (`MOVED` points there) and a node lost, on 7a's rules.
-- **Sentinel:**
-  - the URL form (Lettuce's `redis-sentinel://`; redis-py and go-redis take it in code);
-  - finding the master by name, and confirming it with `ROLE`;
-  - following `+switch-master` on a subscriber of the sentinels;
-  - a sentinel's own credentials and TLS, apart from the data servers'.
-- **The test topology:** in `tools/redis.sh`, per image:
-  - a cluster of three primaries with a replica each;
-  - a sentinel setup: a master, two replicas and three sentinels;
-  - on all eight servers (6.2 has no `CLUSTER SHARDS`).
-  Vectors are captured from them by script: the maps, the redirections, a migration's `ASK`. The scripted server
-  serves several nodes, a `ScriptDialer` dial per address. Live: a resharding under traffic, `CLUSTER FAILOVER`,
-  `SENTINEL FAILOVER`, and a node killed.
+The bar is phase 3's and 7a's:
+- every form honoured or refused;
+- every failure path tested against the scripted server;
+- the whole matrix live, debug and release;
+- every step proven by mutation.
+
+### What the sources showed
+
+Short names: R8 is Redis 8.10.2, V9 Valkey 9.1.2, R62 Redis 6.2.24, and SPEC the cluster specification.
+
+- **How a node answers a key it does not serve** (`getNodeByQuery`, R8 cluster.c:1236-1489, V9 1048-1312). The words
+  come from `clusterRedirectClient` (R8 1498-1527, V9 1321-1345).
+  - **The error lines:**
+    - `-MOVED <slot> <endpoint>:<port>` and `-ASK …`, formatted `"-%s %d %s:%d"`;
+    - `-TRYAGAIN Multiple keys request during rehashing of slot`, and Redis 8's `-TRYAGAIN Slot is being trimmed`;
+    - `-CLUSTERDOWN The cluster is down`, `… and only accepts read commands`, and `-CLUSTERDOWN Hash slot not served`;
+    - `-CROSSSLOT Keys in request don't hash to the same slot`.
+  - **A slot another node owns:** MOVED.
+  - **A slot being migrated, on the source:**
+    - every key present: served;
+    - every key missing: ASK;
+    - some of each: TRYAGAIN.
+  - **On the target:**
+    - with ASKING: served, unless a multi-key command has a key missing, which is TRYAGAIN;
+    - without ASKING: MOVED to the source.
+
+    ASKING lasts one command, except inside MULTI (R8 networking.c:3050).
+  - **A replica:**
+    - without READONLY: MOVED to its primary;
+    - with READONLY: reads served, writes MOVED;
+    - sharded pub/sub is served on a replica even without READONLY.
+  - **A command with no keys** is never redirected and never CLUSTERDOWN (R8 server.c:4602-4606).
+  - **Inside MULTI** each queued command is checked. A redirection there makes EXEC answer EXECABORT. At EXEC every
+    queued key must be in one slot (R8 cluster.c:1263).
+  - **EVAL** with keys in two slots is CROSSSLOT. With `numkeys 0` it runs where it lands.
+  - **PUBLISH** is broadcast across the cluster. SPUBLISH and SSUBSCRIBE are routed by their channel. A node that
+    loses a slot pushes `sunsubscribe` itself (R8 pubsub.c:321-351, from `clusterDelSlot` and `clusterSetMaster`).
+- **Where a redirection points.**
+  - **The endpoint** (`clusterNodePreferredEndpoint`, R8 cluster_legacy.c:6653) is one of:
+    - an IP;
+    - a hostname, or `"?"` when none is set;
+    - `""` for `unknown-endpoint`: `-MOVED 3999 :6380` means "the host you asked, this port" (SPEC:389).
+
+    IPv6 comes without brackets, so a client splits at the last colon. 6.2 always sends the IP.
+  - **The port:**
+    - on 7.2 and later it follows the asking connection: TLS clients get `tls-port` (`clusterNodeClientPort(n,
+      shouldReturnTlsInfo())`, R8 cluster.c:889-895);
+    - on 6.2 and 7.0 a node announces one port, the TLS one under `tls-cluster yes`, so a 6.2 cluster serves either
+      plaintext clients or TLS ones;
+    - Valkey 9 adds `cluster-announce-client-(tls-)port`.
+- **The slot map.**
+  - **`CLUSTER SLOTS`:**
+    - 6.2: `[start, end, [ip, port, id]…]`;
+    - 7.0 and later: `[endpoint, port, id, {ip|hostname}]`, the endpoint NULL for unknown-endpoint;
+    - failed replicas, and replicas at offset 0, are left out (R8 cluster.c:1607-1669);
+    - deprecated in Redis since 7.0, un-deprecated in Valkey 8.0;
+    - Valkey 9.1 adds `availability-zone`.
+  - **`CLUSTER SHARDS`** (7.0 and later):
+    - each node: `id`, `port`, `tls-port`, `ip`, `endpoint`, `hostname`, `role`, `replication-offset` and `health`
+      (`online`, `fail` or `loading`);
+    - slot numbers were bulk strings in 7.0.0–7.2.1;
+    - the docs say `failed` where the code sends `fail`, and NULL where it sends `""`;
+    - rueidis documents it as wrong on Redis 7.x after a failover.
+  - **The spec tells a client** (SPEC:401-411, 548-561, 575-585, 624-650):
+    - refresh the whole map on MOVED;
+    - ASK is one command, ASKING first, with no change to the map;
+    - read the map again before calling a slot unassigned;
+    - wait on TRYAGAIN, then retry.
+- **Commands, as the servers describe them.**
+  - **7.0 and later's COMMAND INFO** has ten elements, the tips and the key specs among them.
+    - A key spec is a `begin_search` (`index`, `keyword` or `unknown`), a `find_keys` (`range`, `keynum` or
+      `unknown`) and flags (`RO`, `RW`, `OW`, `RM`, `access`, `update`, `insert`, `delete`, `not_key`, `incomplete`,
+      …).
+    - 6.2 has seven elements and a `movablekeys` flag. Its specs are the legacy first/last/step.
+  - **`incomplete`:** only MIGRATE on Redis 8.0–8.8.0 and on Valkey 9.1. Redis 7.2.16, and 8.8.3 and later, mark
+    GEORADIUS(BYMEMBER) and XREAD(GROUP) too.
+  - **`command-tips.md` tells a cluster client what to do** with each command:
+    - `multi_shard` (DEL, UNLINK, EXISTS, TOUCH, MGET, MSET, MSETEX): split the keys by slot ("the command must be
+      split even if all the slots are managed by the same shard");
+    - `all_shards` (PING, KEYS, DBSIZE, FLUSHALL, FUNCTION LOAD, SCRIPT EXISTS, WAIT, INFO, RANDOMKEY, …): every
+      primary;
+    - `all_nodes` (SCRIPT LOAD and FLUSH, CONFIG SET, ACL SETUSER, …): every node;
+    - `special` (SCAN): its own procedure.
+  - **The doc also says how to combine the replies:**
+    - `agg_sum` (DEL, DBSIZE), `agg_min` (WAIT), `agg_logical_and` (SCRIPT EXISTS);
+    - `all_succeeded` (MSET, FLUSHALL, CONFIG SET), `one_succeeded` (SCRIPT KILL);
+    - otherwise the default: key order for a keyed command (MGET), concatenation for a keyless one (KEYS).
+
+    It says each command is "atomic per shard".
+- **Valkey's and Redis 8's cluster additions.**
+  - **Valkey 9.0:**
+    - `cluster-databases`, so SELECT works in cluster mode. Redis answers "SELECT is not allowed in cluster mode"
+      (db.c:1577);
+    - `CLUSTER MIGRATESLOTS`, an atomic migration: no ASK, writes paused, then MOVED.
+  - **Valkey 9.1:** CLUSTERSCAN, a string cursor routed as a key.
+  - **Redis 8.4:** `CLUSTER MIGRATION`, atomic too, with writes paused for at most 10 s.
+  - **Valkey's `CLIENT CAPA redirect`** applies to a standalone replica only: `-REDIRECT host:port`.
+- **Sentinel.**
+  - **The client specification** (sentinel-clients.md:49-154):
+    1. the sentinels in turn, with a short timeout each;
+    2. `SENTINEL GET-MASTER-ADDR-BY-NAME`, where a null means the next sentinel;
+    3. `ROLE`, which must say master; otherwise wait a little and start again;
+    4. every reconnect starts at step 1;
+    5. the sentinel that answered moves to the front;
+    6. optionally, `SENTINEL SENTINELS` appended to the end of the list;
+    7. "Sentinel unreachable" is reported apart from "unknown master";
+    8. pub/sub may speed things up, but "should not substitute" this.
+  - **The replies:**
+    - GET-MASTER-ADDR-BY-NAME: `[ip, port]`, the port a bulk string, or a null array (sentinel.c:4021-4034);
+    - SENTINELS and REPLICAS: an array of maps under RESP3, of flat arrays under RESP2 (3818-3833);
+    - ROLE: `["master", offset, [[ip, port, ack]]]`, `["slave", host, port, state, offset]` or `["sentinel",
+      [names]]`;
+    - `+switch-master`: `<name> <oldip> <oldport> <newip> <newport>`.
+  - **What a sentinel accepts:** HELLO 3 (`mode: "sentinel"`), RESP3 SUBSCRIBE mixed with commands, AUTH, CLIENT
+    SETNAME and SETINFO, PING and ROLE. SELECT, ECHO, RESET, QUIT and SSUBSCRIBE are unknown commands there.
+  - **What a failover does to clients:**
+    - every reconfiguration's MULTI sends `CLIENT KILL TYPE normal` and `TYPE pubsub` to the node, "to trigger the
+      ask-master-on-reconnection protocol" (sentinel.c:4923-4991);
+    - a demoted master answers writes `-READONLY You can't write against a read only replica.`;
+    - its blocked clients get `-UNBLOCKED …` and are closed;
+    - a master cut off from the sentinels keeps its clients. `min-replicas-to-write` is the server's own guard.
+  - **Valkey 9:**
+    - a coordinated failover (`SENTINEL FAILOVER … COORDINATED`), which kills clients on both nodes;
+    - GET-PRIMARY-ADDR-BY-NAME, as an alias.
+- **The peers (cluster):**
+
+  | | go-redis | redis-py | redis-rs | Lettuce | rueidis |
+  |---|---|---|---|---|---|
+  | the slot map | SLOTS | SLOTS | SLOTS | NODES, majority vote | SHARDS (8+) or SLOTS |
+  | on MOVED | whole map, 200 ms cooldown | that slot, the whole map every 5th | whole map | whole map, at most every 5 s | that slot, then a lazy whole map |
+  | redirections | 3 | 16 | 16 | 5 | unlimited |
+  | ASK | in one write | its own round trip | its own round trip | in one write | in one write |
+  | a write sent again after an I/O failure | yes | yes | yes | yes (at least once) | no: read-only commands only |
+  | keys | first-key rule and COMMAND | COMMAND, and GETKEYS | a static table | the command builder | generated |
+  | multi-key commands | to the server (the tips on opt-in) | refused, or split (DEL…) | split | split | panics, or helpers |
+  | transactions | one slot | one slot | one slot (async) | none | one slot |
+  | replica reads | ReadOnly, ByLatency, Randomly | `load_balancing_strategy` | `read_routing_strategy` | `ReadFrom` | `SendToReplicas` |
+  | sharded pub/sub, when a slot moves | passed on | moved, silently | not handled | passed on | dropped |
+  | SELECT | none | refused | `database_id` | none | sent |
+
+  Only redis-py's docs mention that a replica read may be stale. Each peer's URL with several hosts differs:
+  - Lettuce: commas;
+  - go-redis and rueidis: repeated `addr=`;
+  - redis-py and redis-rs: no such URL.
+- **The peers (Sentinel):**
+  - **Finding the master:**
+    - GET-MASTER-ADDR-BY-NAME: go-redis (all sentinels at once), plain Lettuce and rueidis;
+    - SENTINEL MASTERS and its flags: redis-py and redis-rs.
+  - **ROLE is checked** only by redis-rs and rueidis.
+  - **Following a failover by subscription:** go-redis, rueidis and Lettuce's MasterReplica. Two of those are buggy:
+    - go-redis listens for `+replica-reconf-done`, which no server sends;
+    - Lettuce names three events without their `+`, so they never fire.
+
+    The others reconnect.
+  - **The sentinels' TLS** is shared with the data servers in go-redis and Lettuce, and separate in redis-rs and
+    rueidis.
+  - **The URL's user and password** mean the sentinels' in go-redis, and the data servers' in Lettuce and rueidis.
+  - **Default timeouts:** 5 s (go-redis, redis-py, rueidis), 60 s (Lettuce), 1 s / 500 ms (redis-rs).
+
+### Decisions
+
+**1. Commands that span nodes follow the server's command tips** (the maintainer's choice, 2026-10-19).
+- **The routing table is generated by script from every server's COMMAND INFO** (`src/cluster/commands.kama`). Each
+  entry has:
+  - the keys rule;
+  - `readonly`;
+  - the request and response policies;
+  - which server it came from (the newest server's entry wins; 6.2 has no tips).
+- **What each policy does:**
+  - `multi_shard` commands are split by slot;
+  - `all_shards` commands go to every primary, and `all_nodes` commands to every node;
+  - the replies are combined by the response policy, as the doc says;
+  - a `special` command (INFO, RANDOMKEY, MEMORY STATS, LATENCY, SCAN) is refused in `call`, and goes through
+    `callEach(command:, on:)` (each node's reply, unmerged) or `Scan`.
+- **The table is checked against the servers themselves,** not against the captures it came from (H8). Each command
+  gets a sample invocation built from COMMAND DOCS, and each server's `COMMAND GETKEYS` answer to it is captured;
+  `route()` must find the same keys.
+- **An unknown command** is `Usage`, naming `callFor(key:, command:)` and `callEach`. There is no COMMAND INFO at run
+  time (H7): it would need a node, it could fail, and it could not route inside a pipeline.
+- **Inside a pipeline or a transaction** a command stays on one slot.
+- **The README says:**
+  - a split MSET is atomic per shard, not across the cluster;
+  - a failure on one shard means part of the call may have run;
+  - a hash tag keeps it one atomic command.
+- **Peers:** redis-rs and Lettuce do this by default, go-redis on opt-in, redis-py in part, and rueidis refuses.
+
+**2. Several hosts are written with commas** (the maintainer's choice). This is Lettuce's form, and libpq's, which
+@kama/postgres reads.
+- **A cluster's seeds:** `redis://u:p@h1:7000,h2:7001/0?read_from=replica`.
+- **The sentinels:** `redis-sentinel://u:p@s1:26379,s2,s3/0?master_name=mymaster[&role=replica]`, and
+  `rediss-sentinel://` for TLS to the sentinels and the data servers both.
+  - A sentinel's port defaults to 26379.
+  - `master_name` is go-redis's key.
+- **The user and password are the data servers'** (Lettuce, rueidis). The sentinels' own credentials are set in code
+  only.
+- **There is one `Config`.** It reads several hosts, the sentinel schemes, `master_name`, `role`, `read_from` and
+  `max_redirects` (H18). Each entry point refuses what is not its own when it connects, naming the right one:
+  - `Connection.connect` refuses several hosts on a non-sentinel URL, and the cluster's options;
+  - `Cluster.connect` refuses a sentinel Config and `reconnect=off` (H3);
+  - `connectOver` refuses a sentinel Config.
+- **`redis://a,b`, today the host `"a,b"`,** becomes two hosts. The URL generator's misread rules gain the comma
+  forms.
+
+**3. A shard channel whose slot moves is followed, and the gap reported** (the maintainer's choice).
+- **What happens:** the node's own `sunsubscribe` of a channel still wanted leads to:
+  1. the map read again;
+  2. SSUBSCRIBE at the new owner;
+  3. `Delivery::Moved(name, to)`, queued first, saying that messages published in between may be lost.
+
+  A refusal there (NOPERM) stays `Unsubscribed`.
+- **Peers:** only redis-py moves a subscription, and silently. The others pass the unsubscribe on, or drop the
+  channel.
+- **`ClusterSubscriber`** runs a plain `Subscriber` per node, each keeping 7a's resubscribe: channels and patterns on
+  one primary, shard channels on each owning primary.
+- **How its `next` waits:**
+  1. it sweeps every node without waiting: frames the reader holds, and TLS plaintext already buffered;
+  2. then it waits on every node's socket at once with `std::net::Poller`. The raw handle is recorded when this
+     client opens a socket, so the `Transport` contract does not change (a contract has no default methods, and a new
+     member breaks every implementer);
+  3. links over a caller's dialer have no handle, so they are waited on in turn, a short slice each. The README says
+     what that costs.
+
+**4. A Sentinel failover is followed on the next connect, with no +switch-master subscription** (the maintainer's
+choice).
+- **The kill and redial are the mechanism:** Sentinel kills every client of a node it reconfigures, so 7a's redial
+  asks the sentinels again and ROLE confirms the answer.
+- **The client spec** says pub/sub should not substitute for this. redis-py, redis-rs and plain Lettuce do the same.
+- **A synchronous client has no thread to listen with** (H19).
+
+**5. The slot map comes from CLUSTER SLOTS on every server.** The outline proposed SHARDS. The reasons:
+- SLOTS has one shape on all eight servers, and 6.2 has no SHARDS;
+- on 7.2 and later its port is the asking connection's;
+- the server leaves out failed and loading replicas itself;
+- SHARDS's slot numbers changed type within 7.x, and rueidis documents it as wrong after a failover there;
+- Valkey un-deprecated SLOTS, and go-redis, redis-py and redis-rs read it.
+
+**Reading the map:**
+- **Endpoints:**
+  - `""` or NULL is the asking node's host;
+  - `"?"` is skipped;
+  - IPv6 splits at the last colon;
+  - every count and port is bounded.
+- **Where it is read:** from the seeds first, then on a refresh from the live nodes, with the seeds last (H10). The
+  first complete answer is taken.
+- **What it may hold:** partial coverage is accepted, and an unowned slot goes to any primary, whose answer stands.
+  Nodes no longer announced are closed.
+- **When it is read again:**
+  - on MOVED: the slot is patched at once, so the call follows it, and the whole map is read at most once a second;
+  - when a node cannot be reached again;
+  - on CLUSTERDOWN.
+
+  There is no timer, and `refreshTopology()` is public.
+
+**6. Redirections, and 7a's rule.**
+- **MOVED and ASK** are followed at once, up to `max_redirects` (default 5, Lettuce's). ASK is ASKING and the
+  command in one write. When the budget runs out, the call returns the last `Server` error.
+- **TRYAGAIN, CLUSTERDOWN, LOADING and MASTERDOWN** are each refused before anything runs. They are waited out with
+  7a's backoff, within `reconnect_timeout`.
+- **7a's rule holds:** anything that may have run is never sent again.
+- **The cluster drives each node's redial** (H2), one paced try (`readyOnce`) at a time:
+  1. a transient failure reads the map again;
+  2. the call goes where the map now says, since nothing was sent;
+  3. the backoff paces the next try.
+
+  So a failover never costs a whole `reconnect_timeout` before the map is read.
+- **WATCH and UNWATCH** are refused in the cluster's `call` and `run`; only `watched` sends them, so a WATCH can never
+  sit on one node while its EXEC goes to another (H4). ASKING, READONLY and READWRITE are refused too.
+
+**7. The shape.**
+- **`redis::Cluster`** owns a 7a `Connection` per node. A node's opens lazily; the seed's opens at connect.
+  - It is owned by one isolate, and `Sendable`.
+  - The database is honoured, as SELECT on each node.
+- **A caller's dialer** comes through a new contract, `Dialers { fn Owned<Dialer> another(); }`, taken by
+  `Cluster.connectWith`. One `Owned<Dialer>` cannot serve several links, and a `Shared` is not `Sendable` (H1). It
+  gets each node's target, so it can remap an announced address, as redis-py's `address_remap` does.
+- **The TLS name checked** is the node's announced endpoint: an IP against IP SANs, a hostname against DNS names.
+  `tls_server_name`, when set, applies to every data node.
+- **Pipelines:**
+  - split by node;
+  - every node's batch written before any is read;
+  - the replies back in the caller's order;
+  - a command redirected or refused before it ran (MOVED, ASK, TRYAGAIN, CLUSTERDOWN, LOADING) sent again, in the
+    original relative order;
+  - a node lost mid-batch makes its own commands' replies `Io`. `Replies` holds an error per command.
+- **Transactions:**
+  - every keyed command in one slot, sent to that slot's primary;
+  - a redirection while queueing or at EXEC means nothing ran, so the whole transaction is sent again at the owner,
+    with ASKING before MULTI for ASK (H6).
+- **`watched`:**
+  - its keys share one slot;
+  - its `TxBody` gets the watching node's `Connection`, unchanged;
+  - ASK backs off (H5);
+  - a slot that moved between WATCH and EXEC is `WatchConflict`, so the transaction runs again from fresh reads.
+- **Scripts:** `eval` routes by the script's keys. NOSCRIPT falls back to EVAL on each node, as today.
+- **Replica reads** are opt-in, as at every peer. `read_from=replica` sends a command flagged `readonly` to a random
+  online replica of its slot's shard, or to the primary when there is none (Lettuce's REPLICA_PREFERRED).
+  - The replica's link sends READONLY in its handshake's one write, so a redial restores it. READONLY stays refused
+    in `call`.
+  - The README says the read may be stale.
+- **SCAN on a cluster** (`Scan.nextIn(cluster:)`) walks each primary in turn. A primary lost mid-scan ends the scan
+  with an error. CLUSTERSCAN waits: it would be a second path, tested on one server (H14).
+
+**8. Sentinel is a way of finding the server.** A `Connection` and a `Subscriber` work over it unchanged.
+- **Finding the master,** as the client specification says:
+  1. the sentinels are asked in order, `connect_timeout` each;
+  2. `GET-MASTER-ADDR-BY-NAME`;
+  3. the data server's handshake carries ROLE in its one write, and ROLE must say `master` (`slave` for
+     `role=replica`). Otherwise the client pauses with 7a's backoff and asks again, within the window;
+  4. the sentinel that answered moves to the front;
+  5. `SENTINEL SENTINELS` adds sentinels not yet known, a bounded list kept across redials.
+- **The errors:**
+  - no sentinel reached is `Connect`, with an attempt per sentinel;
+  - no sentinel knowing the name, and a master that ROLE never confirms, are the one new variant,
+    `RedisError::Sentinel(SentinelError)`.
+- **`role=replica`** reads `SENTINEL REPLICAS`, skips those `s_down`, `o_down` or `disconnected`, and picks one at
+  random.
+- **A `-READONLY` from a sentinel-found master in `call`** loses the link. The call asks the sentinels again and
+  sends once more, since its command never ran. In `run` and `transact` the replies stand, and the next call asks
+  again.
+- **A sentinel connection** never sends SELECT. `tls_server_name` applies to the data servers, and the sentinels are
+  checked against their URL hosts.
+
+**9. A 0.1.0 bug the review found** (H13). `Scan.next` sends a cursor from the old server process to a new one after a
+redial, so keys are skipped without a word.
+- A `generation` count on `Connection` makes such a scan end with an error.
+- The CHANGELOG lists it under Fixed.
+
+**10. The breaks, for the CHANGELOG** (0.x allows them):
+- the new `RedisError` variant;
+- `redis://a,b` read as two hosts;
+- a scan across a redial ending with an error;
+- READONLY's refusal message.
+
+`TxBody`, `Transport`, `Dialer` and `DialTarget` do not change.
+
+### The session's steps
+
+Each step ends green before its commit:
+- `tools/test.sh`, debug and release, on v0.9.667 and on cstar's newest build;
+- the live matrix, once it exists;
+- the step's mutations (`tools/mutations/6-sN.json`), every one CAUGHT, with live mutations run after the matrix.
+
+0. **Done (2026-10-20).** This plan, and the repros ("Decided, and why", "Phase 6"). KRD-11 filed: cstar's 0.9.684
+   refuses `fn int32 main()`, which every tag requires.
+1. **Topologies** (`tools/redis.sh up|down|smoke --topology cluster|sentinel [--server S]`), in containers of their
+   own.
+   - **The cluster:** three primaries with a replica each.
+     - fixed node IDs (a pre-written `nodes.conf`, H21);
+     - ports published 1:1, and `cluster-announce-ip 127.0.0.1`;
+     - a low `cluster-node-timeout`, `enable-debug-command`, and a restart loop per node;
+     - `tls-cluster yes` on 7.2 and later. 6.2 is plaintext (H12), with a TLS one beside it if that is cheap.
+   - **Sentinel:** a master, two replicas and three sentinels.
+     - `announce-ip` and `replica-announce-ip 127.0.0.1`;
+     - a sentinel ACL user;
+     - TLS, with `tls-replication yes`.
+   - **Smoke** uses the image's own `redis-cli -c` and SENTINEL commands. CI starts both topologies.
+2. **Vectors** (`tools/gen-topology-vectors.sh`), in throwaway `--network none` containers. Two runs must be the same.
+   - **The cluster:**
+     - CLUSTER SLOTS under both protocols and over TLS, with the hostname and unknown-endpoint forms;
+     - every redirection, and every CLUSTERDOWN;
+     - a redirection while queueing and one at EXEC, and ASKING then MULTI;
+     - a replica's MOVED, READONLY and MASTERDOWN;
+     - the atomic migrations;
+     - every server's COMMAND INFO, DOCS and GETKEYS.
+   - **Sentinel:**
+     - every SENTINEL reply, under both protocols, and an unknown name;
+     - ROLE three ways;
+     - HELLO in sentinel mode;
+     - `+switch-master`;
+     - the kill at reconfiguration.
+3. **Shared shapes, with no change in behaviour,** as 7a's step 3:
+   - `Replies` holding results, and `Pipeline`'s offsets;
+   - `generation`, `readyOnce` and the grants;
+   - `Config.forNode`, READONLY and ROLE in the handshake;
+   - the scripted server's dialer keyed by address.
+
+   Every test passes unchanged.
+4. **URLs and Config:** several hosts, the sentinel schemes, `master_name`, `role`, the sentinels' credentials,
+   `read_from` and `max_redirects`. Each refusal is worded, and the URL vectors are regenerated.
+5. **Sentinel discovery** (unit):
+   - the order, ROLE, the responder moved to the front, and SENTINELS added;
+   - each error;
+   - READONLY sent again once;
+   - `role=replica`;
+   - a redial asks again;
+   - hostile replies;
+   - the Scan fix.
+6. **Sentinel live,** with `examples/sentinel`:
+   - SENTINEL FAILOVER under calls (each INCR runs once);
+   - DEBUG SLEEP on the master;
+   - a subscriber across a failover;
+   - `role=replica`;
+   - TLS.
+7. **`redis::cluster`'s pure layers** (unit):
+   - the slot map, hostile and bounded;
+   - the MOVED and ASK parser;
+   - the generated table and `route()` against the GETKEYS captures;
+   - the response policies.
+8. **The cluster's core:**
+   - seeds, lazy nodes, routing, splitting and fan-out;
+   - `callEach` and `callFor`;
+   - MOVED, ASK, the waits, and the H2 loop;
+   - `Dialers` and `eval`.
+
+   Unit tests run on a scripted server per node. Live: all eight clusters.
+9. **Pipelines, transactions and `watched` on a cluster.** Live: a resharding interleaved in the test (SETSLOT
+   MIGRATING/IMPORTING, MIGRATE), meeting ASK then MOVED.
+10. **Replica reads and the cluster's SCAN.**
+11. **`ClusterSubscriber`.** Unit tests through the in-turn path; live through the Poller, a slot moved under a shard
+    subscription.
+12. **The cluster live, hardened,** with `examples/cluster`:
+    - CLUSTER FAILOVER under calls;
+    - DEBUG SLEEP on a primary;
+    - a node restarted;
+    - the atomic migrations;
+    - descriptors unchanged after many failovers.
+13. **Docs and 0.2.0:**
+    - the README;
+    - the CHANGELOG, with the breaks;
+    - AGENTS.redis.md, this file and the module headers;
+    - the version;
+    - the dry run;
+    - every gate, cstar's newest build included.
+
+    Then the push and the publish, each the maintainer's word.
+
+**If the session runs long:** steps 0–6 (Sentinel complete), then 7–10, then 11–13.
 
 ## Phase 4: where to start
 
@@ -1599,3 +1991,41 @@ facts underneath.
   buffer, one written). v0.9.667 and v0.9.673 build it.
 - **`tools/mutate.sh`** is postgres's, with `--server S` and this repo's `REDISTEST_*` settings. Each step from 2 on
   adds `tools/mutations/7a-sN.json`.
+
+### Phase 6
+
+Drawn up 2026-10-19 (see "Phase 6: where to start" for the sources and the decisions, which hold unless this section
+says otherwise). Step 0's repros, run 2026-10-20 on v0.9.667 and cstar's 0.9.690, debug and release, confirmed the kama
+facts underneath.
+
+- **What step 0's repros showed** (in the session's scratchpad):
+  - **R1:** a resource element of a field can be handed to a contract method by `ref` (`body.build(conn: ref
+    this.nodes[i].held[0], …)`). So `watched` on a cluster gives its `TxBody` the watching node's `Connection`, and
+    `TxBody` does not change.
+  - **R2:** an element's method can be given another field of `this` by `ref`
+    (`this.nodes[i].held[0].relink(opener: ref this.opener)`), under 0.9.675's rule on a `ref` argument that holds the
+    receiver.
+  - **R3:** a two-level receiver chain mutates in place (`this.nodes[i].held[0].call(…)`).
+  - **R4, R5:** a 16384-entry `DynamicArray<int16>` and a `Map<string, isize>` sit in a `Sendable` resource; a lookup
+    is `contains` then `getRefMut`.
+  - **R6:** a generated table of 450 commands (a resource per command, with its key specs as enums), indexed by a
+    `Map` built once, builds in under 2 s, and the whole release program is 118 KB. There is no `match` on a string,
+    so a lookup goes through the `Map`.
+  - **R7:** a `DynamicArray<Result<…>>` gives up an element with `replace::<Result<…>>(place:, with:)`.
+  - **R8:** a static function holding `ref Opener` can make and drop a short-lived connection over `Opener.none()`.
+    That is the shape of a sentinel query.
+  - **R9:** the root module and a child module can import each other, with a root type granting private members to a
+    child's type method by method (`friend app::cl::Cluster::route[readyOnce, generation]`), and a root type taking
+    the child's by `ref` (`Scan.nextIn(cluster:)`).
+  - **R10:** one `std::net::Poller` watches several sockets at once. Its wait returns when any one is ready, so every
+    ready node is drained before the next wait. A peer that closed reads as readable. A TLS transport answers its own
+    `wait` at once when the engine holds plaintext (src/secure/transport.kama:131), so a sweep before the `Poller`
+    finds that.
+  - **R11, R12:** a contract that gains a member breaks every implementer ("missing method"), and an enum that gains
+    a variant breaks a consumer's exhaustive `match`. So the `Transport` contract stays as it is, and
+    `RedisError::Sentinel` is listed as a break.
+  - **R13:** `@nonExhaustive` is accepted on a package's own enum, but a `match` within the same file still needs no
+    `case _`. Whether it binds a consumer in another package is for step 5 to check, before `RedisError` takes it.
+- **Found on the way:** KRD-11. cstar's 0.9.684 refuses `fn int32 main()`, and every tag (v0.9.667, v0.9.675) refuses
+  `fn uint8 main()`. With the ten `main`s edited in a scratch copy, `tools/test.sh` is green on 0.9.690. KRD-9 is
+  still open there.

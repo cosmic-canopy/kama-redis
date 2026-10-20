@@ -8,13 +8,14 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 **Current compiler:** `kama 0.9.667` (tag `v0.9.667`), which CI pins and the manifests' floor names. Each repro is
 also run on cstar's newest build, which the registry publishes with. The package was last verified on `v0.9.675`
 (2026-10-19, the newest tag and cstar's newest build): unit and live gates green, debug and release; it needed
-KRD-9's workaround, the reader moving its unread bytes one at a time.
+KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` (2026-10-20) the library
+checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-9, KRD-10. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-9, KRD-10, KRD-11. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -126,6 +127,46 @@ or not, could be refused when its manifest is read, naming the clash, as a reser
 "base", but a project's name is its root module…").
 
 **Workaround:** the example is named `tls_connection`, which it can keep either way. Nothing else here depends on it.
+
+### KRD-11 · MED · `main`'s type changed with no overlap: every tag refuses `fn uint8 main()`, and 0.9.684 refuses `fn int32 main()`
+
+**Found** 2026-10-20, on cstar's `0.9.690+g735d65c8`. The rule came in `d0ffc06e` ("check: `main` returns the exit
+status in the platform's own type; `fn int32 main()` is refused", 0.9.684). The library itself has no `main` and
+checks clean on 0.9.690. But this package's two test programs and its eight examples, which ship in the package, have
+`fn int32 main()`, and none of them builds there.
+
+**Repro**, two whole programs:
+
+```kama
+import { core::println };
+fn int32 main() { println(s: "int32 main"); return 0; }
+```
+
+```kama
+import { core::println };
+fn uint8 main() { println(s: "uint8 main"); return 0ui8; }
+```
+
+| | `int32` main | `uint8` main |
+|---|---|---|
+| `v0.9.667` | prints | refused: "`main` is declared `fn int32 main()` — it returns the exit status (0 for success)…" |
+| `v0.9.675` | prints | refused, the same |
+| `0.9.690+g735d65c8` | refused: "`main` returns the exit status in the platform's own type — write `fn uint8 main()`…" | prints |
+
+**Why it is a gap:** the new rule is sound (an `int32` status was truncated at exit without a word). But no compiler
+accepts both forms, so no program builds on both a tag and cstar's newest build. A package whose floor is a tag
+cannot switch until a tag carries the rule, and until then cstar's newest build can only be gated on an edited
+copy. Every published package with an example or a test program has this problem; for this one, that is ten
+programs.
+
+**What would close it:**
+- accept `fn int32 main()` for a window, with a warning that names the new form; or
+- tag a release that carries 0.9.684, so a floor can move to it.
+
+**Workaround, since 2026-10-20:** nothing in the tree. The gate on cstar's newest build runs on a scratch copy whose
+`main`s say `fn uint8 main()`, a one-line change in each, since every `main` here returns the literal 0 or 1. On that
+copy, `tools/test.sh` is green on 0.9.690: the unit program, debug and release, and every example built. When a tag
+carries the rule, the floor and CI's pin move to it, and the ten `main`s change, in one commit.
 
 ## FIXED — kept for the record
 
