@@ -1,0 +1,170 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "        if (spec.notKey() && !notKeys) { return; }",
+  "new": "        if (false) { return; }",
+  "expect": "route: "
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "                if (l >= 0) { last = first + cast<isize>(l); }",
+  "new": "                if (l >= 0) { last = first + cast<isize>(l) + 1; }",
+  "expect": "route: "
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "                else { last = first + ((argc - first) / cast<isize>(lim) + cast<isize>(l)); }",
+  "new": "                else { last = argc + cast<isize>(l); }",
+  "expect": "route: "
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "                else if (numkeys == 0) { return; }",
+  "new": "                else if (numkeys == 0) { found.missing = true; return; }",
+  "expect": "keysOf: numkeys 0 has no keys, and misses none"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "                first = first + cast<isize>(fk);",
+  "new": "                first = first + cast<isize>(fk) + 1;",
+  "expect": "route: "
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "        if (!begun) { found.missing = true; return; }",
+  "new": "        if (!begun) { return; }",
+  "expect": "route: "
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "        if (lower(c: a[i]) != lower(c: w[i])) { return false; }",
+  "new": "        if (a[i] != w[i]) { return false; }",
+  "expect": "keysOf: a keyword in lower case"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "        if (command.length() > 1) {\n            string sub = name.concat",
+  "new": "        if (false) {\n            string sub = name.concat",
+  "expect": "slotOf: a subcommand, in any case"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/cluster/keys.kama",
+  "old": "            if (other != slot) {",
+  "new": "            if (false) {",
+  "expect": "slotOf: keys in two slots are refused"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/cluster/keys.kama",
+  "old": "        Keys k = keysOf(info: this.commands.at(index: at), command: command, notKeys: true);",
+  "new": "        Keys k = keysOf(info: this.commands.at(index: at), command: command, notKeys: false);",
+  "expect": "slotOf: a shard channel routes by its slot"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "        if (map.owners[s] >= 0i16) { return Optional::Some(value: \"two ranges that hold the same slot\"); }",
+  "new": "",
+  "expect": "map: two ranges that overlap"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (start < 0i64 || end < start || end >= cast<int64>(SLOT_COUNT)) {",
+  "new": "    if (start < 0i64 || end >= cast<int64>(SLOT_COUNT)) {",
+  "expect": "map: a range that ends before it starts"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (endpoint.length() == 0) { endpoint = copy asked; }",
+  "new": "",
+  "expect": "a null endpoint is the node asked"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "        match (give ip) { case Some(value: x): { endpoint = give x; } case None: { return Optional::None; } };",
+  "new": "        match (give ip) { case Some(value: x): { } case None: { return Optional::None; } };",
+  "expect": "map: a \"?\" endpoint is its metadata's ip"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (map.nodeList.length() >= MAX_NODES) { return -1; }",
+  "new": "",
+  "expect": "map: more than 1000 nodes"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "                map.shardList[shard].addReplica(at: at);",
+  "new": "",
+  "expect": "each shard's replica"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "        if (map.shardList[i].primary() == primary) { return i; }",
+  "new": "",
+  "expect": "one slot not served, its shard still one"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (slot < 0i64 || slot >= cast<int64>(SLOT_COUNT) || space >= b.length()) { return Optional::None; }",
+  "new": "    if (slot < 0i64 || space >= b.length()) { return Optional::None; }",
+  "expect": "redirect: slot 16384 is past the last"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    while (colon > space && b[colon] != 58ui8) { colon = colon - 1; }",
+  "new": "    colon = space + 1;\n    while (colon < b.length() && b[colon] != 58ui8) { colon = colon + 1; }",
+  "expect": "redirect: an IPv6 address"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (host.length() == 0) { host = copy asked; }",
+  "new": "",
+  "expect": "the empty host is the node asked"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/cluster/map.kama",
+  "old": "    if (port < 1i64 || port > 65535i64) { return Optional::None; }\n    string host",
+  "new": "    if (port < 1i64) { return Optional::None; }\n    string host",
+  "expect": "redirect: a port out of range"
+ }
+]

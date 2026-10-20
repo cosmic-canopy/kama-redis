@@ -1,0 +1,241 @@
+import { std::collections::DynamicArray, std::collections::Map, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, redis::Command, commandTable };
+export { CommandInfo, KeySpec, Begin, Find, Request, Response, Commands, Keys, keysOf };
+
+// Where a command's keys are, as the servers describe them (COMMAND's key specifications; key-specs.md), and how a
+// cluster spreads it (its request and response policies; command-tips.md). The table is generated from every server
+// in the matrix (src/wire/commands.kama, tools/gen-command-table.sh), and `keysOf` reads a command as the server
+// does (getKeysUsingKeySpecs, Redis 8.10.2's db.c:3227-3330), so tests/unit/src/command_vectors.kama, each server's
+// COMMAND GETKEYS of an invocation of each command, checks it.
+
+// Where a key spec's search begins: an argument's index, the argument after a keyword (searched from `from`,
+// forward when it is positive and back from the end when it is negative), or a way only the server's own code knows.
+type enum Begin implements Sendable {
+    Index(int32 at),
+    Keyword(string word, int32 from),
+    Unknown;
+}
+
+// Which arguments from there are keys: a range (to `last` after the first, or from the end when it is negative,
+// `limit` dividing what is left when it is not 0, every `step`th), a count at `at` of keys from `first` on, every
+// `step`th, or a way only the server's own code knows.
+type enum Find implements Sendable {
+    Range(int32 last, int32 step, int32 limit),
+    Keynum(int32 at, int32 first, int32 step),
+    Unknown;
+}
+
+// Where a cluster sends a command (request_policy): by its keys (Default: a command with keys to its slot, one
+// without to any node), to every node (AllNodes) or every primary (AllShards), split by the slots of its keys
+// (MultiShard), or in a way of its own (Special, SCAN).
+type enum Request implements Sendable { Default, AllNodes, AllShards, MultiShard, Special }
+
+// How the replies of a command sent to several nodes make one (response_policy).
+type enum Response implements Sendable { Default, OneSucceeded, AllSucceeded, AggLogicalAnd, AggLogicalOr, AggMin, AggMax, AggSum, Special }
+
+type resource KeySpec implements Sendable {
+    Begin startAt;
+    Find keysFrom;
+    bool partialSpec = false;
+    bool fake = false;
+
+    public ctor make(Begin begin, Find find, bool incomplete, bool notKey) {
+        this.startAt = give begin;
+        this.keysFrom = give find;
+        this.partialSpec = incomplete;
+        this.fake = notKey;
+    }
+    public const fn const ref Begin begin() { return this.startAt; }
+    public const fn const ref Find find() { return this.keysFrom; }
+    // It may not find every key: the server's own code knows the rest (SORT's STORE, MIGRATE's KEYS).
+    public const fn bool incomplete() { return this.partialSpec; }
+    // What it finds is not a key but routes as one: a shard channel (SPUBLISH, SSUBSCRIBE).
+    public const fn bool notKey() { return this.fake; }
+}
+
+// One command or subcommand ("object|encoding"), lower case: its key specs, whether it only reads, and its policies.
+type resource CommandInfo implements Sendable {
+    string nameText;
+    bool reads = false;
+    Request requestPolicy;
+    Response responsePolicy;
+    DynamicArray<KeySpec> specList;
+
+    public ctor make(string name, bool readOnly, Request request, Response response) {
+        this.nameText = give name;
+        this.reads = readOnly;
+        this.requestPolicy = request;
+        this.responsePolicy = response;
+        this.specList = DynamicArray.empty();
+    }
+    public fn void spec(Begin begin, Find find, bool incomplete, bool notKey) {
+        this.specList.add(item: KeySpec.make(begin: give begin, find: give find, incomplete: incomplete, notKey: notKey));
+    }
+    public const fn const ref string name() { return this.nameText; }
+    // The server flags it readonly: a replica may serve it after READONLY.
+    public const fn bool readOnly() { return this.reads; }
+    public const fn Request request() { return this.requestPolicy; }
+    public const fn Response response() { return this.responsePolicy; }
+    public const fn const ref DynamicArray<KeySpec> specs() { return this.specList; }
+}
+
+// The table, and an index of it by name, made once (a cluster keeps one).
+type resource Commands implements Sendable {
+    DynamicArray<CommandInfo> table;
+    Map<string, isize> byName;
+
+    public ctor load() {
+        this.table = commandTable();
+        this.byName = Map.withCapacity(capacity: this.table.length());
+        isize i = 0;
+        while (i < this.table.length()) {
+            this.byName.put(key: copy this.table[i].name(), value: i);
+            i = i + 1;
+        }
+    }
+
+    public const fn isize count() { return this.table.length(); }
+    public const fn const ref CommandInfo at(isize index) { return this.table[index]; }
+
+    // The entry for `command`: its subcommand's ("object|encoding") when the table has one, otherwise its own; -1 when
+    // the table does not know it (a module's command, a newer server's).
+    public unsafe const fn isize indexOf(const ref Command command) {
+        if (command.length() == 0) { return -1; }
+        string name = lowerOf(b: command.part(index: 0));
+        if (command.length() > 1) {
+            string sub = name.concat(other: "|").concat(other: lowerOf(b: command.part(index: 1)));
+            Optional<isize> found = this.byName.get(key: sub);
+            match (found) { case Some(value: i): { return i; } case None: { } };
+        }
+        Optional<isize> own = this.byName.get(key: name);
+        return match (own) { case Some(value: i): i; case None: -1; };
+    }
+}
+
+// The positions of a command's arguments that are keys, in the order the specs find them (0 is the command's name),
+// and whether a spec could not be followed to its end (an unknown or incomplete one, or one the arguments do not fit),
+// so that the server may count more.
+type resource Keys implements Sendable {
+    DynamicArray<isize> positions;
+    bool missing = false;
+
+    friend keysBy[positions, missing];
+
+    public ctor none() { this.positions = DynamicArray.empty(); }
+    public const fn isize count() { return this.positions.length(); }
+    public const fn isize at(isize index) { return this.positions[index]; }
+    public const fn bool partial() { return this.missing; }
+}
+
+// The keys of `command` by `info`'s specs, as the server finds them. With `notKeys`, a spec whose arguments only route
+// as keys (a shard channel) counts too, as a cluster routes by it; COMMAND GETKEYS leaves those out.
+fn Keys keysOf(const ref CommandInfo info, const ref Command command, bool notKeys) {
+    Keys found = Keys.none();
+    isize s = 0;
+    while (s < info.specs().length()) {
+        keysBy(spec: info.specs()[s], command: command, notKeys: notKeys, found: found);
+        s = s + 1;
+    }
+    return give found;
+}
+
+// What one spec finds, added to `found`.
+fn void keysBy(const ref KeySpec spec, const ref Command command, bool notKeys, ref Keys found) {
+    isize argc = command.length();
+    {
+        if (spec.notKey() && !notKeys) { return; }
+        isize first = 0;
+        bool begun = match (spec.begin()) {
+            case Index(at: a): { first = cast<isize>(a); := true; }
+            case Keyword(word: w, from: f): { first = afterKeyword(command: command, word: w, from: cast<isize>(f)); := true; }
+            case Unknown: false;
+        };
+        if (!begun) { found.missing = true; return; }
+        // The keyword is not there: this spec has no keys here.
+        if (first <= 0) { return; }
+        isize last = 0;
+        isize step = 1;
+        bool fits = true;
+        match (spec.find()) {
+            case Range(last: l, step: st, limit: lim): {
+                step = cast<isize>(st);
+                if (l >= 0) { last = first + cast<isize>(l); }
+                else if (lim == 0) { last = argc + cast<isize>(l); }
+                else { last = first + ((argc - first) / cast<isize>(lim) + cast<isize>(l)); }
+            }
+            case Keynum(at: a, first: fk, step: st): {
+                step = cast<isize>(st);
+                isize at = first + cast<isize>(a);
+                isize numkeys = -1;
+                if (at >= 0 && at < argc) { numkeys = countOf(b: command.part(index: at)); }
+                if (numkeys < 0) { fits = false; }
+                // No keys counted: none to find (EVAL's numkeys 0), and nothing is missing.
+                else if (numkeys == 0) { return; }
+                first = first + cast<isize>(fk);
+                last = first + (numkeys - 1) * step;
+            }
+            case Unknown: { fits = false; }
+        };
+        if (!fits || step < 1 || last >= argc || last < first || first >= argc) { found.missing = true; return; }
+        isize i = first;
+        while (i <= last) {
+            found.positions.add(item: i);
+            i = i + step;
+        }
+        if (spec.incomplete()) { found.missing = true; }
+    }
+}
+
+// The position after the first argument that is `word` (any case), searched from `from` (forward from it when it is
+// positive, back from argc + from when it is negative), as the server searches: never the last argument going
+// forward, nor the first going back. 0 when it is not there.
+fn isize afterKeyword(const ref Command command, const ref string word, isize from) {
+    isize argc = command.length();
+    isize start = from;
+    isize end = argc - 1;
+    if (from <= 0) { start = argc + from; end = 1; }
+    isize i = start;
+    while (i != end) {
+        if (i >= argc || i < 1) { break; }
+        if (sameWord(a: command.part(index: i), w: word.bytes())) { return i + 1; }
+        if (start <= end) { i = i + 1; } else { i = i - 1; }
+    }
+    return 0;
+}
+
+fn bool sameWord(ConstView<uint8> a, ConstView<uint8> w) {
+    if (a.length() != w.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (lower(c: a[i]) != lower(c: w[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn uint8 lower(uint8 c) {
+    if (c >= 65ui8 && c <= 90ui8) { return c + 32ui8; }
+    return c;
+}
+
+// A count of keys, as the server parses one (string2ll, and not below 0); -1 when it is not one.
+fn isize countOf(ConstView<uint8> b) {
+    if (b.length() == 0 || b.length() > 18) { return -1; }
+    isize n = 0;
+    isize i = 0;
+    while (i < b.length()) {
+        if (b[i] < 48ui8 || b[i] > 57ui8) { return -1; }
+        n = n * 10 + cast<isize>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    return n;
+}
+
+// A name in lower case; "" when it is not UTF-8.
+fn string lowerOf(ConstView<uint8> b) {
+    DynamicArray<uint8> low = DynamicArray.withCapacity(capacity: b.length());
+    isize i = 0;
+    while (i < b.length()) { low.add(item: lower(c: b[i])); i = i + 1; }
+    Result<string, Utf8Error> s = decode(bytes: low.view());
+    return match (give s) { case Ok(value: t): give t; case Err(error: e): ""; };
+}

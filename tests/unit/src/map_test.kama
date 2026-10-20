@@ -1,0 +1,292 @@
+// A cluster's map (redis::cluster::SlotMap) from every server's CLUSTER SLOTS, and its redirections (Redirect) from
+// every server's MOVED and ASK, as topology_vectors.kama has them: a cluster of 7000-7002, primaries in thirds, with
+// replicas 7003-7005 (tools/gen-topology-vectors.sh). Then hostile maps and redirections, which must be refused, never
+// trusted.
+import { std::collections::DynamicArray, redis::RedisError, redis::ServerError, redis::cluster::SlotMap,
+         redis::cluster::Redirect, redis::cluster::RedirectKind, redis::cluster::keySlot, redis::resp::Value,
+         redis::resp::Reader, redis::resp::Read, redis_unit_tests::check, unhex, errorOf, bytesOf,
+         topologyVersions, topologyNames, topologyHex, topologyKeyServers, topologyKeys };
+export { mapTests };
+
+fn bool has(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = topologyNames();
+    isize i = 0;
+    while (i < names.length()) { if (names[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
+fn DynamicArray<uint8> topo(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = topologyNames();
+    DynamicArray<string> hex = topologyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: hex[i]); }
+        i = i + 1;
+    }
+    panic(msg: "map_test: no topology vector ${name}");
+    return DynamicArray.empty();
+}
+
+fn Value valueOf(const ref DynamicArray<uint8> bytes) {
+    Reader r = Reader.make();
+    r.feed(bytes: bytes.view());
+    Read got = r.next();
+    return match (give got) { case Complete(value: v): give v; case _: Value::Null; };
+}
+
+fn Result<SlotMap, RedisError> mapOf(const ref DynamicArray<uint8> bytes, const ref string asked) {
+    Value v = valueOf(bytes: bytes);
+    return SlotMap.fromSlots(reply: v, asked: asked);
+}
+
+// The port of the node that serves `slot`; -1 when none does.
+fn int32 primaryPort(const ref SlotMap m, isize slot) {
+    isize at = m.primaryOf(slot: slot);
+    if (at < 0) { return -1; }
+    return m.node(index: at).port();
+}
+
+// The ports of the replicas of `slot`'s shard, joined by commas.
+fn string replicaPorts(const ref SlotMap m, isize slot) {
+    DynamicArray<isize> rs = m.replicasOf(slot: slot);
+    string ports = "";
+    isize i = 0;
+    while (i < rs.length()) {
+        int32 p = m.node(index: rs[i]).port();
+        if (i > 0) { ports = ports.concat(other: ","); }
+        ports = ports.concat(other: "${p}");
+        i = i + 1;
+    }
+    return ports;
+}
+
+// The keys a server's cluster cases used: kr:a kr:a2 kr:b kr:c and the migrated slot's two.
+fn DynamicArray<string> keysOf(const ref string server) {
+    DynamicArray<string> servers = topologyKeyServers();
+    DynamicArray<string> keys = topologyKeys();
+    DynamicArray<string> parts = DynamicArray.empty();
+    isize i = 0;
+    while (i < servers.length()) {
+        if (servers[i] == server) {
+            string all = copy keys[i];
+            isize start = 0;
+            isize k = 0;
+            while (k <= all.length()) {
+                if (k == all.length() || all.bytes()[k] == 32ui8) { parts.add(item: all.substring(start: start, end: k)); start = k + 1; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return give parts;
+}
+
+fn int32 serverMapTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = topologyVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        DynamicArray<string> keys = keysOf(server: s);
+        isize gap = keySlot(key: keys[0].bytes());
+        for (int32 proto = 2; proto <= 3; proto = proto + 1) {
+            string p = "${proto}";
+            Result<SlotMap, RedisError> r = mapOf(bytes: topo(server: s, kase: "slots/".concat(other: p)), asked: "127.0.0.1");
+            match (give r) {
+                case Ok(value: m): {
+                    f = f + check(ok: m.shardCount() == 3 && m.nodeCount() == 6 && m.coverage() == 16384,
+                                  what: "${s} slots/${p}: three shards, six nodes, every slot");
+                    f = f + check(ok: primaryPort(m: m, slot: 0) == 7000 && primaryPort(m: m, slot: 5461) == 7001 && primaryPort(m: m, slot: 16383) == 7002,
+                                  what: "${s} slots/${p}: the primaries by slot");
+                    f = f + check(ok: replicaPorts(m: m, slot: 0) == "7003" && replicaPorts(m: m, slot: 10922) == "7004" && replicaPorts(m: m, slot: 10923) == "7005",
+                                  what: "${s} slots/${p}: each shard's replica");
+                    f = f + check(ok: m.node(index: m.primaryOf(slot: 0)).id() == "0000000000000000000000000000000000007000",
+                                  what: "${s} slots/${p}: a node's id");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "${s} slots/${p}: ${m}"); }
+            };
+            Result<SlotMap, RedisError> gapped = mapOf(bytes: topo(server: s, kase: "slots-gap/".concat(other: p)), asked: "127.0.0.1");
+            match (give gapped) {
+                case Ok(value: m): {
+                    f = f + check(ok: m.coverage() == 16383 && primaryPort(m: m, slot: gap) == -1 && primaryPort(m: m, slot: gap + 1) == 7000 && m.shardCount() == 3,
+                                  what: "${s} slots-gap/${p}: one slot not served, its shard still one");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "${s} slots-gap/${p}: ${m}"); }
+            };
+            Result<SlotMap, RedisError> failed = mapOf(bytes: topo(server: s, kase: "slots-after-failover/".concat(other: p)), asked: "127.0.0.1");
+            match (give failed) {
+                case Ok(value: m): {
+                    f = f + check(ok: primaryPort(m: m, slot: 5461) == 7004 && replicaPorts(m: m, slot: 5461) == "7001",
+                                  what: "${s} slots-after-failover/${p}: the replica took the shard over");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "${s} slots-after-failover/${p}: ${m}"); }
+            };
+            if (has(server: s, kase: "slots-hostname/".concat(other: p))) {
+                Result<SlotMap, RedisError> named = mapOf(bytes: topo(server: s, kase: "slots-hostname/".concat(other: p)), asked: "127.0.0.1");
+                match (give named) {
+                    case Ok(value: m): {
+                        f = f + check(ok: m.node(index: m.primaryOf(slot: 0)).host() == "node-7000.kr.test" && m.coverage() == 16384,
+                                      what: "${s} slots-hostname/${p}: a node by its hostname");
+                    }
+                    case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "${s} slots-hostname/${p}: ${m}"); }
+                };
+                // An unknown endpoint is the node that was asked: here, an address of the caller's.
+                Result<SlotMap, RedisError> unknown = mapOf(bytes: topo(server: s, kase: "slots-unknown-endpoint/".concat(other: p)), asked: "10.9.9.9");
+                match (give unknown) {
+                    case Ok(value: m): {
+                        f = f + check(ok: m.node(index: m.primaryOf(slot: 16383)).host() == "10.9.9.9" && primaryPort(m: m, slot: 16383) == 7002,
+                                      what: "${s} slots-unknown-endpoint/${p}: a null endpoint is the node asked");
+                    }
+                    case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "${s} slots-unknown-endpoint/${p}: ${m}"); }
+                };
+            }
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+fn Result<Redirect, RedisError> redirectOf(const ref DynamicArray<uint8> bytes, const ref string asked) {
+    ServerError e = errorOf(reply: bytes.view());
+    return Redirect.of(error: e, asked: asked);
+}
+
+fn string shownRedirect(const ref Result<Redirect, RedisError> r) {
+    return match (r) {
+        case Ok(value: x): {
+            string kind = match (x.kind()) { case Moved: "moved"; case Ask: "ask"; };
+            isize slot = x.slot();
+            int32 port = x.port();
+            string host = copy x.host();
+            := "${kind} ${slot} ${host} ${port}";
+        }
+        case Err(error: e): "refused";
+    };
+}
+
+fn int32 redirectTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = topologyVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string s = copy servers[i];
+        DynamicArray<string> keys = keysOf(server: s);
+        isize b = keySlot(key: keys[2].bytes());
+        isize m = keySlot(key: keys[5].bytes());
+        Result<Redirect, RedisError> moved = redirectOf(bytes: topo(server: s, kase: "moved/3"), asked: "127.0.0.1");
+        string mv = shownRedirect(r: moved);
+        f = f + check(ok: mv == "moved ${b} 127.0.0.1 7001", what: "${s} moved/3: ${mv}");
+        Result<Redirect, RedisError> ask = redirectOf(bytes: topo(server: s, kase: "ask/3"), asked: "127.0.0.1");
+        string ak = shownRedirect(r: ask);
+        f = f + check(ok: ak == "ask ${m} 127.0.0.1 7001", what: "${s} ask/3: ${ak}");
+        if (has(server: s, kase: "moved-unknown-endpoint/3")) {
+            Result<Redirect, RedisError> blank = redirectOf(bytes: topo(server: s, kase: "moved-unknown-endpoint/3"), asked: "10.9.9.9");
+            string bl = shownRedirect(r: blank);
+            f = f + check(ok: bl == "moved ${b} 10.9.9.9 7001", what: "${s} moved-unknown-endpoint/3: the empty host is the node asked (${bl})");
+            Result<Redirect, RedisError> named = redirectOf(bytes: topo(server: s, kase: "moved-hostname/3"), asked: "127.0.0.1");
+            string nm = shownRedirect(r: named);
+            f = f + check(ok: nm == "moved ${b} node-7001.kr.test 7001", what: "${s} moved-hostname/3: ${nm}");
+        }
+        Result<Redirect, RedisError> other = redirectOf(bytes: topo(server: s, kase: "crossslot/3"), asked: "127.0.0.1");
+        f = f + check(ok: shownRedirect(r: other) == "refused", what: "${s} crossslot/3: not a redirection");
+        i = i + 1;
+    }
+    // Hostile redirections: refused, never followed somewhere they do not say.
+    f = f + check(ok: shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 16384 h:1\r\n"), asked: "a")) == "refused", what: "redirect: slot 16384 is past the last");
+    f = f + check(ok: shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED x h:1\r\n"), asked: "a")) == "refused", what: "redirect: a slot that is not a number");
+    f = f + check(ok: shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 1 h:0\r\n"), asked: "a")) == "refused"
+                      && shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 1 h:65536\r\n"), asked: "a")) == "refused", what: "redirect: a port out of range");
+    f = f + check(ok: shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 1 h\r\n"), asked: "a")) == "refused"
+                      && shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 1\r\n"), asked: "a")) == "refused", what: "redirect: no port, or no address");
+    f = f + check(ok: shownRedirect(r: redirectOf(bytes: bytesOf(text: "-MOVED 7 ::1:7000\r\n"), asked: "a")) == "moved 7 ::1 7000",
+                  what: "redirect: an IPv6 address, unbracketed, splits at the last colon");
+    return f;
+}
+
+// One node of a hand-built SLOTS reply: [endpoint, port, id].
+fn Value node(Value endpoint, int64 port, const ref string id) {
+    DynamicArray<Value> parts = DynamicArray.empty();
+    parts.add(item: give endpoint);
+    parts.add(item: Value::Integer(value: port));
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.addAll(items: id.bytes());
+    parts.add(item: Value::Bulk(bytes: give b));
+    return Value::Array(items: give parts);
+}
+
+fn Value text(const ref string s) {
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.addAll(items: s.bytes());
+    return Value::Bulk(bytes: give b);
+}
+
+fn Value range(int64 start, int64 end, Value primary) {
+    DynamicArray<Value> parts = DynamicArray.empty();
+    parts.add(item: Value::Integer(value: start));
+    parts.add(item: Value::Integer(value: end));
+    parts.add(item: give primary);
+    return Value::Array(items: give parts);
+}
+
+fn string refusal(Value reply) {
+    Result<SlotMap, RedisError> r = SlotMap.fromSlots(reply: reply, asked: "h");
+    return match (r) { case Ok(value: m): "accepted"; case Err(error: e): e.message(); };
+}
+
+fn Value one(Value entry) {
+    DynamicArray<Value> all = DynamicArray.empty();
+    all.add(item: give entry);
+    return Value::Array(items: give all);
+}
+
+fn int32 hostileMapTests() {
+    int32 f = 0;
+    f = f + check(ok: refusal(reply: text(s: "x")).contains(substring: "not an array"), what: "map: a reply that is not an array");
+    f = f + check(ok: refusal(reply: one(entry: range(start: 5i64, end: 4i64, primary: node(endpoint: text(s: "a"), port: 1i64, id: "n1")))).contains(substring: "0 to 16383"),
+                  what: "map: a range that ends before it starts");
+    f = f + check(ok: refusal(reply: one(entry: range(start: 0i64, end: 16384i64, primary: node(endpoint: text(s: "a"), port: 1i64, id: "n1")))).contains(substring: "0 to 16383"),
+                  what: "map: slot 16384");
+    DynamicArray<Value> two = DynamicArray.empty();
+    two.add(item: range(start: 0i64, end: 10i64, primary: node(endpoint: text(s: "a"), port: 1i64, id: "n1")));
+    two.add(item: range(start: 10i64, end: 20i64, primary: node(endpoint: text(s: "b"), port: 2i64, id: "n2")));
+    f = f + check(ok: refusal(reply: Value::Array(items: give two)).contains(substring: "same slot"), what: "map: two ranges that overlap");
+    // A primary with a port out of range cannot be reached: its range is served by no one, and the map stands.
+    Result<SlotMap, RedisError> badPort = SlotMap.fromSlots(reply: one(entry: range(start: 0i64, end: 9i64, primary: node(endpoint: text(s: "a"), port: 0i64, id: "n1"))), asked: "h");
+    bool unserved = match (badPort) { case Ok(value: m): m.coverage() == 0 && m.primaryOf(slot: 0) == -1; case Err(error: e): false; };
+    f = f + check(ok: unserved, what: "map: a primary with port 0 serves nothing");
+    // "?" with no ip: unreachable; "?" with an ip in the metadata: that ip.
+    Result<SlotMap, RedisError> unknown = SlotMap.fromSlots(reply: one(entry: range(start: 0i64, end: 9i64, primary: node(endpoint: text(s: "?"), port: 7i64, id: "n1"))), asked: "h");
+    bool none = match (unknown) { case Ok(value: m): m.primaryOf(slot: 0) == -1; case Err(error: e): false; };
+    f = f + check(ok: none, what: "map: a \"?\" endpoint with no ip serves nothing");
+    DynamicArray<Value> withIp = DynamicArray.empty();
+    withIp.add(item: text(s: "?"));
+    withIp.add(item: Value::Integer(value: 7i64));
+    withIp.add(item: text(s: "n1"));
+    DynamicArray<Value> meta = DynamicArray.empty();
+    meta.add(item: text(s: "ip"));
+    meta.add(item: text(s: "10.0.0.7"));
+    withIp.add(item: Value::Map(entries: give meta));
+    Result<SlotMap, RedisError> viaIp = SlotMap.fromSlots(reply: one(entry: range(start: 0i64, end: 9i64, primary: Value::Array(items: give withIp))), asked: "h");
+    bool ip = match (viaIp) { case Ok(value: m): m.primaryOf(slot: 0) >= 0 && m.node(index: m.primaryOf(slot: 0)).host() == "10.0.0.7"; case Err(error: e): false; };
+    f = f + check(ok: ip, what: "map: a \"?\" endpoint is its metadata's ip");
+    // More nodes than a cluster has.
+    DynamicArray<Value> many = DynamicArray.empty();
+    int64 k = 0i64;
+    while (k < 1001i64) {
+        string id = "n${k}";
+        many.add(item: range(start: k, end: k, primary: node(endpoint: text(s: "a"), port: 1i64 + k, id: id)));
+        k = k + 1i64;
+    }
+    f = f + check(ok: refusal(reply: Value::Array(items: give many)).contains(substring: "more nodes"), what: "map: more than 1000 nodes");
+    return f;
+}
+
+fn int32 mapTests() {
+    int32 f = 0;
+    f = f + serverMapTests();
+    f = f + redirectTests();
+    f = f + hostileMapTests();
+    return f;
+}

@@ -1,0 +1,143 @@
+// The cluster's table of commands (src/wire/commands.kama) against every server's own reading of a command's keys:
+// each server's COMMAND GETKEYS of an invocation of each of its commands (command_vectors.kama, from
+// tools/gen-command-table.sh) must be what `CommandTable.keysOf` finds. They are compared as sets: a cluster takes a
+// command only when all its keys share a slot, so the order does not change where it goes, and 6.2's own procedures
+// give ZUNIONSTORE's and its kin's destination last where 7.0 gives it first. Where a spec cannot be followed to its
+// end (SORT's STORE, MIGRATE's KEYS: the server's own code finds those), the table's keys must be some of the
+// server's, so it routes by a key of the command and never by an argument that is not one. One invocation is not
+// compared: on 6.2, a MIGRATE that names a key and KEYS together (6.2's own procedure reads the key alone), which no
+// server will run ("the key argument must be set to the empty string").
+import { std::collections::DynamicArray, redis::Command, redis::RedisError, redis::cluster::CommandTable,
+         redis::cluster::CommandKeys, redis::cluster::keySlot, redis_unit_tests::check, commandOf, textOf,
+         getkeysServers, getkeysInvocations, getkeysKeys };
+export { routeTests };
+
+fn DynamicArray<string> spaced(const ref string text) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    if (text.length() == 0) { return give parts; }
+    isize start = 0;
+    isize i = 0;
+    while (i <= text.length()) {
+        if (i == text.length() || text.bytes()[i] == 32ui8) { parts.add(item: text.substring(start: start, end: i)); start = i + 1; }
+        i = i + 1;
+    }
+    return give parts;
+}
+
+// Whether every word of `a` is in `b`.
+fn bool within(const ref DynamicArray<string> a, const ref DynamicArray<string> b) {
+    isize i = 0;
+    while (i < a.length()) { if (!among(w: a[i], b: b)) { return false; } i = i + 1; }
+    return true;
+}
+fn bool among(const ref string w, const ref DynamicArray<string> b) {
+    isize i = 0;
+    while (i < b.length()) { if (b[i] == w) { return true; } i = i + 1; }
+    return false;
+}
+
+// The keys `table` finds in `command`, as text joined by spaces, and whether it found them all; "?" when it refused.
+unsafe fn string found(ref CommandTable table, const ref Command command, ref bool partial) {
+    Result<CommandKeys, RedisError> r = table.keysOf(command: command);
+    return match (give r) {
+        case Ok(value: k): {
+            partial = k.partial();
+            string text = "";
+            isize i = 0;
+            while (i < k.count()) {
+                if (i > 0) { text = text.concat(other: " "); }
+                text = text.concat(other: textOf(b: command.part(index: k.position(index: i))));
+                i = i + 1;
+            }
+            := give text;
+        }
+        case Err(error: e): "?";
+    };
+}
+
+unsafe fn int32 getkeysTests() {
+    int32 f = 0;
+    CommandTable table = CommandTable.load();
+    DynamicArray<string> servers = getkeysServers();
+    DynamicArray<string> invocations = getkeysInvocations();
+    DynamicArray<string> wants = getkeysKeys();
+    isize keyed = 0;
+    isize keyless = 0;
+    isize skipped = 0;
+    isize i = 0;
+    while (i < invocations.length()) {
+        string want = copy wants[i];
+        string where = servers[i].concat(other: " ").concat(other: invocations[i]);
+        Command c = commandOf(text: invocations[i]);
+        bool partial = false;
+        string got = found(table: table, command: c, partial: partial);
+        if (want.startsWith(prefix: "!")) {
+            // The server will not read this invocation (a subcommand it lacks, arguments it refuses): nothing to check.
+            if (want != "!ERR The command has no key arguments") { skipped = skipped + 1; i = i + 1; continue; }
+            f = f + check(ok: got == "", what: "route: ${where}: the server finds no keys, the table finds [${got}]");
+            keyless = keyless + 1;
+        } else {
+            DynamicArray<string> mine = spaced(text: got);
+            DynamicArray<string> theirs = spaced(text: want);
+            bool same = mine.length() == theirs.length() && within(a: mine, b: theirs) && within(a: theirs, b: mine);
+            if (partial && !same) { same = mine.length() > 0 && within(a: mine, b: theirs); }
+            if (!same && servers[i].startsWith(prefix: "redis-6.") && invocations[i].startsWith(prefix: "MIGRATE ") && invocations[i].contains(substring: " KEYS ")) {
+                skipped = skipped + 1;
+                i = i + 1;
+                continue;
+            }
+            f = f + check(ok: same, what: "route: ${where}: the server finds [${want}], the table [${got}]");
+            keyed = keyed + 1;
+        }
+        i = i + 1;
+    }
+    f = f + check(ok: table.count() > 400, what: "route: the table knows more than 400 commands and subcommands");
+    f = f + check(ok: keyed > 2000 && keyless > 1500, what: "route: more than 2000 invocations with keys and 1500 without, on every server");
+    f = f + check(ok: skipped < 120, what: "route: fewer than 120 invocations a server would not read");
+    return f;
+}
+
+unsafe fn string slotText(ref CommandTable table, const ref string text) {
+    Command c = commandOf(text: text);
+    Result<Optional<isize>, RedisError> r = table.slotOf(command: c);
+    return match (give r) {
+        case Ok(value: o): match (o) { case Some(value: s): "slot"; case None: "none"; };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 slotTests() {
+    int32 f = 0;
+    CommandTable table = CommandTable.load();
+    Command spublish = commandOf(text: "SPUBLISH orders{7} hi");
+    Result<Optional<isize>, RedisError> s1 = table.slotOf(command: spublish);
+    isize want = keySlot(key: "orders{7}".bytes());
+    bool shard = match (s1) { case Ok(value: o): match (o) { case Some(value: s): s == want; case None: false; }; case Err(error: e): false; };
+    f = f + check(ok: shard, what: "slotOf: a shard channel routes by its slot, though GETKEYS calls it no key");
+    Command one = commandOf(text: "MGET {user:1}:name {user:1}:email");
+    Result<Optional<isize>, RedisError> s2 = table.slotOf(command: one);
+    bool tagged = match (s2) { case Ok(value: o): match (o) { case Some(value: s): s == keySlot(key: "user:1".bytes()); case None: false; }; case Err(error: e): false; };
+    f = f + check(ok: tagged, what: "slotOf: keys with one hash tag share its slot");
+    f = f + check(ok: slotText(table: table, text: "MGET a b").contains(substring: "more than one slot"), what: "slotOf: keys in two slots are refused, naming a hash tag");
+    f = f + check(ok: slotText(table: table, text: "PING") == "none" && slotText(table: table, text: "EVAL return 0") == "none",
+                  what: "slotOf: a command without keys has none");
+    f = f + check(ok: slotText(table: table, text: "NOSUCH key").contains(substring: "callFor"), what: "slotOf: an unknown command is refused, naming callFor");
+    f = f + check(ok: slotText(table: table, text: "object encoding k") == "slot", what: "slotOf: a subcommand, in any case");
+    // A keyword in any case, as the server compares it; a count of keys that is 0, which has none and misses none.
+    bool partial = false;
+    Command lower = commandOf(text: "xread count 1 streams kr:x 0");
+    f = f + check(ok: found(table: table, command: lower, partial: partial) == "kr:x", what: "keysOf: a keyword in lower case (streams)");
+    Command geo = commandOf(text: "georadius kr:g 1 2 3 m store kr:d");
+    f = f + check(ok: found(table: table, command: geo, partial: partial) == "kr:g kr:d", what: "keysOf: GEORADIUS's store in lower case");
+    Command none = commandOf(text: "EVAL return 0");
+    string keys = found(table: table, command: none, partial: partial);
+    f = f + check(ok: keys == "" && !partial, what: "keysOf: numkeys 0 has no keys, and misses none");
+    return f;
+}
+
+unsafe fn int32 routeTests() {
+    int32 f = 0;
+    f = f + getkeysTests();
+    f = f + slotTests();
+    return f;
+}

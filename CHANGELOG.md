@@ -23,6 +23,11 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
 - `RedisError::Sentinel(SentinelError)`: the sentinels were reached and none gave an address, or the server they named
   never confirmed its role. When none could be reached, the error is `Connect`, an attempt per sentinel.
 - `examples/sentinel`: the master found through sentinels, and what a failover does to a call.
+- `redis::cluster`:
+  - `CommandTable`: a command's keys (`keysOf`, as COMMAND GETKEYS finds them) and its slot (`slotOf`), from every
+    server's key specifications, checked against every server's GETKEYS;
+  - `SlotMap` and `ClusterNode`, a cluster's map from CLUSTER SLOTS;
+  - `Redirect` and `RedirectKind`, what a MOVED or ASK says.
 
 ### Changed
 - A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it

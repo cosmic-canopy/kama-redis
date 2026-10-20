@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–6 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–7 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -683,12 +683,60 @@ Each step ends green before its commit:
      - `role=replica` not looking for a replica;
      - the sentinels given the server's credentials;
      - a redial that does not ask again.
-7. **`redis::cluster`'s pure layers** (unit):
-   - the slot map, hostile and bounded;
-   - the MOVED and ASK parser;
-   - the generated table (`tools/gen-command-table.sh`, from every server's COMMAND INFO), and `route()` against
-     every server's COMMAND GETKEYS for an invocation of each command built from its COMMAND DOCS;
-   - the response policies.
+7. **Done (2026-10-20).** **`redis::cluster`'s pure layers** (unit).
+   - **The table of commands** (`tools/gen-command-table.sh` → `src/wire/commands.kama`, internal): 466 commands and
+     subcommands from all eight servers' COMMAND output. Each entry has:
+     - its key specs (or the legacy first/last/step);
+     - `readonly`;
+     - its request and response policies.
+
+     The newest server's entry wins. Where servers differ, they differ only in flags (`incomplete`,
+     `variable_flags`, `insert`/`update`) and in tips that are not policies. Where a key is found, they all agree.
+     The official images load none of Redis 8's modules, so no module command is in it: such a command is refused,
+     naming `callFor`.
+   - **The check is not circular.** One or two invocations of each command are built from the newest servers' COMMAND
+     DOCS, a `numkeys` argument counting the keys after it. Each server's COMMAND GETKEYS of each is captured: 3825
+     cases, 2162 with keys and 1663 refused (1567 of those "no key arguments") (`tests/unit/src/command_vectors.kama`).
+   - **`keysOf` (src/wire/route.kama) ports the server's own walk** (`getKeysUsingKeySpecs`, R8 db.c:3227-3330):
+     - index and keyword begin;
+     - range (a limit included) and keynum find;
+     - a keyword in any case, never the last argument going forward;
+     - numkeys 0 has no keys;
+     - a spec that is unknown, incomplete or does not fit makes the reading partial;
+     - `not_key` specs (shard channels) count only for routing.
+   - **Every case agrees** with its server, as a set: 6.2's own procedures give ZUNIONSTORE's destination last. A
+     partial reading must be a subset of the server's keys. One invocation is not compared: on 6.2, a MIGRATE naming a
+     key and KEYS together, which no server runs.
+   - **Public, in `redis::cluster`** (useful beside a cluster for grouping keys by slot, as go-redis's `MasterForKey`
+     and Lettuce's `SlotHash` are):
+     - `CommandTable.load()`, with `keysOf(command:)` (what GETKEYS finds) and `slotOf(command:)` (what a cluster
+       routes by: shard channels count, keys in two slots are `Usage` naming a hash tag, an unknown command is `Usage`
+       naming `callFor`);
+     - `SlotMap.fromSlots(reply:, asked:)`, `ClusterNode`, `Redirect.of(error:, asked:)`, `RedirectKind`.
+   - **`SlotMap`** reads every server's CLUSTER SLOTS under both protocols:
+     - the plain map;
+     - the map at a replica, the gap, and after a failover;
+     - hostnames;
+     - an unknown endpoint, as the node asked;
+     - Valkey's zones.
+
+     It refuses:
+     - a reply that is not an array;
+     - a range out of 0–16383, or ending before it starts;
+     - overlapping ranges;
+     - more than 1000 nodes.
+
+     A primary that cannot be reached (port 0, or `?` with no ip) serves nothing, and `?` with an ip is that ip.
+   - **`Redirect`** reads every server's MOVED and ASK:
+     - an empty host is the node asked;
+     - a hostname is kept;
+     - IPv6 splits at the last colon;
+     - a slot or port out of range is refused.
+   - **The response-policy aggregates move to step 8,** beside the fan-out that uses them.
+   - 21 mutations, all caught. Two had no observable effect and were dropped, each with its reason in this entry:
+     - the backward keyword search's bounds: its one user, MIGRATE's KEYS, is an incomplete spec, whose missing keys
+       the server's own code finds;
+     - the `incomplete` mark: on every captured invocation the keyword search finds what the server's procedure does.
 8. **The cluster's core:**
    - seeds, lazy nodes, routing, splitting and fan-out;
    - `callEach` and `callFor`;

@@ -1,0 +1,330 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, std::fmt::i64Str, redis::RedisError, redis::ServerError, redis::ServerCode,
+         redis::resp::Value, redis::cluster::SLOT_COUNT };
+export { SlotMap, ClusterNode, Redirect, RedirectKind };
+
+// A cluster's map: which node serves each of the 16384 slots, and its replicas, as CLUSTER SLOTS gives them
+// (docs/ROADMAP.md, "Phase 6"): SLOTS is the one reply every server in the matrix has (6.2 has no SHARDS), it names the
+// port of the asking connection's kind (TLS or not), and it leaves out a replica that failed or has not synced.
+//
+// Each node is named by its preferred endpoint, read as the specification says (cluster-spec.md):
+//   - an empty one, or a null (cluster-preferred-endpoint-type unknown-endpoint), is the node that was asked;
+//   - "?" (a node announcing hostnames that has none) is its metadata's `ip` when it gives one, and otherwise the node
+//     cannot be reached and is left out;
+//   - an IPv6 address comes without brackets.
+// Nothing in the reply is trusted: every count, slot and port is checked, and ranges may not overlap.
+
+// One node of the map: where it can be reached and its id (a host:port when the reply gives none).
+type resource ClusterNode implements Sendable, Copyable<This>(bare: give) {
+    string hostText;
+    int32 portNumber;
+    string idText;
+
+    public ctor make(string host, int32 port, string id) { this.hostText = give host; this.portNumber = port; this.idText = give id; }
+    public ctor copy(ref ClusterNode source) { this.hostText = copy source.hostText; this.portNumber = source.portNumber; this.idText = copy source.idText; }
+
+    public const fn const ref string host() { return this.hostText; }
+    public const fn int32 port() { return this.portNumber; }
+    public const fn const ref string id() { return this.idText; }
+    // "host:port", an IPv6 address in brackets.
+    public const fn string place() {
+        int32 p = this.portNumber;
+        string h = copy this.hostText;
+        if (h.contains(substring: ":")) { h = "[".concat(other: h).concat(other: "]"); }
+        return "${h}:${p}";
+    }
+}
+
+// A shard: its primary and its replicas, by index into the map's nodes.
+type resource Shard implements Sendable, Copyable<This>(bare: give) {
+    isize primaryAt;
+    DynamicArray<isize> replicaList;
+    public ctor make(isize primary) { this.primaryAt = primary; this.replicaList = DynamicArray.empty(); }
+    public ctor copy(ref Shard source) { this.primaryAt = source.primaryAt; this.replicaList = copy source.replicaList; }
+    public const fn isize primary() { return this.primaryAt; }
+    public const fn const ref DynamicArray<isize> replicas() { return this.replicaList; }
+    // Add node `at` as a replica, unless it is one already or the primary.
+    public fn void addReplica(isize at) {
+        if (at == this.primaryAt) { return; }
+        isize k = 0;
+        while (k < this.replicaList.length()) { if (this.replicaList[k] == at) { return; } k = k + 1; }
+        this.replicaList.add(item: at);
+    }
+}
+
+// The most nodes a map holds: a cluster's documented ceiling is 1000.
+comptime isize MAX_NODES = 1000;
+
+type resource SlotMap implements Sendable, Copyable<This>(bare: give) {
+    DynamicArray<ClusterNode> nodeList;
+    DynamicArray<Shard> shardList;
+    // For each slot, the shard that serves it; -1 when none does.
+    DynamicArray<int16> owners;
+    isize served = 0;
+
+    friend readEntry[nodeList, shardList, owners, served];
+    friend nodeIndex[nodeList];
+    friend shardOfPrimary[shardList];
+
+    ctor blank() {
+        this.nodeList = DynamicArray.empty();
+        this.shardList = DynamicArray.empty();
+        this.owners = DynamicArray.withCapacity(capacity: SLOT_COUNT);
+        isize s = 0;
+        while (s < SLOT_COUNT) { this.owners.add(item: -1i16); s = s + 1; }
+        this.served = 0;
+    }
+
+    public ctor copy(ref SlotMap source) {
+        this.nodeList = copy source.nodeList;
+        this.shardList = copy source.shardList;
+        this.owners = copy source.owners;
+        this.served = source.served;
+    }
+
+    // The map in `reply`, CLUSTER SLOTS's answer from the node at `asked` (its host, for an endpoint that is empty).
+    // `Unexpected` for a reply that is not a map of slots, saying what is wrong with it.
+    public ctor Result<SlotMap, RedisError> fromSlots(const ref Value reply, const ref string asked) {
+        SlotMap m = SlotMap.blank();
+        Value plain = copy reply;
+        DynamicArray<Value> entries = match (give plain) {
+            case Array(items: xs): give xs;
+            case _: { return Result::Err(error: notAMap(why: "it is not an array")); }
+        };
+        if (entries.length() > SLOT_COUNT) { return Result::Err(error: notAMap(why: "it has more ranges than slots")); }
+        isize i = 0;
+        while (i < entries.length()) {
+            Optional<string> wrong = readEntry(map: m, entry: entries[i], asked: asked);
+            match (give wrong) { case Some(value: w): { return Result::Err(error: notAMap(why: give w)); } case None: { } };
+            i = i + 1;
+        }
+        return Result::Ok(value: give m);
+    }
+
+    public const fn isize nodeCount() { return this.nodeList.length(); }
+    public const fn const ref ClusterNode node(isize index) { return this.nodeList[index]; }
+    public const fn isize shardCount() { return this.shardList.length(); }
+    // How many of the 16384 slots some node serves: fewer than all with cluster-require-full-coverage no.
+    public const fn isize coverage() { return this.served; }
+
+    // The node that serves `slot` (an index into the nodes), or -1 when none does.
+    public const fn isize primaryOf(isize slot) {
+        isize shard = cast<isize>(this.owners[slot]);
+        if (shard < 0) { return -1; }
+        return this.shardList[shard].primary();
+    }
+    // The replicas of the shard that serves `slot`, as indexes into the nodes; none when it has none, or no shard does.
+    public const fn DynamicArray<isize> replicasOf(isize slot) {
+        isize shard = cast<isize>(this.owners[slot]);
+        if (shard < 0) { return DynamicArray.empty(); }
+        return copy this.shardList[shard].replicas();
+    }
+    // Every primary, as indexes into the nodes, in the order of the first slot each serves.
+    public const fn DynamicArray<isize> primaries() {
+        DynamicArray<isize> all = DynamicArray.empty();
+        isize i = 0;
+        while (i < this.shardList.length()) { all.add(item: this.shardList[i].primary()); i = i + 1; }
+        return give all;
+    }
+    // The index of the node with `host` and `port`, or -1.
+    public const fn isize find(const ref string host, int32 port) {
+        isize i = 0;
+        while (i < this.nodeList.length()) {
+            if (this.nodeList[i].port() == port && this.nodeList[i].host() == host) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+// One entry of a SLOTS reply ([start, end, primary, replica…]) into `map`; what is wrong with it, if anything.
+fn Optional<string> readEntry(ref SlotMap map, const ref Value entry, const ref string asked) {
+    DynamicArray<Value> parts = match (entry) { case Array(items: xs): copy xs; case _: DynamicArray.empty(); };
+    if (parts.length() < 3) { return Optional::Some(value: "a range without a start, an end and a primary"); }
+    int64 start = integerOf(v: parts[0]);
+    int64 end = integerOf(v: parts[1]);
+    if (start < 0i64 || end < start || end >= cast<int64>(SLOT_COUNT)) {
+        return Optional::Some(value: "a range of slots that is not within 0 to 16383");
+    }
+    Optional<ClusterNode> primary = nodeOf(v: parts[2], asked: asked);
+    // A primary that cannot be reached ("?" with no ip): its slots stay unserved, as the specification's gaps do.
+    bool reachable = match (primary) { case Some(value: n): true; case None: false; };
+    isize primaryAt = -1;
+    match (give primary) { case Some(value: n): { primaryAt = nodeIndex(map: map, node: give n); } case None: { } };
+    if (reachable && primaryAt < 0) { return Optional::Some(value: "more nodes than a cluster has"); }
+    if (!reachable) { return Optional::None; }
+    isize shard = shardOfPrimary(map: map, primary: primaryAt);
+    isize r = 3;
+    while (r < parts.length()) {
+        Optional<ClusterNode> replica = nodeOf(v: parts[r], asked: asked);
+        match (give replica) {
+            case Some(value: n): {
+                isize at = nodeIndex(map: map, node: give n);
+                if (at < 0) { return Optional::Some(value: "more nodes than a cluster has"); }
+                map.shardList[shard].addReplica(at: at);
+            }
+            case None: { }
+        };
+        r = r + 1;
+    }
+    isize s = cast<isize>(start);
+    while (s <= cast<isize>(end)) {
+        if (map.owners[s] >= 0i16) { return Optional::Some(value: "two ranges that hold the same slot"); }
+        map.owners[s] = truncate<int16>(shard);
+        map.served = map.served + 1;
+        s = s + 1;
+    }
+    return Optional::None;
+}
+
+// A node of an entry: [endpoint, port, id?, metadata?]. None for one that cannot be reached ("?" with no ip) or that
+// is not a node.
+fn Optional<ClusterNode> nodeOf(const ref Value v, const ref string asked) {
+    DynamicArray<Value> parts = match (v) { case Array(items: xs): copy xs; case _: DynamicArray.empty(); };
+    if (parts.length() < 2) { return Optional::None; }
+    int64 port = integerOf(v: parts[1]);
+    if (port < 1i64 || port > 65535i64) { return Optional::None; }
+    bool isNull = match (parts[0]) { case Null: true; case _: false; };
+    string endpoint = "";
+    if (!isNull) {
+        Optional<string> t = textOf(v: parts[0]);
+        match (give t) { case Some(value: x): { endpoint = give x; } case None: { return Optional::None; } };
+    }
+    if (endpoint.length() == 0) { endpoint = copy asked; }
+    if (endpoint == "?") {
+        Optional<string> ip = Optional::None;
+        if (parts.length() > 3) { ip = field(v: parts[3], name: "ip"); }
+        match (give ip) { case Some(value: x): { endpoint = give x; } case None: { return Optional::None; } };
+        if (endpoint.length() == 0) { return Optional::None; }
+    }
+    string id = "";
+    if (parts.length() > 2) {
+        Optional<string> t = textOf(v: parts[2]);
+        match (give t) { case Some(value: x): { id = give x; } case None: { } };
+    }
+    if (id.length() == 0) {
+        int64 p = port;
+        id = endpoint.concat(other: ":").concat(other: i64Str(v: p));
+    }
+    return Optional::Some(value: ClusterNode.make(host: give endpoint, port: cast<int32>(port), id: give id));
+}
+
+// The index of `node` among the map's nodes, by its id, added when it is new; -1 past MAX_NODES.
+fn isize nodeIndex(ref SlotMap map, ClusterNode node) {
+    isize i = 0;
+    while (i < map.nodeList.length()) {
+        if (map.nodeList[i].id() == node.id()) { return i; }
+        i = i + 1;
+    }
+    if (map.nodeList.length() >= MAX_NODES) { return -1; }
+    map.nodeList.add(item: give node);
+    return map.nodeList.length() - 1;
+}
+
+// The shard whose primary is node `primary`, made when it is new: a primary with several ranges is one shard.
+fn isize shardOfPrimary(ref SlotMap map, isize primary) {
+    isize i = 0;
+    while (i < map.shardList.length()) {
+        if (map.shardList[i].primary() == primary) { return i; }
+        i = i + 1;
+    }
+    map.shardList.add(item: Shard.make(primary: primary));
+    return map.shardList.length() - 1;
+}
+
+// A field of a node's metadata: a map under RESP3, a flat array under RESP2.
+fn Optional<string> field(const ref Value v, const ref string name) {
+    DynamicArray<Value> es = match (v) { case Map(entries: xs): copy xs; case Array(items: xs): copy xs; case _: DynamicArray.empty(); };
+    isize i = 0;
+    while (i + 1 < es.length()) {
+        Optional<string> k = textOf(v: es[i]);
+        bool hit = match (k) { case Some(value: t): t == name; case None: false; };
+        if (hit) { return textOf(v: es[i + 1]); }
+        i = i + 2;
+    }
+    return Optional::None;
+}
+
+fn int64 integerOf(const ref Value v) {
+    return match (v) { case Integer(value: n): n; case _: -1i64; };
+}
+
+fn Optional<string> textOf(const ref Value v) {
+    return match (v) {
+        case Bulk(bytes: b): utf8(b: b.view());
+        case Simple(bytes: b): utf8(b: b.view());
+        case _: Optional::None;
+    };
+}
+
+fn Optional<string> utf8(ConstView<uint8> b) {
+    Result<string, Utf8Error> r = decode(bytes: b);
+    return match (give r) { case Ok(value: s): Optional::Some(value: give s); case Err(error: e): Optional::None; };
+}
+
+fn RedisError notAMap(string why) {
+    return RedisError::Unexpected(detail: "CLUSTER SLOTS answered with something that is not a map of slots: ".concat(other: why));
+}
+
+// What a MOVED or ASK error says: from now on (Moved) or for this command only (Ask), `slot` is at that node.
+type enum RedirectKind implements Sendable { Moved, Ask }
+
+type resource Redirect implements Sendable {
+    RedirectKind which;
+    isize slotNumber;
+    string hostText;
+    int32 portNumber;
+
+    friend parsed[make];
+
+    ctor make(RedirectKind kind, isize slot, string host, int32 port) { this.which = kind; this.slotNumber = slot; this.hostText = give host; this.portNumber = port; }
+
+    // The redirection `error` holds, from the node at `asked` (whose host an empty endpoint means, as the
+    // specification says): "MOVED 3999 127.0.0.1:6381", "ASK 3999 :6381", an IPv6 address unbracketed. `Value` for an
+    // error that is not one, or one whose slot or port is out of range.
+    public ctor Result<Redirect, RedisError> of(const ref ServerError error, const ref string asked) {
+        RedirectKind kind = RedirectKind::Moved;
+        bool redirect = match (error.code()) { case Moved: true; case Ask: { kind = RedirectKind::Ask; := true; } case _: false; };
+        if (!redirect) { return Result::Err(error: RedisError::Value(detail: "not a MOVED or ASK error")); }
+        string detail = error.detail();
+        Optional<Redirect> r = parsed(kind: kind, b: detail.bytes(), detail: detail, asked: asked);
+        return match (give r) {
+            case Some(value: x): Result::Ok(value: give x);
+            case None: Result::Err(error: RedisError::Value(detail: "a redirection whose slot or address is out of range: ".concat(other: detail)));
+        };
+    }
+
+    public const fn RedirectKind kind() { return this.which; }
+    public const fn isize slot() { return this.slotNumber; }
+    public const fn const ref string host() { return this.hostText; }
+    public const fn int32 port() { return this.portNumber; }
+}
+
+// "<slot> <endpoint>:<port>" as a redirection; None when it is not one.
+fn Optional<Redirect> parsed(RedirectKind kind, ConstView<uint8> b, const ref string detail, const ref string asked) {
+    isize space = 0;
+    while (space < b.length() && b[space] != 32ui8) { space = space + 1; }
+    int64 slot = digits(b: b, from: 0, to: space);
+    if (slot < 0i64 || slot >= cast<int64>(SLOT_COUNT) || space >= b.length()) { return Optional::None; }
+    isize colon = b.length() - 1;
+    while (colon > space && b[colon] != 58ui8) { colon = colon - 1; }
+    if (colon <= space) { return Optional::None; }
+    int64 port = digits(b: b, from: colon + 1, to: b.length());
+    if (port < 1i64 || port > 65535i64) { return Optional::None; }
+    string host = detail.substring(start: space + 1, end: colon);
+    if (host.length() == 0) { host = copy asked; }
+    return Optional::Some(value: Redirect.make(kind: kind, slot: cast<isize>(slot), host: give host, port: cast<int32>(port)));
+}
+
+// The digits of b[from, to) as a number, at most nine of them; -1 when they are not.
+fn int64 digits(ConstView<uint8> b, isize from, isize to) {
+    if (to <= from || to - from > 9) { return -1i64; }
+    int64 n = 0i64;
+    isize i = from;
+    while (i < to) {
+        if (b[i] < 48ui8 || b[i] > 57ui8) { return -1i64; }
+        n = n * 10i64 + cast<int64>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    return n;
+}
