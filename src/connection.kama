@@ -98,6 +98,9 @@ type resource Connection implements Sendable {
     friend redis::Scan::next[generation];
     // A cluster asks its live nodes for the map first (src/cluster.kama).
     friend redis::NodeLink::live[lost];
+    friend redis::NodeLink::begin[begin];
+    friend redis::NodeLink::finish[finish];
+    friend redis::NodeLink::transact[transactAt];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -510,15 +513,30 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) {
         Optional<RedisError> problem = pipeline.problem();
         match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        bool unsent = false;
+        Result<Deadline, RedisError> begun = this.begin(pipeline: pipeline, unsent: unsent);
+        Deadline deadline = match (give begun) { case Ok(value: d): d; case Err(error: e): { return Result::Err(error: give e); } };
+        return this.finish(pipeline: pipeline, deadline: deadline);
+    }
+
+    // A pipeline's first half: what came while idle, the link (made again if it was lost), then every command in one
+    // write. The deadline its replies have; `unsent` when the failure came before anything was written. A cluster
+    // begins every node's batch before it finishes any (src/cluster.kama).
+    unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {
         Result<Unit, RedisError> idle = this.settle();
-        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
         Result<Unit, RedisError> up = this.ready();
-        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        DynamicArray<Value> values = DynamicArray.empty();
-        if (pipeline.length() == 0) { return Result::Ok(value: Replies.of(values: give values)); }
+        match (give up) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: pipeline.waiting());
+        if (pipeline.length() == 0) { return Result::Ok(value: deadline); }
         Result<Unit, RedisError> sent = this.wire.send(bytes: pipeline.bytes(), deadline: deadline);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        return Result::Ok(value: deadline);
+    }
+
+    // A pipeline's second half: a reply for each command, in order, by `deadline`.
+    unsafe fn Result<Replies, RedisError> finish(const ref Pipeline pipeline, Deadline deadline) {
+        DynamicArray<Value> values = DynamicArray.empty();
         while (values.length() < pipeline.length()) {
             Result<Value, RedisError> got = this.nextReply(deadline: deadline);
             match (give got) {
@@ -574,6 +592,13 @@ type resource Connection implements Sendable {
     // A pipeline with WATCH or UNWATCH is `Usage`, as the server refuses them inside a transaction; WATCH first, with
     // `call` or `watched`. Nothing blocks inside a transaction, so the deadline is `command_timeout` alone.
     public unsafe fn Result<TxOutcome, RedisError> transact(const ref Pipeline pipeline) {
+        DynamicArray<bool> asked = DynamicArray.empty();
+        return this.transactAt(pipeline: pipeline, asking: false, asked: asked);
+    }
+
+    // `transact`, and for a cluster (src/cluster.kama): with `asking`, ASKING first in the same write, so that a slot's
+    // importing node takes the whole transaction; and in `asked`, whether each command's queueing was answered ASK.
+    unsafe fn Result<TxOutcome, RedisError> transactAt(const ref Pipeline pipeline, bool asking, ref DynamicArray<bool> asked) {
         Optional<RedisError> problem = pipeline.problem();
         match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
         if (pipeline.watches()) {
@@ -590,6 +615,10 @@ type resource Connection implements Sendable {
         this.watching = false;
         Deadline deadline = Deadline.within(span: this.commandLimit);
         this.outbox.clear();
+        if (asking) {
+            Command asks = Command.of(name: "ASKING");
+            asks.encode(into: this.outbox);
+        }
         Command multi = Command.of(name: "MULTI");
         multi.encode(into: this.outbox);
         this.outbox.raw(bytes: pipeline.bytes());
@@ -598,13 +627,19 @@ type resource Connection implements Sendable {
         Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
 
-        // MULTI's reply, then one per command, then EXEC's: all of them, before anything is decided.
+        // ASKING's reply, MULTI's, then one per command, then EXEC's: all of them, before anything is decided.
+        Optional<RedisError> refused = Optional::None;
+        if (asking) {
+            Result<Value, RedisError> a = this.nextReply(deadline: deadline);
+            Value asked0 = match (give a) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            if (asked0.isError()) { refused = Optional::Some(value: RedisError::Server(error: serverError(v: asked0))); }
+        }
         Result<Value, RedisError> m = this.nextReply(deadline: deadline);
         Value began = match (give m) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
-        Optional<RedisError> refused = Optional::None;
         bool multiFailed = began.isError();
         if (multiFailed) {
-            refused = Optional::Some(value: RedisError::Server(error: serverError(v: began)));
+            bool none = match (refused) { case Some(value: e): false; case None: true; };
+            if (none) { refused = Optional::Some(value: RedisError::Server(error: serverError(v: began))); }
         } else if (!isStatus(v: began, text: "OK")) {
             this.lose();
             return Result::Err(error: RedisError::Unexpected(detail: "MULTI was answered with something other than OK"));
@@ -613,6 +648,13 @@ type resource Connection implements Sendable {
         while (i < pipeline.length()) {
             Result<Value, RedisError> q = this.nextReply(deadline: deadline);
             Value queued = match (give q) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            bool ask = false;
+            if (queued.isError()) {
+                ServerError queueing = serverError(v: queued);
+                bool redirected = match (queueing.code()) { case Ask: true; case _: false; };
+                ask = redirected;
+            }
+            asked.add(item: ask);
             bool first = match (refused) { case Some(value: e): false; case None: true; };
             if (queued.isError() && first) {
                 refused = Optional::Some(value: RedisError::Server(error: serverError(v: queued)));
@@ -640,6 +682,13 @@ type resource Connection implements Sendable {
         if (ended.isError()) {
             ServerError failed = serverError(v: ended);
             Value dropped = give ended;
+            // Valkey 9.1 queues a transaction's commands in a slot being migrated, and answers at EXEC for all of them
+            // (tools/gen-topology-vectors.sh, exec-after-ask): an ASK there means every key is on the importing node.
+            bool asksAll = match (failed.code()) { case Ask: true; case _: false; };
+            if (asksAll) {
+                isize k = 0;
+                while (k < asked.length()) { asked[k] = true; k = k + 1; }
+            }
             bool readOnly = match (failed.code()) { case ReadOnly: true; case _: false; };
             if (readOnly && this.settings.viaSentinel() && this.settings.role() == SentinelRole::Master) { this.lose(); }
             return Result::Err(error: RedisError::Server(error: give failed));

@@ -33,6 +33,11 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   redirections a call. A command whose reply is each node's own (INFO, SCAN, …) goes through `callEach(command:,
   on:)` (`ClusterTarget`, `NodeReply`); one the table does not know, through `callFor(key:, command:)`. `eval` runs a
   script at its keys' node. `refreshTopology`, `topology`.
+- `Cluster.run`: a pipeline whose commands each stay on one slot, a batch per node, every batch written before any is
+  read, the replies in the pipeline's order. MOVED and ASK are followed command by command; a node lost mid-batch fails
+  only its own commands. `Cluster.transact` and `Cluster.watched`: at the node of the keys' slot, which they must
+  share; a redirection while queueing sends the whole transaction again, and a slot half moved under its keys is waited
+  out.
 - `redis::cluster`:
   - `CommandTable`: a command's keys (`keysOf`, as COMMAND GETKEYS finds them) and its slot (`slotOf`), from every
     server's key specifications, checked against every server's GETKEYS;
@@ -40,6 +45,8 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   - `Redirect` and `RedirectKind`, what a MOVED or ASK says.
 
 ### Changed
+- `Replies` holds a result per command: on a cluster a reply can be the failure of a node's link as well as the server's
+  error reply. `take` is unchanged.
 - A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it
   dials. Before, `redis://a,b` was the one host `a,b`.
 - `RedisError` and `ServerCode` are `@nonExhaustive`: a `match` on either outside this package needs a `case _:`. This

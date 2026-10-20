@@ -11,8 +11,8 @@
   "id": "M2",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };\n        Result<Unit, RedisError> idle = this.settle();",
-  "new": "        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "old": "    unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "    unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
   "expect": "idle: a pipeline finds a link closed"
  },
  {

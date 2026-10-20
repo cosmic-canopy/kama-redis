@@ -3,14 +3,14 @@
 Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-steps 0 to 8 are done: Sentinel, and the cluster's core.**
-- cstar's newest build is 0.9.696, a build of staged work that makes unreachable code an error. The tree now takes
+steps 0 to 9 are done: Sentinel, and the cluster's core with its pipelines and transactions.**
+- cstar's newest build is 0.9.705. Since 0.9.696 unreachable code is an error. The tree now takes
   the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
   stops ends in `stop::<T>(msg:)` (KRD-12). It refuses `fn int32 main()`, which every tag requires (KRD-11), so it is
   gated on a scratch copy whose ten `main`s say `fn uint8 main()`; the live program's channel `send` changed in
-  0.9.680 too. **@kama/tls 0.1.5 does not build on 0.9.696** (four statements after a `while (true)`), so nothing
-  that depends on it does: it needs a release before 0.2.0 can be checked there, which is the registry's check. On
-  0.9.692, before that rule, the unit program and the examples were green.
+  0.9.680 too. **@kama/tls 0.1.5 does not build on 0.9.696 and later** (four statements after a `while (true)`), so
+  nothing that depends on it does: it needs a release before 0.2.0 can be checked there, which is the registry's check.
+  With those four removed in a scratch copy, the unit program is green on 0.9.705, debug and release.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -71,7 +71,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–8 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–9 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -811,8 +811,54 @@ Each step ends green before its commit:
      - `agg_logical_or`, which no command in the table has.
    - **Found:** KRD-11 has a second change with no overlap: a channel's `send` (0.9.680). The live program's socket
      relay uses one.
-9. **Pipelines, transactions and `watched` on a cluster.** Live: a resharding interleaved in the test (SETSLOT
-   MIGRATING/IMPORTING, MIGRATE), meeting ASK then MOVED.
+9. **Done (2026-10-20).** **Pipelines, transactions and `watched` on a cluster.**
+   - **The shapes underneath:**
+     - a `Pipeline` records where each command's bytes begin, and the cluster reads each back (`Command.decoded`) to
+       route it;
+     - `Replies` holds a result per command. On a connection that is the server's error reply, as before; on a cluster
+       it can also be the failure of a node's link. `take` is unchanged;
+     - `Connection.run` is `begin` (settle, ready, one write) and `finish` (the replies), so a cluster writes every
+       node's batch before it reads any;
+     - `Connection.transact` is `transactAt`, which can send ASKING before MULTI in the same write and reports which
+       commands' queueing was answered ASK.
+   - **`Cluster.run(pipeline:)`:**
+     - a command must stay on one slot: one for every node, one the table does not know, and keys in two slots are
+       refused, naming the command, before anything is written;
+     - each node's commands go in one batch, every batch is written before any is read, and the replies come back in
+       the pipeline's order;
+     - a command answered MOVED or ASK goes again where it says (ASKING first, for ASK) in the next round's batch, up
+       to `max_redirects` each; TRYAGAIN, CLUSTERDOWN and LOADING are waited out, as is a node that will not open;
+     - a node's link lost on the way makes that failure the reply of each command it had, since they may have run;
+       the other nodes' replies stand.
+   - **`Cluster.transact(pipeline:)`** runs at the node of its keys' slot, which they must share. A redirection while
+     queueing means nothing ran, and the whole transaction goes again: MOVED at the new owner; ASK at the importing
+     node with ASKING before MULTI, but only when every command with keys was answered ASK. Otherwise the slot is
+     waited out until it has moved (see "Decided, and why").
+   - **Found live, on valkey-9.1 alone:** in a slot being migrated, Valkey 9.1 queues a transaction's commands and
+     answers at EXEC for all of them: ASK when every key is on the importing node, TRYAGAIN when some are still on the
+     source. Every other server answers ASK as each command queues, then EXECABORT. An ASK from EXEC now counts every
+     command as asked, and TRYAGAIN was already waited out. The generator captures both answers on all eight servers
+     (`multi-ask`, `exec-after-ask`, `exec-after-mixed`), and the unit tests replay valkey-9.1's.
+   - **`Cluster.watched(watch:, body:, attempts:)`:**
+     - WATCH, the body and the transaction run on the watched keys' node, over its one connection, and the
+       transaction must stay on their slot;
+     - MOVED at WATCH is followed; ASK, and a refusal that ran nothing, are waited out;
+     - a slot that moved between WATCH and EXEC runs it all again, from fresh reads;
+     - a body that fails, or a transaction off the slot, ends it after UNWATCH.
+   - **Unit tests** over scripted nodes:
+     - pipelines: four commands over three nodes; MOVED, ASK (the map unchanged), TRYAGAIN; a node lost mid-batch; a
+       node that will not open; the budget at 0, and at 1 with two nodes that point at each other (a command's
+       redirections count across rounds); every refusal, and the empty pipeline;
+     - transactions: one slot; ASK on every key; a slot half moved under the keys, waited out; MOVED while queueing;
+       the refusals;
+     - `watched`: a conflict then a commit, MOVED at WATCH, a slot moved between WATCH and EXEC, the refusals with
+       their UNWATCH.
+   - **Live**, in the hand-made reshard, on all eight clusters:
+     - while the slot is half moved: a pipeline meets ASK for a new key, a transaction of new keys runs by ASKING at
+       the importing node, and `watched` runs at the source on a key still there;
+     - once it has moved, a pipeline, a transaction and `watched` from clusters whose maps are stale each meet MOVED;
+     - each counter ends at its count, so nothing ran twice.
+   - **22 mutations (20 unit, 2 live), all caught.**
 10. **Replica reads and the cluster's SCAN.**
 11. **`ClusterSubscriber`.** Unit tests through the in-turn path; live through the Poller, a slot moved under a shard
     subscription.
@@ -2298,6 +2344,12 @@ facts underneath.
     that answered is not asked again after a failover, and FUNCTION LOAD cannot meet its own "already exists".
   - **ASK goes as a pipeline of two** (ASKING, then the command) through the node's `Connection.run`, so nothing new
     in `Connection` was needed: the reply is the second's.
+  - **ASK while a transaction queues is followed only when every command with keys was answered ASK** (step 9). The
+    plan sent the whole transaction to the importing node with ASKING before MULTI on any ASK. But the source answers
+    ASK for a command whose key it lacks and queues one whose key it still has, and at the importing node, under
+    ASKING, a key it lacks reads as missing. So a transaction over keys half moved would run there without the source's
+    values. When some keys were queued, the slot is waited out, within `reconnect_timeout`, until it has moved and
+    MOVED says where. A pipeline follows ASK command by command, since nothing ties its commands together.
   - **`readyOnce` was not needed.** A node's `Config` sets `reconnect_timeout` to 1 ms, so its own redial makes one
     try and returns `Reconnect`, and the cluster's loop paces the next.
 - **Found on the way:** KRD-11. cstar's 0.9.684 refuses `fn int32 main()`, and every tag (v0.9.667, v0.9.675) refuses

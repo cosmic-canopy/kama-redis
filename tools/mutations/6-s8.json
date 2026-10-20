@@ -19,8 +19,8 @@
   "id": "M3",
   "suite": "unit",
   "file": "src/cluster.kama",
-  "old": "                        asking = true;",
-  "new": "                        asking = false;",
+  "old": "        asking = true;\n        return this.linkTo(host: to.host(), port: to.port());",
+  "new": "        asking = false;\n        return this.linkTo(host: to.host(), port: to.port());",
   "expect": "ask: ASKING then the command at 7001"
  },
  {
@@ -67,8 +67,8 @@
   "id": "M9",
   "suite": "unit",
   "file": "src/cluster.kama",
-  "old": "case Err(error: e): { unsent = true; return Result::Err(error: give e); }",
-  "new": "case Err(error: e): { return Result::Err(error: give e); }",
+  "old": "case Err(error: e): { unsent = true; return Result::Err(error: give e); } };\n        if (!asking) {",
+  "new": "case Err(error: e): { return Result::Err(error: give e); } };\n        if (!asking) {",
   "expect": "unreachable: the map read again"
  },
  {
@@ -283,16 +283,16 @@
   "id": "M36",
   "suite": "unit",
   "file": "src/cluster.kama",
-  "old": "        if (entry < 0) { return Result::Err(error: unknownCommand()); }",
-  "new": "        if (entry < 0) { return this.routed(slot: -1, command: command); }",
+  "old": "        isize entry = this.table.indexOf(command: command);\n        if (entry < 0) { return Result::Err(error: unknownCommand()); }",
+  "new": "        isize entry = this.table.indexOf(command: command);\n        if (entry < 0) { return this.routed(slot: -1, command: command); }",
   "expect": "refused: a command the table does not know"
  },
  {
   "id": "M37",
   "suite": "integration",
   "file": "src/cluster.kama",
-  "old": "                        asking = true;",
-  "new": "                        asking = false;",
+  "old": "        asking = true;\n        return this.linkTo(host: to.host(), port: to.port());",
+  "new": "        asking = false;\n        return this.linkTo(host: to.host(), port: to.port());",
   "expect": "reshard: a new key, by ASK, at the importing node"
  },
  {

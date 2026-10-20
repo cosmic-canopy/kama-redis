@@ -6,9 +6,10 @@
 import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::sleep,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Config, redis::Command, redis::RedisError,
          redis::Dialer, redis::Dialers, redis::Script, redis::ScriptCall, redis::libraryVersion, redis::resp::Value,
+         redis::Connection, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody,
          redis::cluster::keySlot,
          redis_unit_tests::check, redis_unit_tests::stop, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
-         commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys };
+         commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex };
 export { clusterTests };
 
 fn string server() { return "redis-8.10.2"; }
@@ -40,6 +41,19 @@ fn string keyAt(isize index) {
 }
 
 fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// What `at`'s cluster answered to `kase`, for a case where servers differ.
+fn DynamicArray<uint8> topoAt(const ref string at, const ref string kase) {
+    string name = at.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = topologyNames();
+    DynamicArray<string> hex = topologyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) { return unhex(text: hex[i]); }
+        i = i + 1;
+    }
+    panic(msg: "cluster_test: no topology vector ${name}");
+}
 
 // A node's side of the handshake under RESP3: its HELLO (in cluster mode), then the two SETINFOs.
 fn DynamicArray<Step> node() {
@@ -697,6 +711,446 @@ unsafe fn int32 connectTests() {
     return f;
 }
 
+// A pipeline of `texts`, each a command written as words.
+fn Pipeline pipelineOf(const ref DynamicArray<string> texts) {
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < texts.length()) { Command c = commandOf(text: texts[i]); p.add(command: c); i = i + 1; }
+    return give p;
+}
+
+fn DynamicArray<string> words2(const ref string a, const ref string b) {
+    DynamicArray<string> w = DynamicArray.empty();
+    w.add(item: copy a);
+    w.add(item: copy b);
+    return give w;
+}
+
+// Each reply of a pipeline as text, joined by " | ": a value as callOutcome shows it, an I/O failure as "io".
+fn string repliesOf(Result<Replies, RedisError> r) {
+    return match (give r) {
+        case Ok(value: rs): { string text = everyReply(rs: rs); := give text; }
+        case Err(error: e): "(".concat(other: e.message()).concat(other: ")");
+    };
+}
+fn string everyReply(Replies rs) {
+    Replies all = give rs;
+    string text = "";
+    isize i = 0;
+    while (i < all.length()) {
+        Result<Value, RedisError> one = all.take(index: i);
+        if (i > 0) { text = text.concat(other: " | "); }
+        string shown = valueOf(r: one);
+        if (isIo(r: one)) { shown = "io"; }
+        text = text.concat(other: shown);
+        i = i + 1;
+    }
+    return text;
+}
+
+// A reply as text: a string as it is, a null as "(nil)", an integer in decimal, an error as its message.
+fn string valueOf(const ref Result<Value, RedisError> r) {
+    return match (r) {
+        case Ok(value: v): match (v) {
+            case Bulk(bytes: b): textOf(b: b.view());
+            case Simple(bytes: b): textOf(b: b.view());
+            case Null: "(nil)";
+            case Integer(value: n): { int64 x = n; := "${x}"; }
+            case Array(items: xs): { isize n = xs.length(); := "[${n}]"; }
+            case _: "?";
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+// A transaction's outcome as text: "committed N", "conflict", or the error.
+fn string txOutcome(const ref Result<TxOutcome, RedisError> r) {
+    return match (r) {
+        case Ok(value: o): match (o) {
+            case Committed(replies: rs): { isize n = rs.length(); := "committed ${n}"; }
+            case WatchConflict: "conflict";
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+// A pipeline: each node's commands in one batch, the replies back in the pipeline's order; what ran nothing sent
+// again; what may have run kept as its reply.
+unsafe fn int32 pipelineTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string a2 = keyAt(index: 1);
+    string b = keyAt(index: 2);
+    string c3 = keyAt(index: 3);
+    string mx = keyAt(index: 4);
+    string my = keyAt(index: 5);
+
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    s0.add(item: expect(command: "GET ${a2}", answer: reply(server: server(), kase: "get-missing/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    o.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    o.serve(place: "127.0.0.1:7002", script: answering(command: "GET ${c3}", answer: reply(server: server(), kase: "get-hit/3")));
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "pipeline: connect", fails: f);
+    DynamicArray<string> texts = DynamicArray.empty();
+    texts.add(item: "GET ${a}"); texts.add(item: "GET ${b}"); texts.add(item: "GET ${c3}"); texts.add(item: "GET ${a2}");
+    Pipeline p = pipelineOf(texts: texts);
+    Result<Replies, RedisError> r1 = c.run(pipeline: p);
+    string o1 = repliesOf(r: give r1);
+    f = f + check(ok: o1 == "va | (nil) | hello | (nil)", what: "pipeline: a batch per node, the replies in the pipeline's order: ${o1}");
+
+    // MOVED: the command goes again, to 7004; the others' replies stand.
+    Opens m = Opens.make();
+    DynamicArray<Step> m0 = seed(slots: "slots/3");
+    m0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    m.serve(place: "127.0.0.1:7000", script: give m0);
+    m.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    m.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster cm = clustered(o: give m, url: oneSeed(), what: "pipeline moved: connect", fails: f);
+    Pipeline pm = pipelineOf(texts: words2(a: "GET ${b}", b: "GET ${a}"));
+    Result<Replies, RedisError> r2 = cm.run(pipeline: pm);
+    string o2 = repliesOf(r: give r2);
+    f = f + check(ok: o2 == "(nil) | va", what: "pipeline: MOVED sends that command again where it says: ${o2}");
+
+    // ASK: ASKING and the command at 7001, in the next round's batch there.
+    Opens k = Opens.make();
+    DynamicArray<Step> k0 = seed(slots: "slots/3");
+    k0.add(item: expect(command: "GET ${my}", answer: topo(kase: "ask/3")));
+    k0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    k.serve(place: "127.0.0.1:7000", script: give k0);
+    DynamicArray<Step> k1 = node();
+    k1.add(item: expect(command: "ASKING", answer: topo(kase: "asking/3")));
+    k1.add(item: expect(command: "GET ${my}", answer: topo(kase: "importing-asking/3")));
+    k.serve(place: "127.0.0.1:7001", script: give k1);
+    Cluster ck = clustered(o: give k, url: oneSeed(), what: "pipeline ask: connect", fails: f);
+    Pipeline pk = pipelineOf(texts: words2(a: "GET ${my}", b: "GET ${a}"));
+    Result<Replies, RedisError> r3 = ck.run(pipeline: pk);
+    string o3 = repliesOf(r: give r3);
+    f = f + check(ok: o3 == "(nil) | va", what: "pipeline: ASK sends ASKING and the command at the node named: ${o3}");
+    isize mslot = keySlot(key: my.bytes());
+    isize kept = ck.topology().primaryOf(slot: mslot);
+    f = f + check(ok: kept >= 0 && ck.topology().node(index: kept).port() == 7000, what: "pipeline: ASK leaves the map as it was");
+
+    // TRYAGAIN: sent again after a pause.
+    Opens t = Opens.make();
+    DynamicArray<Step> t0 = seed(slots: "slots/3");
+    t0.add(item: expect(command: "MGET ${mx} ${my}", answer: topo(kase: "migrating-tryagain/3")));
+    t0.add(item: expect(command: "MGET ${mx} ${my}", answer: topo(kase: "mget-tag/3")));
+    t.serve(place: "127.0.0.1:7000", script: give t0);
+    Cluster ct = clustered(o: give t, url: oneSeed(), what: "pipeline tryagain: connect", fails: f);
+    DynamicArray<string> one = DynamicArray.empty();
+    one.add(item: "MGET ${mx} ${my}");
+    Pipeline pt = pipelineOf(texts: one);
+    Result<Replies, RedisError> r4 = ct.run(pipeline: pt);
+    string o4 = repliesOf(r: give r4);
+    f = f + check(ok: !o4.contains(substring: "TRYAGAIN") && !o4.startsWith(prefix: "("), what: "pipeline: TRYAGAIN is waited out: ${o4}");
+
+    // A node's link lost on the way: its command's reply is the failure (it may have run); the other node's stands.
+    Opens l = Opens.make();
+    DynamicArray<Step> l0 = seed(slots: "slots/3");
+    l0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    l.serve(place: "127.0.0.1:7000", script: give l0);
+    DynamicArray<Step> l1 = node();
+    l1.add(item: Step::Close);
+    l.serve(place: "127.0.0.1:7001", script: give l1);
+    Cluster cl = clustered(o: give l, url: oneSeed(), what: "pipeline lost: connect", fails: f);
+    Pipeline pl = pipelineOf(texts: words2(a: "GET ${a}", b: "GET ${b}"));
+    Result<Replies, RedisError> r5 = cl.run(pipeline: pl);
+    string o5 = repliesOf(r: give r5);
+    f = f + check(ok: o5 == "va | io", what: "pipeline: a node lost mid-batch fails its commands, which may have run: ${o5}");
+
+    // A node that will not open: nothing was sent, so the map is read again and the command goes where it says.
+    Opens u = Opens.make();
+    DynamicArray<Step> u0 = seed(slots: "slots/3");
+    u0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    u.serve(place: "127.0.0.1:7000", script: give u0);
+    u.refuse(place: "127.0.0.1:7001");
+    u.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster cu = clustered(o: give u, url: oneSeed(), what: "pipeline unreachable: connect", fails: f);
+    DynamicArray<string> onlyB = DynamicArray.empty();
+    onlyB.add(item: "GET ${b}");
+    Pipeline pu = pipelineOf(texts: onlyB);
+    Result<Replies, RedisError> r6 = cu.run(pipeline: pu);
+    string o6 = repliesOf(r: give r6);
+    f = f + check(ok: o6 == "(nil)", what: "pipeline: a node that will not open, the map read again: ${o6}");
+
+    // max_redirects=0: the MOVED is that command's reply.
+    Opens z = Opens.make();
+    z.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    z.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    Cluster cz = clustered(o: give z, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&max_redirects=0", what: "pipeline budget: connect", fails: f);
+    Pipeline pz = pipelineOf(texts: onlyB);
+    Result<Replies, RedisError> r7 = cz.run(pipeline: pz);
+    string o7 = repliesOf(r: give r7);
+    f = f + check(ok: o7.contains(substring: "MOVED"), what: "pipeline: past max_redirects, the MOVED is the reply: ${o7}");
+
+    // max_redirects=1, and two nodes that point at each other: the second MOVED is the reply, a round later.
+    Opens pp = Opens.make();
+    pp.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    pp.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    pp.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: topo(kase: "moved/3")));
+    Cluster cpp = clustered(o: give pp, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&max_redirects=1", what: "pipeline ping-pong: connect", fails: f);
+    Pipeline ppp = pipelineOf(texts: onlyB);
+    string o8 = repliesOf(r: cpp.run(pipeline: ppp));
+    f = f + check(ok: o8.contains(substring: "MOVED 7627 127.0.0.1:7001"), what: "pipeline: a command's redirections count across rounds: ${o8}");
+
+    // Refused before anything is written, naming the command; an empty pipeline writes nothing.
+    Opens n = Opens.make();
+    n.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    Cluster cn = clustered(o: give n, url: oneSeed(), what: "pipeline refusals: connect", fails: f);
+    Pipeline every = pipelineOf(texts: words2(a: "GET ${a}", b: "DBSIZE"));
+    string e1 = repliesOf(r: cn.run(pipeline: every));
+    f = f + check(ok: e1.contains(substring: "command 2:") && e1.contains(substring: "every node"), what: "pipeline: a command for every node is refused: ${e1}");
+    DynamicArray<string> spread = DynamicArray.empty();
+    spread.add(item: "MGET ${a} ${b}");
+    Pipeline two = pipelineOf(texts: spread);
+    string e2 = repliesOf(r: cn.run(pipeline: two));
+    f = f + check(ok: e2.contains(substring: "command 1:") && e2.contains(substring: "more than one slot"), what: "pipeline: keys in two slots are refused: ${e2}");
+    Pipeline watch = pipelineOf(texts: words2(a: "WATCH ${a}", b: "GET ${a}"));
+    string e3 = repliesOf(r: cn.run(pipeline: watch));
+    f = f + check(ok: e3.contains(substring: "command 1:") && e3.contains(substring: "watched"), what: "pipeline: WATCH is refused: ${e3}");
+    Pipeline empty = Pipeline.make();
+    string e4 = repliesOf(r: cn.run(pipeline: empty));
+    f = f + check(ok: e4 == "", what: "pipeline: an empty one has no replies: ${e4}");
+    return f;
+}
+
+// A transaction at the node of its keys' slot; what ran nothing sent again whole.
+unsafe fn int32 transactionTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    string mx = keyAt(index: 4);
+    string my = keyAt(index: 5);
+
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    s0.add(item: expect(command: "SET ${a} 1", answer: reply(server: server(), kase: "queued/3")));
+    s0.add(item: expect(command: "INCR ${a}", answer: reply(server: server(), kase: "queued/3")));
+    s0.add(item: expect(command: "EXEC", answer: reply(server: server(), kase: "exec-ok/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "transact: connect", fails: f);
+    Pipeline tx = pipelineOf(texts: words2(a: "SET ${a} 1", b: "INCR ${a}"));
+    Result<TxOutcome, RedisError> r1 = c.transact(pipeline: tx);
+    string o1 = txOutcome(r: r1);
+    f = f + check(ok: o1 == "committed 2", what: "transact: at the node of its keys' slot: ${o1}");
+    Pipeline across = pipelineOf(texts: words2(a: "SET ${a} 1", b: "SET ${b} 1"));
+    string e1 = txOutcome(r: c.transact(pipeline: across));
+    f = f + check(ok: e1.contains(substring: "share one slot") && e1.contains(substring: "command 2"), what: "transact: keys in two slots are refused: ${e1}");
+    Pipeline every = pipelineOf(texts: words2(a: "SET ${a} 1", b: "FLUSHALL"));
+    string e2 = txOutcome(r: c.transact(pipeline: every));
+    f = f + check(ok: e2.contains(substring: "every node"), what: "transact: a command for every node is refused: ${e2}");
+
+    // Every keyed command answered ASK (its keys are all on the importing node): ASKING, then the transaction there.
+    Opens k = Opens.make();
+    DynamicArray<Step> k0 = seed(slots: "slots/3");
+    k0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    k0.add(item: expect(command: "SET ${my} vy", answer: topo(kase: "multi-ask/3")));
+    k0.add(item: expect(command: "EXEC", answer: topo(kase: "exec-after-ask/3")));
+    k.serve(place: "127.0.0.1:7000", script: give k0);
+    DynamicArray<Step> k1 = node();
+    k1.add(item: expect(command: "ASKING", answer: topo(kase: "asking/3")));
+    k1.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    k1.add(item: expect(command: "SET ${my} vy", answer: reply(server: server(), kase: "queued/3")));
+    k1.add(item: expect(command: "EXEC", answer: topo(kase: "importing-asking-multi/3")));
+    k.serve(place: "127.0.0.1:7001", script: give k1);
+    Cluster ck = clustered(o: give k, url: oneSeed(), what: "transact ask: connect", fails: f);
+    DynamicArray<string> setMy = DynamicArray.empty();
+    setMy.add(item: "SET ${my} vy");
+    Pipeline txk = pipelineOf(texts: setMy);
+    string o2 = txOutcome(r: ck.transact(pipeline: txk));
+    f = f + check(ok: o2 == "committed 1", what: "transact: ASK on every key, ASKING then the transaction at the importing node: ${o2}");
+
+    // Some keys still on the source (QUEUED there) and one asked for: the slot is waited out, not followed.
+    Opens h = Opens.make();
+    DynamicArray<Step> h0 = seed(slots: "slots/3");
+    h0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    h0.add(item: expect(command: "SET ${mx} vx", answer: reply(server: server(), kase: "queued/3")));
+    h0.add(item: expect(command: "SET ${my} vy", answer: topo(kase: "multi-ask/3")));
+    h0.add(item: expect(command: "EXEC", answer: topo(kase: "exec-after-mixed/3")));
+    h0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    h0.add(item: expect(command: "SET ${mx} vx", answer: reply(server: server(), kase: "queued/3")));
+    h0.add(item: expect(command: "SET ${my} vy", answer: reply(server: server(), kase: "queued/3")));
+    h0.add(item: expect(command: "EXEC", answer: reply(server: server(), kase: "exec-ok/3")));
+    h.serve(place: "127.0.0.1:7000", script: give h0);
+    Cluster ch = clustered(o: give h, url: oneSeed(), what: "transact half moved: connect", fails: f);
+    Pipeline txh = pipelineOf(texts: words2(a: "SET ${mx} vx", b: "SET ${my} vy"));
+    string o3 = txOutcome(r: ch.transact(pipeline: txh));
+    f = f + check(ok: o3 == "committed 2", what: "transact: a slot half moved under its keys is waited out at the source: ${o3}");
+
+    // Valkey 9.1 queues a transaction in a migrating slot and answers at EXEC for all of it: ASK when every key is on
+    // the importing node, which is followed; TRYAGAIN when some are still on the source, which is waited out.
+    string vk = "valkey-9.1.2";
+    Opens va = Opens.make();
+    DynamicArray<Step> va0 = seed(slots: "slots/3");
+    va0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    va0.add(item: expect(command: "SET ${my} vy", answer: topoAt(at: vk, kase: "multi-ask/3")));
+    va0.add(item: expect(command: "EXEC", answer: topoAt(at: vk, kase: "exec-after-ask/3")));
+    va.serve(place: "127.0.0.1:7000", script: give va0);
+    DynamicArray<Step> va1 = node();
+    va1.add(item: expect(command: "ASKING", answer: topoAt(at: vk, kase: "asking/3")));
+    va1.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    va1.add(item: expect(command: "SET ${my} vy", answer: reply(server: server(), kase: "queued/3")));
+    va1.add(item: expect(command: "EXEC", answer: topoAt(at: vk, kase: "importing-asking-multi/3")));
+    va.serve(place: "127.0.0.1:7001", script: give va1);
+    Cluster cva = clustered(o: give va, url: oneSeed(), what: "transact valkey ask: connect", fails: f);
+    Pipeline txva = pipelineOf(texts: setMy);
+    string o5 = txOutcome(r: cva.transact(pipeline: txva));
+    f = f + check(ok: o5 == "committed 1", what: "transact: Valkey 9.1's ASK at EXEC is followed, ASKING then the transaction: ${o5}");
+    Opens vm = Opens.make();
+    DynamicArray<Step> vm0 = seed(slots: "slots/3");
+    vm0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    vm0.add(item: expect(command: "SET ${mx} vx", answer: topoAt(at: vk, kase: "multi-ask/3")));
+    vm0.add(item: expect(command: "SET ${my} vy", answer: topoAt(at: vk, kase: "multi-ask/3")));
+    vm0.add(item: expect(command: "EXEC", answer: topoAt(at: vk, kase: "exec-after-mixed/3")));
+    vm0.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    vm0.add(item: expect(command: "SET ${mx} vx", answer: reply(server: server(), kase: "queued/3")));
+    vm0.add(item: expect(command: "SET ${my} vy", answer: reply(server: server(), kase: "queued/3")));
+    vm0.add(item: expect(command: "EXEC", answer: reply(server: server(), kase: "exec-ok/3")));
+    vm.serve(place: "127.0.0.1:7000", script: give vm0);
+    Cluster cvm = clustered(o: give vm, url: oneSeed(), what: "transact valkey mixed: connect", fails: f);
+    Pipeline txvm = pipelineOf(texts: words2(a: "SET ${mx} vx", b: "SET ${my} vy"));
+    string o6 = txOutcome(r: cvm.transact(pipeline: txvm));
+    f = f + check(ok: o6 == "committed 2", what: "transact: Valkey 9.1's TRYAGAIN at EXEC, half moved, is waited out: ${o6}");
+
+    // MOVED while queueing (the slot's primary failed over): the whole transaction again, at 7004.
+    Opens m = Opens.make();
+    m.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    DynamicArray<Step> m1 = node();
+    m1.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    m1.add(item: expect(command: "SET ${b} vb", answer: topo(kase: "moved-after-failover/3")));
+    m1.add(item: expect(command: "EXEC", answer: topo(kase: "exec-after-moved/3")));
+    m.serve(place: "127.0.0.1:7001", script: give m1);
+    DynamicArray<Step> m4 = node();
+    m4.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    m4.add(item: expect(command: "SET ${b} vb", answer: reply(server: server(), kase: "queued/3")));
+    m4.add(item: expect(command: "EXEC", answer: topo(kase: "importing-asking-multi/3")));
+    m.serve(place: "127.0.0.1:7004", script: give m4);
+    Cluster cm = clustered(o: give m, url: oneSeed(), what: "transact moved: connect", fails: f);
+    DynamicArray<string> setB = DynamicArray.empty();
+    setB.add(item: "SET ${b} vb");
+    Pipeline txm = pipelineOf(texts: setB);
+    string o4 = txOutcome(r: cm.transact(pipeline: txm));
+    f = f + check(ok: o4 == "committed 1", what: "transact: MOVED while queueing, the transaction again at the owner: ${o4}");
+    return f;
+}
+
+// A body that reads `key` over the watching node's connection, then sets `target` to x.
+type resource ReadThenSet implements TxBody {
+    string key;
+    string target;
+    int32 builds = 0;
+    public ctor of(string key, string target) { this.key = give key; this.target = give target; }
+    public unsafe fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        this.builds = this.builds + 1;
+        Command get = Command.of(name: "GET");
+        get.arg(text: this.key);
+        Result<Value, RedisError> read = conn.call(command: get);
+        Command set = Command.of(name: "SET");
+        set.arg(text: this.target);
+        set.arg(text: "x");
+        tx.add(command: set);
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn int32 count() { return this.builds; }
+}
+
+type resource Fails implements TxBody {
+    public ctor make() { }
+    public fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        return Result::Err(error: RedisError::Value(detail: "the body refused"));
+    }
+}
+
+// The steps of one watched attempt at a node: WATCH key, the body's GET, then MULTI, SET and EXEC answered `exec`.
+fn void attempt(ref DynamicArray<Step> s, const ref string key, DynamicArray<uint8> got, DynamicArray<uint8> exec) {
+    s.add(item: expect(command: "WATCH ${key}", answer: reply(server: server(), kase: "watch/3")));
+    s.add(item: expect(command: "GET ${key}", answer: give got));
+    s.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    s.add(item: expect(command: "SET ${key} x", answer: reply(server: server(), kase: "queued/3")));
+    s.add(item: expect(command: "EXEC", answer: give exec));
+}
+
+// watched: WATCH, the body and the transaction on the node of the watched keys' slot, over its one connection.
+unsafe fn int32 watchedTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+
+    // A conflict, then a commit.
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    attempt(s: s0, key: a, got: topo(kase: "replica-get-readonly/3"), exec: reply(server: server(), kase: "exec-null/3"));
+    attempt(s: s0, key: a, got: topo(kase: "replica-get-readonly/3"), exec: topo(kase: "importing-asking-multi/3"));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "watched: connect", fails: f);
+    Command watch = commandOf(text: "WATCH ${a}");
+    ReadThenSet body = ReadThenSet.of(key: copy a, target: copy a);
+    string o1 = txOutcome(r: c.watched(watch: watch, body: body, attempts: 3));
+    f = f + check(ok: o1 == "committed 1" && body.count() == 2, what: "watched: a conflict runs it again, then it commits: ${o1}");
+
+    // MOVED at WATCH: followed, and it all runs at 7004.
+    Opens m = Opens.make();
+    m.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    m.serve(place: "127.0.0.1:7001", script: answering(command: "WATCH ${b}", answer: topo(kase: "moved-after-failover/3")));
+    DynamicArray<Step> m4 = node();
+    attempt(s: m4, key: b, got: reply(server: server(), kase: "get-missing/3"), exec: topo(kase: "importing-asking-multi/3"));
+    m.serve(place: "127.0.0.1:7004", script: give m4);
+    Cluster cm = clustered(o: give m, url: oneSeed(), what: "watched moved: connect", fails: f);
+    Command watchB = commandOf(text: "WATCH ${b}");
+    ReadThenSet bodyB = ReadThenSet.of(key: copy b, target: copy b);
+    string o2 = txOutcome(r: cm.watched(watch: watchB, body: bodyB, attempts: 3));
+    f = f + check(ok: o2 == "committed 1" && bodyB.count() == 1, what: "watched: MOVED at WATCH is followed: ${o2}");
+
+    // The slot moved between WATCH and EXEC: it runs again, from fresh reads, at the new owner.
+    Opens v = Opens.make();
+    v.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    DynamicArray<Step> v1 = node();
+    v1.add(item: expect(command: "WATCH ${b}", answer: reply(server: server(), kase: "watch/3")));
+    v1.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    v1.add(item: expect(command: "MULTI", answer: reply(server: server(), kase: "multi/3")));
+    v1.add(item: expect(command: "SET ${b} x", answer: topo(kase: "moved-after-failover/3")));
+    v1.add(item: expect(command: "EXEC", answer: topo(kase: "exec-after-moved/3")));
+    v.serve(place: "127.0.0.1:7001", script: give v1);
+    DynamicArray<Step> v4 = node();
+    attempt(s: v4, key: b, got: reply(server: server(), kase: "get-missing/3"), exec: topo(kase: "importing-asking-multi/3"));
+    v.serve(place: "127.0.0.1:7004", script: give v4);
+    Cluster cv = clustered(o: give v, url: oneSeed(), what: "watched moved under: connect", fails: f);
+    ReadThenSet bodyV = ReadThenSet.of(key: copy b, target: copy b);
+    string o3 = txOutcome(r: cv.watched(watch: watchB, body: bodyV, attempts: 3));
+    f = f + check(ok: o3 == "committed 1" && bodyV.count() == 2, what: "watched: a slot moved between WATCH and EXEC runs it again at the owner: ${o3}");
+
+    // A transaction off the watched keys' slot, and a body that fails: UNWATCH, and the error.
+    Opens u = Opens.make();
+    DynamicArray<Step> u0 = seed(slots: "slots/3");
+    u0.add(item: expect(command: "WATCH ${a}", answer: reply(server: server(), kase: "watch/3")));
+    u0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    u0.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "unwatch/3")));
+    u0.add(item: expect(command: "WATCH ${a}", answer: reply(server: server(), kase: "watch/3")));
+    u0.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "unwatch/3")));
+    u0.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    u.serve(place: "127.0.0.1:7000", script: give u0);
+    Cluster cu = clustered(o: give u, url: oneSeed(), what: "watched refusals: connect", fails: f);
+    ReadThenSet elsewhere = ReadThenSet.of(key: copy a, target: copy b);
+    string e1 = txOutcome(r: cu.watched(watch: watch, body: elsewhere, attempts: 3));
+    f = f + check(ok: e1.contains(substring: "watched keys' slot"), what: "watched: a transaction off the watched slot is refused: ${e1}");
+    Fails refuses = Fails.make();
+    string e2 = txOutcome(r: cu.watched(watch: watch, body: refuses, attempts: 3));
+    f = f + check(ok: e2.contains(substring: "the body refused"), what: "watched: a body that fails ends it: ${e2}");
+    // Both sent UNWATCH: the connection answers its next command in step.
+    Command ping = commandOf(text: "PING");
+    Result<DynamicArray<NodeReply>, RedisError> each = cu.callEach(command: ping, on: ClusterTarget::Primaries);
+    DynamicArray<NodeReply> replies = match (give each) { case Ok(value: x): give x; case Err(error: e): DynamicArray.empty(); };
+    bool inStep = replies.length() > 0 && isStatus(r: replies[0].take(), text: "PONG");
+    f = f + check(ok: inStep, what: "watched: UNWATCH after each refusal");
+    Command both = commandOf(text: "WATCH ${a} ${b}");
+    string e3 = txOutcome(r: cu.watched(watch: both, body: elsewhere, attempts: 3));
+    f = f + check(ok: e3.contains(substring: "keys of one slot"), what: "watched: WATCH of keys in two slots is refused: ${e3}");
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
     f = f + routingTests();
@@ -706,5 +1160,8 @@ unsafe fn int32 clusterTests() {
     f = f + refusalTests();
     f = f + eachTests();
     f = f + connectTests();
+    f = f + pipelineTests();
+    f = f + transactionTests();
+    f = f + watchedTests();
     return f;
 }

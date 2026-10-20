@@ -28,11 +28,34 @@ type resource Command implements Sendable {
     friend redis::ScriptCall::finish[appendFrom];
     friend redis::Scan::next[appendFrom];
     friend redis::Subscriber::change[problem];
+    friend redis::Cluster::commandAt[decoded];
 
     // A command named `name` ("GET", "CLIENT"), with no arguments yet.
     public ctor of(const ref string name) {
         this.parts = DynamicArray.empty();
         this.arg(text: name);
+    }
+
+    // The command `bytes` hold, as `encode` wrote it: `*<n>`, then n bulk strings. A cluster reads a pipeline's
+    // commands back so to send each where its keys are. Bytes that are not that give the parts read before them.
+    ctor decoded(ConstView<uint8> bytes) {
+        this.parts = DynamicArray.empty();
+        if (bytes.length() < 4 || bytes[0] != 42ui8) { return give this; }
+        isize at = 1;
+        isize count = 0;
+        while (at < bytes.length() && bytes[at] >= 48ui8 && bytes[at] <= 57ui8) { count = count * 10 + cast<isize>(bytes[at] - 48ui8); at = at + 1; }
+        at = at + 2;
+        isize k = 0;
+        while (k < count && at < bytes.length() && bytes[at] == 36ui8) {
+            at = at + 1;
+            isize size = 0;
+            while (at < bytes.length() && bytes[at] >= 48ui8 && bytes[at] <= 57ui8) { size = size * 10 + cast<isize>(bytes[at] - 48ui8); at = at + 1; }
+            at = at + 2;
+            if (at + size > bytes.length()) { return give this; }
+            this.argBytes(bytes: bytes.slice(from: at, count: size));
+            at = at + size + 2;
+            k = k + 1;
+        }
     }
 
     // An argument: the text's bytes.

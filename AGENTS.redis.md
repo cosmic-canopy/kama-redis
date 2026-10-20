@@ -232,6 +232,10 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
     node's own redial is one try. The cluster paces the next and reads the map between them.
   - What ran nothing (MOVED, ASK, TRYAGAIN, CLUSTERDOWN, LOADING, MASTERDOWN, a node that would not open, a failed
     redial) is sent again (`recourseFor`); anything else is the call's.
+  - A transaction follows ASK only when every command with keys was answered ASK. A source queues a command whose key it
+    still has, and the importing node would run the transaction without that key's value; a mixed answer waits.
+  - A pipeline writes every node's batch before it reads any (`Connection.begin`, `finish`), and a node lost mid-batch
+    fails only its own commands.
   - Its unit tests give each connection the cluster opens the next scripted dialer (`ScriptDialers`), keyed by its
     place, so a test lists its connections in the order the cluster opens them.
 

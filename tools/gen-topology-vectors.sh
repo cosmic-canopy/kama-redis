@@ -9,8 +9,8 @@
 #     with the slots in thirds, each with one replica (7003 of 7000, 7004 of 7001, 7005 of 7002). What it answers:
 #     CLUSTER SLOTS, before the slots are assigned and after; a node's HELLO; the pieces of a command split by slot or sent to every primary (MGET, EXISTS,
 #     MSET, DBSIZE, KEYS, PING, SCRIPT EXISTS, each at its own node); MOVED from a primary and from a replica; CROSSSLOT; a redirection while queueing in MULTI, then
-#     EXEC's EXECABORT, and EXEC's own CROSSSLOT; a slot being migrated (ASK, TRYAGAIN, MOVED back without ASKING,
-#     ASKING for one command, ASKING then a transaction); READONLY and READWRITE on a replica; a slot not served and
+#     EXEC's EXECABORT, and EXEC's own CROSSSLOT; a slot being migrated (ASK, TRYAGAIN, a transaction at its source,
+#     MOVED back without ASKING, ASKING for one command, ASKING then a transaction); READONLY and READWRITE on a replica; a slot not served and
 #     the map with its gap; the map and MOVED after a CLUSTER FAILOVER; the map and MOVED with hostnames and with an
 #     unknown endpoint (7.0 and later); MASTERDOWN; and the cluster down, in both words.
 #   - A sentinel group: a master (7200), two replicas (7201, 7202) and four sentinels (7300-7303) monitoring "kr",
@@ -278,6 +278,11 @@ one(7000, 'CLUSTER', 'SETSLOT', $mslot, 'MIGRATING', $id{7001});
 pair('ask', 7000, [], ['GET', $my]);
 pair('migrating-served', 7000, [], ['GET', $mx]);
 pair('migrating-tryagain', 7000, [], ['MGET', $mx, $my]);
+# A transaction in the migrating slot, at its source: each command redirected as it queues (QUEUED on Valkey 9.1, which
+# answers at EXEC for the whole transaction), then EXEC, for a key the source lacks and for one it has beside it.
+pair('multi-ask', 7000, [['MULTI']], ['GET', $my]);
+pair('exec-after-ask', 7000, [['MULTI'], ['GET', $my]], ['EXEC']);
+pair('exec-after-mixed', 7000, [['MULTI'], ['GET', $mx], ['GET', $my]], ['EXEC']);
 pair('importing-moved', 7001, [], ['GET', $my]);
 pair('asking', 7001, [], ['ASKING']);
 pair('importing-asking', 7001, [['ASKING']], ['GET', $my]);
@@ -539,7 +544,7 @@ my %count; $count{(split / /, $_->[0])[1]}++ for @replies;
 my @every = qw(slots slots-empty slots-standalone slots-at-replica mget-a mget-b mget-c mget-tag exists-a exists-b exists-c mset-a dbsize-a
     dbsize-b dbsize-c keys-a keys-b ping-node script-exists-a script-exists-b moved crossslot crossslot-one-node multi-moved exec-after-moved exec-crossslot
     replica-get replica-readonly replica-get-readonly replica-set-readonly replica-readwrite replica-get-readwrite
-    replica-keyless-write ask migrating-served migrating-tryagain importing-moved asking importing-asking
+    replica-keyless-write ask migrating-served migrating-tryagain multi-ask exec-after-ask exec-after-mixed importing-moved asking importing-asking
     importing-asking-tryagain importing-asking-once importing-asking-multi not-served slots-gap slots-after-failover
     moved-after-failover moved-from-demoted masterdown clusterdown clusterdown-read clusterdown-write get-master-addr
     get-master-addr-unknown sentinels replicas role-master role-replica role-sentinel sentinel-select sentinel-setinfo

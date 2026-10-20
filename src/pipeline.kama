@@ -28,13 +28,20 @@ type resource Pipeline implements Sendable {
     bool watching = false;   // it has a WATCH or UNWATCH, which a transaction cannot
     isize lastWatch = -1;    // the index of its last WATCH or UNWATCH, whose reply settles what is watched after it
     int32 lastEffect = 0;    // and what that command does (watchEffect)
+    DynamicArray<isize> starts;   // where each command's bytes begin, so a cluster can send each where it goes
 
-    friend redis::Connection::run[bytes, problem, waiting, watchIndex, watchResult];
-    friend redis::Connection::transact[bytes, problem, watches];
+    friend redis::Connection::run[problem];
+    friend redis::Connection::begin[bytes, waiting];
+    friend redis::Connection::finish[watchIndex, watchResult];
+    friend redis::Connection::transactAt[bytes, problem, watches];
+    friend redis::Cluster::run[problem];
+    friend redis::Cluster::transact[problem, watches];
+    friend redis::Cluster::commandAt[commandBytes];
 
     public ctor make() {
         this.encoded = Writer.make();
         this.waits = Wait::Span(span: Duration.zero());
+        this.starts = DynamicArray.empty();
     }
 
     // Add `command`. The pipeline keeps its own copy, as the bytes it will send.
@@ -59,6 +66,7 @@ type resource Pipeline implements Sendable {
                 this.lastWatch = this.count - 1;
                 this.lastEffect = watchEffect(command: command);
             }
+            this.starts.add(item: this.encoded.length());
             command.encode(into: this.encoded);
             this.waits = later(a: this.waits, b: blockingWait(command: command));
         }
@@ -75,6 +83,12 @@ type resource Pipeline implements Sendable {
     public const fn isize length() { return this.count; }
 
     const fn ConstView<uint8> bytes() { return this.encoded.view(); }
+    // Command `index`'s bytes, as `encode` wrote them.
+    const fn ConstView<uint8> commandBytes(isize index) {
+        isize end = this.encoded.length();
+        if (index + 1 < this.starts.length()) { end = this.starts[index + 1]; }
+        return this.encoded.view().slice(from: this.starts[index], count: end - this.starts[index]);
+    }
     const fn Wait waiting() { return this.waits; }
     const fn bool watches() { return this.watching; }
     // The index of the last WATCH or UNWATCH, -1 for none, and what it does once answered OK.
@@ -89,41 +103,56 @@ type resource Pipeline implements Sendable {
     }
 }
 
-// A pipeline's replies, in the order of its commands. Each is taken once.
+// A pipeline's replies, in the order of its commands, each its command's own: a value, or an error. Each is taken once.
+// On a connection the error is the server's (an error reply); on a cluster it can also be the failure of a node's
+// link, for the commands that node had, which may have run.
 type resource Replies implements Sendable {
-    DynamicArray<Value> values;
+    DynamicArray<Result<Value, RedisError>> results;
     DynamicArray<bool> taken;
 
-    friend redis::Connection::run[of];
-    friend redis::Connection::transact[of];
+    friend redis::Connection::finish[of];
+    friend redis::Connection::transactAt[of];
+    friend redis::Cluster::run[ofResults];
 
     ctor of(DynamicArray<Value> values) {
         this.taken = DynamicArray.empty();
+        this.results = DynamicArray.withCapacity(capacity: values.length());
         isize i = 0;
-        while (i < values.length()) { this.taken.add(item: false); i = i + 1; }
-        this.values = give values;
+        while (i < values.length()) {
+            Value v = replace::<Value>(place: values[i], with: Value::Null);
+            i = i + 1;
+            this.taken.add(item: false);
+            if (v.isError()) {
+                RedisError e = RedisError::Server(error: serverError(v: v));
+                Value dropped = give v;
+                this.results.add(item: Result::Err(error: give e));
+            } else {
+                this.results.add(item: Result::Ok(value: give v));
+            }
+        }
     }
 
-    public const fn isize length() { return this.values.length(); }
+    ctor ofResults(DynamicArray<Result<Value, RedisError>> results) {
+        this.taken = DynamicArray.empty();
+        isize i = 0;
+        while (i < results.length()) { this.taken.add(item: false); i = i + 1; }
+        this.results = give results;
+    }
+
+    public const fn isize length() { return this.results.length(); }
 
     // The reply to command `index` (0 for the first), taken out: an error reply is `Server`, as `call` gives one, and
     // the other replies are still there. A reply taken already is `Usage`; an index past the end panics, as a
     // collection's does.
     public fn Result<Value, RedisError> take(isize index) {
-        if (index < 0 || index >= this.values.length()) {
-            isize n = this.values.length();
+        if (index < 0 || index >= this.results.length()) {
+            isize n = this.results.length();
             panic(msg: "Replies.take: index ${index} of ${n} replies");
         }
         if (this.taken[index]) {
             return Result::Err(error: RedisError::Usage(detail: "reply ${index} was taken already: each reply is taken once"));
         }
         this.taken[index] = true;
-        Value v = replace::<Value>(place: this.values[index], with: Value::Null);
-        if (v.isError()) {
-            RedisError e = RedisError::Server(error: serverError(v: v));
-            Value dropped = give v;
-            return Result::Err(error: give e);
-        }
-        return Result::Ok(value: give v);
+        return replace::<Result<Value, RedisError>>(place: this.results[index], with: Result::Err(error: RedisError::Closed));
     }
 }

@@ -1,0 +1,178 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                if (state.asking(index: i)) { Command asks = Command.of(name: \"ASKING\"); batches[b].add(command: asks); }",
+  "new": "                if (false) { Command asks = Command.of(name: \"ASKING\"); batches[b].add(command: asks); }",
+  "expect": "pipeline: ASK sends ASKING and the command at the node named"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                replyAt[b].add(item: batches[b].length());",
+  "new": "                replyAt[b].add(item: 0);",
+  "expect": "pipeline: a batch per node, the replies in the pipeline's order"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (way == Recourse::Wait || way == Recourse::Reread) { state.again(index: index, failure: give reply); return way; }",
+  "new": "        if (way == Recourse::Wait || way == Recourse::Reread) { state.settle(index: index, reply: give reply); return way; }",
+  "expect": "pipeline: TRYAGAIN is waited out"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        int32 redirects = state.redirects(index: index);",
+  "new": "        int32 redirects = 0;",
+  "expect": "pipeline: a command's redirections count across rounds"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (to.kind() == RedirectKind::Moved) { return this.follow(redirect: to); }",
+  "new": "        if (true) { return this.follow(redirect: to); }",
+  "expect": "pipeline: ASK leaves the map as it was"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                unsent.add(item: none);",
+  "new": "                unsent.add(item: true);",
+  "expect": "pipeline: a node lost mid-batch fails its commands"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    unsafe fn Result<Deadline, RedisError> beginOn(isize at, const ref Pipeline pipeline, ref bool unsent) {\n        Result<Unit, RedisError> open = this.opened(at: at);\n        match (give open) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };",
+  "new": "    unsafe fn Result<Deadline, RedisError> beginOn(isize at, const ref Pipeline pipeline, ref bool unsent) {\n        Result<Unit, RedisError> open = this.opened(at: at);\n        match (give open) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };",
+  "expect": "pipeline: a node that will not open, the map read again"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (rereading) { Result<Unit, RedisError> fetched = this.readMap(window: window); }",
+  "new": "            if (false) { Result<Unit, RedisError> fetched = this.readMap(window: window); }",
+  "expect": "pipeline: a node that will not open, the map read again"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (way == Recourse::Follow && isAsk(e: e) && !everyAsked(asked: asked, keyed: keyed)) { way = Recourse::Wait; }",
+  "new": "",
+  "expect": "transact: a slot half moved under its keys is waited out at the source"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    while (i < keyed.length()) { if (keyed[i] && !asked[i]) { return false; } i = i + 1; }",
+  "new": "    while (i < keyed.length()) { if (keyed[i]) { return false; } i = i + 1; }",
+  "expect": "transact: ASK on every key, ASKING then the transaction at the importing node"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            Command asks = Command.of(name: \"ASKING\");\n            asks.encode(into: this.outbox);",
+  "new": "            Command asks = Command.of(name: \"ASKING\");",
+  "expect": "transact: ASK on every key, ASKING then the transaction at the importing node"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                ask = redirected;",
+  "new": "                ask = false;",
+  "expect": "transact: ASK on every key, ASKING then the transaction at the importing node"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (s >= 0 && s != slot) {",
+  "new": "            if (false) {",
+  "expect": "transact: keys in two slots are refused"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (request == Request::AllShards || request == Request::AllNodes || request == Request::Special || response == Response::Special) {\n            return Result::Err(error: RedisError::Usage(detail: which",
+  "new": "        if (false) {\n            return Result::Err(error: RedisError::Usage(detail: which",
+  "expect": "pipeline: a command for every node is refused"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "case Ok(value: x): x < 0 || x == slot;",
+  "new": "case Ok(value: x): true;",
+  "expect": "watched: a transaction off the watched slot is refused"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (conflict) { continue; }",
+  "new": "            if (conflict) { return give outcome; }",
+  "expect": "watched: a conflict runs it again, then it commits"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                if (way == Recourse::Follow && moved) {",
+  "new": "                if (false) {",
+  "expect": "watched: MOVED at WATCH is followed"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                isize next = this.redirected(e: e, from: at, redirects: once, asking: asks);\n            } else {",
+  "new": "                isize next = -1;\n            } else {",
+  "expect": "watched: a slot moved between WATCH and EXEC runs it again at the owner"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (!buildOk) {\n                this.unwatch(at: at);",
+  "new": "            if (!buildOk) {",
+  "expect": "watched: UNWATCH after each refusal"
+ },
+ {
+  "id": "M20",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "            Command asks = Command.of(name: \"ASKING\");\n            asks.encode(into: this.outbox);",
+  "new": "            Command asks = Command.of(name: \"ASKING\");",
+  "expect": "reshard: a transaction on new keys, half moved"
+ },
+ {
+  "id": "M21",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "                if (state.asking(index: i)) { Command asks = Command.of(name: \"ASKING\"); batches[b].add(command: asks); }",
+  "new": "                if (false) { Command asks = Command.of(name: \"ASKING\"); batches[b].add(command: asks); }",
+  "expect": "reshard: a pipeline, half moved"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (asksAll) {\n                isize k = 0;",
+  "new": "            if (false) {\n                isize k = 0;",
+  "expect": "transact: Valkey 9.1's ASK at EXEC is followed"
+ }
+]

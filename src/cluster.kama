@@ -1,8 +1,9 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error, std::memory::Owned, std::random::Rng, std::time::Duration, std::time::Instant,
-         std::time::monotonicNow, std::time::sleep,
+         std::time::monotonicNow, std::time::sleep, std::memory::replace,
          redis::Config, redis::UrlTransport, redis::Connection, redis::Dialers, redis::Dialer, redis::Command,
-         redis::Pipeline, redis::Replies, redis::ScriptCall, redis::RedisError, redis::ServerError, redis::ConnectError,
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::RedisError,
+         redis::ServerError, redis::ConnectError,
          redis::cluster::SlotMap, redis::cluster::ClusterNode, redis::cluster::Redirect, redis::cluster::RedirectKind,
          redis::cluster::keySlot,
          redis::wire::Commands, redis::wire::Keys, redis::wire::keysOf, redis::wire::slotIn, redis::wire::Request,
@@ -38,6 +39,11 @@ export { Cluster, ClusterTarget, NodeReply };
 //   - TRYAGAIN, CLUSTERDOWN, LOADING, MASTERDOWN: nothing ran. The call waits (a redial's backoff) and sends again,
 //     within `reconnect_timeout`; for all but TRYAGAIN it reads the map first, since a failover may be under way.
 //   At most `max_redirects` (default 5) redirections a call; past them the last is the call's error.
+//
+// Pipelines and transactions keep each command on one slot. `run` sends each node its commands in one batch, writes
+// every batch before it reads any, and follows MOVED and ASK command by command. `transact` and `watched` run at the
+// node of the keys' slot, which they must share; a redirection while a transaction queues sends it all again, and a
+// slot half moved under its keys is waited out until it has moved.
 //
 // A node's connection is a `Connection` of its own, with what 7a gives one: what is lost is made again by its next
 // call, and nothing is ever sent twice. The cluster drives each node's redial: a node's connection gets one try a call,
@@ -98,7 +104,90 @@ type resource NodeLink implements Sendable {
     public fn void attach(Connection connection) { this.held.add(item: give connection); }
     public unsafe fn Result<Value, RedisError> call(const ref Command command) { return this.held[0].call(command: command); }
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) { return this.held[0].run(pipeline: pipeline); }
+    public unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {
+        return this.held[0].begin(pipeline: pipeline, unsent: unsent);
+    }
+    public unsafe fn Result<Replies, RedisError> finish(const ref Pipeline pipeline, Deadline deadline) {
+        return this.held[0].finish(pipeline: pipeline, deadline: deadline);
+    }
+    public unsafe fn Result<TxOutcome, RedisError> transact(const ref Pipeline pipeline, bool asking, ref DynamicArray<bool> asked) {
+        return this.held[0].transactAt(pipeline: pipeline, asking: asking, asked: asked);
+    }
+    // `body` run over this node's connection, whose WATCH is in force.
+    public unsafe fn Result<Unit, RedisError> build(TxBody body, ref Pipeline tx) { return body.build(conn: ref this.held[0], tx: ref tx); }
     public unsafe fn void close() { if (this.held.length() > 0) { this.held[0].close(); } }
+}
+
+// Where each command of a pipeline stands as a cluster sends it: its reply once it has one (until then, the last
+// failure that sends it again), how many redirections it has followed, and the node a redirection named for its next
+// send, with ASKING first for an ASK.
+type resource Pending implements Sendable {
+    DynamicArray<Result<Value, RedisError>> results;
+    DynamicArray<bool> settled;
+    DynamicArray<int32> followed;
+    DynamicArray<isize> targets;
+    DynamicArray<bool> asks;
+
+    public ctor make(isize count) {
+        this.results = DynamicArray.withCapacity(capacity: count);
+        this.settled = DynamicArray.empty();
+        this.followed = DynamicArray.empty();
+        this.targets = DynamicArray.empty();
+        this.asks = DynamicArray.empty();
+        isize i = 0;
+        while (i < count) {
+            this.results.add(item: Result::Err(error: RedisError::Closed));
+            this.settled.add(item: false);
+            this.followed.add(item: 0);
+            this.targets.add(item: -1);
+            this.asks.add(item: false);
+            i = i + 1;
+        }
+    }
+
+    public const fn isize count() { return this.results.length(); }
+    public const fn bool isSettled(isize index) { return this.settled[index]; }
+    public const fn isize link(isize index) { return this.targets[index]; }
+    public const fn bool asking(isize index) { return this.asks[index]; }
+    public const fn int32 redirects(isize index) { return this.followed[index]; }
+
+    // Command `index`'s reply, for good.
+    public fn void settle(isize index, Result<Value, RedisError> reply) {
+        this.results[index] = give reply;
+        this.settled[index] = true;
+    }
+    // Command `index` goes again, to the cluster's choice of node: `failure` is its reply if it never gets another.
+    public fn void again(isize index, Result<Value, RedisError> failure) {
+        this.results[index] = give failure;
+        this.targets[index] = -1;
+        this.asks[index] = false;
+    }
+    // Command `index` goes again, to link `at`, a redirection's, with ASKING first for an ASK.
+    public fn void redirect(isize index, Result<Value, RedisError> failure, isize at, bool ask) {
+        this.results[index] = give failure;
+        this.followed[index] = this.followed[index] + 1;
+        this.targets[index] = at;
+        this.asks[index] = ask;
+    }
+    public const fn bool anyLeft() {
+        isize i = 0;
+        while (i < this.settled.length()) { if (!this.settled[i]) { return true; } i = i + 1; }
+        return false;
+    }
+    // Every command still to go keeps its last failure as its reply.
+    public fn void settleLeft() {
+        isize i = 0;
+        while (i < this.settled.length()) { this.settled[i] = true; i = i + 1; }
+    }
+    public fn DynamicArray<Result<Value, RedisError>> replies() {
+        DynamicArray<Result<Value, RedisError>> all = DynamicArray.withCapacity(capacity: this.results.length());
+        isize i = 0;
+        while (i < this.results.length()) {
+            all.add(item: replace::<Result<Value, RedisError>>(place: this.results[i], with: Result::Err(error: RedisError::Closed)));
+            i = i + 1;
+        }
+        return give all;
+    }
 }
 
 // What a cluster does about a call's failure: nothing (it is the call's, since its command may have run, or it is
@@ -230,6 +319,366 @@ type resource Cluster implements Sendable {
         return this.call(command: bySource);
     }
 
+    // Send every command of `pipeline` where its keys are, and return their replies in its order: each node's commands
+    // in one write, every node's written before any is read. A command must stay on one slot: one that goes to every
+    // node, one the table does not know, and keys in two slots are refused (`Usage`, naming the command), before
+    // anything is written. A command answered MOVED, ASK, TRYAGAIN, CLUSTERDOWN or LOADING never ran, and is sent again
+    // where the cluster now says, as `call` sends one, after the others; a node that could not be reached is waited out
+    // as `call` waits. A node's link lost on the way makes that failure the reply of each command the node had, since
+    // they may have run; the other nodes' replies stand.
+    public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        Optional<RedisError> problem = pipeline.problem();
+        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        isize n = pipeline.length();
+        DynamicArray<Command> commands = DynamicArray.empty();
+        DynamicArray<isize> slots = DynamicArray.empty();
+        isize i = 0;
+        while (i < n) {
+            Command c = Cluster::commandAt(pipeline: pipeline, index: i);
+            Result<isize, RedisError> found = this.oneSlot(command: c, index: i, within: "a pipeline");
+            isize slot = match (give found) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+            slots.add(item: slot);
+            commands.add(item: give c);
+            i = i + 1;
+        }
+        this.freshen();
+        Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
+        Pending state = Pending.make(count: n);
+        while (state.anyLeft()) {
+            // This round's batches, a node's at a time, each command in its order.
+            DynamicArray<isize> nodes = DynamicArray.empty();
+            DynamicArray<Pipeline> batches = DynamicArray.empty();
+            DynamicArray<DynamicArray<isize>> members = DynamicArray.empty();
+            DynamicArray<DynamicArray<isize>> replyAt = DynamicArray.empty();
+            i = 0;
+            while (i < n) {
+                if (state.isSettled(index: i)) { i = i + 1; continue; }
+                isize at = state.link(index: i);
+                if (at < 0) { at = this.linkFor(slot: slots[i]); }
+                if (at < 0) { state.settle(index: i, reply: Result::Err(error: noPrimary())); i = i + 1; continue; }
+                isize b = 0;
+                while (b < nodes.length() && nodes[b] != at) { b = b + 1; }
+                if (b == nodes.length()) {
+                    nodes.add(item: at);
+                    batches.add(item: Pipeline.make());
+                    members.add(item: DynamicArray.empty());
+                    replyAt.add(item: DynamicArray.empty());
+                }
+                if (state.asking(index: i)) { Command asks = Command.of(name: "ASKING"); batches[b].add(command: asks); }
+                replyAt[b].add(item: batches[b].length());
+                batches[b].add(command: commands[i]);
+                members[b].add(item: i);
+                i = i + 1;
+            }
+            // Every batch written, then every batch read.
+            DynamicArray<Result<Deadline, RedisError>> begun = DynamicArray.empty();
+            DynamicArray<bool> unsent = DynamicArray.empty();
+            isize b = 0;
+            while (b < nodes.length()) {
+                bool none = false;
+                begun.add(item: this.beginOn(at: nodes[b], pipeline: batches[b], unsent: none));
+                unsent.add(item: none);
+                b = b + 1;
+            }
+            bool wait = false;
+            bool rereading = false;
+            b = 0;
+            while (b < nodes.length()) {
+                Result<Deadline, RedisError> started = replace::<Result<Deadline, RedisError>>(place: begun[b], with: Result::Err(error: RedisError::Closed));
+                Result<Replies, RedisError> read = match (give started) {
+                    case Ok(value: d): this.links[nodes[b]].finish(pipeline: batches[b], deadline: d);
+                    case Err(error: e): Result::Err(error: give e);
+                };
+                match (give read) {
+                    case Ok(value: replies): {
+                        Replies got = give replies;
+                        isize k = 0;
+                        while (k < members[b].length()) {
+                            Result<Value, RedisError> one = got.take(index: replyAt[b][k]);
+                            Recourse way = this.answer(state: state, index: members[b][k], reply: give one, unsent: false, from: nodes[b]);
+                            if (way == Recourse::Wait) { wait = true; }
+                            if (way == Recourse::Reread) { rereading = true; }
+                            k = k + 1;
+                        }
+                    }
+                    case Err(error: e): {
+                        // The batch never went (nothing was sent), or its link was lost on the way: each of its
+                        // commands has that failure, and goes again only if nothing was sent.
+                        isize k = 0;
+                        while (k < members[b].length()) {
+                            RedisError each = copy e;
+                            Recourse way = this.answer(state: state, index: members[b][k], reply: Result::Err(error: give each), unsent: unsent[b], from: nodes[b]);
+                            if (way == Recourse::Wait) { wait = true; }
+                            if (way == Recourse::Reread) { rereading = true; }
+                            k = k + 1;
+                        }
+                    }
+                };
+                b = b + 1;
+            }
+            if (!state.anyLeft()) { break; }
+            if (rereading) { Result<Unit, RedisError> fetched = this.readMap(window: window); }
+            if ((wait || rereading) && !this.pause(window: window)) { state.settleLeft(); }
+        }
+        return Result::Ok(value: Replies.ofResults(results: state.replies()));
+    }
+
+    // A pipeline command's reply, `reply`, from the node at host `asked`: settled, or sent again (a redirection, or a
+    // refusal that ran nothing), as `routed` would. What the round must do before the next: `Wait` or `Reread` when
+    // this command waits, `Follow` or `Fail` otherwise.
+    unsafe fn Recourse answer(ref Pending state, isize index, Result<Value, RedisError> reply, bool unsent, isize from) {
+        bool failed = match (reply) { case Ok(value: v): false; case Err(error: e): true; };
+        if (!failed) { this.failures = 0; state.settle(index: index, reply: give reply); return Recourse::Fail; }
+        Recourse way = match (reply) { case Err(error: e): recourseFor(e: e, unsent: unsent); case Ok(value: v): Recourse::Fail; };
+        if (way == Recourse::Fail) { state.settle(index: index, reply: give reply); return Recourse::Fail; }
+        if (way == Recourse::Wait || way == Recourse::Reread) { state.again(index: index, failure: give reply); return way; }
+        int32 redirects = state.redirects(index: index);
+        bool ask = false;
+        isize at = match (reply) {
+            case Err(error: e): this.redirected(e: e, from: from, redirects: redirects, asking: ask);
+            case Ok(value: v): -1;
+        };
+        if (at < 0) { state.settle(index: index, reply: give reply); return Recourse::Fail; }
+        state.redirect(index: index, failure: give reply, at: at, ask: ask);
+        return Recourse::Follow;
+    }
+
+    // The redirection `e` from link `from` (MOVED or ASK), followed, one more of `redirects`: the link it names, with
+    // `asking` set for an ASK; a MOVED goes into the map. -1 when it cannot be: past max_redirects, a redirection that
+    // does not read, or a map that holds as many nodes as a cluster can.
+    unsafe fn isize redirected(const ref RedisError e, isize from, ref int32 redirects, ref bool asking) {
+        if (redirects >= this.settings.maxRedirects()) { return -1; }
+        redirects = redirects + 1;
+        string host = copy this.links[from].host();
+        Result<Redirect, RedisError> parsed = match (e) {
+            case Server(error: s): Redirect.of(error: s, asked: host);
+            case _: Result::Err(error: RedisError::Closed);
+        };
+        Redirect to = match (give parsed) { case Ok(value: x): give x; case Err(error: bad): { return -1; } };
+        if (to.kind() == RedirectKind::Moved) { return this.follow(redirect: to); }
+        asking = true;
+        return this.linkTo(host: to.host(), port: to.port());
+    }
+
+    unsafe fn Result<Deadline, RedisError> beginOn(isize at, const ref Pipeline pipeline, ref bool unsent) {
+        Result<Unit, RedisError> open = this.opened(at: at);
+        match (give open) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
+        return this.links[at].begin(pipeline: pipeline, unsent: unsent);
+    }
+
+    // Send `pipeline` as one transaction, as `Connection.transact` does, at the primary of its keys' slot: they must
+    // share one, since a transaction runs on one node (`Usage` naming the command, before anything is written; a
+    // transaction of commands without keys goes to a primary). Answered MOVED, ASK, TRYAGAIN, CLUSTERDOWN or LOADING
+    // while it queued, it never ran, and is sent again where the cluster now says. An ASK is followed (ASKING before
+    // MULTI) only when every command with keys was answered ASK, so all its keys are on the importing node already; a
+    // slot half moved, with some of them still on its source, is waited out until it has moved.
+    public unsafe fn Result<TxOutcome, RedisError> transact(const ref Pipeline pipeline) {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        Optional<RedisError> problem = pipeline.problem();
+        match (give problem) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+        if (pipeline.watches()) {
+            return Result::Err(error: RedisError::Usage(detail: "WATCH and UNWATCH cannot be inside a transaction, where the server refuses them: use watched"));
+        }
+        DynamicArray<bool> keyed = DynamicArray.empty();
+        Result<isize, RedisError> found = this.txSlot(pipeline: pipeline, keyed: keyed);
+        isize slot = match (give found) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+        this.freshen();
+        Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
+        int32 redirects = 0;
+        isize next = -1;
+        bool asking = false;
+        while (true) {
+            isize at = next;
+            if (at < 0) { at = this.linkFor(slot: slot); }
+            if (at < 0) { return Result::Err(error: noPrimary()); }
+            bool unsent = false;
+            DynamicArray<bool> asked = DynamicArray.empty();
+            Result<TxOutcome, RedisError> r = this.txOn(at: at, pipeline: pipeline, asking: asking, unsent: unsent, asked: asked);
+            next = -1;
+            asking = false;
+            bool failed = match (r) { case Ok(value: o): false; case Err(error: e): true; };
+            if (!failed) { this.failures = 0; return give r; }
+            RedisError e = match (give r) { case Err(error: x): give x; case Ok(value: o): RedisError::Closed; };
+            Recourse way = recourseFor(e: e, unsent: unsent);
+            if (way == Recourse::Follow && isAsk(e: e) && !everyAsked(asked: asked, keyed: keyed)) { way = Recourse::Wait; }
+            match (way) {
+                case Follow: {
+                    next = this.redirected(e: e, from: at, redirects: redirects, asking: asking);
+                    if (next < 0) { return Result::Err(error: give e); }
+                    RedisError followed = give e;
+                }
+                case Wait: {
+                    if (!this.pause(window: window)) { return Result::Err(error: give e); }
+                    RedisError waited = give e;
+                }
+                case Reread: {
+                    Result<Unit, RedisError> fetched = this.readMap(window: window);
+                    if (!this.pause(window: window)) { return Result::Err(error: give e); }
+                    RedisError waited = give e;
+                }
+                case Fail: { return Result::Err(error: give e); }
+            };
+        }
+    }
+
+    // Run a transaction under WATCH, as `Connection.watched` does, on the node of the watched keys' slot: `watch` (a
+    // WATCH naming keys of one slot) there, then `body` over that node's own connection (its reads are the node's),
+    // then the transaction it built, which must stay on the same slot, over the same connection. A WATCH answered MOVED
+    // goes where it says; an ASK, or a refusal that ran nothing, is waited out. A slot that moved between WATCH and EXEC
+    // (the transaction answered MOVED or ASK) is a watched key that changed: it all runs again, from fresh reads, up to
+    // `attempts` times in all, then `WatchConflict`. A body that fails ends it with that error, after UNWATCH.
+    public unsafe fn Result<TxOutcome, RedisError> watched(const ref Command watch, TxBody body, int32 attempts) {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        if (attempts < 1) { return Result::Err(error: RedisError::Usage(detail: "watched needs at least 1 attempt")); }
+        if (!named(command: watch, word: "WATCH") || watch.length() < 2) {
+            return Result::Err(error: RedisError::Usage(detail: "watched takes a WATCH command that names the keys it watches"));
+        }
+        Result<Unit, RedisError> plain = admit(command: watch);
+        match (give plain) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        isize entry = this.table.indexOf(command: watch);
+        if (entry < 0) { return Result::Err(error: unknownCommand()); }
+        Keys keys = keysOf(info: this.table.at(index: entry), command: watch, notKeys: true);
+        Result<Optional<isize>, RedisError> found = slotIn(command: watch, keys: keys);
+        isize slot = match (give found) {
+            case Ok(value: o): match (o) { case Some(value: x): x; case None: -1; };
+            case Err(error: e): { return Result::Err(error: watchSlots(e: give e)); }
+        };
+        this.freshen();
+        Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
+        int32 tries = 0;
+        int32 redirects = 0;
+        while (tries < attempts) {
+            isize at = this.linkFor(slot: slot);
+            if (at < 0) { return Result::Err(error: noPrimary()); }
+            bool unsent = false;
+            Result<Value, RedisError> w = this.sendTo(at: at, command: watch, asking: false, unsent: unsent);
+            bool watchSet = match (w) { case Ok(value: v): true; case Err(error: e): false; };
+            if (!watchSet) {
+                RedisError e = match (give w) { case Err(error: x): give x; case Ok(value: v): RedisError::Closed; };
+                Recourse way = recourseFor(e: e, unsent: unsent);
+                bool moved = match (e.serverCode()) { case Some(value: c): match (c) { case Moved: true; case _: false; }; case None: false; };
+                if (way == Recourse::Follow && moved) {
+                    bool asks = false;
+                    isize next = this.redirected(e: e, from: at, redirects: redirects, asking: asks);
+                    if (next < 0) { return Result::Err(error: give e); }
+                    RedisError followed = give e;
+                    continue;
+                }
+                // An ASK (the slot half moved) is waited out until it has moved, as is a refusal that ran nothing.
+                bool waits = way == Recourse::Wait || way == Recourse::Reread || (way == Recourse::Follow && !moved);
+                if (!waits) { return Result::Err(error: give e); }
+                if (way == Recourse::Reread) { Result<Unit, RedisError> fetched = this.readMap(window: window); }
+                if (!this.pause(window: window)) { return Result::Err(error: give e); }
+                RedisError waited = give e;
+                continue;
+            }
+            tries = tries + 1;
+            Pipeline tx = Pipeline.make();
+            Result<Unit, RedisError> built = this.links[at].build(body: body, tx: tx);
+            bool buildOk = match (built) { case Ok(value: u): true; case Err(error: e): false; };
+            if (!buildOk) {
+                this.unwatch(at: at);
+                return match (give built) { case Err(error: e): Result::Err(error: give e); case Ok(value: u): Result::Err(error: RedisError::Closed); };
+            }
+            DynamicArray<bool> keyed = DynamicArray.empty();
+            Result<isize, RedisError> txFound = this.txSlot(pipeline: tx, keyed: keyed);
+            bool txOk = match (txFound) { case Ok(value: x): x < 0 || x == slot; case Err(error: e): false; };
+            if (!txOk) {
+                this.unwatch(at: at);
+                return match (give txFound) {
+                    case Err(error: e): Result::Err(error: give e);
+                    case Ok(value: x): Result::Err(error: RedisError::Usage(detail: "the transaction's keys must be in the watched keys' slot: give them one hash tag, as {user:1}:name and {user:1}:email"));
+                };
+            }
+            bool txUnsent = false;
+            DynamicArray<bool> asked = DynamicArray.empty();
+            Result<TxOutcome, RedisError> outcome = this.txOn(at: at, pipeline: tx, asking: false, unsent: txUnsent, asked: asked);
+            bool conflict = match (outcome) { case Ok(value: o): match (o) { case WatchConflict: true; case _: false; }; case Err(error: e): false; };
+            if (conflict) { continue; }
+            bool ran = match (outcome) { case Ok(value: o): true; case Err(error: e): false; };
+            if (ran) { this.failures = 0; return give outcome; }
+            RedisError e = match (give outcome) { case Err(error: x): give x; case Ok(value: o): RedisError::Closed; };
+            Recourse way = recourseFor(e: e, unsent: txUnsent);
+            if (way == Recourse::Fail) { return Result::Err(error: give e); }
+            // The slot moved between WATCH and EXEC, or the cluster refused it for now: nothing ran. MOVED goes into the
+            // map; the rest waits. Then it all runs again, from fresh reads.
+            bool moved = match (e.serverCode()) { case Some(value: c): match (c) { case Moved: true; case _: false; }; case None: false; };
+            if (moved) {
+                // Into the map, so the next WATCH goes there; within the attempts, not the redirections.
+                int32 once = 0;
+                bool asks = false;
+                isize next = this.redirected(e: e, from: at, redirects: once, asking: asks);
+            } else {
+                if (way == Recourse::Reread) { Result<Unit, RedisError> fetched = this.readMap(window: window); }
+                if (!this.pause(window: window)) { return Result::Err(error: give e); }
+            }
+            RedisError retried = give e;
+        }
+        return Result::Ok(value: TxOutcome::WatchConflict);
+    }
+
+    unsafe fn void unwatch(isize at) {
+        Command unwatch = Command.of(name: "UNWATCH");
+        Result<Value, RedisError> ignored = this.links[at].call(command: unwatch);
+    }
+
+    unsafe fn Result<TxOutcome, RedisError> txOn(isize at, const ref Pipeline pipeline, bool asking, ref bool unsent, ref DynamicArray<bool> asked) {
+        Result<Unit, RedisError> open = this.opened(at: at);
+        match (give open) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
+        return this.links[at].transact(pipeline: pipeline, asking: asking, asked: asked);
+    }
+
+    // The slot every keyed command of `pipeline` shares (-1 when none has keys), and in `keyed` which have keys. `Usage`
+    // naming the command for one that goes to every node or the table does not know, and for keys in two slots.
+    unsafe fn Result<isize, RedisError> txSlot(const ref Pipeline pipeline, ref DynamicArray<bool> keyed) {
+        isize slot = -1;
+        isize first = -1;
+        isize i = 0;
+        while (i < pipeline.length()) {
+            Command c = Cluster::commandAt(pipeline: pipeline, index: i);
+            Result<isize, RedisError> found = this.oneSlot(command: c, index: i, within: "a transaction");
+            isize s = match (give found) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+            keyed.add(item: s >= 0);
+            if (s >= 0 && slot < 0) { slot = s; first = i; }
+            if (s >= 0 && s != slot) {
+                int64 a = cast<int64>(first + 1);
+                int64 b = cast<int64>(i + 1);
+                return Result::Err(error: RedisError::Usage(detail: "a transaction runs on one node, so its keys must share one slot: command ${b}'s are not in command ${a}'s; give them one hash tag, as {user:1}:name and {user:1}:email"));
+            }
+            i = i + 1;
+        }
+        return Result::Ok(value: slot);
+    }
+
+    // The slot of `command`, the `index`th of a pipeline or a transaction (`within` says which), where it must stay on
+    // one: -1 for one without keys. `Usage` naming it for what the cluster refuses, one that goes to every node or is
+    // each node's own, one the table does not know, and keys in two slots.
+    unsafe fn Result<isize, RedisError> oneSlot(const ref Command command, isize index, const ref string within) {
+        int64 n = cast<int64>(index + 1);
+        string which = "command ${n}: ";
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: RedisError::Usage(detail: which.concat(other: e.message()))); } };
+        isize entry = this.table.indexOf(command: command);
+        if (entry < 0) { return Result::Err(error: RedisError::Usage(detail: which.concat(other: "this client's table of commands does not know it, so it cannot say where it goes"))); }
+        Request request = this.table.at(index: entry).request();
+        Response response = this.table.at(index: entry).response();
+        if (request == Request::AllShards || request == Request::AllNodes || request == Request::Special || response == Response::Special) {
+            return Result::Err(error: RedisError::Usage(detail: which.concat(other: "it goes to every node, or each node answers it for itself, and in ").concat(other: within).concat(other: " a command stays on one slot: send it with call or callEach")));
+        }
+        Keys keys = keysOf(info: this.table.at(index: entry), command: command, notKeys: true);
+        Result<Optional<isize>, RedisError> found = slotIn(command: command, keys: keys);
+        return match (give found) {
+            case Ok(value: o): match (o) { case Some(value: s): Result::Ok(value: s); case None: Result::Ok(value: -1); };
+            case Err(error: e): Result::Err(error: RedisError::Usage(detail: which.concat(other: e.message())));
+        };
+    }
+
+    // Command `index` of `pipeline`, read back from its bytes.
+    static fn Command commandAt(const ref Pipeline pipeline, isize index) {
+        return Command.decoded(bytes: pipeline.commandBytes(index: index));
+    }
+
     // Read the map again now (CLUSTER SLOTS), from the nodes, then the seeds. A failure leaves the map as it was.
     public unsafe fn Result<Unit, RedisError> refreshTopology() {
         if (this.shut) { return Result::Err(error: RedisError::Closed); }
@@ -258,10 +707,10 @@ type resource Cluster implements Sendable {
         Result<Unit, RedisError> plain = admit(command: command);
         match (give plain) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         if (isWatch(command: command)) {
-            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry WATCH or UNWATCH: the keys watched are one node's, so Cluster.watched sends them, and the transaction, on that node's connection"));
+            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry WATCH or UNWATCH: the keys watched are one node's, so Cluster.watched links them, and the transaction, on that node's connection"));
         }
         if (named(command: command, word: "ASKING")) {
-            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry ASKING: it sends ASKING itself, with the command an ASK redirection names"));
+            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry ASKING: it links ASKING itself, with the command an ASK redirection names"));
         }
         return Result::Ok(value: Unit::Unit);
     }
@@ -292,22 +741,7 @@ type resource Cluster implements Sendable {
             Recourse way = recourseFor(e: e, unsent: unsent);
             match (way) {
                 case Follow: {
-                    if (redirects >= this.settings.maxRedirects()) { return Result::Err(error: give e); }
-                    redirects = redirects + 1;
-                    string asked = copy this.links[at].host();
-                    Result<Redirect, RedisError> parsed = match (e) {
-                        case Server(error: s): Redirect.of(error: s, asked: asked);
-                        case _: Result::Err(error: RedisError::Closed);
-                    };
-                    bool readable = match (parsed) { case Ok(value: x): true; case Err(error: bad): false; };
-                    if (!readable) { return Result::Err(error: give e); }
-                    Redirect to = match (give parsed) { case Ok(value: x): give x; case Err(error: bad): { return Result::Err(error: give e); } };
-                    if (to.kind() == RedirectKind::Moved) {
-                        next = this.follow(redirect: to);
-                    } else {
-                        next = this.linkTo(host: to.host(), port: to.port());
-                        asking = true;
-                    }
+                    next = this.redirected(e: e, from: at, redirects: redirects, asking: asking);
                     if (next < 0) { return Result::Err(error: give e); }
                     RedisError followed = give e;
                 }
@@ -686,6 +1120,25 @@ fn Shape shapeOf(isize specs, const ref Begin begin, const ref Find find) {
     };
     if (step < 1) { return Shape.unknown(); }
     return Shape.of(step: step, countAt: countAt);
+}
+
+fn bool isAsk(const ref RedisError e) {
+    return match (e.serverCode()) { case Some(value: c): match (c) { case Ask: true; case _: false; }; case None: false; };
+}
+
+// Whether every command with keys (`keyed`) was answered ASK while it queued (`asked`): all of a transaction's keys are
+// on the importing node, so ASKING and the transaction there run it on all of them.
+fn bool everyAsked(const ref DynamicArray<bool> asked, const ref DynamicArray<bool> keyed) {
+    if (asked.length() != keyed.length()) { return false; }
+    isize i = 0;
+    while (i < keyed.length()) { if (keyed[i] && !asked[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+// A WATCH whose keys are in two slots says so in watched's words.
+fn RedisError watchSlots(RedisError e) {
+    string said = e.message();
+    return RedisError::Usage(detail: "watched watches keys of one slot, the transaction's: ".concat(other: said));
 }
 
 // What a cluster does about a call's failure `e`; `unsent` says no connection could be opened, so nothing was sent.

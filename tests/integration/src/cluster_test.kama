@@ -5,6 +5,7 @@
 import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Connection, redis::Config, redis::Command,
          redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value, redis::cluster::keySlot,
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody,
          redis::cluster::SlotMap,
          redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl };
 export { clusterTests };
@@ -216,12 +217,79 @@ fn DynamicArray<string> splitComma(const ref string text) {
     return give parts;
 }
 
+// A pipeline of the commands in `texts`, each written as words; its replies as text, joined by " | ".
+unsafe fn string piped(ref Cluster c, const ref DynamicArray<string> texts) {
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < texts.length()) { Command one = commandOf(text: texts[i]); p.add(command: one); i = i + 1; }
+    Result<Replies, RedisError> r = c.run(pipeline: p);
+    Replies rs = match (give r) { case Ok(value: x): give x; case Err(error: e): { return "(failed) ".concat(other: e.message()); } };
+    string text = "";
+    i = 0;
+    while (i < rs.length()) {
+        Result<Value, RedisError> one = rs.take(index: i);
+        if (i > 0) { text = text.concat(other: " | "); }
+        string shownOne = match (one) { case Ok(value: v): shown(v: v); case Err(error: e): "(error) ".concat(other: e.message()); };
+        text = text.concat(other: shownOne);
+        i = i + 1;
+    }
+    return text;
+}
+
+// A transaction of the commands in `texts`: "committed N", "conflict", or the error.
+unsafe fn string transacted(ref Cluster c, const ref DynamicArray<string> texts) {
+    Pipeline p = Pipeline.make();
+    isize i = 0;
+    while (i < texts.length()) { Command one = commandOf(text: texts[i]); p.add(command: one); i = i + 1; }
+    Result<TxOutcome, RedisError> r = c.transact(pipeline: p);
+    return outcomeOf(r: give r);
+}
+
+fn string outcomeOf(Result<TxOutcome, RedisError> r) {
+    return match (give r) {
+        case Ok(value: o): match (give o) { case Committed(replies: rs): { isize n = rs.length(); := "committed ${n}"; } case WatchConflict: "conflict"; };
+        case Err(error: e): e.message();
+    };
+}
+
+fn DynamicArray<string> three(const ref string a, const ref string b, const ref string c) {
+    DynamicArray<string> w = DynamicArray.empty();
+    w.add(item: copy a); w.add(item: copy b); w.add(item: copy c);
+    return give w;
+}
+
+// A body that reads `key` over the watching node's connection, then increments it.
+type resource Bump implements TxBody {
+    string key;
+    public ctor of(string key) { this.key = give key; }
+    public unsafe fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        Command get = Command.of(name: "GET");
+        get.arg(text: this.key);
+        Result<Value, RedisError> read = conn.call(command: get);
+        Command incr = Command.of(name: "INCR");
+        incr.arg(text: this.key);
+        tx.add(command: incr);
+        return Result::Ok(value: Unit::Unit);
+    }
+}
+
+unsafe fn string watchedOn(ref Cluster c, const ref string key) {
+    Command watch = Command.of(name: "WATCH");
+    watch.arg(text: key);
+    Bump body = Bump.of(key: copy key);
+    Result<TxOutcome, RedisError> r = c.watched(watch: watch, body: body, attempts: 5);
+    return outcomeOf(r: give r);
+}
+
 // A slot moved by hand under the cluster's feet: ASK while it is half moved (a new key's SET and GET go to the
 // importing node, ASKING first), then MOVED once it is moved, and back.
 unsafe fn int32 reshardTests(ref Cluster c) {
     int32 f = 0;
     string here = "kr:{moving}:here";
     string fresh = "kr:{moving}:fresh";
+    string pipedKey = "kr:{moving}:piped";
+    string counted = "kr:{moving}:counted";
+    string watchedKey = "kr:{moving}:watched";
     isize slot = keySlot(key: here.bytes());
     Result<Unit, RedisError> fetched = c.refreshTopology();
     string refreshed = match (fetched) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
@@ -242,7 +310,8 @@ unsafe fn int32 reshardTests(ref Cluster c) {
     Connection from = match (give a) { case Ok(value: x): give x; case Err(error: e): { return f; } };
     Connection to = match (give b) { case Ok(value: x): give x; case Err(error: e): { return f; } };
     string set = said(c: c, text: "SET ${here} h");
-    f = f + check(ok: set == "OK", what: "reshard: SET before the move: ${set}");
+    string put = said(c: c, text: "SET ${watchedKey} 1");
+    f = f + check(ok: set == "OK" && put == "OK", what: "reshard: SET before the move: ${set} ${put}");
 
     string begun = moveSlot(from: from, to: to, toPort: toPort, slot: slot);
     f = f + check(ok: begun == "OK", what: "reshard: the slot half moved: ${begun}");
@@ -254,11 +323,43 @@ unsafe fn int32 reshardTests(ref Cluster c) {
     string onTarget = ask(c: to, text: "CLUSTER COUNTKEYSINSLOT ${slot}");
     f = f + check(ok: onTarget == "1", what: "reshard: the ASKed SET is on the importing node: ${onTarget}");
 
+    // Half moved: a pipeline's commands each where the slot's keys are; a transaction on new keys only, by ASKING
+    // before MULTI at the importing node; `watched` on a key still on the source, there.
+    string pipe = piped(c: c, texts: three(a: "GET ${here}", b: "SET ${pipedKey} p", c: "GET ${pipedKey}"));
+    f = f + check(ok: pipe == "h | OK | p", what: "reshard: a pipeline, half moved, by ASK where a key is missing: ${pipe}");
+    string tx = transacted(c: c, texts: three(a: "SET ${counted} 1", b: "INCR ${counted}", c: "INCR ${counted}"));
+    f = f + check(ok: tx == "committed 3", what: "reshard: a transaction on new keys, half moved, by ASKING at the importing node: ${tx}");
+    string asking = ask(c: to, text: "ASKING");
+    string counted3 = ask(c: to, text: "GET ${counted}");
+    f = f + check(ok: counted3 == "3", what: "reshard: the transaction ran on the importing node: ${counted3}");
+    string guarded = watchedOn(c: c, key: watchedKey);
+    f = f + check(ok: guarded == "committed 1", what: "reshard: watched, half moved, on a key still on the source: ${guarded}");
+
+    // Three clusters whose maps still say the source, for MOVED once the slot has moved.
+    Result<Cluster, RedisError> forPipe = reach(url: plainUrl());
+    Result<Cluster, RedisError> forTx = reach(url: plainUrl());
+    Result<Cluster, RedisError> forWatch = reach(url: plainUrl());
+
     string done = finishMove(from: from, to: to, toPort: toPort, slot: slot);
     f = f + check(ok: done == "OK", what: "reshard: the slot moved: ${done}");
+    match (give forPipe) {
+        case Ok(value: x): { Cluster cp = give x; string p2 = piped(c: cp, texts: three(a: "GET ${here}", b: "GET ${fresh}", c: "GET ${pipedKey}")); f = f + check(ok: p2 == "h | f | p", what: "reshard: a pipeline after the move, by MOVED: ${p2}"); }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "reshard: connect for a pipeline: ${m}"); }
+    };
+    match (give forTx) {
+        case Ok(value: x): { Cluster ctx = give x; DynamicArray<string> one = DynamicArray.empty(); one.add(item: "INCR ${counted}"); string t2 = transacted(c: ctx, texts: one); f = f + check(ok: t2 == "committed 1", what: "reshard: a transaction after the move, by MOVED: ${t2}"); }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "reshard: connect for a transaction: ${m}"); }
+    };
+    match (give forWatch) {
+        case Ok(value: x): { Cluster cw = give x; string w2 = watchedOn(c: cw, key: watchedKey); f = f + check(ok: w2 == "committed 1", what: "reshard: watched after the move, by MOVED at WATCH: ${w2}"); }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "reshard: connect for watched: ${m}"); }
+    };
     string after = said(c: c, text: "GET ${here}");
     isize nowAt = c.topology().primaryOf(slot: slot);
     f = f + check(ok: after == "h" && nowAt == other, what: "reshard: MOVED followed, the map takes it: ${after}");
+    string counted4 = said(c: c, text: "GET ${counted}");
+    string watched2 = said(c: c, text: "GET ${watchedKey}");
+    f = f + check(ok: counted4 == "4" && watched2 == "3", what: "reshard: each ran once: ${counted4} ${watched2}");
 
     // And back, so the cluster is as it was.
     string back = moveSlot(from: to, to: from, toPort: fromPort, slot: slot);
@@ -266,7 +367,7 @@ unsafe fn int32 reshardTests(ref Cluster c) {
     f = f + check(ok: back == "OK" && ended == "OK", what: "reshard: the slot moved back: ${back} ${ended}");
     string home = said(c: c, text: "GET ${fresh}");
     f = f + check(ok: home == "f", what: "reshard: MOVED back: ${home}");
-    string wiped = said(c: c, text: "DEL ${here} ${fresh}");
+    string wiped = said(c: c, text: "DEL ${here} ${fresh} ${pipedKey} ${counted} ${watchedKey}");
     return f;
 }
 
