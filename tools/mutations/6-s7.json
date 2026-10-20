@@ -66,9 +66,9 @@
  {
   "id": "M9",
   "suite": "unit",
-  "file": "src/cluster/keys.kama",
-  "old": "            if (other != slot) {",
-  "new": "            if (false) {",
+  "file": "src/wire/route.kama",
+  "old": "        if (other != slot) {",
+  "new": "        if (false) {",
   "expect": "slotOf: keys in two slots are refused"
  },
  {

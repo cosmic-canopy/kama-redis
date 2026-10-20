@@ -1,0 +1,40 @@
+import { std::io::IoError, std::random::Rng, std::time::Duration, redis::RedisError };
+export { transient, closedKind, backoffAfter };
+
+// What is tried again, and after how long: a connection's redial (docs/ROADMAP.md, "Phase 7a") and a cluster's
+// calls (docs/ROADMAP.md, "Phase 6") share these.
+
+// What a server that is down, restarting or full does to a redial, which tries again: no address opened (`Connect`),
+// one opened and said nothing in time (`Timeout`), the link closed or reset before the handshake ended (a forwarder
+// in front of a server that is down accepts, then closes), a refusal with the generic code (maxclients's ERR: this
+// configuration was accepted before), and -LOADING. Through sentinels, a server that did not confirm its role. A
+// refusal with a code of its own (WRONGPASS, NOPERM, NOAUTH), a certificate refused, a TLS setting that will not
+// load, and bytes that are not RESP are final.
+fn bool transient(const ref RedisError e) {
+    return match (e) {
+        case Connect(error: c): true;
+        case Sentinel(error: s): s.isUnconfirmed();
+        case Timeout: true;
+        case Io(error: x): closedKind(x: x);
+        case Tls(detail: d, cause: t): match (t) { case Closed: true; case Io(error: x): closedKind(x: x); case _: false; };
+        case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };
+        case _: false;
+    };
+}
+
+// Whether `x` is the peer closing the link: an end of stream, or a write or read the peer reset.
+fn bool closedKind(IoError x) {
+    return match (x.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+}
+
+// The pause after `failures` tries in a row failed: 100 ms, doubling with each, to 1 s; half of it fixed and half drawn
+// at random from `jitter`, so that clients that lost one server do not all come back at once.
+unsafe fn Duration backoffAfter(int32 failures, ref Rng jitter) {
+    int64 ms = 100i64;
+    int32 n = 1;
+    while (n < failures && ms < 1000i64) { ms = ms * 2i64; n = n + 1; }
+    if (ms > 1000i64) { ms = 1000i64; }
+    int64 half = ms / 2i64;
+    int64 drawn = cast<int64>(jitter.below(n: cast<isize>(half + 1i64)));
+    return Duration.fromMillis(ms: half + drawn);
+}

@@ -18,7 +18,7 @@
  {
   "id": "M3",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case UnexpectedEof: true; case BrokenPipe: true;",
   "new": "case UnexpectedEof: false; case BrokenPipe: true;",
   "expect": "the refusal, not the close"
@@ -34,7 +34,7 @@
  {
   "id": "M5",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case BrokenPipe: true; case ConnectionReset: true; case _: false;",
   "new": "case BrokenPipe: true; case ConnectionReset: false; case _: false;",
   "expect": "reset, then a read: the refusal"
@@ -42,7 +42,7 @@
  {
   "id": "M6",
   "suite": "integration",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case UnexpectedEof: true; case BrokenPipe: true;",
   "new": "case UnexpectedEof: false; case BrokenPipe: true;",
   "expect": "failure: maxclients"
@@ -50,7 +50,7 @@
  {
   "id": "M7",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true;",
   "new": "case UnexpectedEof: true; case BrokenPipe: false; case ConnectionReset: true;",
   "expect": "reset, then a write: the refusal"

@@ -3,10 +3,11 @@
 Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-step 0 is done.**
-- cstar's newest build is 0.9.690. It checks the library clean, which is what the registry runs. But it refuses `fn
+steps 0 to 8 are done: Sentinel, and the cluster's core.**
+- cstar's newest build is 0.9.692. It checks the library clean, which is what the registry runs. But it refuses `fn
   int32 main()`, which every tag requires (KRD-11), so it is gated on a scratch copy whose ten `main`s say `fn uint8
-  main()`. There everything is green.
+  main()`. There the unit program and the examples are green. The live program builds on no compiler of both kinds
+  either: a channel's `send` changed in 0.9.680 (KRD-11 too).
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -67,7 +68,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–7 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–8 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -737,13 +738,76 @@ Each step ends green before its commit:
      - the backward keyword search's bounds: its one user, MIGRATE's KEYS, is an incomplete spec, whose missing keys
        the server's own code finds;
      - the `incomplete` mark: on every captured invocation the keyword search finds what the server's procedure does.
-8. **The cluster's core:**
-   - seeds, lazy nodes, routing, splitting and fan-out;
-   - `callEach` and `callFor`;
-   - MOVED, ASK, the waits, and the H2 loop;
-   - `Dialers` and `eval`.
+8. **Done (2026-10-20).** **The cluster's core:** `redis::Cluster` (src/cluster.kama).
+   - **Connecting:** the seeds in turn, CLUSTER SLOTS from the first that answers (`Cluster.connect`, and
+     `connectWith(dialers:)` through the new `Dialers` contract, a dialer for each connection the cluster opens).
+     Refused, each in words:
+     - a Sentinel configuration, unix:// and reconnect=off (`Config`);
+     - a server not in cluster mode, whose CLUSTER SLOTS says "cluster support disabled" on all eight servers
+       (`Config`, naming `Connection.connect`);
+     - a cluster whose slots are not assigned, whose map is empty (`Unexpected`).
+   - **A connection per node,** 7a's `Connection`, opened when a call first goes there. `Config.forNode` gives each
+     the cluster's settings without the cluster's own options, and one try per redial. Every node speaks the protocol
+     the first settled on, so replies have one shape.
+   - **Routing by the table:**
+     - a command with keys goes to its slot's primary, and one without to a primary (the first whose link is up);
+     - `multi_shard` commands are split by slot, a piece per slot in the order of each slot's first key. MSETEX's
+       count is rewritten for each piece, and what follows the keys goes with every piece;
+     - `all_shards` commands go to every primary, `all_nodes` ones to every node;
+     - the replies are made one by the response policy: key order, a sum, the least, the most, and/or, all or one
+       succeeded, or gathered (arrays one after another).
+   - **Refused before anything is written:**
+     - a `special` command (INFO, RANDOMKEY, LATENCY, SCAN), naming `callEach`;
+     - a command the table does not know, naming `callFor` and `callEach`;
+     - WATCH and UNWATCH, naming `watched` (step 9), and ASKING.
+   - **What the cluster answers:**
+     - MOVED is followed, and the map takes it at once (`SlotMap`'s private `moved`). The whole map is read again
+       before the next call, but not within a second of the last reading;
+     - ASK is ASKING and the command in one write, a pipeline of two. The map is unchanged;
+     - TRYAGAIN is waited out, and CLUSTERDOWN, LOADING and MASTERDOWN after reading the map, within
+       `reconnect_timeout`. At most `max_redirects` redirections;
+     - a node that cannot be opened, or whose one redial fails for a reason that passes (nothing was sent), takes the
+       same path. The map is read again (the live links, then the map's nodes, then the seeds), and after a pause the
+       call goes where it says. The pause is 7a's backoff, kept across calls; `backoffAfter` and `transient` moved to
+       `redis::wire` (src/wire/retry.kama) for both;
+     - what may have run is the call's, and is never sent again.
+   - **The rest of the API:** `callEach(command:, on: Primaries|AllNodes)` gives `NodeReply`s, each taken once;
+     `callFor(key:, command:)`; `eval` at the keys' node, then EVAL there on NOSCRIPT; `refreshTopology()`,
+     `topology()`, `close()`.
+   - **The vectors gained** (tools/gen-topology-vectors.sh, two runs the same):
+     - a node's HELLO;
+     - CLUSTER SLOTS before the slots are assigned, and on a standalone server;
+     - the pieces of split and fanned-out commands, each at its own node: MGET (one key, and two of one slot), EXISTS,
+       MSET, DBSIZE, KEYS, PING and SCRIPT EXISTS.
+     One run died without a word on valkey-9.1. Three runs of valkey-9.1 alone passed, and with every topology up
+     beside @kama/postgres's ten containers the podman machine is short of memory. A failed container now reports
+     its exit status and how far it got.
+   - **Unit tests** over scripted nodes, each connection taking the next scripted dialer in the order the cluster opens
+     them (`ScriptDialers`), each keyed by its place:
+     - routing, an unknown endpoint;
+     - MOVED, the map patched, then read again a second on;
+     - ASK twice, with the map unchanged; the redirection budget at 1 and at 0;
+     - TRYAGAIN, CLUSTERDOWN, LOADING, and a cluster that stays down;
+     - a node that will not open; a failover found through an idle link's refused redial;
+     - an I/O loss, not resent, then a redial;
+     - every split and policy above, and a piece refused as the call's error;
+     - each refusal; `callFor`, `eval`, `callEach` on both targets;
+     - the seeds in turn, none reached, the protocol pinned, and the empty map.
+   - **Live** (tests/integration/src/cluster_test.kama), on all eight clusters, debug and release:
+     - a key per shard, every split and fan-out, `eval`, `callFor`, and `callEach`'s six INFOs;
+     - a slot moved by hand mid-test. A new key's SET and GET go by ASK while the slot is half moved, MOVED follows
+       once it has moved, and it moves back. The keys are MIGRATEd over the cluster's TLS ports, since MIGRATE
+       uses TLS under `tls-cluster yes`;
+     - TLS at the nodes' TLS ports, and a standalone server refused.
 
-   Unit tests run on a scripted server per node. Live: all eight clusters.
+     `tools/test-integration.sh` starts the cluster topology and reads its settings.
+   - **38 mutations (36 unit, 2 live), all caught.** Not mutated, each for its reason:
+     - a split's one-slot shortcut, since its one piece is the command;
+     - closing the links a new map lacks, which no call observes;
+     - a node's one-try redial, which changes how long a call takes, not what it returns;
+     - `agg_logical_or`, which no command in the table has.
+   - **Found:** KRD-11 has a second change with no overlap: a channel's `send` (0.9.680). The live program's socket
+     relay uses one.
 9. **Pipelines, transactions and `watched` on a cluster.** Live: a resharding interleaved in the test (SETSLOT
    MIGRATING/IMPORTING, MIGRATE), meeting ASK then MOVED.
 10. **Replica reads and the cluster's SCAN.**
@@ -2216,6 +2280,23 @@ facts underneath.
     `RedisError::Sentinel` is listed as a break.
   - **R13:** `@nonExhaustive` is accepted on a package's own enum, but a `match` within the same file still needs no
     `case _`. Whether it binds a consumer in another package is for step 5 to check, before `RedisError` takes it.
+- **What building the cluster's core settled (step 8):**
+  - **A command without keys goes to the first primary whose link is up,** or else the map's first. Lettuce sends
+    one to its default connection and redis-py to its default node; go-redis picks at random. A fixed choice reuses
+    an open connection and keeps the unit tests' scripts deterministic, and a primary takes a keyless write (EVAL with
+    no keys, FUNCTION, PUBLISH) where a replica refuses it.
+  - **MOVED patches the map at once, and the whole map is read before the next call,** at most once a second (the
+    spec says to read it whole; go-redis waits 200 ms between readings, Lettuce 5 s). The reading is not on the call
+    that met MOVED, which has its answer by then.
+  - **A split command runs its pieces in turn, and every piece runs even when one fails.** Stopping at the first
+    failure would leave the outcome depending on the order of the slots; the caller is told plainly that part of the
+    call may have run. Writing every piece before reading any comes with the pipelines (step 9).
+  - **A fan-out sends to each node once.** Its nodes are tracked by address across readings of the map, so a node
+    that answered is not asked again after a failover, and FUNCTION LOAD cannot meet its own "already exists".
+  - **ASK goes as a pipeline of two** (ASKING, then the command) through the node's `Connection.run`, so nothing new
+    in `Connection` was needed: the reply is the second's.
+  - **`readyOnce` was not needed.** A node's `Config` sets `reconnect_timeout` to 1 ms, so its own redial makes one
+    try and returns `Reconnect`, and the cluster's loop paces the next.
 - **Found on the way:** KRD-11. cstar's 0.9.684 refuses `fn int32 main()`, and every tag (v0.9.667, v0.9.675) refuses
   `fn uint8 main()`. With the ten `main`s edited in a scratch copy, `tools/test.sh` is green on 0.9.690. KRD-9 is
   still open there.

@@ -1,0 +1,928 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, std::memory::Owned, std::random::Rng, std::time::Duration, std::time::Instant,
+         std::time::monotonicNow, std::time::sleep,
+         redis::Config, redis::UrlTransport, redis::Connection, redis::Dialers, redis::Dialer, redis::Command,
+         redis::Pipeline, redis::Replies, redis::ScriptCall, redis::RedisError, redis::ServerError, redis::ConnectError,
+         redis::cluster::SlotMap, redis::cluster::ClusterNode, redis::cluster::Redirect, redis::cluster::RedirectKind,
+         redis::cluster::keySlot,
+         redis::wire::Commands, redis::wire::Keys, redis::wire::keysOf, redis::wire::slotIn, redis::wire::Request,
+         redis::wire::Response, redis::wire::Begin, redis::wire::Find, redis::wire::admit, redis::wire::isWatch,
+         redis::wire::named, redis::wire::Deadline, redis::wire::transient, redis::wire::backoffAfter,
+         redis::wire::unattributed, redis::resp::Value };
+export { Cluster, ClusterTarget, NodeReply };
+
+// A Redis or Valkey cluster (docs/ROADMAP.md, "Phase 6"): a connection per node, each opened when a call first goes
+// there, and the map of which node serves each of the 16384 slots, read with CLUSTER SLOTS from the seeds the Config
+// names (redis://h1:7000,h2:7001) and again as the cluster changes.
+//
+//   Result<Cluster, RedisError> c = Cluster.connect(config: Config.parse(url: "redis://127.0.0.1:7000,127.0.0.1:7001"));
+//   Result<Value, RedisError> v = cluster.call(command: cmd"GET ${key}");
+//
+// Where `call` sends a command is the servers' own word for it: the table of commands (src/wire/commands.kama), read
+// from every server in the matrix, gives its keys and its tips (command-tips.md).
+//   - A command with keys goes to the primary of its keys' slot. Keys in two slots are refused (`Usage`, naming a hash
+//     tag), as the server would refuse them (CROSSSLOT). A command without keys goes to a primary.
+//   - A command whose tips spread it (request_policy) goes as they say: MGET, MSET, DEL, EXISTS, … split by slot, a
+//     piece per slot; DBSIZE, KEYS, FLUSHALL, SCRIPT EXISTS, … to every primary; SCRIPT LOAD, CONFIG SET, … to every
+//     node. Their replies make one as the tips say (response_policy): in the order of the keys, a sum, the least, OK
+//     from every node, … A split MSET is atomic in each slot, not across the cluster, and when one piece fails, others
+//     may have run; one hash tag ({user:1}:name, {user:1}:email) keeps a command whole.
+//   - A command whose reply is each node's own (INFO, RANDOMKEY, LATENCY, SCAN) is refused, naming `callEach`, which
+//     gives every node's reply as it is. A command the table does not know (a module's) is refused, naming `callFor`,
+//     which sends a command to the node a key names, and `callEach`.
+//
+// What the cluster answers on the way:
+//   - MOVED: the slot is at another node from now on. The map takes it at once, the command goes there, and the whole
+//     map is read again before the next call, at most once a second.
+//   - ASK: this command, once, at another node: ASKING and the command, in one write.
+//   - TRYAGAIN, CLUSTERDOWN, LOADING, MASTERDOWN: nothing ran. The call waits (a redial's backoff) and sends again,
+//     within `reconnect_timeout`; for all but TRYAGAIN it reads the map first, since a failover may be under way.
+//   At most `max_redirects` (default 5) redirections a call; past them the last is the call's error.
+//
+// A node's connection is a `Connection` of its own, with what 7a gives one: what is lost is made again by its next
+// call, and nothing is ever sent twice. The cluster drives each node's redial: a node's connection gets one try a call,
+// and when that fails (nothing was sent), the cluster reads the map again, sends where it now says, and waits between
+// tries, within `reconnect_timeout`. A failover so costs a reading of the map, not a node's whole reconnect_timeout.
+// Every node speaks the protocol the first one settled on, so replies have one shape whichever node gives them.
+
+// Which nodes `callEach` sends to: every primary, or every node the map names, replicas included.
+type enum ClusterTarget implements Sendable { Primaries, AllNodes }
+
+// One node's reply to `callEach`: the node, and what it answered.
+type resource NodeReply implements Sendable {
+    ClusterNode at;
+    DynamicArray<Result<Value, RedisError>> held;   // one, until it is taken
+
+    friend redis::Cluster::callEach[of];
+
+    ctor of(ClusterNode node, Result<Value, RedisError> reply) {
+        this.at = give node;
+        this.held = DynamicArray.empty();
+        this.held.add(item: give reply);
+    }
+
+    public const fn const ref ClusterNode node() { return this.at; }
+
+    // The node's reply, taken out: an error reply is `Server`, as `call` gives one, and a node that could not be
+    // reached is its error. Taken twice is `Usage`.
+    public fn Result<Value, RedisError> take() {
+        if (this.held.length() == 0) {
+            return Result::Err(error: RedisError::Usage(detail: "this node's reply was taken already: each reply is taken once"));
+        }
+        return this.held.remove(index: 0);
+    }
+}
+
+// A node's place, and its connection once a call has gone there: zero or one.
+type resource NodeLink implements Sendable {
+    string hostText;
+    int32 portNumber;
+    DynamicArray<Connection> held;
+
+    public ctor make(string host, int32 port) { this.hostText = give host; this.portNumber = port; this.held = DynamicArray.empty(); }
+
+    public const fn const ref string host() { return this.hostText; }
+    public const fn int32 port() { return this.portNumber; }
+    public const fn bool isAt(const ref string host, int32 port) { return this.portNumber == port && this.hostText == host; }
+    // "host:port", an IPv6 address in brackets.
+    public const fn string place() {
+        int32 p = this.portNumber;
+        string h = copy this.hostText;
+        if (h.contains(substring: ":")) { h = "[".concat(other: h).concat(other: "]"); }
+        return "${h}:${p}";
+    }
+    public const fn bool opened() { return this.held.length() > 0; }
+    // Whether its connection is open and its link up: a call to it need not redial.
+    public const fn bool live() { return this.held.length() > 0 && !this.held[0].lost(); }
+
+    public fn void attach(Connection connection) { this.held.add(item: give connection); }
+    public unsafe fn Result<Value, RedisError> call(const ref Command command) { return this.held[0].call(command: command); }
+    public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) { return this.held[0].run(pipeline: pipeline); }
+    public unsafe fn void close() { if (this.held.length() > 0) { this.held[0].close(); } }
+}
+
+// What a cluster does about a call's failure: nothing (it is the call's, since its command may have run, or it is
+// final), follow a redirection, or send again after a pause (nothing ran), reading the map first when it may have
+// changed.
+type enum Recourse implements Sendable { Fail, Follow, Wait, Reread }
+
+type resource Cluster implements Sendable {
+    // What the cluster was made from, kept whole: the seeds, and each node's settings.
+    Config settings;
+    DynamicArray<Owned<Dialers>> making;   // empty: this client's own sockets; one: the caller's dialers
+    SlotMap map;
+    Commands table;
+    DynamicArray<NodeLink> links;
+    // A MOVED changed the map: it is read whole again before the next call, but not within a second of the last try.
+    bool stale = false;
+    Instant lastRead;
+    // How many tries in a row have failed: the backoff between tries grows with it, across calls, as a redial's does.
+    int32 failures = 0;
+    Rng jitter;
+    bool shut = false;
+
+    // Connect to the cluster `config` names: its hosts are seeds, asked in turn for the map until one gives it. A
+    // Sentinel configuration, a unix:// one and reconnect=off are refused (`Config`), as is a server that is not in
+    // cluster mode.
+    public unsafe ctor Result<Cluster, RedisError> connect(const ref Config config) {
+        DynamicArray<Owned<Dialers>> none = DynamicArray.empty();
+        return Cluster.start(config: config, making: give none);
+    }
+
+    // `connect`, with each connection's transports opened by a dialer from `dialers` (a tunnel, a NAT's mapping of the
+    // nodes' announced addresses): one for each connection the cluster opens, since a dialer belongs to its connection.
+    public unsafe ctor Result<Cluster, RedisError> connectWith(Owned<Dialers> dialers, const ref Config config) {
+        DynamicArray<Owned<Dialers>> one = DynamicArray.empty();
+        one.add(item: give dialers);
+        return Cluster.start(config: config, making: give one);
+    }
+
+    unsafe ctor Result<Cluster, RedisError> start(const ref Config config, DynamicArray<Owned<Dialers>> making) {
+        Optional<RedisError> wrong = notACluster(config: config);
+        match (give wrong) {
+            case Some(value: e): { DynamicArray<Owned<Dialers>> unused = give making; return Result::Err(error: give e); }
+            case None: { }
+        };
+        Cluster c = Cluster.made(config: config, making: give making);
+        Result<Unit, RedisError> read = c.readMap(window: Deadline.none());
+        return match (give read) {
+            case Ok(value: u): Result::Ok(value: give c);
+            case Err(error: e): { Cluster failed = give c; := Result::Err(error: give e); }
+        };
+    }
+
+    unsafe ctor made(const ref Config config, DynamicArray<Owned<Dialers>> making) {
+        this.settings = copy config;
+        this.making = give making;
+        this.map = SlotMap.blank();
+        this.table = Commands.load();
+        this.links = DynamicArray.empty();
+        this.lastRead = monotonicNow();
+        this.jitter = Rng.fromEntropy();
+    }
+
+    // Send `command` where the cluster's map and the command's tips say, and return its reply (or the replies made
+    // one). Refused before anything is written: what a connection refuses, WATCH and UNWATCH (`watched` sends them),
+    // ASKING (the cluster's own), a command whose reply is each node's own (`callEach`), one the table does not know
+    // (`callFor`, `callEach`), and keys in more than one slot for a command that cannot be split. An error reply is
+    // `Server`; a failure of a node's link is that call's, as on a connection, and the command is never sent again.
+    public unsafe fn Result<Value, RedisError> call(const ref Command command) {
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        isize entry = this.table.indexOf(command: command);
+        if (entry < 0) { return Result::Err(error: unknownCommand()); }
+        Request request = this.table.at(index: entry).request();
+        Response response = this.table.at(index: entry).response();
+        if (request == Request::Special || response == Response::Special) { return Result::Err(error: ownReplies()); }
+        if (request == Request::AllShards || request == Request::AllNodes) {
+            return this.fanOut(command: command, every: request == Request::AllNodes, response: response);
+        }
+        Keys keys = keysOf(info: this.table.at(index: entry), command: command, notKeys: true);
+        if (request == Request::MultiShard) { return this.split(command: command, entry: entry, keys: keys, response: response); }
+        Result<Optional<isize>, RedisError> slot = slotIn(command: command, keys: keys);
+        isize at = match (give slot) {
+            case Ok(value: o): match (o) { case Some(value: s): s; case None: -1; };
+            case Err(error: e): { return Result::Err(error: give e); }
+        };
+        return this.routed(slot: at, command: command);
+    }
+
+    // Send `command` to the primary of `key`'s slot, whatever the table says of it: a module's command, or one whose
+    // keys the table cannot find. Redirections and waits are followed as for `call`.
+    public unsafe fn Result<Value, RedisError> callFor(ConstView<uint8> key, const ref Command command) {
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.routed(slot: keySlot(key: key), command: command);
+    }
+
+    // Send `command` to every primary, or every node, and return each node's reply as it answered, unmerged and with no
+    // redirection followed: INFO, LATENCY, CONFIG GET, CLIENT LIST, a module's command. A node that cannot be reached
+    // has its error as its reply.
+    public unsafe fn Result<DynamicArray<NodeReply>, RedisError> callEach(const ref Command command, ClusterTarget on) {
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.freshen();
+        DynamicArray<isize> nodes = this.nodesFor(every: on == ClusterTarget::AllNodes);
+        DynamicArray<NodeReply> replies = DynamicArray.empty();
+        isize i = 0;
+        while (i < nodes.length()) {
+            isize at = this.linkOf(node: nodes[i]);
+            bool unsent = false;
+            Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: false, unsent: unsent);
+            ClusterNode which = copy this.map.node(index: nodes[i]);
+            replies.add(item: NodeReply.of(node: give which, reply: give r));
+            i = i + 1;
+        }
+        return Result::Ok(value: give replies);
+    }
+
+    // Call a script (src/script.kama) at the node its keys name (a script with none goes to a primary): EVALSHA, and
+    // if that node lacks the script (NOSCRIPT, so it never ran), EVAL, which loads it there for the next call.
+    public unsafe fn Result<Value, RedisError> eval(const ref ScriptCall call) {
+        Command bySha = call.bySha();
+        Result<Value, RedisError> first = this.call(command: bySha);
+        bool missing = match (first) {
+            case Err(error: e): match (e.serverCode()) { case Some(value: c): match (c) { case NoScript: true; case _: false; }; case None: false; };
+            case Ok(value: v): false;
+        };
+        if (!missing) { return give first; }
+        Command bySource = call.bySource();
+        return this.call(command: bySource);
+    }
+
+    // Read the map again now (CLUSTER SLOTS), from the nodes, then the seeds. A failure leaves the map as it was.
+    public unsafe fn Result<Unit, RedisError> refreshTopology() {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        this.lastRead = monotonicNow();
+        return this.readMap(window: Deadline.none());
+    }
+
+    // The map as the cluster last read it, with what MOVED has changed since.
+    public const fn const ref SlotMap topology() { return this.map; }
+
+    // Close every node's connection. Every call answers `Closed` from now on; closing twice is harmless.
+    public unsafe fn void close() {
+        this.shut = true;
+        isize i = 0;
+        while (i < this.links.length()) { this.links[i].close(); i = i + 1; }
+    }
+
+    public const fn bool isClosed() { return this.shut; }
+
+    unsafe ~Cluster() { this.close(); }
+
+    // What `call`, `callFor` and `callEach` refuse before anything is written: what a connection refuses, and what is
+    // the cluster's own to send.
+    fn Result<Unit, RedisError> admitted(const ref Command command) {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        Result<Unit, RedisError> plain = admit(command: command);
+        match (give plain) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (isWatch(command: command)) {
+            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry WATCH or UNWATCH: the keys watched are one node's, so Cluster.watched sends them, and the transaction, on that node's connection"));
+        }
+        if (named(command: command, word: "ASKING")) {
+            return Result::Err(error: RedisError::Usage(detail: "a cluster does not carry ASKING: it sends ASKING itself, with the command an ASK redirection names"));
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // ---- where a command goes ----
+
+    // `command` at the node serving `slot` (-1: a command without keys), with the cluster's answers on the way followed:
+    // a redirection at once, up to max_redirects; a refusal that ran nothing, and a node that could not be reached
+    // (nothing was sent), waited out within reconnect_timeout, the map read again when it may have changed. Anything
+    // that may have run is the call's, and never sent again.
+    unsafe fn Result<Value, RedisError> routed(isize slot, const ref Command command) {
+        this.freshen();
+        Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
+        int32 redirects = 0;
+        isize next = -1;      // the node a redirection named, for the next send
+        bool asking = false;
+        while (true) {
+            isize at = next;
+            if (at < 0) { at = this.linkFor(slot: slot); }
+            if (at < 0) { return Result::Err(error: noPrimary()); }
+            bool unsent = false;
+            Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: asking, unsent: unsent);
+            next = -1;
+            asking = false;
+            bool failed = match (r) { case Ok(value: v): false; case Err(error: e): true; };
+            if (!failed) { this.failures = 0; return give r; }
+            RedisError e = match (give r) { case Err(error: x): give x; case Ok(value: v): RedisError::Closed; };
+            Recourse way = recourseFor(e: e, unsent: unsent);
+            match (way) {
+                case Follow: {
+                    if (redirects >= this.settings.maxRedirects()) { return Result::Err(error: give e); }
+                    redirects = redirects + 1;
+                    string asked = copy this.links[at].host();
+                    Result<Redirect, RedisError> parsed = match (e) {
+                        case Server(error: s): Redirect.of(error: s, asked: asked);
+                        case _: Result::Err(error: RedisError::Closed);
+                    };
+                    bool readable = match (parsed) { case Ok(value: x): true; case Err(error: bad): false; };
+                    if (!readable) { return Result::Err(error: give e); }
+                    Redirect to = match (give parsed) { case Ok(value: x): give x; case Err(error: bad): { return Result::Err(error: give e); } };
+                    if (to.kind() == RedirectKind::Moved) {
+                        next = this.follow(redirect: to);
+                    } else {
+                        next = this.linkTo(host: to.host(), port: to.port());
+                        asking = true;
+                    }
+                    if (next < 0) { return Result::Err(error: give e); }
+                    RedisError followed = give e;
+                }
+                case Wait: {
+                    if (!this.pause(window: window)) { return Result::Err(error: give e); }
+                    RedisError waited = give e;
+                }
+                case Reread: {
+                    Result<Unit, RedisError> read = this.readMap(window: window);
+                    if (!this.pause(window: window)) { return Result::Err(error: give e); }
+                    RedisError waited = give e;
+                }
+                case Fail: { return Result::Err(error: give e); }
+            };
+        }
+        return Result::Err(error: RedisError::Closed);
+    }
+
+    // `command` to every primary, or with `every` to every node, as its tips say, and their replies made one by
+    // `response`. A node that cannot be reached is waited out as `routed` waits (nothing was sent to it): the map read
+    // again, then the nodes it names that have not answered, within reconnect_timeout; past it, its error is a reply.
+    unsafe fn Result<Value, RedisError> fanOut(const ref Command command, bool every, Response response) {
+        this.freshen();
+        Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
+        DynamicArray<string> answered = DynamicArray.empty();
+        DynamicArray<Result<Value, RedisError>> replies = DynamicArray.empty();
+        while (true) {
+            DynamicArray<isize> nodes = this.nodesFor(every: every);
+            DynamicArray<Result<Value, RedisError>> unreached = DynamicArray.empty();
+            isize i = 0;
+            while (i < nodes.length()) {
+                isize at = this.linkOf(node: nodes[i]);
+                string place = this.links[at].place();
+                if (among(names: answered, name: place)) { i = i + 1; continue; }
+                bool unsent = false;
+                Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: false, unsent: unsent);
+                bool again = match (r) {
+                    case Err(error: e): match (recourseFor(e: e, unsent: unsent)) { case Wait: true; case Reread: true; case _: false; };
+                    case Ok(value: v): false;
+                };
+                if (again) {
+                    string unused = give place;
+                    unreached.add(item: give r);
+                } else {
+                    answered.add(item: give place);
+                    replies.add(item: give r);
+                }
+                i = i + 1;
+            }
+            if (unreached.length() == 0) { break; }
+            Result<Unit, RedisError> read = this.readMap(window: window);
+            if (!this.pause(window: window)) {
+                while (unreached.length() > 0) { replies.add(item: unreached.remove(index: 0)); }
+                break;
+            }
+        }
+        if (replies.length() == 0) { return Result::Err(error: noPrimary()); }
+        return aggregate(response: response, replies: give replies);
+    }
+
+    // A command whose keys may be in several slots (MGET, MSET, DEL, EXISTS, …), as its tips say: a piece per slot,
+    // each with that slot's keys (and what follows each key: MSET's value), each at its slot's node, and the pieces'
+    // replies made one by `response`: MGET's in the order of its keys, DEL's summed, MSET's OK when every piece's is.
+    // Keys in one slot go as they are. The pieces run in turn, every one of them even when one fails; the call's error
+    // is then the first piece's that failed.
+    unsafe fn Result<Value, RedisError> split(const ref Command command, isize entry, const ref Keys keys, Response response) {
+        if (keys.count() == 0) { return this.routed(slot: -1, command: command); }
+        DynamicArray<isize> slots = DynamicArray.empty();
+        bool oneSlot = true;
+        isize k = 0;
+        while (k < keys.count()) {
+            slots.add(item: keySlot(key: command.part(index: keys.at(index: k))));
+            if (slots[k] != slots[0]) { oneSlot = false; }
+            k = k + 1;
+        }
+        if (oneSlot) { return this.routed(slot: slots[0], command: command); }
+        Shape shape = shapeOf(specs: this.table.at(index: entry).specs().length(), begin: this.table.at(index: entry).specs()[0].begin(),
+                              find: this.table.at(index: entry).specs()[0].find());
+        if (!shape.fits(keys: keys)) { return Result::Err(error: unsplittable()); }
+        // The slots in the order their first key comes, and each one's keys.
+        DynamicArray<isize> order = DynamicArray.empty();
+        DynamicArray<DynamicArray<isize>> groups = DynamicArray.empty();
+        k = 0;
+        while (k < keys.count()) {
+            isize g = 0;
+            while (g < order.length() && order[g] != slots[k]) { g = g + 1; }
+            if (g == order.length()) { order.add(item: slots[k]); groups.add(item: DynamicArray.empty()); }
+            groups[g].add(item: k);
+            k = k + 1;
+        }
+        string name = nameOf(command: command, fallback: this.table.at(index: entry).name());
+        DynamicArray<Result<Value, RedisError>> replies = DynamicArray.empty();
+        isize g = 0;
+        while (g < order.length()) {
+            Command piece = shape.piece(command: command, keys: keys, group: groups[g], name: name);
+            replies.add(item: this.routed(slot: order[g], command: piece));
+            g = g + 1;
+        }
+        if (response == Response::Default) { return inKeyOrder(replies: give replies, groups: groups, total: keys.count()); }
+        return aggregate(response: response, replies: give replies);
+    }
+
+    // The link of the node the map says serves `slot`; for -1 (a command without keys), or a slot no node serves, a
+    // primary's (`anyPrimary`). -1 when the map names no primary.
+    unsafe fn isize linkFor(isize slot) {
+        isize node = -1;
+        if (slot >= 0) { node = this.map.primaryOf(slot: slot); }
+        if (node < 0) { node = this.anyPrimary(); }
+        if (node < 0) { return -1; }
+        return this.linkOf(node: node);
+    }
+
+    // A primary for what any primary takes: the first whose connection is up, or else the first. -1 when there is none.
+    fn isize anyPrimary() {
+        DynamicArray<isize> primaries = this.map.primaries();
+        isize i = 0;
+        while (i < primaries.length()) {
+            isize at = this.findLink(host: this.map.node(index: primaries[i]).host(), port: this.map.node(index: primaries[i]).port());
+            if (at >= 0 && this.links[at].live()) { return primaries[i]; }
+            i = i + 1;
+        }
+        if (primaries.length() == 0) { return -1; }
+        return primaries[0];
+    }
+
+    // The nodes of the map (indexes into it): every primary, or with `every` every node.
+    fn DynamicArray<isize> nodesFor(bool every) {
+        if (!every) { return this.map.primaries(); }
+        DynamicArray<isize> all = DynamicArray.empty();
+        isize n = 0;
+        while (n < this.map.nodeCount()) { all.add(item: n); n = n + 1; }
+        return give all;
+    }
+
+    // The link of the map's node `node`, made when there is none yet.
+    unsafe fn isize linkOf(isize node) {
+        string host = copy this.map.node(index: node).host();
+        int32 port = this.map.node(index: node).port();
+        return this.linkTo(host: host, port: port);
+    }
+
+    // The link at `host` and `port`, made (not yet opened) when there is none.
+    unsafe fn isize linkTo(const ref string host, int32 port) {
+        isize at = this.findLink(host: host, port: port);
+        if (at >= 0) { return at; }
+        this.links.add(item: NodeLink.make(host: copy host, port: port));
+        return this.links.length() - 1;
+    }
+
+    const fn isize findLink(const ref string host, int32 port) {
+        isize i = 0;
+        while (i < this.links.length()) {
+            if (this.links[i].isAt(host: host, port: port)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // `command` on link `at`, its connection opened first when it is not yet; with `asking`, ASKING and the command in
+    // one write, the command's reply the answer. `unsent` says the connection could not be opened, so nothing was sent.
+    unsafe fn Result<Value, RedisError> sendTo(isize at, const ref Command command, bool asking, ref bool unsent) {
+        Result<Unit, RedisError> open = this.opened(at: at);
+        match (give open) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
+        if (!asking) { return this.links[at].call(command: command); }
+        Pipeline p = Pipeline.make();
+        Command asks = Command.of(name: "ASKING");
+        p.add(command: asks);
+        p.add(command: command);
+        Result<Replies, RedisError> rs = this.links[at].run(pipeline: p);
+        Replies replies = match (give rs) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        return replies.take(index: 1);
+    }
+
+    // Link `at`'s connection, opened when it is not yet: the cluster's Config for that node, through a dialer of the
+    // caller's when it gave some. The error is the connect's.
+    unsafe fn Result<Unit, RedisError> opened(isize at) {
+        if (this.links[at].opened()) { return Result::Ok(value: Unit::Unit); }
+        Config node = this.nodeConfig(host: this.links[at].host(), port: this.links[at].port());
+        Result<Connection, RedisError> made = this.dial(config: node);
+        Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        // Every node speaks the protocol the first settled on, so that replies have one shape whichever node gives them.
+        this.settings.setProtocol(protocol: c.protocol());
+        this.links[at].attach(connection: give c);
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    unsafe fn Result<Connection, RedisError> dial(const ref Config config) {
+        if (this.making.length() > 0) {
+            Owned<Dialer> d = this.making[0].another();
+            return Connection.connectWith(dialer: give d, config: config);
+        }
+        return Connection.connect(config: config);
+    }
+
+    // The cluster's Config for the node at `host` and `port` (its TLS name the node's own, unless tls_server_name says
+    // otherwise), with one try for each redial: the cluster drives the tries itself, and reads the map between them.
+    const fn Config nodeConfig(const ref string host, int32 port) {
+        Config c = this.settings.forNode(host: copy host, port: port);
+        Result<Unit, RedisError> once = c.setReconnectTimeout(timeout: Duration.fromMillis(ms: 1i64));
+        return give c;
+    }
+
+    // A MOVED: the map takes it at once, and is read whole again before the next call. The link of the node it names;
+    // -1 when the map holds as many nodes as a cluster can.
+    unsafe fn isize follow(const ref Redirect redirect) {
+        isize node = this.map.moved(slot: redirect.slot(), host: copy redirect.host(), port: redirect.port());
+        if (node < 0) { return -1; }
+        this.stale = true;
+        return this.linkTo(host: redirect.host(), port: redirect.port());
+    }
+
+    // Wait before the next try, a redial's backoff, unless it would end past `window`: then false, and the call ends.
+    unsafe fn bool pause(Deadline window) {
+        this.failures = this.failures + 1;
+        Duration d = backoffAfter(failures: this.failures, jitter: ref this.jitter);
+        if (!window.allows(at: monotonicNow() + d)) { return false; }
+        sleep(d: d);
+        return true;
+    }
+
+    // ---- the map ----
+
+    // A map a MOVED changed is read again before the next call, but not within a second of the last try. A reading that
+    // fails leaves the map as MOVED left it, and the next MOVED says what else changed.
+    unsafe fn void freshen() {
+        if (!this.stale) { return; }
+        Instant now = monotonicNow();
+        if (now < this.lastRead + Duration.fromSecs(s: 1i64)) { return; }
+        this.lastRead = now;
+        Result<Unit, RedisError> read = this.readMap(window: Deadline.within(span: this.settings.connectTimeout()));
+    }
+
+    // Read the map (CLUSTER SLOTS): from the nodes whose connection is up, then the map's other nodes, then the seeds,
+    // until one answers with a map that serves a slot, or `window` passes. Nodes the new map does not name are let go.
+    // When none answers, the error is the first that one which was reached gave, or `Connect` with every attempt.
+    unsafe fn Result<Unit, RedisError> readMap(Deadline window) {
+        Command slots = Command.of(name: "CLUSTER");
+        slots.arg(text: "SLOTS");
+        DynamicArray<string> asked = DynamicArray.empty();
+        Optional<RedisError> said = Optional::None;
+        ConnectError unreachable = ConnectError.make();
+        // Each round's candidates: the links that are up; then every node of the map; then the seeds.
+        int32 round = 0;
+        while (round < 3) {
+            DynamicArray<isize> candidates = this.candidates(round: round);
+            isize i = 0;
+            while (i < candidates.length()) {
+                isize at = candidates[i];
+                i = i + 1;
+                string place = this.links[at].place();
+                if (among(names: asked, name: place)) { continue; }
+                if (round > 0 && !window.allows(at: monotonicNow())) { continue; }
+                asked.add(item: copy place);
+                Result<SlotMap, RedisError> got = this.mapFrom(at: at, command: slots);
+                match (give got) {
+                    case Ok(value: m): { this.adopt(next: give m); return Result::Ok(value: Unit::Unit); }
+                    case Err(error: e): { noteFailure(e: give e, said: said, unreachable: unreachable); }
+                };
+            }
+            round = round + 1;
+        }
+        return match (give said) {
+            case Some(value: e): { ConnectError unused = give unreachable; := Result::Err(error: give e); }
+            case None: Result::Err(error: RedisError::Connect(error: give unreachable));
+        };
+    }
+
+    // The links a reading of the map asks in `round`: 0, those whose connection is up; 1, every node of the map; 2, the
+    // seeds the Config names.
+    unsafe fn DynamicArray<isize> candidates(int32 round) {
+        DynamicArray<isize> chosen = DynamicArray.empty();
+        if (round == 0) {
+            isize i = 0;
+            while (i < this.links.length()) { if (this.links[i].live()) { chosen.add(item: i); } i = i + 1; }
+        } else if (round == 1) {
+            isize n = 0;
+            while (n < this.map.nodeCount()) { chosen.add(item: this.linkOf(node: n)); n = n + 1; }
+        } else {
+            isize s = 0;
+            while (s < this.settings.hostCount()) {
+                string host = this.settings.hostAt(index: s);
+                chosen.add(item: this.linkTo(host: host, port: this.settings.portAt(index: s)));
+                s = s + 1;
+            }
+        }
+        return give chosen;
+    }
+
+    // The map link `at`'s node gives: `Unexpected` for one that serves no slot (a cluster not yet set up), `Config` for
+    // a server that is not in cluster mode.
+    unsafe fn Result<SlotMap, RedisError> mapFrom(isize at, const ref Command command) {
+        bool unsent = false;
+        Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: false, unsent: unsent);
+        string place = this.links[at].place();
+        Value reply = match (give r) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: notInCluster(e: give e, place: place)); } };
+        Result<SlotMap, RedisError> read = SlotMap.fromSlots(reply: reply, asked: this.links[at].host());
+        SlotMap m = match (give read) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (m.coverage() == 0) {
+            return Result::Err(error: RedisError::Unexpected(detail: "the cluster node at ".concat(other: place).concat(other: " serves no slot: a cluster whose slots are not yet assigned")));
+        }
+        return Result::Ok(value: give m);
+    }
+
+    // `next` is the map from now on: the links of nodes it does not name are closed and let go.
+    unsafe fn void adopt(SlotMap next) {
+        this.map = give next;
+        this.stale = false;
+        this.lastRead = monotonicNow();
+        isize i = this.links.length();
+        while (i > 0) {
+            i = i - 1;
+            if (this.map.find(host: this.links[i].host(), port: this.links[i].port()) < 0) {
+                NodeLink gone = this.links.remove(index: i);
+                gone.close();
+            }
+        }
+    }
+}
+
+// How a command's pieces are made, from its one key spec: the keys from the argument at `firstKey` on, each with the
+// `step - 1` arguments after it (MSET's value), and, for a spec that counts its keys (MSETEX's numkeys), the count at
+// `countAt`; -1 when there is none.
+type value Shape implements Sendable {
+    bool known = false;
+    isize step = 1;
+    isize countAt = -1;
+
+    public ctor unknown() { this.known = false; }
+    public ctor of(isize step, isize countAt) { this.known = true; this.step = step; this.countAt = countAt; }
+
+    // Whether `keys` are as the shape has them: one after another, `step` apart, all of them found.
+    public const fn bool fits(const ref Keys keys) {
+        if (!this.known || keys.partial() || keys.count() == 0) { return false; }
+        isize k = 1;
+        while (k < keys.count()) {
+            if (keys.at(index: k) != keys.at(index: k - 1) + this.step) { return false; }
+            k = k + 1;
+        }
+        return true;
+    }
+
+    // The piece of `command` with the keys `group` names (indexes into `keys`): the arguments before the first key
+    // (the count made the group's), each key of the group with what follows it, and what comes after the last key.
+    public const fn Command piece(const ref Command command, const ref Keys keys, const ref DynamicArray<isize> group, const ref string name) {
+        Command c = Command.of(name: name);
+        isize first = keys.at(index: 0);
+        isize p = 1;
+        while (p < first) {
+            if (p == this.countAt) { c.argInt(value: cast<int64>(group.length())); } else { c.argBytes(bytes: command.part(index: p)); }
+            p = p + 1;
+        }
+        isize g = 0;
+        while (g < group.length()) {
+            isize at = keys.at(index: group[g]);
+            isize j = 0;
+            while (j < this.step) { c.argBytes(bytes: command.part(index: at + j)); j = j + 1; }
+            g = g + 1;
+        }
+        p = keys.at(index: keys.count() - 1) + this.step;
+        while (p < command.length()) { c.argBytes(bytes: command.part(index: p)); p = p + 1; }
+        return give c;
+    }
+}
+
+// The shape of a command with `specs` key specs, the first beginning at `begin` and found by `find`: known for one spec
+// that begins at an index and finds a range to the end, or a count of keys.
+fn Shape shapeOf(isize specs, const ref Begin begin, const ref Find find) {
+    if (specs != 1) { return Shape.unknown(); }
+    isize from = match (begin) { case Index(at: i): cast<isize>(i); case _: -1; };
+    if (from < 1) { return Shape.unknown(); }
+    isize step = 0;
+    isize countAt = -1;
+    match (find) {
+        case Range(last: l, step: s, limit: m): { if (l == -1 && m == 0) { step = cast<isize>(s); } }
+        case Keynum(at: a, first: f, step: s): { step = cast<isize>(s); countAt = from + cast<isize>(a); }
+        case Unknown: { }
+    };
+    if (step < 1) { return Shape.unknown(); }
+    return Shape.of(step: step, countAt: countAt);
+}
+
+// What a cluster does about a call's failure `e`; `unsent` says no connection could be opened, so nothing was sent.
+fn Recourse recourseFor(const ref RedisError e, bool unsent) {
+    if (unsent) {
+        if (transient(e: e)) { return Recourse::Reread; }
+        return Recourse::Fail;
+    }
+    return match (e) {
+        case Server(error: s): match (s.code()) {
+            case Moved: Recourse::Follow;
+            case Ask: Recourse::Follow;
+            case TryAgain: Recourse::Wait;
+            case ClusterDown: Recourse::Reread;
+            case Loading: Recourse::Reread;
+            case MasterDown: Recourse::Reread;
+            case _: Recourse::Fail;
+        };
+        // The node's connection was lost and its one redial failed: it sent nothing of the call's.
+        case Reconnect(error: r): reread(cause: r.cause());
+        case _: Recourse::Fail;
+    };
+}
+
+fn Recourse reread(const ref RedisError cause) {
+    if (transient(e: cause)) { return Recourse::Reread; }
+    return Recourse::Fail;
+}
+
+// A failure of a reading of the map, kept for its error: the first answer from a node that was reached, and every
+// attempt at one that was not (a redial's included).
+fn void noteFailure(RedisError e, ref Optional<RedisError> said, ref ConnectError unreachable) {
+    bool counted = match (e) {
+        case Connect(error: c): { addAttempts(from: c, to: unreachable); := true; }
+        case Reconnect(error: r): match (r.cause()) { case Connect(error: c): { addAttempts(from: c, to: unreachable); := true; } case _: false; };
+        case _: false;
+    };
+    if (counted) { RedisError dropped = give e; return; }
+    bool first = match (said) { case Some(value: x): false; case None: true; };
+    if (first) { said = Optional::Some(value: give e); } else { RedisError dropped = give e; }
+}
+
+fn void addAttempts(const ref ConnectError from, ref ConnectError to) {
+    isize k = 0;
+    while (k < from.count()) { to.add(attempt: copy from.attempt(index: k)); k = k + 1; }
+}
+
+// CLUSTER SLOTS's refusal on a server that is not in cluster mode says so, naming the server and what to use.
+fn RedisError notInCluster(RedisError e, const ref string place) {
+    bool standalone = match (e) { case Server(error: s): s.detail().contains(substring: "cluster support disabled"); case _: false; };
+    if (!standalone) { return give e; }
+    string said = e.message();
+    return RedisError::Config(detail: "the server at ".concat(other: place).concat(other: " is not in cluster mode (").concat(other: said).concat(other: "): connect to it with Connection.connect"));
+}
+
+// What `config` asks of a cluster that it cannot give.
+fn Optional<RedisError> notACluster(const ref Config config) {
+    if (config.viaSentinel()) {
+        return Optional::Some(value: RedisError::Config(detail: "a Sentinel configuration finds one server through its sentinels: connect with Connection.connect; a cluster's seeds are hosts, as redis://h1:7000,h2:7001"));
+    }
+    if (config.transport() == UrlTransport::Unix) {
+        return Optional::Some(value: RedisError::Config(detail: "a cluster's nodes are reached at the hosts and ports its map names: a unix:// configuration names one server's socket"));
+    }
+    if (!config.reconnect()) {
+        return Optional::Some(value: RedisError::Config(detail: "a cluster makes a node's lost connection again as its map changes: reconnect=off is for one connection"));
+    }
+    return Optional::None;
+}
+
+fn RedisError unknownCommand() {
+    return RedisError::Usage(detail: "this client's table of commands does not know this one (a module's, or a newer server's), so it cannot say where it goes: send it to the node a key names with callFor(key:, command:), or to every node with callEach(command:, on:)");
+}
+
+fn RedisError ownReplies() {
+    return RedisError::Usage(detail: "each node answers this command for itself (INFO, RANDOMKEY, LATENCY, SCAN, …), so no one reply is the cluster's: callEach(command:, on:) gives every node's");
+}
+
+fn RedisError unsplittable() {
+    return RedisError::Usage(detail: "the command's keys are in more than one slot, and its arguments are not ones this client can split by slot: give its keys one hash tag, as {user:1}:name and {user:1}:email");
+}
+
+fn RedisError noPrimary() { return RedisError::Unexpected(detail: "the cluster's map names no primary"); }
+
+fn bool among(const ref DynamicArray<string> names, const ref string name) {
+    isize i = 0;
+    while (i < names.length()) { if (names[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
+// The command's name as it was written, for its pieces; the table's when it is not text.
+fn string nameOf(const ref Command command, const ref string fallback) {
+    Result<string, Utf8Error> r = decode(bytes: command.part(index: 0));
+    return match (give r) { case Ok(value: s): give s; case Err(error: e): copy fallback; };
+}
+
+// ---- replies made one (command-tips.md, "response_policy") ----
+
+// The pieces' replies of a split command whose replies are one per key (MGET), back in the order of its keys: `groups`
+// says which keys (by index) each piece had. The first piece's error is the call's.
+fn Result<Value, RedisError> inKeyOrder(DynamicArray<Result<Value, RedisError>> replies, const ref DynamicArray<DynamicArray<isize>> groups, isize total) {
+    DynamicArray<Value> values = DynamicArray.empty();
+    Optional<RedisError> failed = everyValue(replies: give replies, values: values);
+    match (give failed) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+    DynamicArray<Value> ordered = DynamicArray.withCapacity(capacity: total);
+    isize k = 0;
+    while (k < total) { ordered.add(item: Value::Null); k = k + 1; }
+    isize g = 0;
+    while (g < groups.length()) {
+        Value v = values.remove(index: 0);
+        DynamicArray<Value> items = match (give v) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
+        if (items.length() != groups[g].length()) {
+            return Result::Err(error: RedisError::Unexpected(detail: "a piece of a split command was answered with something other than a reply per key"));
+        }
+        isize j = 0;
+        while (j < groups[g].length()) {
+            ordered[groups[g][j]] = items.remove(index: 0);
+            j = j + 1;
+        }
+        g = g + 1;
+    }
+    return Result::Ok(value: Value::Array(items: give ordered));
+}
+
+// The replies of a command sent to several nodes, made one as its response policy says. One that succeeded is enough
+// for `OneSucceeded`; any other wants them all, and the first error is the call's.
+fn Result<Value, RedisError> aggregate(Response response, DynamicArray<Result<Value, RedisError>> replies) {
+    if (response == Response::OneSucceeded) {
+        isize i = 0;
+        while (i < replies.length()) {
+            bool ok = match (replies[i]) { case Ok(value: v): true; case Err(error: e): false; };
+            if (ok) { return replies.remove(index: i); }
+            i = i + 1;
+        }
+        return replies.remove(index: 0);
+    }
+    DynamicArray<Value> values = DynamicArray.empty();
+    Optional<RedisError> failed = everyValue(replies: give replies, values: values);
+    match (give failed) { case Some(value: e): { return Result::Err(error: give e); } case None: { } };
+    if (response == Response::AllSucceeded) { return Result::Ok(value: values.remove(index: 0)); }
+    bool folds = response == Response::AggSum || response == Response::AggMin || response == Response::AggMax
+                 || response == Response::AggLogicalAnd || response == Response::AggLogicalOr;
+    if (!folds) { return Result::Ok(value: gathered(values: give values)); }
+    Value sum = values.remove(index: 0);
+    while (values.length() > 0) {
+        Value next = values.remove(index: 0);
+        Optional<Value> both = combined(a: sum, b: next, response: response);
+        match (give both) {
+            case Some(value: v): { sum = give v; }
+            case None: { return Result::Err(error: RedisError::Unexpected(detail: "the nodes' replies to the command are not ones its response policy can combine")); }
+        };
+    }
+    return Result::Ok(value: give sum);
+}
+
+// The values of `replies`, attributes taken off, into `values`; the first error among them, if any.
+fn Optional<RedisError> everyValue(DynamicArray<Result<Value, RedisError>> replies, ref DynamicArray<Value> values) {
+    Optional<RedisError> first = Optional::None;
+    while (replies.length() > 0) {
+        Result<Value, RedisError> r = replies.remove(index: 0);
+        match (give r) {
+            case Ok(value: v): { values.add(item: unattributed(v: give v)); }
+            case Err(error: e): {
+                bool none = match (first) { case Some(value: x): false; case None: true; };
+                if (none) { first = Optional::Some(value: give e); } else { RedisError dropped = give e; }
+            }
+        };
+    }
+    return give first;
+}
+
+// Replies of a command without keys gathered into one (the default): arrays (KEYS's) one after another, as are sets
+// and maps; replies of any other kind side by side in an array.
+fn Value gathered(DynamicArray<Value> values) {
+    bool arrays = true;
+    bool sets = true;
+    bool maps = true;
+    isize i = 0;
+    while (i < values.length()) {
+        bool array = match (values[i]) { case Array(items: xs): true; case _: false; };
+        bool set = match (values[i]) { case Set(items: xs): true; case _: false; };
+        bool kv = match (values[i]) { case Map(entries: xs): true; case _: false; };
+        arrays = arrays && array;
+        sets = sets && set;
+        maps = maps && kv;
+        i = i + 1;
+    }
+    if (!arrays && !sets && !maps) { return Value::Array(items: give values); }
+    DynamicArray<Value> all = DynamicArray.empty();
+    while (values.length() > 0) {
+        Value v = values.remove(index: 0);
+        DynamicArray<Value> items = match (give v) {
+            case Array(items: xs): give xs;
+            case Set(items: xs): give xs;
+            case Map(entries: xs): give xs;
+            case _: DynamicArray.empty();
+        };
+        all.addAll(items: items.view());
+    }
+    if (sets) { return Value::Set(items: give all); }
+    if (maps) { return Value::Map(entries: give all); }
+    return Value::Array(items: give all);
+}
+
+comptime int64 MOST = 9223372036854775807i64;
+
+// Two replies combined by `response`: integers summed, the least or the most kept, or taken as truths (0 is false);
+// arrays of the same length element by element (SCRIPT EXISTS's). None when they cannot be, or a sum would overflow.
+fn Optional<Value> combined(const ref Value a, const ref Value b, Response response) {
+    int64 x = 0i64;
+    int64 y = 0i64;
+    bool integers = match (a) { case Integer(value: n): { x = n; := match (b) { case Integer(value: m): { y = m; := true; } case _: false; }; } case _: false; };
+    if (integers) {
+        if (response == Response::AggSum) {
+            if ((y > 0i64 && x > MOST - y) || (y < 0i64 && x < -MOST - 1i64 - y)) { return Optional::None; }
+            return Optional::Some(value: Value::Integer(value: x + y));
+        }
+        if (response == Response::AggMin) { if (y < x) { return Optional::Some(value: Value::Integer(value: y)); } return Optional::Some(value: Value::Integer(value: x)); }
+        if (response == Response::AggMax) { if (y > x) { return Optional::Some(value: Value::Integer(value: y)); } return Optional::Some(value: Value::Integer(value: x)); }
+        bool t = x != 0i64;
+        bool u = y != 0i64;
+        bool truth = t && u;
+        if (response == Response::AggLogicalOr) { truth = t || u; }
+        int64 n = 0i64;
+        if (truth) { n = 1i64; }
+        return Optional::Some(value: Value::Integer(value: n));
+    }
+    DynamicArray<Value> xs = match (a) { case Array(items: v): copy v; case _: DynamicArray.empty(); };
+    DynamicArray<Value> ys = match (b) { case Array(items: v): copy v; case _: DynamicArray.empty(); };
+    bool arrays = match (a) { case Array(items: v): match (b) { case Array(items: w): true; case _: false; }; case _: false; };
+    if (!arrays || xs.length() != ys.length()) { return Optional::None; }
+    DynamicArray<Value> each = DynamicArray.empty();
+    isize i = 0;
+    while (i < xs.length()) {
+        Optional<Value> one = combined(a: xs[i], b: ys[i], response: response);
+        match (give one) { case Some(value: v): { each.add(item: give v); } case None: { return Optional::None; } };
+        i = i + 1;
+    }
+    return Optional::Some(value: Value::Array(items: give each));
+}

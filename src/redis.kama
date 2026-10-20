@@ -8,14 +8,18 @@
 //                    (src/arg.kama), `reply::<T>` and its kin (src/reply.kama), Pipeline and Replies
 //                    (src/pipeline.kama), TxOutcome and TxBody (src/transaction.kama), Script and ScriptCall
 //                    (src/script.kama), Scan (src/scan.kama), Subscriber, Delivery, Message and ChannelKind
-//                    (src/subscriber.kama), ServerInfo (src/server.kama), the Transport and Dialer contracts
-//                    (src/transport.kama), RedisUrl (src/url.kama)
+//                    (src/subscriber.kama), ServerInfo (src/server.kama), the Transport, Dialer and Dialers
+//                    contracts (src/transport.kama), RedisUrl (src/url.kama), Cluster, ClusterTarget and NodeReply
+//                    (src/cluster.kama)
 //   redis::wire      internal: a deadline, RESP over a transport and what a value holds in memory, the commands a
 //                    connection does not carry and the blocking commands' timeouts (src/wire/known.kama), the
-//                    server's integer grammar
+//                    server's integer grammar, what Sentinel answers (src/wire/sentinel.kama), the table of commands
+//                    and their keys (src/wire/commands.kama, route.kama), and what is tried again (src/wire/retry.kama)
 //   redis::secure    internal: TLS over any transport, and the TlsConfig each connect attempt builds
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
-//   redis::cluster   key slots (src/cluster/slot.kama); to come (0.2.0): the slot map and redirections
+//   redis::cluster   key slots (src/cluster/slot.kama), the table of commands' keys and slots (CommandTable,
+//                    src/cluster/keys.kama), the slot map and redirections (SlotMap, ClusterNode, Redirect,
+//                    src/cluster/map.kama)
 //   redis::pool      to come (0.3.0): a connection pool shared by isolates
 //
 // The rules every module holds:

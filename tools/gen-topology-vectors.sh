@@ -4,9 +4,11 @@
 # "Phase 6").
 #
 # Each server in the matrix (tools/redis.sh list) is asked live, in a throwaway container with no network:
+#   - A server not in cluster mode (7400), for CLUSTER SLOTS's refusal there.
 #   - A cluster of six nodes (7000-7005), built by hand so that it comes out the same every run: three primaries
 #     with the slots in thirds, each with one replica (7003 of 7000, 7004 of 7001, 7005 of 7002). What it answers:
-#     CLUSTER SLOTS; MOVED from a primary and from a replica; CROSSSLOT; a redirection while queueing in MULTI, then
+#     CLUSTER SLOTS, before the slots are assigned and after; a node's HELLO; the pieces of a command split by slot or sent to every primary (MGET, EXISTS,
+#     MSET, DBSIZE, KEYS, PING, SCRIPT EXISTS, each at its own node); MOVED from a primary and from a replica; CROSSSLOT; a redirection while queueing in MULTI, then
 #     EXEC's EXECABORT, and EXEC's own CROSSSLOT; a slot being migrated (ASK, TRYAGAIN, MOVED back without ASKING,
 #     ASKING for one command, ASKING then a transaction); READONLY and READWRITE on a replica; a slot not served and
 #     the map with its gap; the map and MOVED after a CLUSTER FAILOVER; the map and MOVED with hostnames and with an
@@ -61,6 +63,8 @@ for p in 7000 7001 7002 7003 7004 7005; do
         --cluster-node-timeout 2000 --save "" --appendonly no --daemonize yes --logfile /tmp/c$p/log >/dev/null 2>&1
 done
 redis-server --port 7200 --save "" --appendonly no --daemonize yes --logfile /tmp/d7200.log >/dev/null 2>&1
+# A server not in cluster mode, for what CLUSTER SLOTS answers there.
+redis-server --port 7400 --save "" --appendonly no --daemonize yes --logfile /tmp/s7400.log >/dev/null 2>&1
 for p in 7201 7202; do
     redis-server --port $p --replicaof 127.0.0.1 7200 --save "" --appendonly no --daemonize yes --logfile /tmp/d$p.log >/dev/null 2>&1
 done
@@ -195,6 +199,8 @@ my %id = map { $_ => text($_, 'CLUSTER', 'MYID') } @nodes;
 %canonId = map { $id{$_} => sprintf('%040d', $_) } @nodes;
 my $epoch = 1;
 one($_, 'CLUSTER', 'SET-CONFIG-EPOCH', $epoch++) for @nodes;
+# A node of a cluster whose slots are not yet assigned: its map serves nothing.
+pair('slots-empty', 7000, [], ['CLUSTER', 'SLOTS']);
 my @thirds = ([0, 5460], [5461, 10922], [10923, 16383]);
 for my $i (0 .. 2) { one(7000 + $i, 'CLUSTER', 'ADDSLOTS', $thirds[$i][0] .. $thirds[$i][1]); }
 one(7000, 'CLUSTER', 'MEET', '127.0.0.1', $_) for 7001 .. 7005;
@@ -229,7 +235,29 @@ print "keys\t$kA $kA2 $kB $kC $mx $my\n";
 { my $c = open_to(7002); tcall($c, 'SET', $kC, 'vc'); tcall($c, 'WAIT', '1', '2000'); close $c->{s}; }
 
 pair('slots', 7000, [], ['CLUSTER', 'SLOTS']);
+pair('slots-standalone', 7400, [], ['CLUSTER', 'SLOTS']);
 pair('slots-at-replica', 7003, [], ['CLUSTER', 'SLOTS']);
+# A node's own HELLO: what a cluster's connection to each node meets first.
+{ my $c = open_to(7000); record('hello3-node', ['HELLO', '3'], tenc(canon_hello(tcall($c, 'HELLO', '3')))); close $c->{s}; }
+# What the pieces of a call split by slot, or sent to every primary, meet (the commands' tips): each at its own node.
+# The script's SHA1 is that of "return 1", which only 7000 has.
+my $sha = 'e0e1f9fabfc9d4800c877a703b823ac0578ff8db';
+pair('mget-a', 7000, [], ['MGET', $kA]);
+pair('mget-b', 7001, [], ['MGET', $kB]);
+pair('mget-c', 7002, [], ['MGET', $kC]);
+pair('mget-tag', 7000, [], ['MGET', $mx, $my]);
+pair('exists-a', 7000, [], ['EXISTS', $kA]);
+pair('exists-b', 7001, [], ['EXISTS', $kB]);
+pair('exists-c', 7002, [], ['EXISTS', $kC]);
+pair('mset-a', 7000, [], ['MSET', $kA, 'va']);
+pair('dbsize-a', 7000, [], ['DBSIZE']);
+pair('dbsize-b', 7001, [], ['DBSIZE']);
+pair('dbsize-c', 7002, [], ['DBSIZE']);
+pair('keys-a', 7000, [], ['KEYS', $kA]);
+pair('keys-b', 7001, [], ['KEYS', $kA]);
+pair('ping-node', 7000, [], ['PING']);
+pair('script-exists-a', 7000, [['SCRIPT', 'LOAD', 'return 1']], ['SCRIPT', 'EXISTS', $sha]);
+pair('script-exists-b', 7001, [], ['SCRIPT', 'EXISTS', $sha]);
 pair('moved', 7000, [], ['GET', $kB]);
 pair('crossslot', 7000, [], ['MGET', $kA, $kB]);
 pair('crossslot-one-node', 7000, [], ['MGET', $kA, $kA2]);
@@ -483,8 +511,10 @@ for server in $SERVERS; do
         redis-*)  image=docker.io/library/redis:${server#redis-} ;;
         valkey-*) image=docker.io/valkey/valkey:${server#valkey-} ;;
     esac
-    "$RT" run --rm -i --network none "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt" ||
-        { echo "gen-topology-vectors: $server failed" >&2; exit 1; }
+    status=0
+    "$RT" run --rm -i --network none "$image" sh -c "$(cat "$tmp/run.sh")" < "$tmp/ask.pl" > "$tmp/one.txt" || status=$?
+    # A container that dies without a word (137: killed, as by a machine out of memory) says how far it got.
+    [ "$status" = 0 ] || { echo "gen-topology-vectors: $server failed (exit $status), after:" >&2; tail -n 3 "$tmp/one.txt" | cut -c1-200 >&2; exit 1; }
     number=$(head -n 1 "$tmp/one.txt")
     case "$number" in [0-9]*.[0-9]*) ;; *) echo "gen-topology-vectors: $server gave no version" >&2; cat "$tmp/one.txt" >&2; exit 1 ;; esac
     tail -n +2 "$tmp/one.txt" | sed "s/^/${server%%-*}-$number	/" >> "$tmp/live.tsv"
@@ -506,7 +536,8 @@ while (<$f>) {
 }
 my %hex = map { $_->[0] => $_->[2] } @replies;
 my %count; $count{(split / /, $_->[0])[1]}++ for @replies;
-my @every = qw(slots slots-at-replica moved crossslot crossslot-one-node multi-moved exec-after-moved exec-crossslot
+my @every = qw(slots slots-empty slots-standalone slots-at-replica mget-a mget-b mget-c mget-tag exists-a exists-b exists-c mset-a dbsize-a
+    dbsize-b dbsize-c keys-a keys-b ping-node script-exists-a script-exists-b moved crossslot crossslot-one-node multi-moved exec-after-moved exec-crossslot
     replica-get replica-readonly replica-get-readonly replica-set-readonly replica-readwrite replica-get-readwrite
     replica-keyless-write ask migrating-served migrating-tryagain importing-moved asking importing-asking
     importing-asking-tryagain importing-asking-once importing-asking-multi not-served slots-gap slots-after-failover
@@ -520,7 +551,7 @@ for my $must (@every) {
         die "gen-topology-vectors: case $must/$proto is not on every server\n" unless ($count{"$must/$proto"} // 0) == @versions;
     }
 }
-for my $must (qw(sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted)) {
+for my $must (qw(hello3-node sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted)) {
     die "gen-topology-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 # What the client's design rests on, checked on every server rather than taken from the docs.

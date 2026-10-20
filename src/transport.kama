@@ -1,7 +1,7 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
          std::net::SocketAddr, std::net::IpAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
          std::net::UnixStream, std::net::UnixAddr, std::time::Duration, std::memory::Owned, redis::RedisError };
-export { Transport, TcpTransport, UnixTransport, Dialer, DialTarget };
+export { Transport, TcpTransport, UnixTransport, Dialer, Dialers, DialTarget };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. That is what lets every step
@@ -39,6 +39,13 @@ type contract Dialer for resource implements Sendable {
     // A connected transport to `target`, within `timeoutMs` (< 0: no limit). A `TimedOut` error is the deadline
     // passing, and the next address is tried, as for any failure to connect.
     fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs);
+}
+
+// Dialers for a cluster (`Cluster.connectWith`): one for each connection it opens, a node's or a seed's, since a dialer
+// belongs to the connection that holds it. Each dialer is given every address its connection tries, so it can send
+// a node's announced address somewhere else (a tunnel, a NAT), as redis-py's address_remap does.
+type contract Dialers for resource implements Sendable {
+    fn Owned<Dialer> another();
 }
 
 // One place a connection attempt goes: an address of a host, or a Unix-domain socket.

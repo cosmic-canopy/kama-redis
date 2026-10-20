@@ -1,0 +1,711 @@
+// redis::Cluster over scripted nodes (docs/ROADMAP.md, "Phase 6"). Each connection the cluster opens takes the next
+// scripted dialer (`ScriptDialers`), keyed by its place, so a cluster that opens its connections in another order, or
+// dials a node it should not, finds closed ports. What the nodes say is redis-8.10.2's cluster, from
+// topology_vectors.kama: 7000-7002 primaries with the slots in thirds, 7003-7005 their replicas, and after a failover
+// 7004 in place of 7001. Replies a cluster's captures lack are the standalone server's (server_vectors.kama).
+import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::sleep,
+         redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Config, redis::Command, redis::RedisError,
+         redis::Dialer, redis::Dialers, redis::Script, redis::ScriptCall, redis::libraryVersion, redis::resp::Value,
+         redis::cluster::keySlot,
+         redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
+         commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys };
+export { clusterTests };
+
+fn string server() { return "redis-8.10.2"; }
+
+// The keys the cluster's cases use (topology_vectors.kama): 0 and 1 in shard 0 (7000) in two slots, 2 in shard 1
+// (7001), 3 in shard 2 (7002), 4 and 5 in the slot that migrates from 7000 to 7001 (4 on 7000, 5 on neither).
+fn string keyAt(isize index) {
+    DynamicArray<string> servers = topologyKeyServers();
+    DynamicArray<string> keys = topologyKeys();
+    isize i = 0;
+    while (i < servers.length()) {
+        if (servers[i] == server()) {
+            string all = copy keys[i];
+            isize n = 0;
+            isize start = 0;
+            isize k = 0;
+            while (k <= all.length()) {
+                if (k == all.length() || all.bytes()[k] == 32ui8) {
+                    if (n == index) { return all.substring(start: start, end: k); }
+                    n = n + 1;
+                    start = k + 1;
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    panic(msg: "cluster_test: no key ${index}");
+    return "";
+}
+
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// A node's side of the handshake under RESP3: its HELLO (in cluster mode), then the two SETINFOs.
+fn DynamicArray<Step> node() {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3", answer: topo(kase: "hello3-node")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server(), kase: "setinfo-ver")));
+    return give s;
+}
+
+// A node that answers its handshake, then CLUSTER SLOTS with the map `slots` ("slots/3").
+fn DynamicArray<Step> seed(const ref string slots) {
+    DynamicArray<Step> s = node();
+    s.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: slots)));
+    return give s;
+}
+
+// A node that answers its handshake, then `command` with `answer`.
+fn DynamicArray<Step> answering(const ref string command, DynamicArray<uint8> answer) {
+    DynamicArray<Step> s = node();
+    s.add(item: expect(command: command, answer: give answer));
+    return give s;
+}
+
+// The connections a test's cluster opens, in the order it opens them: each one's place, and what each dial there
+// meets (a redial is the connection's next dial).
+type resource Opens {
+    DynamicArray<Owned<Dialer>> made;
+
+    public ctor make() { this.made = DynamicArray.empty(); }
+
+    // The next connection, at `place`, its one dial served by `script`.
+    public unsafe fn void serve(string place, DynamicArray<Step> script) {
+        DynamicArray<Dial> d = DynamicArray.empty();
+        d.add(item: Dial::Serve(steps: give script));
+        this.each(place: give place, dials: give d);
+    }
+
+    // The next connection, at `place`, its dial refused.
+    public unsafe fn void refuse(string place) {
+        DynamicArray<Dial> d = DynamicArray.empty();
+        d.add(item: Dial::Refuse);
+        this.each(place: give place, dials: give d);
+    }
+
+    // The next connection, at `place`, each of its dials in turn.
+    public unsafe fn void each(string place, DynamicArray<Dial> dials) {
+        DynamicArray<string> where = DynamicArray.empty();
+        isize i = 0;
+        while (i < dials.length()) { where.add(item: copy place); i = i + 1; }
+        Owned<Dialer> d = new ScriptDialer.byPlace(places: give where, dials: give dials);
+        this.made.add(item: give d);
+    }
+
+    public unsafe fn Owned<Dialers> dialers() {
+        Owned<ScriptDialers> all = new ScriptDialers.make();
+        while (this.made.length() > 0) { all.then(dialer: this.made.remove(index: 0)); }
+        Owned<Dialers> d = give all;
+        return give d;
+    }
+}
+
+// The seed 7000 alone, a second each to connect and to wait.
+fn string oneSeed() { return "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1"; }
+
+unsafe fn Result<Cluster, RedisError> through(Opens o, const ref string url) {
+    Opens taken = give o;
+    Owned<Dialers> d = taken.dialers();
+    Config c = configOf(url: url);
+    return Cluster.connectWith(dialers: give d, config: c);
+}
+
+// The cluster a check needs. When it cannot be made, the check `what` fails here (counted in `fails`), and a stand-in,
+// a cluster whose seed answers nothing past the map, lets the test go on to its end.
+unsafe fn Cluster clustered(Opens o, const ref string url, const ref string what, ref int32 fails) {
+    Result<Cluster, RedisError> r = through(o: give o, url: url);
+    return match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); fails = fails + check(ok: false, what: "${what} (${m})"); := standIn(); }
+    };
+}
+
+unsafe fn Cluster standIn() {
+    Opens o = Opens.make();
+    o.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    Result<Cluster, RedisError> r = through(o: give o, url: oneSeed());
+    return match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { panic(msg: "cluster_test: the stand-in cluster"); := standIn(); }
+    };
+}
+
+fn bool isBulk(const ref Result<Value, RedisError> r, const ref string text) {
+    return match (r) { case Ok(value: v): match (v) { case Bulk(bytes: b): textOf(b: b.view()) == text; case _: false; }; case Err(error: e): false; };
+}
+fn bool isNull(const ref Result<Value, RedisError> r) {
+    return match (r) { case Ok(value: v): v.isNull(); case Err(error: e): false; };
+}
+fn bool isInteger(const ref Result<Value, RedisError> r, int64 n) {
+    return match (r) { case Ok(value: v): match (v) { case Integer(value: x): x == n; case _: false; }; case Err(error: e): false; };
+}
+fn bool isStatus(const ref Result<Value, RedisError> r, const ref string text) {
+    return match (r) { case Ok(value: v): match (v) { case Simple(bytes: b): textOf(b: b.view()) == text; case _: false; }; case Err(error: e): false; };
+}
+fn bool hasCode(const ref Result<Value, RedisError> r, const ref string code) {
+    return match (r) {
+        case Err(error: e): match (e) { case Server(error: s): s.codeText() == code; case _: false; };
+        case Ok(value: v): false;
+    };
+}
+fn bool isUsage(const ref Result<Value, RedisError> r, const ref string words) {
+    return match (r) { case Err(error: e): match (e) { case Usage(detail: d): d.contains(substring: words); case _: false; }; case Ok(value: v): false; };
+}
+fn bool isIo(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
+}
+// The texts of an array reply's items, joined by spaces, a null as "-"; "?" for anything else.
+fn string itemsOf(const ref Result<Value, RedisError> r) {
+    DynamicArray<Value> xs = match (r) { case Ok(value: v): match (v) { case Array(items: i): copy i; case _: DynamicArray.empty(); }; case Err(error: e): DynamicArray.empty(); };
+    bool array = match (r) { case Ok(value: v): match (v) { case Array(items: i): true; case _: false; }; case Err(error: e): false; };
+    if (!array) { return "?"; }
+    string text = "";
+    isize i = 0;
+    while (i < xs.length()) {
+        if (i > 0) { text = text.concat(other: " "); }
+        string one = match (xs[i]) {
+            case Bulk(bytes: b): textOf(b: b.view());
+            case Integer(value: n): { int64 x = n; := "${x}"; }
+            case Null: "-";
+            case _: "?";
+        };
+        text = text.concat(other: one);
+        i = i + 1;
+    }
+    return text;
+}
+
+unsafe fn Result<Value, RedisError> callText(ref Cluster c, const ref string text) {
+    Command command = commandOf(text: text);
+    return c.call(command: command);
+}
+
+// Where a command goes: its keys' slot's primary, each node's connection opened when a call first goes there.
+unsafe fn int32 routingTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    o.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "route: connect", fails: f);
+    f = f + check(ok: c.topology().nodeCount() == 6 && c.topology().shardCount() == 3, what: "route: the map has six nodes in three shards");
+    Result<Value, RedisError> r1 = callText(c: c, text: "GET ${a}");
+    string o1 = callOutcome(r: r1);
+    f = f + check(ok: isBulk(r: r1, text: "va"), what: "route: a key of shard 0 goes to 7000, the seed's connection: ${o1}");
+    Result<Value, RedisError> r2 = callText(c: c, text: "GET ${b}");
+    string o2 = callOutcome(r: r2);
+    f = f + check(ok: isNull(r: r2), what: "route: a key of shard 1 goes to 7001, a connection opened for it: ${o2}");
+
+    // A map whose endpoints are unknown (cluster-preferred-endpoint-type unknown-endpoint) names the node asked.
+    Opens u = Opens.make();
+    u.serve(place: "127.0.0.1:7000", script: seed(slots: "slots-unknown-endpoint/3"));
+    u.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster cu = clustered(o: give u, url: oneSeed(), what: "route: connect, unknown endpoints", fails: f);
+    Result<Value, RedisError> r3 = callText(c: cu, text: "GET ${b}");
+    string o3 = callOutcome(r: r3);
+    f = f + check(ok: isNull(r: r3), what: "route: an unknown endpoint is the host asked: ${o3}");
+    return f;
+}
+
+// MOVED: followed at once, the map patched, then read whole again a second later; ASK: this command, once.
+unsafe fn int32 redirectTests() {
+    int32 f = 0;
+    string b = keyAt(index: 2);
+    string my = keyAt(index: 5);
+    isize slotB = keySlot(key: b.bytes());
+
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    o.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    DynamicArray<Step> s4 = answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3"));
+    s4.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    s4.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    o.serve(place: "127.0.0.1:7004", script: give s4);
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "moved: connect", fails: f);
+    Result<Value, RedisError> r1 = callText(c: c, text: "GET ${b}");
+    string o1 = callOutcome(r: r1);
+    f = f + check(ok: isNull(r: r1), what: "moved: followed to 7004: ${o1}");
+    isize owner = c.topology().primaryOf(slot: slotB);
+    f = f + check(ok: owner >= 0 && c.topology().node(index: owner).port() == 7004, what: "moved: the map takes the slot at once");
+    f = f + check(ok: c.topology().shardCount() == 4, what: "moved: the patched map has 7004 as a shard of its own until it is read again");
+    Result<Value, RedisError> r2 = callText(c: c, text: "GET ${b}");
+    string o2 = callOutcome(r: r2);
+    f = f + check(ok: isNull(r: r2), what: "moved: the next call goes straight to 7004: ${o2}");
+    f = f + check(ok: c.topology().shardCount() == 4, what: "moved: within a second of the last reading, the map is not read again");
+    sleep(d: Duration.fromMillis(ms: 1100i64));
+    Result<Value, RedisError> r3 = callText(c: c, text: "GET ${b}");
+    string o3 = callOutcome(r: r3);
+    f = f + check(ok: isNull(r: r3) && c.topology().shardCount() == 3, what: "moved: a second on, the map is read again: ${o3}");
+
+    // ASK: ASKING and the command at the node named, in one write; the map unchanged.
+    Opens k = Opens.make();
+    DynamicArray<Step> k0 = seed(slots: "slots/3");
+    k0.add(item: expect(command: "GET ${my}", answer: topo(kase: "ask/3")));
+    k0.add(item: expect(command: "GET ${my}", answer: topo(kase: "ask/3")));
+    k.serve(place: "127.0.0.1:7000", script: give k0);
+    DynamicArray<Step> k1 = node();
+    k1.add(item: expect(command: "ASKING", answer: topo(kase: "asking/3")));
+    k1.add(item: expect(command: "GET ${my}", answer: topo(kase: "importing-asking/3")));
+    k1.add(item: expect(command: "ASKING", answer: topo(kase: "asking/3")));
+    k1.add(item: expect(command: "GET ${my}", answer: topo(kase: "importing-asking/3")));
+    k.serve(place: "127.0.0.1:7001", script: give k1);
+    Cluster ck = clustered(o: give k, url: oneSeed(), what: "ask: connect", fails: f);
+    Result<Value, RedisError> a1 = callText(c: ck, text: "GET ${my}");
+    string oa1 = callOutcome(r: a1);
+    f = f + check(ok: isNull(r: a1), what: "ask: ASKING then the command at 7001: ${oa1}");
+    isize mslot = keySlot(key: my.bytes());
+    isize still = ck.topology().primaryOf(slot: mslot);
+    f = f + check(ok: still >= 0 && ck.topology().node(index: still).port() == 7000, what: "ask: the map is not changed");
+    Result<Value, RedisError> a2 = callText(c: ck, text: "GET ${my}");
+    string oa2 = callOutcome(r: a2);
+    f = f + check(ok: isNull(r: a2), what: "ask: the next call asks 7000 again: ${oa2}");
+
+    // The budget: max_redirects=1 follows one MOVED and returns the second; 0 follows none.
+    Opens m = Opens.make();
+    m.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    m.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    m.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: topo(kase: "moved/3")));
+    Cluster cm = clustered(o: give m, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&max_redirects=1", what: "budget: connect", fails: f);
+    Result<Value, RedisError> b1 = callText(c: cm, text: "GET ${b}");
+    string ob1 = callOutcome(r: b1);
+    f = f + check(ok: hasCode(r: b1, code: "MOVED") && ob1.contains(substring: "7001"), what: "budget: past max_redirects the last MOVED is the call's: ${ob1}");
+    Opens z = Opens.make();
+    z.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    z.serve(place: "127.0.0.1:7001", script: answering(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    Cluster cz = clustered(o: give z, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&max_redirects=0", what: "budget: connect, none", fails: f);
+    Result<Value, RedisError> b2 = callText(c: cz, text: "GET ${b}");
+    string ob2 = callOutcome(r: b2);
+    f = f + check(ok: hasCode(r: b2, code: "MOVED") && ob2.contains(substring: "7004"), what: "budget: max_redirects=0 follows none: ${ob2}");
+    return f;
+}
+
+// What ran nothing is waited out and sent again: TRYAGAIN after a pause, CLUSTERDOWN after the map is read again, and
+// a node that cannot be reached by reading the map and going where it says. What may have run is the call's.
+unsafe fn int32 waitTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    string mx = keyAt(index: 4);
+    string my = keyAt(index: 5);
+
+    Opens t = Opens.make();
+    DynamicArray<Step> t0 = seed(slots: "slots/3");
+    t0.add(item: expect(command: "MGET ${mx} ${my}", answer: topo(kase: "migrating-tryagain/3")));
+    t0.add(item: expect(command: "MGET ${mx} ${my}", answer: reply(server: server(), kase: "mget/3")));
+    t.serve(place: "127.0.0.1:7000", script: give t0);
+    Cluster ct = clustered(o: give t, url: oneSeed(), what: "tryagain: connect", fails: f);
+    Result<Value, RedisError> r1 = callText(c: ct, text: "MGET ${mx} ${my}");
+    string o1 = callOutcome(r: r1);
+    f = f + check(ok: itemsOf(r: r1) != "?", what: "tryagain: sent again after a pause: ${o1}");
+
+    Opens d = Opens.make();
+    DynamicArray<Step> d0 = seed(slots: "slots/3");
+    d0.add(item: expect(command: "GET ${a}", answer: topo(kase: "clusterdown/3")));
+    d0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    d0.add(item: expect(command: "GET ${a}", answer: topo(kase: "clusterdown-read/3")));
+    d.serve(place: "127.0.0.1:7000", script: give d0);
+    Cluster cd = clustered(o: give d, url: oneSeed(), what: "clusterdown: connect", fails: f);
+    Result<Value, RedisError> r2 = callText(c: cd, text: "GET ${a}");
+    string o2 = callOutcome(r: r2);
+    f = f + check(ok: isBulk(r: r2, text: "va"), what: "clusterdown: the map read again, then sent again: ${o2}");
+
+    // LOADING (a node restarted, reading its data): the map read again, then sent again.
+    Opens ld = Opens.make();
+    DynamicArray<Step> ld0 = seed(slots: "slots/3");
+    ld0.add(item: expect(command: "GET ${a}", answer: reply(server: server(), kase: "loading-get")));
+    ld0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    ld0.add(item: expect(command: "GET ${a}", answer: topo(kase: "clusterdown-read/3")));
+    ld.serve(place: "127.0.0.1:7000", script: give ld0);
+    Cluster cld = clustered(o: give ld, url: oneSeed(), what: "loading: connect", fails: f);
+    Result<Value, RedisError> rl = callText(c: cld, text: "GET ${a}");
+    string ol = callOutcome(r: rl);
+    f = f + check(ok: isBulk(r: rl, text: "va"), what: "loading: the map read again, then sent again: ${ol}");
+
+    // A failover: 7001's link closed while idle, and its one redial refused (nothing was sent), so the map is read
+    // again from 7000, which names 7004, and the call goes there.
+    Opens fo = Opens.make();
+    DynamicArray<Step> fo0 = seed(slots: "slots/3");
+    fo0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    fo.serve(place: "127.0.0.1:7000", script: give fo0);
+    DynamicArray<Step> fo1 = answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3"));
+    fo1.add(item: Step::Hangup);
+    fo.serve(place: "127.0.0.1:7001", script: give fo1);
+    fo.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster cfo = clustered(o: give fo, url: oneSeed(), what: "failover: connect", fails: f);
+    Result<Value, RedisError> rf1 = callText(c: cfo, text: "GET ${b}");
+    Result<Value, RedisError> rf2 = callText(c: cfo, text: "GET ${b}");
+    string of2 = callOutcome(r: rf2);
+    f = f + check(ok: isNull(r: rf1) && isNull(r: rf2), what: "failover: a node's redial refused, the map read again, the call at 7004: ${of2}");
+
+    // A cluster that stays down: within reconnect_timeout, then its words.
+    Opens g = Opens.make();
+    DynamicArray<Step> g0 = seed(slots: "slots/3");
+    isize n = 0;
+    while (n < 12) {
+        g0.add(item: expect(command: "GET ${a}", answer: topo(kase: "clusterdown/3")));
+        g0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+        n = n + 1;
+    }
+    g.serve(place: "127.0.0.1:7000", script: give g0);
+    Cluster cg = clustered(o: give g, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=0.3", what: "clusterdown: connect, down", fails: f);
+    Result<Value, RedisError> r3 = callText(c: cg, text: "GET ${a}");
+    string o3 = callOutcome(r: r3);
+    f = f + check(ok: hasCode(r: r3, code: "CLUSTERDOWN"), what: "clusterdown: past reconnect_timeout, the cluster's words: ${o3}");
+
+    // 7001 cannot be reached (nothing was sent): the map, read again from 7000, says 7004, and the call goes there.
+    Opens h = Opens.make();
+    DynamicArray<Step> h0 = seed(slots: "slots/3");
+    h0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    h.serve(place: "127.0.0.1:7000", script: give h0);
+    h.refuse(place: "127.0.0.1:7001");
+    h.serve(place: "127.0.0.1:7004", script: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Cluster ch = clustered(o: give h, url: oneSeed(), what: "unreachable: connect", fails: f);
+    Result<Value, RedisError> r4 = callText(c: ch, text: "GET ${b}");
+    string o4 = callOutcome(r: r4);
+    f = f + check(ok: isNull(r: r4), what: "unreachable: the map read again, the call sent where it says: ${o4}");
+
+    // A node's link lost after the command was written: the call's error, never sent again; the next call redials.
+    Opens l = Opens.make();
+    DynamicArray<Dial> dials = DynamicArray.empty();
+    DynamicArray<Step> l0 = seed(slots: "slots/3");
+    l0.add(item: Step::Close);
+    dials.add(item: Dial::Serve(steps: give l0));
+    dials.add(item: Dial::Serve(steps: thenPinged(script: answering(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")))));
+    l.each(place: "127.0.0.1:7000", dials: give dials);
+    Cluster cl = clustered(o: give l, url: oneSeed(), what: "lost: connect", fails: f);
+    Result<Value, RedisError> r5 = callText(c: cl, text: "GET ${a}");
+    string o5 = callOutcome(r: r5);
+    f = f + check(ok: isIo(r: r5), what: "lost: a command that may have run is the call's error: ${o5}");
+    Result<Value, RedisError> r6 = callText(c: cl, text: "GET ${a}");
+    string o6 = callOutcome(r: r6);
+    f = f + check(ok: isBulk(r: r6, text: "va"), what: "lost: the next call makes the node's link again: ${o6}");
+    return f;
+}
+
+// A redial ends with a PING (Connection.probe): `script`'s handshake, the PING answered, then the rest of it.
+fn DynamicArray<Step> thenPinged(DynamicArray<Step> script) {
+    DynamicArray<Step> s = give script;
+    // The handshake's three steps come first; the PING follows them.
+    s.insertAt(index: 3, item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    return give s;
+}
+
+// Commands the tips spread: split by slot, or sent to every primary, and their replies made one.
+unsafe fn int32 spreadTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string a2 = keyAt(index: 1);
+    string b = keyAt(index: 2);
+    string c3 = keyAt(index: 3);
+    string mx = keyAt(index: 4);
+    string my = keyAt(index: 5);
+
+    // MGET across three shards: a piece per slot, in the order of the first key of each, the values in key order.
+    Opens m = Opens.make();
+    DynamicArray<Step> m0 = seed(slots: "slots/3");
+    m0.add(item: expect(command: "MGET ${a}", answer: topo(kase: "mget-a/3")));
+    m0.add(item: expect(command: "MGET ${a}", answer: topo(kase: "mget-a/3")));
+    m0.add(item: expect(command: "MGET ${a2}", answer: topo(kase: "mget-b/3")));
+    m0.add(item: expect(command: "MGET ${mx} ${my}", answer: topo(kase: "mget-tag/3")));
+    m.serve(place: "127.0.0.1:7000", script: give m0);
+    m.serve(place: "127.0.0.1:7001", script: answering(command: "MGET ${b}", answer: topo(kase: "mget-b/3")));
+    DynamicArray<Step> m2 = answering(command: "MGET ${c3}", answer: topo(kase: "mget-c/3"));
+    m2.add(item: expect(command: "MGET ${c3}", answer: topo(kase: "mget-c/3")));
+    m.serve(place: "127.0.0.1:7002", script: give m2);
+    Cluster cm = clustered(o: give m, url: oneSeed(), what: "mget: connect", fails: f);
+    Result<Value, RedisError> r1 = callText(c: cm, text: "MGET ${b} ${a} ${c3}");
+    string o1 = itemsOf(r: r1);
+    f = f + check(ok: o1 == "- va vc", what: "mget: split by slot, the values in the keys' order: ${o1}");
+    // Two keys on one node, in two slots: two pieces there.
+    Result<Value, RedisError> r2 = callText(c: cm, text: "MGET ${a} ${a2}");
+    string o2 = itemsOf(r: r2);
+    f = f + check(ok: o2 == "va -", what: "mget: two slots of one node are two pieces: ${o2}");
+    // Two keys of one slot are one piece, and its values go back to their keys' places.
+    Result<Value, RedisError> r2b = callText(c: cm, text: "MGET ${mx} ${c3} ${my}");
+    string o2b = itemsOf(r: r2b);
+    f = f + check(ok: o2b == "vx vc -", what: "mget: a piece of two keys, its values in their keys' places: ${o2b}");
+
+    // EXISTS: summed. MSET: OK when every piece is; one piece refused is the call's error.
+    Opens e = Opens.make();
+    DynamicArray<Step> e0 = seed(slots: "slots/3");
+    e0.add(item: expect(command: "EXISTS ${a}", answer: topo(kase: "exists-a/3")));
+    e0.add(item: expect(command: "MSET ${a} va", answer: topo(kase: "mset-a/3")));
+    e0.add(item: expect(command: "MSET ${a} va", answer: topo(kase: "mset-a/3")));
+    e.serve(place: "127.0.0.1:7000", script: give e0);
+    DynamicArray<Step> e1 = answering(command: "EXISTS ${b}", answer: topo(kase: "exists-b/3"));
+    e1.add(item: expect(command: "MSET ${b} vb", answer: topo(kase: "mset-a/3")));
+    e1.add(item: expect(command: "MSET ${b} vb", answer: reply(server: server(), kase: "readonly")));
+    e.serve(place: "127.0.0.1:7001", script: give e1);
+    e.serve(place: "127.0.0.1:7002", script: answering(command: "EXISTS ${c3}", answer: topo(kase: "exists-c/3")));
+    Cluster ce = clustered(o: give e, url: oneSeed(), what: "exists: connect", fails: f);
+    Result<Value, RedisError> r3 = callText(c: ce, text: "EXISTS ${a} ${b} ${c3}");
+    string o3 = callOutcome(r: r3);
+    f = f + check(ok: isInteger(r: r3, n: 2i64), what: "exists: the pieces' counts summed: ${o3}");
+    Result<Value, RedisError> r4 = callText(c: ce, text: "MSET ${a} va ${b} vb");
+    string o4 = callOutcome(r: r4);
+    f = f + check(ok: isStatus(r: r4, text: "OK"), what: "mset: a piece per slot, each key with its value: ${o4}");
+    Result<Value, RedisError> r5 = callText(c: ce, text: "MSET ${a} va ${b} vb");
+    string o5 = callOutcome(r: r5);
+    f = f + check(ok: hasCode(r: r5, code: "READONLY"), what: "mset: a piece refused is the call's error: ${o5}");
+
+    // MSETEX counts its keys: each piece counts its own, and what follows the keys goes with every piece.
+    Opens x = Opens.make();
+    x.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    x.serve(place: "127.0.0.1:7001", script: answering(command: "MSETEX 1 ${b} vb EX 10", answer: topo(kase: "exists-c/3")));
+    DynamicArray<Step> x2 = answering(command: "MSETEX 1 ${c3} vc EX 10", answer: topo(kase: "exists-a/3"));
+    x.serve(place: "127.0.0.1:7002", script: give x2);
+    Cluster cx = clustered(o: give x, url: oneSeed(), what: "msetex: connect", fails: f);
+    Result<Value, RedisError> rx = callText(c: cx, text: "MSETEX 2 ${b} vb ${c3} vc EX 10");
+    string ox = callOutcome(r: rx);
+    f = f + check(ok: isInteger(r: rx, n: 1i64), what: "msetex: a piece per slot, each counting its keys, the options after each: ${ox}");
+
+    // WAIT: the least of the primaries' counts. SCRIPT KILL: one primary's success is enough, and none is the error.
+    Opens w = Opens.make();
+    DynamicArray<Step> w0 = seed(slots: "slots/3");
+    w0.add(item: expect(command: "WAIT 0 0", answer: topo(kase: "dbsize-a/3")));
+    w0.add(item: expect(command: "SCRIPT KILL", answer: reply(server: server(), kase: "notbusy")));
+    w0.add(item: expect(command: "SCRIPT KILL", answer: reply(server: server(), kase: "notbusy")));
+    w.serve(place: "127.0.0.1:7000", script: give w0);
+    DynamicArray<Step> w1 = answering(command: "WAIT 0 0", answer: topo(kase: "dbsize-c/3"));
+    w1.add(item: expect(command: "SCRIPT KILL", answer: topo(kase: "mset-a/3")));
+    w1.add(item: expect(command: "SCRIPT KILL", answer: reply(server: server(), kase: "notbusy")));
+    w.serve(place: "127.0.0.1:7001", script: give w1);
+    DynamicArray<Step> w2 = answering(command: "WAIT 0 0", answer: topo(kase: "dbsize-a/3"));
+    w2.add(item: expect(command: "SCRIPT KILL", answer: reply(server: server(), kase: "notbusy")));
+    w2.add(item: expect(command: "SCRIPT KILL", answer: reply(server: server(), kase: "notbusy")));
+    w.serve(place: "127.0.0.1:7002", script: give w2);
+    Cluster cw = clustered(o: give w, url: oneSeed(), what: "wait: connect", fails: f);
+    Result<Value, RedisError> rw = callText(c: cw, text: "WAIT 0 0");
+    string ow = callOutcome(r: rw);
+    f = f + check(ok: isInteger(r: rw, n: 1i64), what: "wait: the least of the primaries' counts: ${ow}");
+    Result<Value, RedisError> rk = callText(c: cw, text: "SCRIPT KILL");
+    string ok1 = callOutcome(r: rk);
+    f = f + check(ok: isStatus(r: rk, text: "OK"), what: "script kill: one primary's success is the call's: ${ok1}");
+    Result<Value, RedisError> rk2 = callText(c: cw, text: "SCRIPT KILL");
+    string ok2 = callOutcome(r: rk2);
+    f = f + check(ok: hasCode(r: rk2, code: "NOTBUSY"), what: "script kill: no primary's success is the error: ${ok2}");
+
+    // DBSIZE summed, KEYS gathered, SCRIPT EXISTS and-ed, PING answered by every primary.
+    Script one = Script.of(source: "return 1");
+    string sha = one.sha();
+    Opens p = Opens.make();
+    DynamicArray<Step> p0 = seed(slots: "slots/3");
+    p0.add(item: expect(command: "DBSIZE", answer: topo(kase: "dbsize-a/3")));
+    p0.add(item: expect(command: "KEYS ${a}", answer: topo(kase: "keys-a/3")));
+    p0.add(item: expect(command: "SCRIPT EXISTS ${sha}", answer: topo(kase: "script-exists-a/3")));
+    p0.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    p.serve(place: "127.0.0.1:7000", script: give p0);
+    DynamicArray<Step> p1 = answering(command: "DBSIZE", answer: topo(kase: "dbsize-b/3"));
+    p1.add(item: expect(command: "KEYS ${a}", answer: topo(kase: "keys-b/3")));
+    p1.add(item: expect(command: "SCRIPT EXISTS ${sha}", answer: topo(kase: "script-exists-b/3")));
+    p1.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    p.serve(place: "127.0.0.1:7001", script: give p1);
+    DynamicArray<Step> p2 = answering(command: "DBSIZE", answer: topo(kase: "dbsize-c/3"));
+    p2.add(item: expect(command: "KEYS ${a}", answer: topo(kase: "keys-b/3")));
+    p2.add(item: expect(command: "SCRIPT EXISTS ${sha}", answer: topo(kase: "script-exists-b/3")));
+    p2.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    p.serve(place: "127.0.0.1:7002", script: give p2);
+    Cluster cp = clustered(o: give p, url: oneSeed(), what: "primaries: connect", fails: f);
+    Result<Value, RedisError> r6 = callText(c: cp, text: "DBSIZE");
+    string o6 = callOutcome(r: r6);
+    f = f + check(ok: isInteger(r: r6, n: 3i64), what: "dbsize: every primary's, summed: ${o6}");
+    Result<Value, RedisError> r7 = callText(c: cp, text: "KEYS ${a}");
+    string o7 = itemsOf(r: r7);
+    f = f + check(ok: o7 == a, what: "keys: every primary's, one after another: ${o7}");
+    Result<Value, RedisError> r8 = callText(c: cp, text: "SCRIPT EXISTS ${sha}");
+    string o8 = itemsOf(r: r8);
+    f = f + check(ok: o8 == "0", what: "script exists: a script is there only when every primary has it: ${o8}");
+    Result<Value, RedisError> r9 = callText(c: cp, text: "PING");
+    string o9 = callOutcome(r: r9);
+    f = f + check(ok: isStatus(r: r9, text: "PONG"), what: "ping: every primary answers: ${o9}");
+    return f;
+}
+
+// What is refused before anything is written, each naming what to use; and what goes to a node a key names.
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    Opens o = Opens.make();
+    o.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    DynamicArray<Step> s1 = answering(command: "FOO.BAR ${b}", answer: reply(server: server(), kase: "unknown"));
+    s1.add(item: expect(command: "EVALSHA d3c21d0c2b9ca22f82737626a27bcaf5d288f99f 1 ${b}", answer: reply(server: server(), kase: "noscript")));
+    s1.add(item: Step::Any(reply: reply(server: server(), kase: "evalsha-hit")));
+    o.serve(place: "127.0.0.1:7001", script: give s1);
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "refusals: connect", fails: f);
+    Result<Value, RedisError> info = callText(c: c, text: "INFO");
+    f = f + check(ok: isUsage(r: info, words: "callEach"), what: "refused: INFO's reply is each node's own, naming callEach");
+    Result<Value, RedisError> scan = callText(c: c, text: "SCAN 0");
+    f = f + check(ok: isUsage(r: scan, words: "callEach"), what: "refused: SCAN, naming callEach");
+    Result<Value, RedisError> random = callText(c: c, text: "RANDOMKEY");
+    f = f + check(ok: isUsage(r: random, words: "callEach"), what: "refused: RANDOMKEY, naming callEach");
+    Result<Value, RedisError> watch = callText(c: c, text: "WATCH ${a}");
+    f = f + check(ok: isUsage(r: watch, words: "watched"), what: "refused: WATCH, naming watched");
+    Result<Value, RedisError> asking = callText(c: c, text: "asking");
+    f = f + check(ok: isUsage(r: asking, words: "ASKING itself"), what: "refused: ASKING, the cluster's own");
+    Result<Value, RedisError> sub = callText(c: c, text: "SUBSCRIBE ch");
+    f = f + check(ok: isUsage(r: sub, words: "pub/sub"), what: "refused: what a connection refuses");
+    Result<Value, RedisError> module = callText(c: c, text: "FOO.BAR ${b}");
+    f = f + check(ok: isUsage(r: module, words: "callFor"), what: "refused: a command the table does not know, naming callFor");
+    Result<Value, RedisError> rename = callText(c: c, text: "RENAME ${a} ${b}");
+    f = f + check(ok: isUsage(r: rename, words: "hash tag"), what: "refused: keys in two slots, naming a hash tag");
+
+    // callFor: whatever the table says, the node of the key's slot.
+    Command foo = commandOf(text: "FOO.BAR ${b}");
+    Result<Value, RedisError> r1 = c.callFor(key: b.bytes(), command: foo);
+    string o1 = callOutcome(r: r1);
+    f = f + check(ok: hasCode(r: r1, code: "ERR") && o1.contains(substring: "FOO") == false && o1.contains(substring: "fake server") == false,
+                  what: "callFor: sent to 7001, the key's node: ${o1}");
+
+    // eval: EVALSHA at the node of the script's keys, then EVAL there on NOSCRIPT.
+    Script s = Script.of(source: "return redis.call('GET', KEYS[1])");
+    ScriptCall call = ScriptCall.of(script: s);
+    call.addKeyBytes(bytes: b.bytes());
+    Result<Value, RedisError> r2 = c.eval(call: call);
+    string o2 = callOutcome(r: r2);
+    f = f + check(ok: isBulk(r: r2, text: "hello"), what: "eval: EVALSHA at the keys' node, then EVAL on NOSCRIPT: ${o2}");
+    c.close();
+    Result<Value, RedisError> closed = callText(c: c, text: "GET ${a}");
+    bool isClosed = match (closed) { case Err(error: e): match (e) { case Closed: true; case _: false; }; case Ok(value: v): false; };
+    f = f + check(ok: isClosed && c.isClosed(), what: "close: every call answers Closed");
+    return f;
+}
+
+// callEach: every primary's, or every node's, reply as it is.
+unsafe fn int32 eachTests() {
+    int32 f = 0;
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "DBSIZE", answer: topo(kase: "dbsize-a/3")));
+    s0.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    DynamicArray<Step> s1 = answering(command: "DBSIZE", answer: topo(kase: "dbsize-b/3"));
+    s1.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    o.serve(place: "127.0.0.1:7001", script: give s1);
+    DynamicArray<Step> s2 = answering(command: "DBSIZE", answer: topo(kase: "dbsize-c/3"));
+    s2.add(item: expect(command: "PING", answer: topo(kase: "ping-node/3")));
+    o.serve(place: "127.0.0.1:7002", script: give s2);
+    o.serve(place: "127.0.0.1:7003", script: answering(command: "PING", answer: topo(kase: "ping-node/3")));
+    o.serve(place: "127.0.0.1:7004", script: answering(command: "PING", answer: topo(kase: "ping-node/3")));
+    o.serve(place: "127.0.0.1:7005", script: answering(command: "PING", answer: topo(kase: "ping-node/3")));
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "each: connect", fails: f);
+    Command dbsize = commandOf(text: "DBSIZE");
+    Result<DynamicArray<NodeReply>, RedisError> r1 = c.callEach(command: dbsize, on: ClusterTarget::Primaries);
+    DynamicArray<NodeReply> each = match (give r1) { case Ok(value: x): give x; case Err(error: e): DynamicArray.empty(); };
+    string seen = "";
+    isize i = 0;
+    while (i < each.length()) {
+        int32 port = each[i].node().port();
+        Result<Value, RedisError> r = each[i].take();
+        int64 n = match (r) { case Ok(value: v): match (v) { case Integer(value: x): x; case _: -1i64; }; case Err(error: e): -1i64; };
+        seen = seen.concat(other: "${port}=${n} ");
+        i = i + 1;
+    }
+    f = f + check(ok: seen == "7000=2 7001=0 7002=1 ", what: "each: every primary's reply, unmerged: ${seen}");
+    bool again = each.length() > 0 && match (each[0].take()) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: v): false; };
+    f = f + check(ok: again, what: "each: a node's reply is taken once");
+    Command ping = commandOf(text: "PING");
+    Result<DynamicArray<NodeReply>, RedisError> r2 = c.callEach(command: ping, on: ClusterTarget::AllNodes);
+    DynamicArray<NodeReply> all = match (give r2) { case Ok(value: x): give x; case Err(error: e): DynamicArray.empty(); };
+    isize pongs = 0;
+    i = 0;
+    while (i < all.length()) {
+        Result<Value, RedisError> r = all[i].take();
+        if (isStatus(r: r, text: "PONG")) { pongs = pongs + 1; }
+        i = i + 1;
+    }
+    f = f + check(ok: all.length() == 6 && pongs == 6, what: "each: every node, the replicas too");
+    return f;
+}
+
+// Connecting: the seeds in turn, the map from the first that gives one; what a cluster is not refused, in words.
+unsafe fn int32 connectTests() {
+    int32 f = 0;
+    Opens two = Opens.make();
+    two.refuse(place: "127.0.0.1:7000");
+    two.serve(place: "127.0.0.1:7001", script: seed(slots: "slots/3"));
+    Result<Cluster, RedisError> r1 = through(o: give two, url: "redis://127.0.0.1:7000,127.0.0.1:7001?connect_timeout=1&reconnect_timeout=1");
+    bool second = match (r1) { case Ok(value: c): c.topology().nodeCount() == 6; case Err(error: e): false; };
+    f = f + check(ok: second, what: "seeds: one refused, the next gives the map");
+
+    Opens none = Opens.make();
+    none.refuse(place: "127.0.0.1:7000");
+    none.refuse(place: "127.0.0.1:7001");
+    Result<Cluster, RedisError> r2 = through(o: give none, url: "redis://127.0.0.1:7000,127.0.0.1:7001?connect_timeout=1&reconnect_timeout=1");
+    string o2 = match (r2) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+    bool both = match (r2) { case Err(error: e): match (e) { case Connect(error: c): c.count() == 2; case _: false; }; case Ok(value: c): false; };
+    f = f + check(ok: both, what: "seeds: none reached is Connect, with an attempt for each: ${o2}");
+
+    Opens plain = Opens.make();
+    plain.serve(place: "127.0.0.1:7000", script: seed(slots: "slots-standalone/3"));
+    Result<Cluster, RedisError> r3 = through(o: give plain, url: oneSeed());
+    string o3 = match (r3) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+    bool standalone = match (r3) { case Err(error: e): match (e) { case Config(detail: d): d.contains(substring: "not in cluster mode") && d.contains(substring: "Connection.connect"); case _: false; }; case Ok(value: c): false; };
+    f = f + check(ok: standalone, what: "a server not in cluster mode is refused, naming Connection.connect: ${o3}");
+
+    Opens empty = Opens.make();
+    empty.serve(place: "127.0.0.1:7000", script: seed(slots: "slots-empty/3"));
+    Result<Cluster, RedisError> re = through(o: give empty, url: oneSeed());
+    string oe = match (re) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: oe.contains(substring: "serves no slot"), what: "connect: a cluster whose slots are not assigned is refused: ${oe}");
+
+    DynamicArray<string> refused = DynamicArray.empty();
+    refused.add(item: "redis-sentinel://127.0.0.1:7300?master_name=kr");
+    refused.add(item: "unix:///tmp/kr.sock");
+    refused.add(item: "redis://127.0.0.1:7000?reconnect=off");
+    DynamicArray<string> words = DynamicArray.empty();
+    words.add(item: "Sentinel");
+    words.add(item: "unix://");
+    words.add(item: "reconnect=off");
+    isize i = 0;
+    while (i < refused.length()) {
+        Opens unused = Opens.make();
+        Result<Cluster, RedisError> r = through(o: give unused, url: refused[i]);
+        string got = match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+        bool config = match (r) { case Err(error: e): match (e) { case Config(detail: d): d.contains(substring: words[i]); case _: false; }; case Ok(value: c): false; };
+        string u = copy refused[i];
+        f = f + check(ok: config, what: "connect: ${u} is not a cluster's: ${got}");
+        i = i + 1;
+    }
+
+    // A node that refuses HELLO takes the RESP2 path, and every node after it speaks RESP2 too: no HELLO to them.
+    Opens p2 = Opens.make();
+    DynamicArray<Step> s0 = steps();
+    s0.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3")));
+    s0.add(item: Step::Any(reply: reply(server: server(), kase: "setinfo-name")));
+    s0.add(item: Step::Any(reply: reply(server: server(), kase: "setinfo-ver")));
+    s0.add(item: expect(command: "PING", answer: topo(kase: "ping-node/2")));
+    s0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/2")));
+    p2.serve(place: "127.0.0.1:7000", script: give s0);
+    string b = keyAt(index: 2);
+    DynamicArray<Step> s1 = steps();
+    s1.add(item: expect(command: "PING", answer: topo(kase: "ping-node/2")));
+    s1.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/2")));
+    p2.serve(place: "127.0.0.1:7001", script: give s1);
+    Cluster c = clustered(o: give p2, url: oneSeed(), what: "protocol: connect", fails: f);
+    Result<Value, RedisError> r4 = callText(c: c, text: "GET ${b}");
+    string o4 = callOutcome(r: r4);
+    f = f + check(ok: isNull(r: r4), what: "protocol: every node speaks what the first settled on: ${o4}");
+    return f;
+}
+
+unsafe fn int32 clusterTests() {
+    int32 f = 0;
+    f = f + routingTests();
+    f = f + redirectTests();
+    f = f + waitTests();
+    f = f + spreadTests();
+    f = f + refusalTests();
+    f = f + eachTests();
+    f = f + connectTests();
+    return f;
+}

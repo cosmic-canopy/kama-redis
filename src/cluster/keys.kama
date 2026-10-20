@@ -1,5 +1,5 @@
-import { std::collections::DynamicArray, std::fmt::i64Str, redis::Command, redis::RedisError, redis::cluster::keySlot,
-         redis::wire::Commands, redis::wire::Keys, redis::wire::keysOf };
+import { std::collections::DynamicArray, redis::Command, redis::RedisError, redis::wire::Commands, redis::wire::Keys,
+         redis::wire::keysOf, redis::wire::slotIn };
 export { CommandTable, CommandKeys };
 
 // A command's keys, and the slot a cluster sends it to, as the servers themselves say: from every server's COMMAND
@@ -33,19 +33,7 @@ type resource CommandTable implements Sendable {
         isize at = this.commands.indexOf(command: command);
         if (at < 0) { return Result::Err(error: unknown(command: command)); }
         Keys k = keysOf(info: this.commands.at(index: at), command: command, notKeys: true);
-        if (k.count() == 0) { return Result::Ok(value: Optional::None); }
-        isize slot = keySlot(key: command.part(index: k.at(index: 0)));
-        isize i = 1;
-        while (i < k.count()) {
-            isize other = keySlot(key: command.part(index: k.at(index: i)));
-            if (other != slot) {
-                string a = i64Str(v: cast<int64>(slot));
-                string b = i64Str(v: cast<int64>(other));
-                return Result::Err(error: RedisError::Usage(detail: "the command's keys are in more than one slot (${a} and ${b}): give them one hash tag, as {user:1}:name and {user:1}:email, to put them in one"));
-            }
-            i = i + 1;
-        }
-        return Result::Ok(value: Optional::Some(value: slot));
+        return slotIn(command: command, keys: k);
     }
 }
 
@@ -64,5 +52,5 @@ type resource CommandKeys implements Sendable {
 }
 
 fn RedisError unknown(const ref Command command) {
-    return RedisError::Usage(detail: "this client's table of commands does not know this one (a module's, or a newer server's): send it to the node a key names, with Cluster.callFor");
+    return RedisError::Usage(detail: "this client's table of commands does not know this one (a module's, or a newer server's): send it to the node a key names with Cluster.callFor, or to every node with Cluster.callEach");
 }

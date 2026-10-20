@@ -5,7 +5,7 @@
 #   tools/test-integration.sh --server S …       the servers named
 #   tools/test-integration.sh --down …           remove each server's container when its run is done
 #
-# Each server is started (or reused) by tools/redis.sh, with its sentinel topology beside it, which writes their
+# Each server is started (or reused) by tools/redis.sh, with its sentinel and cluster topologies beside it, which write their
 # REDISTEST_* settings; this script exports them and runs both builds against them. `kama` is $KAMA or the PATH. When a case fails, `tools/redis.sh smoke
 # --server S` tells a misconfigured server from a wrong client.
 set -eu
@@ -35,13 +35,15 @@ failed=""
 for s in $SERVERS; do
     "$ROOT/tools/redis.sh" up --server "$s" >/dev/null
     "$ROOT/tools/redis.sh" up --server "$s" --topology sentinel >/dev/null
+    "$ROOT/tools/redis.sh" up --server "$s" --topology cluster >/dev/null
     for mode in --debug --release; do
         dir="$sockets/$s$mode"; mkdir -p "$dir"
         echo "== $s ($mode)"
-        if ( set -a; . "$ROOT/out/redistest-$s.env"; . "$ROOT/out/redistest-sentinel-$s.env"; set +a
+        if ( set -a; . "$ROOT/out/redistest-$s.env"; . "$ROOT/out/redistest-sentinel-$s.env"; . "$ROOT/out/redistest-cluster-$s.env"; set +a
              REDISTEST_SOCKDIR="$dir" "$tmp/integration$mode" ); then :; else failed="$failed $s$mode"; fi
     done
-    [ "$DOWN" = 1 ] && { "$ROOT/tools/redis.sh" down --server "$s" >/dev/null; "$ROOT/tools/redis.sh" down --server "$s" --topology sentinel >/dev/null; }
+    [ "$DOWN" = 1 ] && { "$ROOT/tools/redis.sh" down --server "$s" >/dev/null; "$ROOT/tools/redis.sh" down --server "$s" --topology sentinel >/dev/null
+                         "$ROOT/tools/redis.sh" down --server "$s" --topology cluster >/dev/null; }
 done
 if [ -n "$failed" ]; then echo "test-integration.sh: FAILED on$failed" >&2; exit 1; fi
 echo "test-integration.sh: OK on$(printf ' %s' $SERVERS)"

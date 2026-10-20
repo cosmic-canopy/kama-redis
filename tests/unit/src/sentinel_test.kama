@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::memory::Owned,
          redis::Scan, redis::TxOutcome, redis::libraryVersion, redis::resp::Value,
          redis_unit_tests::check, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
          commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport };
-export { sentinelTests };
+export { sentinelTests, topo };
 
 fn string server() { return "redis-8.10.2"; }
 

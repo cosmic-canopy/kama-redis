@@ -23,6 +23,16 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
 - `RedisError::Sentinel(SentinelError)`: the sentinels were reached and none gave an address, or the server they named
   never confirmed its role. When none could be reached, the error is `Connect`, an attempt per sentinel.
 - `examples/sentinel`: the master found through sentinels, and what a failover does to a call.
+- `Cluster`: a Redis or Valkey cluster, from its seeds (`Cluster.connect`, `connectWith` with `Dialers`, a dialer for
+  each connection it opens). A connection per node, each opened when a call first goes there; the map from CLUSTER
+  SLOTS. `call` sends a command where its keys' slot is, and spreads one as the servers' command tips say: MGET, MSET,
+  DEL, EXISTS, … split by slot; DBSIZE, KEYS, FLUSHALL, … to every primary; SCRIPT LOAD, CONFIG SET, … to every node;
+  the replies made one by the tips' response policy. MOVED is followed and taken into the map, which is read again a
+  second later; ASK is ASKING and the command in one write; TRYAGAIN, CLUSTERDOWN and LOADING are waited out within
+  `reconnect_timeout`, as is a node that cannot be reached, by reading the map again. At most `max_redirects`
+  redirections a call. A command whose reply is each node's own (INFO, SCAN, …) goes through `callEach(command:,
+  on:)` (`ClusterTarget`, `NodeReply`); one the table does not know, through `callFor(key:, command:)`. `eval` runs a
+  script at its keys' node. `refreshTopology`, `topology`.
 - `redis::cluster`:
   - `CommandTable`: a command's keys (`keysOf`, as COMMAND GETKEYS finds them) and its slot (`slotOf`), from every
     server's key specifications, checked against every server's GETKEYS;

@@ -193,7 +193,8 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
     - **The cluster** is three primaries with a replica each (`tests/integration/server/cluster.sh`), every node in
       plaintext and over TLS, with `tls-cluster yes` on every server. Under it, 6.2 gives a plaintext client the
       plaintext port too (`pport`). It is created once, over the TLS ports, since a CLUSTER MEET's bus port is the
-      given port's.
+      given port's. A test that MIGRATEs keys between nodes names the target's TLS port: MIGRATE uses TLS under
+      `tls-cluster yes`.
     - **Sentinel** is two groups, each a master, two replicas and three sentinels monitoring `kr`
       (`tests/integration/server/sentinel.sh`). A sentinel names the port it monitors, so one group is plaintext and
       the other TLS only. The TLS group's sentinels have their default user off: log in as `kr_sentinel`.
@@ -223,6 +224,16 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
   `Connection` is public for it. Pub/sub
   frames are read by one classifier (`classify` in src/subscriber.kama) for both protocols; a push that is not pub/sub
   goes to the connection's bounded set-aside list, never to a subscriber's deliveries.
+
+- **A `Cluster` is a 7a `Connection` per node** (src/cluster.kama), and where a command goes is the servers' own word:
+  the table of commands (src/wire/commands.kama, from `tools/gen-command-table.sh`) gives its keys and its tips. Never
+  route by a guessed key position.
+  - A node's `Config` (`Config.forNode`, granted to `Cluster.nodeConfig`) sets `reconnect_timeout` to 1 ms, so the
+    node's own redial is one try. The cluster paces the next and reads the map between them.
+  - What ran nothing (MOVED, ASK, TRYAGAIN, CLUSTERDOWN, LOADING, MASTERDOWN, a node that would not open, a failed
+    redial) is sent again (`recourseFor`); anything else is the call's.
+  - Its unit tests give each connection the cluster opens the next scripted dialer (`ScriptDialers`), keyed by its
+    place, so a test lists its connections in the order the cluster opens them.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used, and so is every nesting depth.

@@ -10,7 +10,7 @@
  {
   "id": "M2",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "        case Connect(error: c): true;\n        case Sentinel(error: s): s.isUnconfirmed();",
   "new": "        case Connect(error: c): false;\n        case Sentinel(error: s): s.isUnconfirmed();",
   "expect": "refused three times, then served"
@@ -18,7 +18,7 @@
  {
   "id": "M3",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "        case Io(error: x): closedKind(x: x);\n        case Tls(detail: d, cause: t)",
   "new": "        case Io(error: x): false;\n        case Tls(detail: d, cause: t)",
   "expect": "a link closed, then one reset"
@@ -26,7 +26,7 @@
  {
   "id": "M4",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case Tls(detail: d, cause: t): match (t) { case Closed: true; case Io(error: x): closedKind(x: x); case _: false; };",
   "new": "case Tls(detail: d, cause: t): false;",
   "expect": "a link closed during the TLS handshake is tried again"
@@ -34,7 +34,7 @@
  {
   "id": "M5",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };",
   "new": "case Server(error: s): match (s.code()) { case Err: false; case Loading: true; case _: false; };",
   "expect": "a server with no room left is tried again"
@@ -42,7 +42,7 @@
  {
   "id": "M6",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "case Server(error: s): match (s.code()) { case Err: true; case Loading: true; case _: false; };",
   "new": "case Server(error: s): match (s.code()) { case Err: true; case Loading: false; case _: false; };",
   "expect": "LOADING is waited out"

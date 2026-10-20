@@ -63,6 +63,8 @@ type resource SlotMap implements Sendable, Copyable<This>(bare: give) {
     isize served = 0;
 
     friend readEntry[nodeList, shardList, owners, served];
+    friend redis::Cluster::follow[moved];
+    friend redis::Cluster::made[blank];
     friend nodeIndex[nodeList];
     friend shardOfPrimary[shardList];
 
@@ -134,6 +136,25 @@ type resource SlotMap implements Sendable, Copyable<This>(bare: give) {
             i = i + 1;
         }
         return -1;
+    }
+
+    // A MOVED's word, until the map is read again: `slot` is served by the node at `host` and `port`, a primary from
+    // now on (a node the map lacks joins it, named by its address). The node's index, or -1 when the map holds as many
+    // nodes as a cluster can.
+    fn isize moved(isize slot, string host, int32 port) {
+        isize at = this.find(host: host, port: port);
+        if (at < 0) {
+            int32 p = port;
+            string id = host.concat(other: ":").concat(other: i64Str(v: cast<int64>(p)));
+            at = nodeIndex(map: this, node: ClusterNode.make(host: give host, port: port, id: give id));
+            if (at < 0) { return -1; }
+        } else {
+            string known = give host;
+        }
+        isize shard = shardOfPrimary(map: this, primary: at);
+        if (this.owners[slot] < 0i16) { this.served = this.served + 1; }
+        this.owners[slot] = truncate<int16>(shard);
+        return at;
     }
 }
 

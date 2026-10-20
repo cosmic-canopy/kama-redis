@@ -1,7 +1,7 @@
 import { std::collections::ConstView, std::time::Duration, std::fmt::parse, std::fmt::ParseError,
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, redis::Command, redis::RedisError,
          redis::ServerError, redis::resp::Value, Deadline, decimal };
-export { admit, serverError, isWatch, watchEffect, Wait, blockingWait, later, callDeadline };
+export { admit, serverError, isWatch, watchEffect, named, Wait, blockingWait, later, callDeadline };
 
 // What a connection knows about a command before it sends it. (docs/ROADMAP.md, "Decided, and why", "Phase 3".)
 //

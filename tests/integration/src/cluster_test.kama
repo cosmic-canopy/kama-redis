@@ -1,0 +1,315 @@
+// The cluster, live (docs/ROADMAP.md, "Phase 6", step 8), on tools/redis.sh's cluster topology: six nodes, three
+// primaries with a replica each, each node in plaintext and over TLS. Which node is a primary is read from the map,
+// never assumed: a test that fails a node over leaves the cluster with other primaries, and the release run after the
+// debug one uses the same cluster. Each test leaves the slots where it found them.
+import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
+         redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Connection, redis::Config, redis::Command,
+         redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value, redis::cluster::keySlot,
+         redis::cluster::SlotMap,
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl };
+export { clusterTests };
+
+unsafe fn Result<Cluster, RedisError> reach(const ref string url) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Cluster.connect(config: config);
+}
+
+unsafe fn string plainUrl() { return setting(name: "REDISTEST_CLUSTER_URL").concat(other: "?connect_timeout=2&reconnect_timeout=5"); }
+
+// Send `text` and show the reply, as `ask` does on a connection.
+unsafe fn string said(ref Cluster c, const ref string text) {
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.call(command: command);
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.message()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+// The port of the map's node `index`.
+fn string portOf(const ref Cluster c, isize index) {
+    int32 p = c.topology().node(index: index).port();
+    return "${p}";
+}
+
+// The primary that serves `key`'s slot, as an index into the map.
+fn isize ownerOf(const ref Cluster c, const ref string key) { return c.topology().primaryOf(slot: keySlot(key: key.bytes())); }
+
+// Keys "kr:{c<n>}" for the first n that lands on each primary in turn: one key per shard, in the order of the
+// primaries' first slots.
+fn DynamicArray<string> keysPerShard(const ref Cluster c) {
+    DynamicArray<isize> primaries = c.topology().primaries();
+    DynamicArray<string> keys = DynamicArray.empty();
+    isize p = 0;
+    while (p < primaries.length()) {
+        int64 n = 0i64;
+        while (n < 100000i64) {
+            string k = "kr:{c".concat(other: i64Str(v: n)).concat(other: "}");
+            if (ownerOf(c: c, key: k) == primaries[p]) { keys.add(item: give k); break; }
+            n = n + 1i64;
+        }
+        p = p + 1;
+    }
+    return give keys;
+}
+
+// A key, a call per shard, and the commands the tips spread.
+unsafe fn int32 spreadTests(ref Cluster c) {
+    int32 f = 0;
+    string flushed = said(c: c, text: "FLUSHALL");
+    f = f + check(ok: flushed == "OK", what: "cluster: FLUSHALL on every primary: ${flushed}");
+    DynamicArray<string> keys = keysPerShard(c: c);
+    isize shards = keys.length();
+    f = f + check(ok: shards == 3, what: "cluster: three shards, a key on each");
+    if (shards != 3) { return f; }
+    string k0 = copy keys[0];
+    string k1 = copy keys[1];
+    string k2 = copy keys[2];
+    string s0 = said(c: c, text: "SET ${k0} v0");
+    string s1 = said(c: c, text: "SET ${k1} v1");
+    string s2 = said(c: c, text: "SET ${k2} v2");
+    f = f + check(ok: s0 == "OK" && s1 == "OK" && s2 == "OK", what: "cluster: SET at each key's primary: ${s0} ${s1} ${s2}");
+    string g1 = said(c: c, text: "GET ${k1}");
+    f = f + check(ok: g1 == "v1", what: "cluster: GET at the key's primary: ${g1}");
+    string mget = said(c: c, text: "MGET ${k2} kr:none ${k0} ${k1}");
+    f = f + check(ok: mget == "[v2, (nil), v0, v1]", what: "cluster: MGET split by slot, the values in the keys' order: ${mget}");
+    string exists = said(c: c, text: "EXISTS ${k0} ${k1} ${k2} kr:none");
+    f = f + check(ok: exists == "3", what: "cluster: EXISTS summed: ${exists}");
+    string size = said(c: c, text: "DBSIZE");
+    f = f + check(ok: size == "3", what: "cluster: DBSIZE summed over the primaries: ${size}");
+    string found = said(c: c, text: "KEYS kr:{c*");
+    bool all = found.contains(substring: k0) && found.contains(substring: k1) && found.contains(substring: k2);
+    f = f + check(ok: all, what: "cluster: KEYS gathered from every primary: ${found}");
+    string mset = said(c: c, text: "MSET ${k0} w0 ${k1} w1 ${k2} w2");
+    string again = said(c: c, text: "MGET ${k0} ${k1} ${k2}");
+    f = f + check(ok: mset == "OK" && again == "[w0, w1, w2]", what: "cluster: MSET split by slot: ${mset} ${again}");
+    string tagged = said(c: c, text: "MSET {kr:u}:a 1 {kr:u}:b 2");
+    f = f + check(ok: tagged == "OK", what: "cluster: MSET of one hash tag, whole: ${tagged}");
+    string ping = said(c: c, text: "PING");
+    f = f + check(ok: ping == "PONG", what: "cluster: PING from every primary: ${ping}");
+    Command load = Command.of(name: "SCRIPT");
+    load.arg(text: "LOAD");
+    load.arg(text: "return 1");
+    Result<Value, RedisError> loaded = c.call(command: load);
+    string sha = match (loaded) { case Ok(value: v): shown(v: v); case Err(error: x): x.message(); };
+    string there = said(c: c, text: "SCRIPT EXISTS ${sha}");
+    f = f + check(ok: there == "[1]", what: "cluster: SCRIPT LOAD on every node, then SCRIPT EXISTS: ${sha} ${there}");
+    string deleted = said(c: c, text: "DEL ${k0} ${k1} ${k2} {kr:u}:a {kr:u}:b");
+    f = f + check(ok: deleted == "5", what: "cluster: DEL summed: ${deleted}");
+
+    // A script at its key's node: EVALSHA, then EVAL on NOSCRIPT where the node lacks it.
+    string put = said(c: c, text: "SET ${k1} scripted");
+    Script get = Script.of(source: "return redis.call('GET', KEYS[1])");
+    ScriptCall call = ScriptCall.of(script: get);
+    call.addKeyBytes(bytes: k1.bytes());
+    Result<Value, RedisError> e = c.eval(call: call);
+    string ran = match (e) { case Ok(value: v): shown(v: v); case Err(error: x): x.message(); };
+    f = f + check(ok: ran == "scripted", what: "cluster: eval at the key's node: ${ran}");
+
+    // callFor: the key's node, whatever the command.
+    Command getK2 = commandOf(text: "GET ${k1}");
+    Result<Value, RedisError> r = c.callFor(key: k1.bytes(), command: getK2);
+    string got = match (r) { case Ok(value: v): shown(v: v); case Err(error: x): x.message(); };
+    f = f + check(ok: got == "scripted", what: "cluster: callFor at the key's node: ${got}");
+
+    // callEach: every node's INFO, as it is.
+    Command info = commandOf(text: "INFO server");
+    Result<DynamicArray<NodeReply>, RedisError> each = c.callEach(command: info, on: ClusterTarget::AllNodes);
+    DynamicArray<NodeReply> replies = match (give each) { case Ok(value: x): give x; case Err(error: x): DynamicArray.empty(); };
+    isize answered = 0;
+    isize i = 0;
+    while (i < replies.length()) {
+        Result<Value, RedisError> one = replies[i].take();
+        string text = match (one) { case Ok(value: v): shown(v: v); case Err(error: x): x.message(); };
+        if (text.contains(substring: "redis_version:")) { answered = answered + 1; }
+        i = i + 1;
+    }
+    f = f + check(ok: replies.length() == 6 && answered == 6, what: "cluster: callEach on every node, six INFOs");
+    string refused = said(c: c, text: "INFO");
+    f = f + check(ok: refused.contains(substring: "callEach"), what: "cluster: INFO through call is refused, naming callEach: ${refused}");
+    string wiped = said(c: c, text: "DEL ${k1}");
+    return f;
+}
+
+// The TLS port of the node whose plaintext port is `port`: the same place in the two lists.
+unsafe fn string tlsPortOf(const ref string port) {
+    DynamicArray<string> plain = listOf(text: setting(name: "REDISTEST_CLUSTER_PORTS"));
+    DynamicArray<string> tls = listOf(text: setting(name: "REDISTEST_CLUSTER_TLS_PORTS"));
+    isize i = 0;
+    while (i < plain.length()) { if (plain[i] == port && i < tls.length()) { return copy tls[i]; } i = i + 1; }
+    return "";
+}
+
+fn DynamicArray<string> listOf(const ref string text) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    isize start = 0;
+    isize i = 0;
+    while (i <= text.length()) {
+        if (i == text.length() || text.bytes()[i] == 44ui8) { parts.add(item: text.substring(start: start, end: i)); start = i + 1; }
+        i = i + 1;
+    }
+    return give parts;
+}
+
+unsafe fn Result<Connection, RedisError> nodeAt(const ref string port) {
+    return open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=2"));
+}
+
+// Move `slot` from the node at `from` to the node at `to` as redis-cli --cluster reshard does: the target importing,
+// the source migrating, then `between` (what runs while the slot is half moved), then the source's keys MIGRATEd (over
+// the cluster's TLS, which MIGRATE uses under tls-cluster yes) and the slot given to the target on both.
+unsafe fn string moveSlot(ref Connection from, ref Connection to, const ref string toPort, isize slot) {
+    string fromId = ask(c: from, text: "CLUSTER MYID");
+    string toId = ask(c: to, text: "CLUSTER MYID");
+    int64 s = cast<int64>(slot);
+    string slotText = i64Str(v: s);
+    string a = ask(c: to, text: "CLUSTER SETSLOT ${slotText} IMPORTING ${fromId}");
+    string b = ask(c: from, text: "CLUSTER SETSLOT ${slotText} MIGRATING ${toId}");
+    if (a != "OK" || b != "OK") { return "SETSLOT: ${a} ${b}"; }
+    return "OK";
+}
+
+unsafe fn string finishMove(ref Connection from, ref Connection to, const ref string toPort, isize slot) {
+    string fromId = ask(c: from, text: "CLUSTER MYID");
+    string toId = ask(c: to, text: "CLUSTER MYID");
+    int64 s = cast<int64>(slot);
+    string slotText = i64Str(v: s);
+    string keys = ask(c: from, text: "CLUSTER GETKEYSINSLOT ${slotText} 100");
+    string tlsPort = tlsPortOf(port: toPort);
+    if (keys != "[]") {
+        // "[k1, k2]" → MIGRATE 127.0.0.1 <tls port> "" 0 5000 KEYS k1 k2
+        string names = keys.substring(start: 1, end: keys.length() - 1);
+        Command migrate = Command.of(name: "MIGRATE");
+        migrate.arg(text: "127.0.0.1");
+        migrate.arg(text: tlsPort);
+        migrate.arg(text: "");
+        migrate.arg(text: "0");
+        migrate.arg(text: "5000");
+        migrate.arg(text: "KEYS");
+        DynamicArray<string> each = splitComma(text: names);
+        isize i = 0;
+        while (i < each.length()) { migrate.arg(text: each[i]); i = i + 1; }
+        Result<Value, RedisError> m = from.call(command: migrate);
+        string moved = match (m) { case Ok(value: v): shown(v: v); case Err(error: e): e.message(); };
+        if (moved != "OK") { return "MIGRATE: ${moved}"; }
+    }
+    string c = ask(c: to, text: "CLUSTER SETSLOT ${slotText} NODE ${toId}");
+    string d = ask(c: from, text: "CLUSTER SETSLOT ${slotText} NODE ${toId}");
+    if (c != "OK" || d != "OK") { return "SETSLOT NODE: ${c} ${d}"; }
+    return "OK";
+}
+
+fn DynamicArray<string> splitComma(const ref string text) {
+    DynamicArray<string> parts = DynamicArray.empty();
+    isize start = 0;
+    isize i = 0;
+    while (i <= text.length()) {
+        if (i == text.length() || text.bytes()[i] == 44ui8) {
+            string one = text.substring(start: start, end: i);
+            if (one.startsWith(prefix: " ")) { one = one.substring(start: 1, end: one.length()); }
+            parts.add(item: give one);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return give parts;
+}
+
+// A slot moved by hand under the cluster's feet: ASK while it is half moved (a new key's SET and GET go to the
+// importing node, ASKING first), then MOVED once it is moved, and back.
+unsafe fn int32 reshardTests(ref Cluster c) {
+    int32 f = 0;
+    string here = "kr:{moving}:here";
+    string fresh = "kr:{moving}:fresh";
+    isize slot = keySlot(key: here.bytes());
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    string refreshed = match (fetched) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+    isize owner = c.topology().primaryOf(slot: slot);
+    DynamicArray<isize> primaries = c.topology().primaries();
+    isize other = -1;
+    isize i = 0;
+    while (i < primaries.length()) { if (primaries[i] != owner && other < 0) { other = primaries[i]; } i = i + 1; }
+    f = f + check(ok: owner >= 0 && other >= 0, what: "reshard: the slot's primary and another: ${refreshed}");
+    if (owner < 0 || other < 0) { return f; }
+    string fromPort = portOf(c: c, index: owner);
+    string toPort = portOf(c: c, index: other);
+    Result<Connection, RedisError> a = nodeAt(port: fromPort);
+    Result<Connection, RedisError> b = nodeAt(port: toPort);
+    bool both = match (a) { case Ok(value: x): match (b) { case Ok(value: y): true; case Err(error: e): false; }; case Err(error: e): false; };
+    f = f + check(ok: both, what: "reshard: a connection to each of the two nodes");
+    if (!both) { return f; }
+    Connection from = match (give a) { case Ok(value: x): give x; case Err(error: e): { return f; } };
+    Connection to = match (give b) { case Ok(value: x): give x; case Err(error: e): { return f; } };
+    string set = said(c: c, text: "SET ${here} h");
+    f = f + check(ok: set == "OK", what: "reshard: SET before the move: ${set}");
+
+    string begun = moveSlot(from: from, to: to, toPort: toPort, slot: slot);
+    f = f + check(ok: begun == "OK", what: "reshard: the slot half moved: ${begun}");
+    string served = said(c: c, text: "GET ${here}");
+    f = f + check(ok: served == "h", what: "reshard: a key still on the source is served there: ${served}");
+    string asked = said(c: c, text: "SET ${fresh} f");
+    string read = said(c: c, text: "GET ${fresh}");
+    f = f + check(ok: asked == "OK" && read == "f", what: "reshard: a new key, by ASK, at the importing node: ${asked} ${read}");
+    string onTarget = ask(c: to, text: "CLUSTER COUNTKEYSINSLOT ${slot}");
+    f = f + check(ok: onTarget == "1", what: "reshard: the ASKed SET is on the importing node: ${onTarget}");
+
+    string done = finishMove(from: from, to: to, toPort: toPort, slot: slot);
+    f = f + check(ok: done == "OK", what: "reshard: the slot moved: ${done}");
+    string after = said(c: c, text: "GET ${here}");
+    isize nowAt = c.topology().primaryOf(slot: slot);
+    f = f + check(ok: after == "h" && nowAt == other, what: "reshard: MOVED followed, the map takes it: ${after}");
+
+    // And back, so the cluster is as it was.
+    string back = moveSlot(from: to, to: from, toPort: fromPort, slot: slot);
+    string ended = finishMove(from: to, to: from, toPort: fromPort, slot: slot);
+    f = f + check(ok: back == "OK" && ended == "OK", what: "reshard: the slot moved back: ${back} ${ended}");
+    string home = said(c: c, text: "GET ${fresh}");
+    f = f + check(ok: home == "f", what: "reshard: MOVED back: ${home}");
+    string wiped = said(c: c, text: "DEL ${here} ${fresh}");
+    return f;
+}
+
+unsafe fn int32 clusterTests() {
+    int32 f = 0;
+    Result<Cluster, RedisError> r = reach(url: plainUrl());
+    match (give r) {
+        case Ok(value: c): {
+            Cluster cl = give c;
+            f = f + spreadTests(c: cl);
+            f = f + reshardTests(c: cl);
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster: connect: ${m}"); }
+    };
+
+    // Over TLS: each node's TLS port, as the map names it to a TLS connection, checked against the test CA.
+    string certs = setting(name: "REDISTEST_CERTDIR");
+    string tlsUrl = setting(name: "REDISTEST_CLUSTER_TLS_URL").concat(other: "?connect_timeout=2&tls_ca=").concat(other: certs).concat(other: "/ca.crt");
+    Result<Cluster, RedisError> t = reach(url: tlsUrl);
+    match (give t) {
+        case Ok(value: c): {
+            Cluster ct = give c;
+            DynamicArray<string> keys = keysPerShard(c: ct);
+            isize ok = 0;
+            isize i = 0;
+            while (i < keys.length()) {
+                string k = copy keys[i];
+                string s = said(c: ct, text: "SET ${k} t");
+                string g = said(c: ct, text: "GET ${k}");
+                if (s == "OK" && g == "t") { ok = ok + 1; }
+                string d = said(c: ct, text: "DEL ${k}");
+                i = i + 1;
+            }
+            int32 port = ct.topology().node(index: 0).port();
+            string tlsPorts = setting(name: "REDISTEST_CLUSTER_TLS_PORTS");
+            f = f + check(ok: ok == 3 && tlsPorts.contains(substring: "${port}"), what: "cluster over TLS: a key on each shard, at the TLS ports");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster over TLS: connect: ${m}"); }
+    };
+
+    // A server that is not a cluster is refused, naming Connection.connect.
+    Result<Cluster, RedisError> s = reach(url: mainUrl(userinfo: "", tail: ""));
+    string refused = match (s) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: refused.contains(substring: "not in cluster mode"), what: "cluster: a standalone server is refused: ${refused}");
+    return f;
+}

@@ -17,9 +17,9 @@ import { std::collections::DynamicArray, std::collections::View, std::collection
          std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::ReliableStream,
          std::memory::Owned, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
-         redis::Transport, redis::Dialer, redis::DialTarget, redis::RedisError,
+         redis::Transport, redis::Dialer, redis::Dialers, redis::DialTarget, redis::RedisError,
          redis::resp::Reader, redis::resp::Read, redis::resp::Value };
-export { FakeServer, Step, ScriptDialer, Dial, ServerSide };
+export { FakeServer, Step, ScriptDialer, ScriptDialers, Dial, ServerSide };
 
 type enum Step implements Sendable {
     // The client's next command must be exactly `args`; `reply` answers it. Any other command is answered with an
@@ -536,5 +536,24 @@ type resource ScriptDialer implements Dialer, Sendable {
             }
         };
         return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused));
+    }
+}
+
+// `Dialers` for a cluster (`Cluster.connectWith`): each connection the cluster opens takes the next dialer, in the
+// order the test has them. A dialer made `byPlace` refuses a place it was not given, so a cluster that opens its
+// connections in another order, or dials a node it should not, finds closed ports. Past the last, a connection's
+// dialer refuses every dial.
+type resource ScriptDialers implements Dialers, Sendable {
+    DynamicArray<Owned<Dialer>> ready;
+
+    public ctor make() { this.ready = DynamicArray.empty(); }
+    public fn void then(Owned<Dialer> dialer) { this.ready.add(item: give dialer); }
+
+    public unsafe fn Owned<Dialer> another() {
+        if (this.ready.length() == 0) {
+            Owned<Dialer> none = new ScriptDialer.make(dials: DynamicArray.empty());
+            return give none;
+        }
+        return this.ready.remove(index: 0);
     }
 }

@@ -1,6 +1,7 @@
 import { std::collections::DynamicArray, std::collections::Map, std::collections::ConstView, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, redis::Command, commandTable };
-export { CommandInfo, KeySpec, Begin, Find, Request, Response, Commands, Keys, keysOf };
+         std::encoding::utf8::Utf8Error, std::fmt::i64Str, redis::Command, redis::RedisError, redis::cluster::keySlot,
+         commandTable };
+export { CommandInfo, KeySpec, Begin, Find, Request, Response, Commands, Keys, keysOf, slotIn };
 
 // Where a command's keys are, as the servers describe them (COMMAND's key specifications; key-specs.md), and how a
 // cluster spreads it (its request and response policies; command-tips.md). The table is generated from every server
@@ -125,6 +126,24 @@ type resource Keys implements Sendable {
     public const fn isize count() { return this.positions.length(); }
     public const fn isize at(isize index) { return this.positions[index]; }
     public const fn bool partial() { return this.missing; }
+}
+
+// The slot of `command`'s `keys` (found with `notKeys`, so a shard channel counts): None for none, which any node
+// takes. `Usage` for keys in more than one slot, which a cluster refuses (CROSSSLOT).
+fn Result<Optional<isize>, RedisError> slotIn(const ref Command command, const ref Keys keys) {
+    if (keys.count() == 0) { return Result::Ok(value: Optional::None); }
+    isize slot = keySlot(key: command.part(index: keys.at(index: 0)));
+    isize i = 1;
+    while (i < keys.count()) {
+        isize other = keySlot(key: command.part(index: keys.at(index: i)));
+        if (other != slot) {
+            string a = i64Str(v: cast<int64>(slot));
+            string b = i64Str(v: cast<int64>(other));
+            return Result::Err(error: RedisError::Usage(detail: "the command's keys are in more than one slot (${a} and ${b}): give them one hash tag, as {user:1}:name and {user:1}:email, to put them in one"));
+        }
+        i = i + 1;
+    }
+    return Result::Ok(value: Optional::Some(value: slot));
 }
 
 // The keys of `command` by `info`'s specs, as the server finds them. With `notKeys`, a spec whose arguments only route

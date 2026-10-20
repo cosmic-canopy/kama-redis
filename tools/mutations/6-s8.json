@@ -1,0 +1,306 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case Moved: Recourse::Follow;",
+  "new": "            case Moved: Recourse::Fail;",
+  "expect": "moved: followed to 7004"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case Ask: Recourse::Follow;",
+  "new": "            case Ask: Recourse::Fail;",
+  "expect": "ask: ASKING then the command at 7001"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                        asking = true;",
+  "new": "                        asking = false;",
+  "expect": "ask: ASKING then the command at 7001"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "if (redirects >= this.settings.maxRedirects())",
+  "new": "if (redirects > this.settings.maxRedirects())",
+  "expect": "budget: max_redirects=0 follows none"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case TryAgain: Recourse::Wait;",
+  "new": "            case TryAgain: Recourse::Fail;",
+  "expect": "tryagain: sent again after a pause"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case ClusterDown: Recourse::Reread;",
+  "new": "            case ClusterDown: Recourse::Fail;",
+  "expect": "clusterdown: the map read again, then sent again"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case ClusterDown: Recourse::Reread;",
+  "new": "            case ClusterDown: Recourse::Wait;",
+  "expect": "clusterdown: the map read again, then sent again"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case Loading: Recourse::Reread;",
+  "new": "            case Loading: Recourse::Fail;",
+  "expect": "loading: the map read again, then sent again"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "case Err(error: e): { unsent = true; return Result::Err(error: give e); }",
+  "new": "case Err(error: e): { return Result::Err(error: give e); }",
+  "expect": "unreachable: the map read again"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    if (transient(e: cause)) { return Recourse::Reread; }",
+  "new": "    if (false) { return Recourse::Reread; }",
+  "expect": "failover: a node's redial refused"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        this.stale = true;",
+  "new": "        this.stale = false;",
+  "expect": "moved: a second on, the map is read again"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (now < this.lastRead + Duration.fromSecs(s: 1i64)) { return; }",
+  "new": "        if (false) { return; }",
+  "expect": "moved: within a second of the last reading"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        isize node = this.map.moved(slot: redirect.slot(), host: copy redirect.host(), port: redirect.port());",
+  "new": "        isize node = 0;",
+  "expect": "moved: the map takes the slot at once"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            ordered[groups[g][j]] = items.remove(index: 0);",
+  "new": "            ordered[groups[g][j]] = items.remove(index: items.length() - 1);",
+  "expect": "mget: a piece of two keys, its values in their keys' places"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            return Optional::Some(value: Value::Integer(value: x + y));",
+  "new": "            return Optional::Some(value: Value::Integer(value: x));",
+  "expect": "exists: the pieces' counts summed"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "if (response == Response::AggMin) { if (y < x)",
+  "new": "if (response == Response::AggMin) { if (y > x)",
+  "expect": "wait: the least of the primaries' counts"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        bool truth = t && u;",
+  "new": "        bool truth = t || u;",
+  "expect": "script exists: a script is there only when every primary has it"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        all.addAll(items: items.view());",
+  "new": "",
+  "expect": "keys: every primary's, one after another"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (ok) { return replies.remove(index: i); }",
+  "new": "            if (ok) { return replies.remove(index: 0); }",
+  "expect": "script kill: one primary's success is the call's"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "                if (none) { first = Optional::Some(value: give e); } else { RedisError dropped = give e; }",
+  "new": "                RedisError dropped = give e;",
+  "expect": "mset: a piece refused is the call's error"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (isWatch(command: command)) {",
+  "new": "        if (false) {",
+  "expect": "refused: WATCH, naming watched"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (named(command: command, word: \"ASKING\")) {",
+  "new": "        if (false) {",
+  "expect": "refused: ASKING, the cluster's own"
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (request == Request::Special || response == Response::Special) {",
+  "new": "        if (false) {",
+  "expect": "refused: INFO's reply is each node's own"
+ },
+ {
+  "id": "M24",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    if (config.viaSentinel()) {",
+  "new": "    if (false) {",
+  "expect": "connect: redis-sentinel://"
+ },
+ {
+  "id": "M25",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    if (config.transport() == UrlTransport::Unix) {",
+  "new": "    if (false) {",
+  "expect": "connect: unix://"
+ },
+ {
+  "id": "M26",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    if (!config.reconnect()) {",
+  "new": "    if (false) {",
+  "expect": "connect: redis://127.0.0.1:7000?reconnect=off"
+ },
+ {
+  "id": "M27",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "s.detail().contains(substring: \"cluster support disabled\")",
+  "new": "s.detail().contains(substring: \"nothing of the kind\")",
+  "expect": "a server not in cluster mode is refused"
+ },
+ {
+  "id": "M28",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        this.settings.setProtocol(protocol: c.protocol());",
+  "new": "",
+  "expect": "protocol: every node speaks what the first settled on"
+ },
+ {
+  "id": "M29",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            while (s < this.settings.hostCount()) {",
+  "new": "            while (s < 1) {",
+  "expect": "seeds: one refused, the next gives the map"
+ },
+ {
+  "id": "M30",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "this.nodesFor(every: on == ClusterTarget::AllNodes)",
+  "new": "this.nodesFor(every: false)",
+  "expect": "each: every node, the replicas too"
+ },
+ {
+  "id": "M31",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            case Err(error: e): match (e.serverCode()) { case Some(value: c): match (c) { case NoScript: true; case _: false; }; case None: false; };",
+  "new": "            case Err(error: e): false;",
+  "expect": "eval: EVALSHA at the keys' node"
+ },
+ {
+  "id": "M32",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (p == this.countAt) {",
+  "new": "            if (false) {",
+  "expect": "msetex: a piece per slot, each counting its keys"
+ },
+ {
+  "id": "M33",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            while (j < this.step) {",
+  "new": "            while (j < 1) {",
+  "expect": "mset: a piece per slot, each key with its value"
+ },
+ {
+  "id": "M34",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        case Connect(error: c): { addAttempts(from: c, to: unreachable); := true; }",
+  "new": "        case Connect(error: c): false;",
+  "expect": "seeds: none reached is Connect, with an attempt for each"
+ },
+ {
+  "id": "M35",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (m.coverage() == 0) {",
+  "new": "        if (false) {",
+  "expect": "connect: a cluster whose slots are not assigned is refused"
+ },
+ {
+  "id": "M36",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (entry < 0) { return Result::Err(error: unknownCommand()); }",
+  "new": "        if (entry < 0) { return this.routed(slot: -1, command: command); }",
+  "expect": "refused: a command the table does not know"
+ },
+ {
+  "id": "M37",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "                        asking = true;",
+  "new": "                        asking = false;",
+  "expect": "reshard: a new key, by ASK, at the importing node"
+ },
+ {
+  "id": "M38",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "            case Moved: Recourse::Follow;",
+  "new": "            case Moved: Recourse::Fail;",
+  "expect": "reshard: MOVED followed"
+ }
+]

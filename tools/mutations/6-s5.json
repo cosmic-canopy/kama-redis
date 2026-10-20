@@ -50,7 +50,7 @@
  {
   "id": "M7",
   "suite": "unit",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "        case Sentinel(error: s): s.isUnconfirmed();\n        case Timeout: true;",
   "new": "        case Sentinel(error: s): false;\n        case Timeout: true;",
   "expect": "a redial that meets a replica asks again"

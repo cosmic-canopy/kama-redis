@@ -3,14 +3,14 @@
   "id": "M1",
   "suite": "integration",
   "file": "src/connection.kama",
-  "old": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
-  "new": "    unsafe fn Result<Value, RedisError> exchange(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
+  "old": "    unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {\n        Result<Unit, RedisError> idle = this.settle();",
+  "new": "    unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {\n        Result<Unit, RedisError> idle = Result::Ok(value: Unit::Unit);",
   "expect": "restart: a call rides the restart"
  },
  {
   "id": "M2",
   "suite": "integration",
-  "file": "src/connection.kama",
+  "file": "src/wire/retry.kama",
   "old": "        case Io(error: x): closedKind(x: x);\n        case Tls(detail: d, cause: t)",
   "new": "        case Io(error: x): false;\n        case Tls(detail: d, cause: t)",
   "expect": "restart: a call rides the restart"

@@ -157,6 +157,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
 
     // A connection through sentinels asks each one with `forSentinel`, and reaches the server it names with `forNode`.
     friend redis::Connection::askSentinels[forSentinel, forNode];
+    friend redis::Cluster::nodeConfig[forNode];
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -606,7 +607,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         return give c;
     }
 
-    // This configuration for the server the sentinels named at `host` and `port`: one host, everything else as given.
+    // This configuration for one server at `host` and `port`, the sentinels' answer or a cluster's node: one host, no
+    // cluster options (the cluster's own), everything else as given.
     const fn Config forNode(string host, int32 port) {
         Config c = copy this;
         c.hostText = give host;
@@ -614,6 +616,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         c.moreHosts = DynamicArray.empty();
         c.morePorts = DynamicArray.empty();
         c.viaSentinels = false;
+        c.readChoice = Optional::None;
+        c.redirectChoice = Optional::None;
         return give c;
     }
 

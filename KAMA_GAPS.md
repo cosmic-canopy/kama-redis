@@ -8,7 +8,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 **Current compiler:** `kama 0.9.667` (tag `v0.9.667`), which CI pins and the manifests' floor names. Each repro is
 also run on cstar's newest build, which the registry publishes with. The package was last verified on `v0.9.675`
 (2026-10-19, the newest tag and cstar's newest build): unit and live gates green, debug and release; it needed
-KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` (2026-10-20) the library
+KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` and `0.9.692` (2026-10-20) the library
 checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
@@ -167,6 +167,31 @@ programs.
 `main`s say `fn uint8 main()`, a one-line change in each, since every `main` here returns the literal 0 or 1. On that
 copy, `tools/test.sh` is green on 0.9.690: the unit program, debug and release, and every example built. When a tag
 carries the rule, the floor and CI's pin move to it, and the ten `main`s change, in one commit.
+
+**A second change with no overlap, found 2026-10-20 on `0.9.692+gbc03abd0`:** a channel's `send`. `28e7e363` (0.9.680,
+"channels return `Result`") made it return `Result<Unit, Undelivered<T>>` and removed `SendResult`, which every tag
+has and needs. The live test program's Unix-socket relay sends its result on a channel, so it builds on no compiler
+of the two kinds either. Repro, run with `fn uint8 main()` on 0.9.692 and `fn int32 main()` on the tags:
+
+```kama
+import { core::println, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::SendResult };
+fn int32 main() {
+    Channel<int32> ch = Channel.bounded(capacity: 1);
+    Sender<int32> tx = ch.sender();
+    SendResult<int32> r = tx.send(item: 7);   // 0.9.680 on: Result<Unit, Undelivered<int32>> r = …
+    println(s: "sent");
+    return 0;
+}
+```
+
+| | `SendResult<int32> r = tx.send(…)` | `Result<Unit, Undelivered<int32>> r = tx.send(…)` |
+|---|---|---|
+| `v0.9.667`, `v0.9.675` | prints | refused: "`std.concurrent` does not export `Undelivered`" |
+| `0.9.692+gbc03abd0` | refused: "`std.concurrent` does not export `SendResult`" | prints |
+
+The same fix closes both: a window in which the old form is accepted with a word naming the new one, or a tag that
+carries 0.9.680 and 0.9.684. The scratch copy for cstar's newest build would edit the relay's two sends too, if the
+live program were gated there; today only the unit program and the examples are.
 
 ## FIXED — kept for the record
 

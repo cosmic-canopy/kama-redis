@@ -227,7 +227,7 @@
   "id": "M29",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "    if (config.hostCount() > 1) {",
+  "old": "    if (config.hostCount() > 1 && !config.viaSentinel()) {",
   "new": "    if (false) {",
   "expect": "connect: several hosts are a cluster's"
  },
