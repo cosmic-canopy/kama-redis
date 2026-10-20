@@ -3,14 +3,14 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::f64Str, std::fmt::parse,
          std::fmt::ParseError, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          std::uuid::Uuid, redis::Connection, redis::Command, redis::cmd, redis::reply, redis::RedisError, redis::resp::Value,
-         redis_integration_tests::check, open, mainUrl, ask, shown };
+         redis_integration_tests::check, redis_integration_tests::stop, open, mainUrl, ask, shown };
 export { argTests };
 
 unsafe fn Connection reach(const ref string tail) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "arg_test: connect: ${m}"); return reach(tail: tail); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "arg_test: connect: ${m}"); }
     };
     return give c;
 }

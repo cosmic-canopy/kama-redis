@@ -71,7 +71,6 @@ type resource Wire implements Sendable {
                 }
             };
         }
-        return Result::Err(error: RedisError::Closed);
     }
 
     // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`. While a write must
@@ -173,7 +172,6 @@ type resource Wire implements Sendable {
                 if (!ready.readable) { return Result::Err(error: RedisError::Timeout); }
             }
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // A failure the transport reported, in its own words when it has them (a TLS transport's), else as the I/O
@@ -220,5 +218,4 @@ fn Value unattributed(Value v) {
         Optional<Value> last = parts.pop();
         current = match (give last) { case Some(value: x): give x; case None: Value::Null; };
     }
-    return give current;
 }

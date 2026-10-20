@@ -7,14 +7,14 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::concu
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Command, redis::Pipeline,
          redis::Replies, redis::RedisError, redis::resp::Value,
-         redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask, commandOf };
+         redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, open, mainUrl, ask, commandOf };
 export { restartTests };
 
 unsafe fn Connection reach(const ref string url, const ref string what) {
     Result<Connection, RedisError> r = open(url: url);
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "restart_test: ${what}: ${m}"); return reach(url: url, what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "restart_test: ${what}: ${m}"); }
     };
     return give c;
 }
@@ -109,9 +109,9 @@ unsafe fn int32 restartTests() {
 
     // A subscriber: Reconnected inside next, then a message published after the restart.
     Result<Config, RedisError> parsed = Config.parse(url: url);
-    Config config = match (give parsed) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "restart_test: config"); return 1; } };
+    Config config = match (give parsed) { case Ok(value: v): give v; case Err(error: e): { return stop::<int32>(msg: "restart_test: config"); } };
     Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
-    Subscriber sub = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "restart_test: subscriber: ${m}"); return 1; } };
+    Subscriber sub = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "restart_test: subscriber: ${m}"); } };
     DynamicArray<string> channel = DynamicArray.empty();
     channel.add(item: "kr:restart:news");
     Result<Unit, RedisError> subscribed = sub.subscribe(names: channel);
@@ -167,9 +167,9 @@ unsafe fn int32 restartTests() {
     lower.arg(text: "SET"); lower.arg(text: "client-output-buffer-limit"); lower.arg(text: "pubsub 262144 0 0");
     Result<Value, RedisError> lowered = admin.call(command: lower);
     Result<Config, RedisError> parsed2 = Config.parse(url: url);
-    Config config2 = match (give parsed2) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "restart_test: config"); return 1; } };
+    Config config2 = match (give parsed2) { case Ok(value: v): give v; case Err(error: e): { return stop::<int32>(msg: "restart_test: config"); } };
     Result<Subscriber, RedisError> made2 = Subscriber.connect(config: config2);
-    Subscriber slow = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "restart_test: slow subscriber: ${m}"); return 1; } };
+    Subscriber slow = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "restart_test: slow subscriber: ${m}"); } };
     DynamicArray<string> flood = DynamicArray.empty();
     flood.add(item: "kr:restart:flood");
     Result<Unit, RedisError> floodSub = slow.subscribe(names: flood);

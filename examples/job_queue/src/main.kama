@@ -57,7 +57,6 @@ unsafe fn int32 work(ref Connection conn) {
         match (finished) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return -1; } };
         done = done + 1;
     }
-    return done;
 }
 
 fn int32 main() {

@@ -4,10 +4,13 @@ Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the 
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
 steps 0 to 8 are done: Sentinel, and the cluster's core.**
-- cstar's newest build is 0.9.692. It checks the library clean, which is what the registry runs. But it refuses `fn
-  int32 main()`, which every tag requires (KRD-11), so it is gated on a scratch copy whose ten `main`s say `fn uint8
-  main()`. There the unit program and the examples are green. The live program builds on no compiler of both kinds
-  either: a channel's `send` changed in 0.9.680 (KRD-11 too).
+- cstar's newest build is 0.9.696, a build of staged work that makes unreachable code an error. The tree now takes
+  the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
+  stops ends in `stop::<T>(msg:)` (KRD-12). It refuses `fn int32 main()`, which every tag requires (KRD-11), so it is
+  gated on a scratch copy whose ten `main`s say `fn uint8 main()`; the live program's channel `send` changed in
+  0.9.680 too. **@kama/tls 0.1.5 does not build on 0.9.696** (four statements after a `while (true)`), so nothing
+  that depends on it does: it needs a release before 0.2.0 can be checked there, which is the registry's check. On
+  0.9.692, before that rule, the unit program and the examples were green.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.

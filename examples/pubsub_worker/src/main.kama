@@ -65,7 +65,6 @@ unsafe fn int32 work(ref Subscriber sub) {
             case Unsubscribed(kind: k, channel: c): { println(s: "no longer subscribed to a channel"); }
         };
     }
-    return handled;
 }
 
 fn int32 main() {

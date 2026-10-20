@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::colle
          std::fmt::parse, std::fmt::ParseError,
          redis::reply, redis::replyOpt, redis::replyOpts, redis::replyRecord, redis::replyRecordOpt, redis::RedisError,
          redis::resp::Value, redis::resp::Reader, redis::resp::Read,
-         redis_unit_tests::check, unhex, serverVersions, replyNames, replyCommands, replyHex, replySetups, respNames,
+         redis_unit_tests::check, redis_unit_tests::stop, unhex, serverVersions, replyNames, replyCommands, replyHex, replySetups, respNames,
          respInputs };
 export { replyTests, splitOn };
 
@@ -98,7 +98,6 @@ fn isize indexOf(const ref string server, const ref string kase) {
         i = i + 1;
     }
     panic(msg: "reply_test: no server vector ${name}");
-    return -1;
 }
 
 fn Result<Value, RedisError> valueOf(ConstView<uint8> b) {
@@ -163,12 +162,12 @@ fn DynamicArray<uint8> argBytes(const ref string shown) {
 
 fn int64 intOf(const ref string text) {
     Result<int64, ParseError> p = parse::<int64>(s: text);
-    return match (p) { case Ok(value: v): v; case Err(error: e): { panic(msg: "reply_test: not an integer: ${text}"); := 0i64; } };
+    return match (p) { case Ok(value: v): v; case Err(error: e): { := stop::<int64>(msg: "reply_test: not an integer: ${text}"); } };
 }
 
 fn float64 floatOf(const ref string text) {
     Result<float64, ParseError> p = parse::<float64>(s: text);
-    return match (p) { case Ok(value: v): v; case Err(error: e): { panic(msg: "reply_test: not a float: ${text}"); := 0.0; } };
+    return match (p) { case Ok(value: v): v; case Err(error: e): { := stop::<float64>(msg: "reply_test: not a float: ${text}"); } };
 }
 
 fn string joined(const ref DynamicArray<string> xs) {

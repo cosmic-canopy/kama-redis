@@ -6,7 +6,7 @@ import { core::println, std::collections::DynamicArray, std::collections::ConstV
          std::encoding::hex::encode as hexEncode, std::encoding::hex::decode as hexDecode,
          std::encoding::hex::DecodeError, std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::fmt::i64Str, std::concurrent::Isolate,
          redis::resp::Reader, redis::resp::Writer, redis::resp::Value, redis::resp::Read, redis::resp::Limits,
-         redis_unit_tests::check, respNames, respSources, respInputs, respMaxElements, respWant, respNotes };
+         redis_unit_tests::check, redis_unit_tests::stop, respNames, respSources, respInputs, respMaxElements, respWant, respNotes };
 export { respTests, describe, readAll, readChunked, unhex };
 
 // ---- helpers shared with the vector tests ----
@@ -22,9 +22,9 @@ fn DynamicArray<uint8> unhexBytes(ConstView<uint8> b) {
         i = i + 1;
     }
     Result<string, Utf8Error> t = utf8Decode(bytes: squeezed.view());
-    string digits = match (give t) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "unhex: not text"); := ""; } };
+    string digits = match (give t) { case Ok(value: v): give v; case Err(error: e): { := stop::<string>(msg: "unhex: not text"); } };
     Result<DynamicArray<uint8>, DecodeError> r = hexDecode(text: digits);
-    return match (give r) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "unhex: not hex"); := DynamicArray.empty(); } };
+    return match (give r) { case Ok(value: v): give v; case Err(error: e): { := stop::<DynamicArray<uint8>>(msg: "unhex: not hex"); } };
 }
 
 // A value as one line, the same line tools/resp-dump.c prints for hiredis's reply.

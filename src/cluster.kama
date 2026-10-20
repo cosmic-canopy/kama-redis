@@ -323,7 +323,6 @@ type resource Cluster implements Sendable {
                 case Fail: { return Result::Err(error: give e); }
             };
         }
-        return Result::Err(error: RedisError::Closed);
     }
 
     // `command` to every primary, or with `every` to every node, as its tips say, and their replies made one by

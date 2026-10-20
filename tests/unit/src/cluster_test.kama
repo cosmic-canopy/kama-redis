@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Config, redis::Command, redis::RedisError,
          redis::Dialer, redis::Dialers, redis::Script, redis::ScriptCall, redis::libraryVersion, redis::resp::Value,
          redis::cluster::keySlot,
-         redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
+         redis_unit_tests::check, redis_unit_tests::stop, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys };
 export { clusterTests };
 
@@ -37,7 +37,6 @@ fn string keyAt(isize index) {
         i = i + 1;
     }
     panic(msg: "cluster_test: no key ${index}");
-    return "";
 }
 
 fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
@@ -130,7 +129,7 @@ unsafe fn Cluster standIn() {
     Result<Cluster, RedisError> r = through(o: give o, url: oneSeed());
     return match (give r) {
         case Ok(value: c): give c;
-        case Err(error: e): { panic(msg: "cluster_test: the stand-in cluster"); := standIn(); }
+        case Err(error: e): { := stop::<Cluster>(msg: "cluster_test: the stand-in cluster"); }
     };
 }
 

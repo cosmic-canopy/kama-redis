@@ -2,7 +2,7 @@
 // request, the client's name, the database, keepalive, and a name that resolves to several addresses.
 import { std::collections::DynamicArray, redis::Connection, redis::Config, redis::Command, redis::RedisError,
          redis::Protocol, redis::ServerInfo, redis::libraryVersion, redis::resp::Value,
-         redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask, shown,
+         redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, mainUrl, open, attempt, ask, shown,
          productWanted, versionPrefix };
 export { connectTests };
 
@@ -10,7 +10,7 @@ unsafe fn Connection connected(const ref string url, const ref string what) {
     Result<Connection, RedisError> r = open(url: url);
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "connect_test: ${what}: ${m}"); return connected(url: url, what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "connect_test: ${what}: ${m}"); }
     };
     return give c;
 }

@@ -1,14 +1,14 @@
 // Failures and sizes, live: a connection the server kills, errors by their codes, an error inside EXEC's reply, and
 // replies large in bytes and in elements.
 import { std::collections::DynamicArray, std::collections::Map, std::time::Duration, std::time::sleep, redis::Connection, redis::Command, redis::RedisError, redis::ServerInfo,
-         redis::reply, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask, commandOf, codeOf, shown };
+         redis::reply, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, mainUrl, open, attempt, ask, commandOf, codeOf, shown };
 export { failureTests };
 
 unsafe fn Connection connected(const ref string what) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: ""));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "failure_test: ${what}: ${m}"); return connected(what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "failure_test: ${what}: ${m}"); }
     };
     return give c;
 }

@@ -535,7 +535,6 @@ type resource ScriptDialer implements Dialer, Sendable {
                 return Result::Ok(value: give fake);
             }
         };
-        return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused));
     }
 }
 

@@ -26,7 +26,6 @@ fn DynamicArray<uint8> topo(const ref string server, const ref string kase) {
         i = i + 1;
     }
     panic(msg: "map_test: no topology vector ${name}");
-    return DynamicArray.empty();
 }
 
 fn Value valueOf(const ref DynamicArray<uint8> bytes) {

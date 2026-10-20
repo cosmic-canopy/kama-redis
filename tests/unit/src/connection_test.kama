@@ -7,7 +7,7 @@ import { core::println, std::collections::DynamicArray, std::collections::ConstV
          redis::Connection, redis::libraryVersion, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::Protocol, redis::RedisError, redis::ServerError,
          redis::ServerCode, redis::ServerInfo, redis::Transport, redis::Dialer, redis::resp::Value, redis::resp::Limits,
          redis::resp::Reader, redis::resp::Read,
-         redis_unit_tests::check, unhex, FakeServer, Step, ScriptDialer, Dial,
+         redis_unit_tests::check, redis_unit_tests::stop, unhex, FakeServer, Step, ScriptDialer, Dial,
          serverVersions, replyNames, replyHex, proxyNames, proxyHex, respNames, respInputs, connectionServers, connectionNames };
 export { connectionTests, welcome, connected, expect, reply, proxy, callOutcome, callClosed, isSimple, textOf, resp, pushIn, configOf, bytesOf,
          commandOf };
@@ -25,7 +25,6 @@ fn DynamicArray<uint8> reply(const ref string server, const ref string kase) {
         i = i + 1;
     }
     panic(msg: "connection_test: no server vector ${name}");
-    return DynamicArray.empty();
 }
 
 fn bool hasReply(const ref string server, const ref string kase) {
@@ -48,7 +47,6 @@ fn DynamicArray<uint8> proxy(const ref string name) {
         i = i + 1;
     }
     panic(msg: "connection_test: no proxy vector ${name}");
-    return DynamicArray.empty();
 }
 
 fn DynamicArray<uint8> resp(const ref string name) {
@@ -60,7 +58,6 @@ fn DynamicArray<uint8> resp(const ref string name) {
         i = i + 1;
     }
     panic(msg: "connection_test: no resp vector ${name}");
-    return DynamicArray.empty();
 }
 
 // The bytes of the first push message in `b`, which holds whole RESP values. (DEBUG PROTOCOL push sends an ordinary
@@ -83,7 +80,6 @@ fn DynamicArray<uint8> pushIn(const ref DynamicArray<uint8> b) {
         start = end;
     }
     panic(msg: "connection_test: no push message in the vector");
-    return DynamicArray.empty();
 }
 
 // ---- scripts ----
@@ -131,7 +127,7 @@ fn Config configOf(const ref string url) {
     Result<Config, RedisError> r = Config.parse(url: url);
     Config c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "connection_test: ${m}"); return configOf(url: "redis://"); }
+        case Err(error: e): { string m = e.message(); return stop::<Config>(msg: "connection_test: ${m}"); }
     };
     return give c;
 }
@@ -175,7 +171,7 @@ unsafe fn Connection connected(DynamicArray<Step> script, const ref string url, 
     Result<Connection, RedisError> r = over(script: give script, url: url);
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "connection_test: ${what}: ${m}"); return connected(script: steps(), url: url, what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "connection_test: ${what}: ${m}"); }
     };
     return give c;
 }

@@ -200,7 +200,6 @@ type resource Subscriber implements Sendable {
                 case Other(value: x): { return this.unexpected(detail: "the server sent a reply no call was waiting for"); }
             };
         }
-        return Result::Ok(value: Optional::None);
     }
 
     // PING the server, which answers between messages: a check that the connection is alive. Messages read on the
@@ -234,7 +233,6 @@ type resource Subscriber implements Sendable {
                 case Aside(push: p): { this.keepAside(push: give p); }
             };
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // Unsubscribe from everything, wait until the server has confirmed it, and hand the connection back, ready for
@@ -407,7 +405,6 @@ type resource Subscriber implements Sendable {
                 case Other(value: x): { return this.fail(detail: "a subscription was answered with something other than its confirmations"); }
             };
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // A confirmation no call is waiting for. The server sends a sunsubscribe of its own when a shard channel's slot

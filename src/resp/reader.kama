@@ -231,7 +231,6 @@ type resource Reader implements Sendable {
                 case Bad(error: e): { this.fail(error: e); return Read::Invalid(error: e); }
             };
         }
-        return Read::Incomplete;
     }
 
     // Bytes received and not yet read.
@@ -436,7 +435,6 @@ type resource Reader implements Sendable {
             Value done = this.closeTop();
             this.vals.add(item: give done);
         }
-        return Step::More;
     }
 
     // An attribute is complete: its entries stay on `vals` for the next value at the level below.

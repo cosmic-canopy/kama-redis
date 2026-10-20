@@ -3,7 +3,7 @@
 import { core::println, std::collections::DynamicArray, std::time::Duration, redis::Config, redis::Protocol,
          redis::RedisError, redis::UrlTransport, redis::TlsVerify, redis::TlsVersion, redis::SentinelRole, redis::ReadFrom,
          redis::Connection, redis::Subscriber, redis::Transport, redis::socketPathMax, std::memory::Owned,
-         redis_unit_tests::check, FakeServer, Step };
+         redis_unit_tests::check, redis_unit_tests::stop, FakeServer, Step };
 export { configTests };
 
 fn string refusal(const ref string url) {
@@ -17,7 +17,7 @@ fn Config parsed(const ref string url) {
     Result<Config, RedisError> r = Config.parse(url: url);
     Config c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "config_test: ${m}"); return parsed(url: "redis://"); }
+        case Err(error: e): { string m = e.message(); return stop::<Config>(msg: "config_test: ${m}"); }
     };
     return give c;
 }
@@ -163,7 +163,7 @@ fn int32 setterTests() {
                   what: "unix: an empty or too long path is refused");
 
     Result<Config, RedisError> made = Config.tcp(host: "example.com", port: 6380);
-    Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "config_test: tcp"); return 1; } };
+    Config c = match (give made) { case Ok(value: v): give v; case Err(error: e): { return stop::<int32>(msg: "config_test: tcp"); } };
     f = f + check(ok: c.host() == "example.com" && c.port() == 6380 && c.transport() == UrlTransport::Tcp, what: "tcp: host and port");
 
     Result<Unit, RedisError> emptyPw = c.setAuth(user: Optional::None, password: "");
@@ -253,11 +253,11 @@ fn int32 tlsTests() {
 
     // The setters.
     Result<Config, RedisError> plain = Config.tcp(host: "h", port: 6379);
-    Config p = match (give plain) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "config_test: tcp"); return 1; } };
+    Config p = match (give plain) { case Ok(value: x): give x; case Err(error: e): { return stop::<int32>(msg: "config_test: tcp"); } };
     Result<Unit, RedisError> onPlain = p.setTlsVerify(mode: TlsVerify::Chain);
     f = f + check(ok: refusedSetting(r: onPlain), what: "tls setters: refused on a configuration that is not TLS");
     Result<Config, RedisError> made = Config.tls(host: "redis.example", port: 6380);
-    Config t = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "config_test: tls"); return 1; } };
+    Config t = match (give made) { case Ok(value: x): give x; case Err(error: e): { return stop::<int32>(msg: "config_test: tls"); } };
     f = f + check(ok: t.transport() == UrlTransport::Tls && t.port() == 6380 && t.tlsVerify() == TlsVerify::Full, what: "tls: Config.tls");
     Result<Config, RedisError> noHost = Config.tls(host: "", port: 6380);
     f = f + check(ok: refusedConfig(r: noHost), what: "tls: Config.tls refuses an empty host");

@@ -4,11 +4,18 @@
 // just that.
 import { core::println, respTests, slotTests, urlTests, errorTests, configTests, connectionTests, argTests, replyTests, pipelineTests, blockingTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, reconnectTests,
          topologyTests, sentinelTests, routeTests, mapTests, clusterTests };
-export { check };
+export { check, stop };
 
 fn int32 check(bool ok, string what) {
     if (!ok) { println(s: "  FAIL ${what}"); return 1; }
     return 0;
+}
+
+// A value of type T that is never made: the program stops here, saying `msg`. A `match` arm that cannot go on ends
+// with it (`:= stop::<T>(msg: …)`, or `return stop::<R>(…)`), since no compiler of both kinds takes an arm that ends in
+// `panic` (KRD-12).
+fn T stop<T>(const ref string msg) {
+    panic(msg: msg);
 }
 
 fn int32 main() {

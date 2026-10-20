@@ -709,7 +709,6 @@ type resource Connection implements Sendable {
             }
             return Result::Ok(value: give v);
         }
-        return Result::Err(error: RedisError::Closed);
     }
 
     // Close the connection. It sends no QUIT, which is deprecated since 7.2. Closing twice is harmless.
@@ -1048,7 +1047,6 @@ type resource Connection implements Sendable {
                 case Invalid(error: e): { return Optional::Some(value: RedisError::Protocol(error: e)); }
             };
         }
-        return Optional::None;
     }
 
     // A link `settle` found lost before the call wrote anything: the call makes it again when it can, and otherwise
@@ -1097,7 +1095,6 @@ type resource Connection implements Sendable {
                 }
             };
         }
-        return Result::Err(error: RedisError::Closed);
     }
 
     // Wait for the backoff to end, but not past `window`: each call makes at least one try.

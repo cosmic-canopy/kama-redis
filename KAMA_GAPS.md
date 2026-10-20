@@ -9,13 +9,16 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 also run on cstar's newest build, which the registry publishes with. The package was last verified on `v0.9.675`
 (2026-10-19, the newest tag and cstar's newest build): unit and live gates green, debug and release; it needed
 KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` and `0.9.692` (2026-10-20) the library
-checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there.
+checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there. On
+`0.9.696` (a build of staged work, 2026-10-20) the library and both test programs check clean but for KRD-11, with
+KRD-12's workaround; what fails there is `@kama/tls` 0.1.5, which has four statements after a `while (true)` and needs
+a release of its own.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-9, KRD-10, KRD-11. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-9 (answered, until a tag has the answer), KRD-11, KRD-12. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -84,49 +87,18 @@ fn int32 main() {
 `copyWithin(from:, count:, to:)` (one `memmove`, overlap allowed), which this reader would use, and which a ring
 buffer or a codec also needs.
 
+**Answered in 0.9.694 (`3aea6e59`, "std: `View.copyWithin`"),** checked 2026-10-20 on `0.9.696+gc86f3e82`. The repro
+is still refused, now naming the fix ("`copyWithin(from:, to:, count:)` moves elements inside one buffer"), and the
+slide written as `this.buf.viewMut().copyWithin(from: start, to: 0, count: unread)` prints `ok 5 6 7`, debug and
+release. No tag has `copyWithin` yet, so the loop below stays until the floor moves to one that does; then
+`Reader.spare` makes that one call, and `tools/mutations/krd9-slide.json` aims at it.
+
 **Workaround, since 2026-10-19:** `Reader.spare` moves the unread bytes one at a time
 (`this.buf[i] = this.buf[this.start + i]`), one window at a time, so the package builds on 0.9.675 too, which the
 registry checks with. Refusing two windows of one buffer is defensible, so the ask is now the second reading's: a
 `copyWithin` (one `memmove`). When std has it, the loop goes, and the reader moves its bytes in one call again. A unit
 test (`resp slide`) makes the reader slide with part of a line unread, and a mutation of the loop fails it
 (`tools/mutations/krd9-slide.json`).
-
-### KRD-10 · MED · An application named like a dependency's module breaks that dependency's imports
-
-**Found** 2026-10-19, building this package's examples: one named `tls` would not build, its errors all inside
-`@kama/redis` (`module tls is not visible from redis`). A project's name is its root module, and kama resolved
-`@kama/redis`'s own `import { tls::… }` to the application instead of to `@kama/tls`. Any application named `tls`
-that uses `@kama/redis`, or `@kama/postgres`, fails the same way, with errors that point at the library.
-
-**Repro**, three files and two applications that differ only in their name:
-
-```
-middle/kama.json      { "name": "@repro/middle", "version": "0.1.0", "kind": "library", "kama": ">=0.9.667",
-                        "dependencies": { "@kama/tls": { "version": "^0.1.3" } },
-                        "modules": { ".": { "visibility": "public" } } }
-middle/src/middle.kama
-                      import { tls::version };
-                      export { engine };
-                      fn string engine() { return version(); }
-app-NAME/kama.json    { "name": "NAME", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.667",
-                        "entry": "src/main.kama", "dependencies": { "@repro/middle": { "path": "../middle" } },
-                        "modules": { ".": { "visibility": "internal" } } }
-app-NAME/src/main.kama
-                      import { core::println, middle::engine };
-                      fn int32 main() { string e = engine(); println(s: give e); return 0; }
-```
-
-- NAME `other`: prints `4.1.1` on `v0.9.667`, `v0.9.673` and `0.9.675+g4afcda97`.
-- NAME `tls`: refused on all three, in the library's file: "`.kama/deps/middle/src/middle.kama:1:9: error: module
-  `tls` is not visible from `middle` — its `visibility` in `kama.json` does not name this module`", then "`module
-  `tls` does not export `version`".
-
-**What would close it:** a library's imports resolve within the library's own dependencies, whatever the
-application is called. Short of that, an application whose name is the module of one of its dependencies, direct
-or not, could be refused when its manifest is read, naming the clash, as a reserved word already is ("`name` is
-"base", but a project's name is its root module…").
-
-**Workaround:** the example is named `tls_connection`, which it can keep either way. Nothing else here depends on it.
 
 ### KRD-11 · MED · `main`'s type changed with no overlap: every tag refuses `fn uint8 main()`, and 0.9.684 refuses `fn int32 main()`
 
@@ -193,11 +165,93 @@ The same fix closes both: a window in which the old form is accepted with a word
 carries 0.9.680 and 0.9.684. The scratch copy for cstar's newest build would edit the relay's two sends too, if the
 live program were gated there; today only the unit program and the examples are.
 
+### KRD-12 · MED · A value-producing `match` arm that ends in `panic` has no form both kinds of compiler take
+
+**Found** 2026-10-20, on cstar's `0.9.696+gc86f3e82`, a build of work then staged and not yet committed (its
+VERSION and SPEC.md, *Unreachable code is an error*). The new rule refuses a statement after one that never
+completes, a `panic` among them, and lets a value-producing arm end in a `panic`. The tags take neither half: an arm
+must end in `:=` or in `return`, `break` or `continue`. So an arm that can only stop the program builds on one kind of
+compiler or the other, never both. The test programs had 37 such arms (`{ …; panic(msg: …); := x; }` and
+`{ …; panic(msg: …); return x; }`).
+
+**Repro**, a whole program (`fn uint8 main()` on 0.9.696, KRD-11):
+
+```kama
+import { core::println };
+fn int32 viaArm(Optional<int32> o) {
+    return match (o) {
+        case Some(value: v): v;
+        case None: { panic(msg: "none"); := -1; }   // 0.9.696: `{ panic(msg: "none"); }`
+    };
+}
+fn int32 main() { int32 w = viaArm(o: Optional::Some(value: 4)); println(s: "${w}"); return 0; }
+```
+
+| | `{ panic(…); := -1; }` | `{ panic(…); }` |
+|---|---|---|
+| `v0.9.667`, `v0.9.675` | prints `4` | refused: "a value-producing `match` arm block must end in `:= <expr>;` or diverge (return/break/continue)" |
+| `0.9.696+gc86f3e82` | refused: "unreachable code — the `panic` … never returns" | prints `4` |
+
+The rest of the rule has forms every compiler takes, and the tree uses them: nothing after a `while (true)` with no
+`break` (13 places in the library, 2 in the examples), nothing after a `panic` that ends a function, nothing after a
+`match` whose every arm returns. The tags accept each of those as the function's end.
+
+**What would close it:** a tag that counts a `panic` as divergence in an arm, as 0.9.696 does; or, in the new rule, a
+window that takes `:=` after a `panic` with a word naming the new form.
+
+**Workaround, since 2026-10-20:** each test program has `fn T stop<T>(const ref string msg) { panic(msg: msg); }`
+(a function may end in `panic` on every compiler), and an arm that stops ends `:= stop::<T>(msg: …)`, or
+`return stop::<R>(msg: …)`. When a tag counts a `panic` in an arm, the arms say `{ …; panic(msg: …); }` and `stop`
+goes.
+
 ## FIXED — kept for the record
 
 KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
 the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
 same change, the first tag with all three.
+
+### KRD-10 · MED · An application named like a dependency's module broke that dependency's imports — FIXED in 0.9.693
+
+**Found** 2026-10-19, building this package's examples: one named `tls` would not build, its errors all inside
+`@kama/redis` (`module tls is not visible from redis`). A project's name is its root module, and kama resolved
+`@kama/redis`'s own `import { tls::… }` to the application instead of to `@kama/tls`. Any application named `tls`
+that uses `@kama/redis`, or `@kama/postgres`, fails the same way, with errors that point at the library.
+
+**Repro**, three files and two applications that differ only in their name:
+
+```
+middle/kama.json      { "name": "@repro/middle", "version": "0.1.0", "kind": "library", "kama": ">=0.9.667",
+                        "dependencies": { "@kama/tls": { "version": "^0.1.3" } },
+                        "modules": { ".": { "visibility": "public" } } }
+middle/src/middle.kama
+                      import { tls::version };
+                      export { engine };
+                      fn string engine() { return version(); }
+app-NAME/kama.json    { "name": "NAME", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.667",
+                        "entry": "src/main.kama", "dependencies": { "@repro/middle": { "path": "../middle" } },
+                        "modules": { ".": { "visibility": "internal" } } }
+app-NAME/src/main.kama
+                      import { core::println, middle::engine };
+                      fn int32 main() { string e = engine(); println(s: give e); return 0; }
+```
+
+- NAME `other`: prints `4.1.1` on `v0.9.667`, `v0.9.673` and `0.9.675+g4afcda97`.
+- NAME `tls`: refused on all three, in the library's file: "`.kama/deps/middle/src/middle.kama:1:9: error: module
+  `tls` is not visible from `middle` — its `visibility` in `kama.json` does not name this module`", then "`module
+  `tls` does not export `version`".
+
+**What would close it:** a library's imports resolve within the library's own dependencies, whatever the
+application is called. Short of that, an application whose name is the module of one of its dependencies, direct
+or not, could be refused when its manifest is read, naming the clash, as a reserved word already is ("`name` is
+"base", but a project's name is its root module…").
+
+**Workaround:** the example is named `tls_connection`, which it can keep either way. Nothing else here depends on it.
+
+**Fixed** by the second of the two ways asked, in 0.9.693 (`f1e73abc`, "pkg: a project named like a dependency's
+module is refused"). Checked 2026-10-20 on `0.9.696+gc86f3e82`: `kama pkg install` of the app named `tls` refuses
+it, naming the clash ("'@kama/tls' (required by @repro/middle) imports as 'tls', which is this project's own name …;
+rename the project"), and the app named `other` installs. AGENTS.redis.md's rule against an example named `tls`
+stays: it is what the refusal now enforces.
 
 ### KRD-8 · HIGH · std's `deserialize`, instantiated with a type of the program's, resolved its names in std — FIXED in 0.9.565
 

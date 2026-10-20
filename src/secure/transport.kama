@@ -88,7 +88,6 @@ type resource TlsTransport implements Transport, Sendable {
             if (want == Interest::Write) { ready = r.writable; }
             if (!ready) { return Result::Err(error: RedisError::Timeout); }
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // What the handshake settled, once it is done.

@@ -8,7 +8,7 @@ import { core::println, core::env, std::collections::DynamicArray, std::collecti
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion as EngineVersion,
          redis::Connection, redis::Config, redis::RedisError, redis::Transport, redis::Dialer, redis::TlsVerify, redis::TlsVersion,
          redis::TlsSession, redis::Subscriber, redis::Pipeline, redis::Command, redis::Replies, redis::resp::Value,
-         redis_unit_tests::check, FakeServer, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, callOutcome, isSimple,
+         redis_unit_tests::check, redis_unit_tests::stop, FakeServer, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, callOutcome, isSimple,
          commandOf, serverVersions, ended, setThenIncr, transaction, shown, soon };
 export { tlsTests };
 
@@ -19,7 +19,7 @@ fn string vectorServer() { return "redis-8.10.2"; }
 
 fn string certPath(const ref string name) {
     Optional<string> dir = env(name: "REDISTEST_CERTDIR");
-    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "tls_test: REDISTEST_CERTDIR is not set: run tools/test.sh"); := ""; } };
+    string d = match (give dir) { case Some(value: v): give v; case None: { := stop::<string>(msg: "tls_test: REDISTEST_CERTDIR is not set: run tools/test.sh"); } };
     return d.concat(other: "/").concat(other: name);
 }
 
@@ -27,7 +27,7 @@ fn string certPath(const ref string name) {
 // takes any answer, 2 requires one the test CA signed. `only`: 12 or 13 pins that version, 0 takes either.
 unsafe fn TlsConfig serverTls(const ref string cert, int32 policy, int32 only) {
     Result<TlsConfig, TlsError> made = TlsConfig.server();
-    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "tls_test: server config"); := serverTls(cert: cert, policy: policy, only: only); } };
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { := stop::<TlsConfig>(msg: "tls_test: server config"); } };
     string crt = certPath(name: cert.concat(other: ".crt"));
     string key = certPath(name: cert.concat(other: ".key"));
     string none = "";
@@ -552,7 +552,7 @@ unsafe fn int32 redialTests() {
     dials.add(item: Dial::ServeTls(steps: give up, config: serverTls(cert: "server", policy: 0, only: 12), sni: "localhost"));
     Owned<Dialer> d = new ScriptDialer.make(dials: give dials);
     Result<Connection, RedisError> made = Connection.connectWith(dialer: give d, config: config);
-    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: redial: ${m}"); return 1; } };
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "tls_test: redial: ${m}"); } };
     Command lose = commandOf(text: "GET kr:lost");
     Result<Value, RedisError> lost = c.call(command: lose);
     Command ping = Command.of(name: "PING");
@@ -576,7 +576,7 @@ unsafe fn int32 redialTests() {
     again.add(item: Dial::ServeTls(steps: greeting(), config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
     Owned<Dialer> d2 = new ScriptDialer.make(dials: give again);
     Result<Connection, RedisError> made2 = Connection.connectWith(dialer: give d2, config: own);
-    Connection c2 = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: redial ca: ${m}"); return 1; } };
+    Connection c2 = match (give made2) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "tls_test: redial ca: ${m}"); } };
     Command lose2 = commandOf(text: "GET kr:lost");
     Result<Value, RedisError> lost2 = c2.call(command: lose2);
     Result<isize, IoError> w2 = writeFile(path: ca, bytes: otherPem);
@@ -602,7 +602,7 @@ unsafe fn int32 redialTests() {
     idle.add(item: Dial::ServeTls(steps: give next, config: serverTls(cert: "server", policy: 0, only: 0), sni: "localhost"));
     Owned<Dialer> d3 = new ScriptDialer.make(dials: give idle);
     Result<Connection, RedisError> made3 = Connection.connectWith(dialer: give d3, config: config);
-    Connection c3 = match (give made3) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: idle close_notify: ${m}"); return 1; } };
+    Connection c3 = match (give made3) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "tls_test: idle close_notify: ${m}"); } };
     Command ping3 = Command.of(name: "PING");
     Result<Value, RedisError> p3 = c3.call(command: ping3);
     string p3Got = callOutcome(r: p3);

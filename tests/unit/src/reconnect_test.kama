@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::memor
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::Protocol, redis::RedisError,
          redis::TxOutcome, redis::Dialer, redis::Subscriber, redis::Delivery, redis::ChannelKind, redis::cluster::keySlot,
          redis::resp::Value, redis::resp::Reader, redis::resp::Read,
-         redis_unit_tests::check, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
+         redis_unit_tests::check, redis_unit_tests::stop, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
          commandOf, transaction, setThenIncr, pushIn, connected };
 export { reconnectTests };
 
@@ -30,7 +30,7 @@ unsafe fn Connection dialed(DynamicArray<Dial> dials, const ref Config config, c
     Result<Connection, RedisError> r = Connection.connectWith(dialer: give d, config: config);
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); panic(msg: "reconnect_test: ${what}: ${m}"); return dialed(dials: DynamicArray.empty(), config: config, what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "reconnect_test: ${what}: ${m}"); }
     };
     return give c;
 }
@@ -572,7 +572,6 @@ fn DynamicArray<uint8> frameOf(const ref DynamicArray<uint8> b, isize index) {
         k = k + 1;
     }
     panic(msg: "reconnect_test: no such frame");
-    return DynamicArray.empty();
 }
 
 fn DynamicArray<uint8> joined(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b) {
@@ -594,7 +593,7 @@ unsafe fn Subscriber subscriberWith(DynamicArray<Dial> dials, const ref Config c
     Result<Subscriber, RedisError> r = Subscriber.connectWith(dialer: give d, config: config);
     Subscriber sub = match (give r) {
         case Ok(value: x): give x;
-        case Err(error: e): { string m = e.message(); panic(msg: "reconnect_test: ${what}: ${m}"); return subscriberWith(dials: DynamicArray.empty(), config: config, what: what); }
+        case Err(error: e): { string m = e.message(); return stop::<Subscriber>(msg: "reconnect_test: ${what}: ${m}"); }
     };
     return give sub;
 }
