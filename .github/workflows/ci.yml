@@ -3,8 +3,8 @@
 # Two jobs:
 #   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64.
 #   - integration: a real server per matrix entry via tools/redis.sh (docker on the Linux runner; macOS
-#     runners have no container runtime). `tools/redis.sh smoke` first proves the server's configuration
-#     with its own redis-cli, one check per authentication case and transport; then
+#     runners have no container runtime), with its cluster and sentinel topologies beside it. `tools/redis.sh smoke`
+#     first proves each one's configuration with the servers' own redis-cli; then
 #     tools/test-integration.sh runs the live suite (tests/integration), debug and release, and
 #     tools/check-readme.sh and tools/check-examples.sh run the README's programs and examples/.
 # Windows is not in the matrix; the package has never been built there.
@@ -74,6 +74,16 @@ jobs:
       - name: Server smoke (one check per authentication case and transport)
         run: tools/redis.sh smoke --server ${{ matrix.server }}
 
+      - name: Start ${{ matrix.server }}'s cluster and sentinel topologies
+        run: |
+          tools/redis.sh up --server ${{ matrix.server }} --topology cluster
+          tools/redis.sh up --server ${{ matrix.server }} --topology sentinel
+
+      - name: Topology smoke (what the client relies on, with the servers' own redis-cli)
+        run: |
+          tools/redis.sh smoke --server ${{ matrix.server }} --topology cluster
+          tools/redis.sh smoke --server ${{ matrix.server }} --topology sentinel
+
       - name: Integration tests (debug and release)
         run: tools/test-integration.sh --server ${{ matrix.server }}
 
@@ -82,10 +92,16 @@ jobs:
           tools/check-readme.sh --server ${{ matrix.server }}
           tools/check-examples.sh --server ${{ matrix.server }}
 
-      - name: Server log on failure
+      - name: Server logs on failure
         if: failure()
-        run: tools/redis.sh logs --server ${{ matrix.server }} || true
+        run: |
+          tools/redis.sh logs --server ${{ matrix.server }} || true
+          tools/redis.sh logs --server ${{ matrix.server }} --topology cluster || true
+          tools/redis.sh logs --server ${{ matrix.server }} --topology sentinel || true
 
       - name: Stop ${{ matrix.server }}
         if: always()
-        run: tools/redis.sh down --server ${{ matrix.server }}
+        run: |
+          tools/redis.sh down --server ${{ matrix.server }}
+          tools/redis.sh down --server ${{ matrix.server }} --topology cluster
+          tools/redis.sh down --server ${{ matrix.server }} --topology sentinel

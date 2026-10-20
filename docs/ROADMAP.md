@@ -67,7 +67,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | step 0 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–1 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -196,8 +196,10 @@ Short names: R8 is Redis 8.10.2, V9 Valkey 9.1.2, R62 Redis 6.2.24, and SPEC the
   - **The port:**
     - on 7.2 and later it follows the asking connection: TLS clients get `tls-port` (`clusterNodeClientPort(n,
       shouldReturnTlsInfo())`, R8 cluster.c:889-895);
-    - on 6.2 and 7.0 a node announces one port, the TLS one under `tls-cluster yes`, so a 6.2 cluster serves either
-      plaintext clients or TLS ones;
+    - on 6.2 and 7.0, under `tls-cluster yes`, a node announces its TLS port and its plaintext one beside it (`pport`,
+      `deriveAnnouncedPorts`, R62 cluster.c:444-458). MOVED and SLOTS give a plaintext client the plaintext port (R62
+      4370-4373, 5960-5963), so one cluster serves both kinds of client. Under `tls-cluster no` every client gets the
+      plaintext port (the review's H12 said otherwise, from the 7.0 source alone; step 1 read 6.2's);
     - Valkey 9 adds `cluster-announce-client-(tls-)port`.
 - **The slot map.**
   - **`CLUSTER SLOTS`:**
@@ -493,26 +495,54 @@ Each step ends green before its commit:
 
 0. **Done (2026-10-20).** This plan, and the repros ("Decided, and why", "Phase 6"). KRD-11 filed: cstar's 0.9.684
    refuses `fn int32 main()`, which every tag requires.
-1. **Topologies** (`tools/redis.sh up|down|smoke --topology cluster|sentinel [--server S]`), in containers of their
-   own.
-   - **The cluster:** three primaries with a replica each.
-     - fixed node IDs (a pre-written `nodes.conf`, H21);
-     - ports published 1:1, and `cluster-announce-ip 127.0.0.1`;
-     - a low `cluster-node-timeout`, `enable-debug-command`, and a restart loop per node;
-     - `tls-cluster yes` on 7.2 and later. 6.2 is plaintext (H12), with a TLS one beside it if that is cheap.
-   - **Sentinel:** a master, two replicas and three sentinels.
-     - `announce-ip` and `replica-announce-ip 127.0.0.1`;
-     - a sentinel ACL user;
-     - TLS, with `tls-replication yes`.
-   - **Smoke** uses the image's own `redis-cli -c` and SENTINEL commands. CI starts both topologies.
+1. **Done (2026-10-20).** **Topologies:** `tools/redis.sh up|down|env|cli|logs|smoke --topology cluster|sentinel
+   [--server S]`, in containers of their own.
+   - **The cluster** (`tests/integration/server/cluster.sh`):
+     - three primaries with a replica each, every node in plaintext and over TLS;
+     - ports published 1:1 and `cluster-announce-ip 127.0.0.1`;
+     - `cluster-node-timeout 2000`, DEBUG enabled where a server has the setting (7.0 and later), and each node in a
+       restart loop.
+
+     It is created once, by the image's `redis-cli --cluster create` over the TLS ports, since a CLUSTER MEET's bus
+     port is the given port's. Its smoke has 13 checks:
+     - the state;
+     - CLUSTER SLOTS naming plaintext ports to a plaintext client and TLS ports to a TLS one;
+     - MOVED by the asking connection's kind;
+     - a replica's WAIT and its read after READONLY;
+     - `redis-cli -c` in both kinds;
+     - the read-only user;
+     - DEBUG.
+   - **Sentinel** (`tests/integration/server/sentinel.sh`) is two groups, each a master, two replicas and three
+     sentinels monitoring `kr`. A sentinel names the port it monitors, so one group is plaintext and the other TLS
+     only, and the TLS group's sentinels want `kr_sentinel`'s password. Its smoke has 14 checks:
+     - in each group: one master named by all three sentinels, ROLE on each server, and each sentinel knowing the
+       others;
+     - ROLE and HELLO 3 on a sentinel;
+     - SELECT unknown there;
+     - an unknown name a null;
+     - the TLS group's NOAUTH, WRONGPASS and refused plaintext;
+     - the data servers' own user on the TLS master.
+   - **CI** starts both topologies beside each server and runs their smoke. Both pass on all eight servers.
+   - **What building it settled:**
+     - **6.2 serves both kinds of client.** Under `tls-cluster yes` a node announces its plaintext port beside its
+       TLS one (`pport`), and MOVED and SLOTS give a plaintext client that one (R62 cluster.c:444-458, 4370-4373,
+       5960-5963). So every server's cluster is TLS on the bus. The review's H12 was wrong.
+     - **A node's own links present the test client certificate** (`tls-client-cert-file`). The server's certificate
+       is for serverAuth only, and a cluster bus link that presented it stayed in `handshake` for good.
+     - **After SENTINEL FAILOVER the old master turns replica only on a later INFO poll,** up to 10 s on. A check in
+       between sees two masters. A SENTINEL FAILOVER moved the plain group's master in 2 s, and a CLUSTER FAILOVER
+       moved a shard's at once; smoke passed again after each.
+     - **The generator cannot capture a reply over TLS:** it runs in `--network none` containers whose Perl has no
+       TLS. A reply over TLS has the same shape as one in plaintext, and the port it names is checked live (smoke,
+       then the integration suite).
+     - **COMMAND INFO, DOCS and GETKEYS move to step 7,** where the table they check is generated.
 2. **Vectors** (`tools/gen-topology-vectors.sh`), in throwaway `--network none` containers. Two runs must be the same.
    - **The cluster:**
-     - CLUSTER SLOTS under both protocols and over TLS, with the hostname and unknown-endpoint forms;
+     - CLUSTER SLOTS under both protocols, with the hostname and unknown-endpoint forms;
      - every redirection, and every CLUSTERDOWN;
      - a redirection while queueing and one at EXEC, and ASKING then MULTI;
      - a replica's MOVED, READONLY and MASTERDOWN;
-     - the atomic migrations;
-     - every server's COMMAND INFO, DOCS and GETKEYS.
+     - the atomic migrations.
    - **Sentinel:**
      - every SENTINEL reply, under both protocols, and an unknown name;
      - ROLE three ways;
@@ -545,7 +575,8 @@ Each step ends green before its commit:
 7. **`redis::cluster`'s pure layers** (unit):
    - the slot map, hostile and bounded;
    - the MOVED and ASK parser;
-   - the generated table and `route()` against the GETKEYS captures;
+   - the generated table (`tools/gen-command-table.sh`, from every server's COMMAND INFO), and `route()` against
+     every server's COMMAND GETKEYS for an invocation of each command built from its COMMAND DOCS;
    - the response policies.
 8. **The cluster's core:**
    - seeds, lazy nodes, routing, splitting and fan-out;

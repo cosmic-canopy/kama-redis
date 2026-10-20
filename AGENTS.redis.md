@@ -184,6 +184,26 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
   - The live TLS test relays through a listener of its own that reads the ClientHello's server name (SNI on the
     wire), and meets silence at one that never accepts. An accepted stream starts in its listener's mode (on every OS
     since kama 0.9.671, on macOS before it too): set it blocking before reading from a non-blocking listener.
+  - **The topologies** (phase 6): `--topology cluster|sentinel` on `up`, `down`, `env`, `cli`, `logs` and `smoke`. Each
+    runs in a container of its own (`kama-redis-cluster-S`, `kama-redis-sentinel-S`), its settings in
+    `out/redistest-<topology>-S.env`.
+    - Their ports are published 1:1 and announced as 127.0.0.1. A server names its peers' addresses to clients
+      (MOVED, CLUSTER SLOTS, GET-MASTER-ADDR-BY-NAME), and such an address must mean the same inside the container and
+      out. The ranges are 17000 + 20k (cluster) and 18000 + 20k (sentinel), where k is the base port less 16300.
+    - **The cluster** is three primaries with a replica each (`tests/integration/server/cluster.sh`), every node in
+      plaintext and over TLS, with `tls-cluster yes` on every server. Under it, 6.2 gives a plaintext client the
+      plaintext port too (`pport`). It is created once, over the TLS ports, since a CLUSTER MEET's bus port is the
+      given port's.
+    - **Sentinel** is two groups, each a master, two replicas and three sentinels monitoring `kr`
+      (`tests/integration/server/sentinel.sh`). A sentinel names the port it monitors, so one group is plaintext and
+      the other TLS only. The TLS group's sentinels have their default user off: log in as `kr_sentinel`.
+    - **A node's own links** (the cluster bus, replication, a sentinel's connections) present the test client
+      certificate (`tls-client-cert-file`). The server's certificate is for serverAuth only, and a bus link that
+      presents it never completes its handshake.
+    - Every server and sentinel runs in a restart loop, as the standalone server does.
+    - **After a failover, wait before checking.** Sentinel turns the old master into a replica only on a later INFO poll,
+      up to 10 s on, so a check right after SENTINEL FAILOVER can see two masters. The smoke checks pass again once it
+      settles.
 
 - **`redis::resp`'s reader is built so that nothing is read twice and memory follows the bytes that came.** Keep it
   that way when changing it. The rules are in `src/resp/reader.kama`'s header:
