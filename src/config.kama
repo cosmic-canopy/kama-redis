@@ -66,8 +66,9 @@ type enum SentinelRole implements Sendable {
 type enum ReadFrom implements Sendable {
     // The primary that serves the slot. The default, as every peer client's is.
     Primary,
-    // A replica of that primary, chosen at random, or the primary when it has none up. A replica may be behind its
-    // primary, so a read there can miss a write the caller just made.
+    // A replica of that primary, chosen at random, or the primary when it has none up; a read the replica will not
+    // serve (MASTERDOWN, its link lost) goes again to the primary. A replica may be behind its primary, so a read there
+    // can miss a write the caller just made: WAIT first when it must not.
     Replica;
 
     // As the read_from option spells it.
@@ -154,10 +155,15 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     // A cluster's options, set or not, so a `Connection` can refuse them.
     Optional<ReadFrom> readChoice;
     Optional<int32> redirectChoice;
+    // A cluster node's link that serves reads from a replica (read_from=replica): READONLY in its handshake, every
+    // time it is made. Set by the cluster alone.
+    bool replicaReads = false;
 
     // A connection through sentinels asks each one with `forSentinel`, and reaches the server it names with `forNode`.
     friend redis::Connection::askSentinels[forSentinel, forNode];
-    friend redis::Cluster::nodeConfig[forNode];
+    friend redis::Cluster::nodeConfig[forNode, replicaReads];
+    friend redis::Connection::handshake[replicaReads];
+    friend redis::Connection::resp2Handshake[replicaReads];
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -235,6 +241,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.sentinelSecret = copy source.sentinelSecret;
         this.readChoice = source.readChoice;
         this.redirectChoice = source.redirectChoice;
+        this.replicaReads = source.replicaReads;
     }
 
     // A connection URL: redis://, valkey://, rediss://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://

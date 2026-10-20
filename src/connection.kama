@@ -101,6 +101,7 @@ type resource Connection implements Sendable {
     friend redis::NodeLink::begin[begin];
     friend redis::NodeLink::finish[finish];
     friend redis::NodeLink::transact[transactAt];
+    friend redis::NodeLink::generation[generation];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -872,6 +873,13 @@ type resource Connection implements Sendable {
             libVer.encode(into: this.outbox);
             after = after + 2;
         }
+        // A cluster's link for replica reads: READONLY, in the same write, on every link made.
+        bool readonly = config.replicaReads;
+        if (readonly) {
+            Command ro = Command.of(name: "READONLY");
+            ro.encode(into: this.outbox);
+            after = after + 1;
+        }
         Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
 
@@ -934,6 +942,10 @@ type resource Connection implements Sendable {
                 k = k + 1;
             }
         }
+        if (readonly) {
+            Result<Unit, RedisError> ro = this.expectOk(what: "READONLY", deadline: deadline);
+            match (give ro) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        }
         this.speaking = Protocol::Resp3;
         this.identified.add(item: give info);
         return Result::Ok(value: Unit::Unit);
@@ -975,6 +987,11 @@ type resource Connection implements Sendable {
             select.argInt(value: config.database());
             select.encode(into: this.outbox);
             steps.add(item: "SELECT");
+        }
+        if (config.replicaReads) {
+            Command ro = Command.of(name: "READONLY");
+            ro.encode(into: this.outbox);
+            steps.add(item: "READONLY");
         }
         this.speaking = Protocol::Resp2;
         if (steps.length() == 0) {

@@ -1,0 +1,138 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (this.settings.readFrom() == ReadFrom::Replica) { c.replicaReads = true; }",
+  "new": "        if (false) { c.replicaReads = true; }",
+  "expect": "replica: a read goes to the slot's replica, READONLY in its handshake"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (!readOnly || slot < 0 || this.settings.readFrom() != ReadFrom::Replica) { return -1; }",
+  "new": "        if (true) { return -1; }",
+  "expect": "replica: a read goes to the slot's replica"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (!readOnly || slot < 0 || this.settings.readFrom() != ReadFrom::Replica) { return -1; }",
+  "new": "        if (slot < 0 || this.settings.readFrom() != ReadFrom::Replica) { return -1; }",
+  "expect": "replica: a write goes to the primary"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        while (i < n) { state.prefer(index: i, at: this.replicaFor(slot: slots[i], readOnly: reads[i])); i = i + 1; }",
+  "new": "",
+  "expect": "replica: in a pipeline, each read at a replica"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool readonly = config.replicaReads;",
+  "new": "        bool readonly = false;",
+  "expect": "replica: a read goes to the slot's replica, READONLY in its handshake"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (config.replicaReads) {\n            Command ro = Command.of(name: \"READONLY\");",
+  "new": "        if (false) {\n            Command ro = Command.of(name: \"READONLY\");",
+  "expect": "replica: RESP2's READONLY"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        this.replicaReads = source.replicaReads;",
+  "new": "",
+  "expect": "replica: RESP2's READONLY, and again on a link made again"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        isize next = first;   // the node a redirection named",
+  "new": "        isize next = -1;   // the node a redirection named",
+  "expect": "replica: a read goes to the slot's replica"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "                this.walking = this.walking + 1;",
+  "new": "",
+  "expect": "scan: every primary in turn"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "                this.done = this.walking >= this.hosts.length();\n                this.link = -1i64;",
+  "new": "                this.done = this.walking >= this.hosts.length();",
+  "expect": "scan: every primary in turn"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "        bool moved = this.link >= 0i64 && (now != this.link || host != this.nodeHost || port != this.nodePort);",
+  "new": "        bool moved = false;",
+  "expect": "scan: a node's link made again mid-scan ends it"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "(now != this.link || host != this.nodeHost || port != this.nodePort)",
+  "new": "(now != this.link)",
+  "expect": "scan: a key's slot that moves mid-scan ends it"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (this.lastAnswered >= 0 && this.lastAnswered < this.links.length()) {",
+  "new": "        if (false) {",
+  "expect": "scan: a key's slot that moves mid-scan ends it"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "    fn void primaryPlaces(ref DynamicArray<string> hosts, ref DynamicArray<int32> ports) {\n        DynamicArray<isize> primaries = this.map.primaries();\n        isize i = 0;\n        while (i < primaries.length()) {",
+  "new": "    fn void primaryPlaces(ref DynamicArray<string> hosts, ref DynamicArray<int32> ports) {\n        DynamicArray<isize> primaries = this.map.primaries();\n        isize i = 0;\n        while (i < 1) {",
+  "expect": "scan: every primary in turn"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/scan.kama",
+  "old": "        if (ended) { this.done = true; }\n        return give items;\n    }",
+  "new": "        return give items;\n    }",
+  "expect": "scan: SCAN's one page, then done"
+ },
+ {
+  "id": "M16",
+  "suite": "integration",
+  "file": "src/cluster.kama",
+  "old": "        if (this.settings.readFrom() == ReadFrom::Replica) { c.replicaReads = true; }",
+  "new": "        if (false) { c.replicaReads = true; }",
+  "expect": "replica: the replica served the GET"
+ },
+ {
+  "id": "M17",
+  "suite": "integration",
+  "file": "src/scan.kama",
+  "old": "        bool moved = this.link >= 0i64 && (now != this.link || host != this.nodeHost || port != this.nodePort);",
+  "new": "        bool moved = false;",
+  "expect": "scan: a primary's link made again mid-scan ends it"
+ }
+]

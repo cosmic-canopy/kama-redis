@@ -89,7 +89,7 @@ fn string refusal(const ref Command command) {
         return "a connection does not carry CLIENT NO-EVICT, NO-TOUCH, CAPA or IMPORT-SOURCE: each sets something on the connection that a reconnect would lose without a word";
     }
     if (named(command: command, word: "READONLY") || named(command: command, word: "READWRITE")) {
-        return "a connection does not carry READONLY or READWRITE: they are for reading from a cluster's replicas, which a later release of this client brings, and a reconnect would lose them without a word";
+        return "a connection does not carry READONLY or READWRITE: a cluster reads from its replicas with read_from=replica, which sends READONLY on every link it makes; sent by hand, a reconnect would lose it without a word";
     }
     return "";
 }

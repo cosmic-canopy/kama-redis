@@ -6,7 +6,7 @@
 import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::sleep,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Config, redis::Command, redis::RedisError,
          redis::Dialer, redis::Dialers, redis::Script, redis::ScriptCall, redis::libraryVersion, redis::resp::Value,
-         redis::Connection, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody,
+         redis::Connection, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan,
          redis::cluster::keySlot,
          redis_unit_tests::check, redis_unit_tests::stop, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex };
@@ -1151,6 +1151,159 @@ unsafe fn int32 watchedTests() {
     return f;
 }
 
+// A node's handshake for reads from replicas: READONLY after the SETINFOs, in the same write.
+fn DynamicArray<Step> nodeReading() {
+    DynamicArray<Step> s = node();
+    s.add(item: expect(command: "READONLY", answer: topo(kase: "replica-readonly/3")));
+    return give s;
+}
+
+fn string replicaSeed() { return "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&read_from=replica"; }
+
+// read_from=replica: every link sends READONLY as it is made; a read goes to a replica of its slot, a write to the
+// primary; a replica that will not serve sends the read to the primary.
+unsafe fn int32 replicaTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string c3 = keyAt(index: 3);
+
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = nodeReading();
+    s0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    s0.add(item: expect(command: "SET ${a} x", answer: reply(server: server(), kase: "select1")));
+    s0.add(item: expect(command: "SET ${a} y", answer: reply(server: server(), kase: "select1")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    DynamicArray<Step> s3 = nodeReading();
+    s3.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    s3.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    o.serve(place: "127.0.0.1:7003", script: give s3);
+    Cluster c = clustered(o: give o, url: replicaSeed(), what: "replica: connect", fails: f);
+    Result<Value, RedisError> r1 = callText(c: c, text: "GET ${a}");
+    string o1 = callOutcome(r: r1);
+    f = f + check(ok: isBulk(r: r1, text: "va"), what: "replica: a read goes to the slot's replica, READONLY in its handshake: ${o1}");
+    Result<Value, RedisError> r2 = callText(c: c, text: "SET ${a} x");
+    string o2 = callOutcome(r: r2);
+    f = f + check(ok: isStatus(r: r2, text: "OK"), what: "replica: a write goes to the primary: ${o2}");
+    Pipeline p = pipelineOf(texts: words2(a: "GET ${a}", b: "SET ${a} y"));
+    string o3 = repliesOf(r: c.run(pipeline: p));
+    f = f + check(ok: o3 == "va | OK", what: "replica: in a pipeline, each read at a replica and each write at the primary: ${o3}");
+
+    // MASTERDOWN (a replica cut off from its primary, serving no stale data): the map read again, then the primary.
+    Opens m = Opens.make();
+    DynamicArray<Step> m0 = nodeReading();
+    m0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    m0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    m.serve(place: "127.0.0.1:7000", script: give m0);
+    DynamicArray<Step> m5 = nodeReading();
+    m5.add(item: expect(command: "GET ${c3}", answer: topo(kase: "masterdown/3")));
+    m.serve(place: "127.0.0.1:7005", script: give m5);
+    DynamicArray<Step> m2 = nodeReading();
+    m2.add(item: expect(command: "GET ${c3}", answer: reply(server: server(), kase: "get-hit/3")));
+    m.serve(place: "127.0.0.1:7002", script: give m2);
+    Cluster cm = clustered(o: give m, url: replicaSeed(), what: "replica masterdown: connect", fails: f);
+    Result<Value, RedisError> r4 = callText(c: cm, text: "GET ${c3}");
+    string o4 = callOutcome(r: r4);
+    f = f + check(ok: isBulk(r: r4, text: "hello"), what: "replica: MASTERDOWN sends the read to the primary: ${o4}");
+
+    // RESP2: READONLY is one of the path's steps; and a replica's link made again sends READONLY again.
+    Opens t = Opens.make();
+    DynamicArray<Step> t0 = steps();
+    t0.add(item: expect(command: "READONLY", answer: topo(kase: "replica-readonly/2")));
+    t0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/2")));
+    t.serve(place: "127.0.0.1:7000", script: give t0);
+    DynamicArray<Dial> d3 = DynamicArray.empty();
+    DynamicArray<Step> first = steps();
+    first.add(item: expect(command: "READONLY", answer: topo(kase: "replica-readonly/2")));
+    first.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/2")));
+    first.add(item: Step::Hangup);
+    d3.add(item: Dial::Serve(steps: give first));
+    DynamicArray<Step> again = steps();
+    again.add(item: expect(command: "READONLY", answer: topo(kase: "replica-readonly/2")));
+    again.add(item: expect(command: "PING", answer: topo(kase: "ping-node/2")));
+    again.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/2")));
+    d3.add(item: Dial::Serve(steps: give again));
+    t.each(place: "127.0.0.1:7003", dials: give d3);
+    Cluster ct = clustered(o: give t, url: "redis://127.0.0.1:7000?connect_timeout=1&reconnect_timeout=1&read_from=replica&protocol=2", what: "replica resp2: connect", fails: f);
+    Result<Value, RedisError> r5 = callText(c: ct, text: "GET ${a}");
+    Result<Value, RedisError> r6 = callText(c: ct, text: "GET ${a}");
+    string o6 = callOutcome(r: r6);
+    f = f + check(ok: isBulk(r: r5, text: "va") && isBulk(r: r6, text: "va"), what: "replica: RESP2's READONLY, and again on a link made again: ${o6}");
+    return f;
+}
+
+// A SCAN page: cursor `cursor`, the one key `key`.
+fn DynamicArray<uint8> scanPage(const ref string cursor, const ref string key) {
+    isize nc = cursor.length();
+    isize nk = key.length();
+    return bytesOf(text: "*2\r\n$${nc}\r\n${cursor}\r\n*1\r\n$${nk}\r\n${key}\r\n");
+}
+
+// SCAN on a cluster: every primary in turn, each from cursor 0 to its 0; a node whose link is made again mid-scan, or
+// a key's slot that moves, ends it.
+unsafe fn int32 clusterScanTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "SCAN 0", answer: scanPage(cursor: "17", key: a)));
+    s0.add(item: expect(command: "SCAN 17", answer: reply(server: server(), kase: "scan/3")));
+    s0.add(item: expect(command: "SSCAN ${a} 0", answer: reply(server: server(), kase: "sscan/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    o.serve(place: "127.0.0.1:7001", script: answering(command: "SCAN 0", answer: reply(server: server(), kase: "scan/3")));
+    o.serve(place: "127.0.0.1:7002", script: answering(command: "SCAN 0", answer: reply(server: server(), kase: "scan/3")));
+    Cluster c = clustered(o: give o, url: oneSeed(), what: "scan: connect", fails: f);
+    Scan keys = Scan.keys();
+    isize pages = 0;
+    bool failed = false;
+    while (!keys.isDone() && pages < 10) {
+        Result<Value, RedisError> page = keys.nextIn(cluster: c);
+        bool ok = match (page) { case Ok(value: v): true; case Err(error: e): false; };
+        if (!ok) { failed = true; break; }
+        pages = pages + 1;
+    }
+    Result<Value, RedisError> after = keys.nextIn(cluster: c);
+    string done = callOutcome(r: after);
+    f = f + check(ok: !failed && pages == 4 && done.contains(substring: "every node answered cursor 0"), what: "scan: every primary in turn, two pages at 7000: ${pages} ${done}");
+    Scan members = Scan.setMembers(key: a);
+    Result<Value, RedisError> m1 = members.nextIn(cluster: c);
+    string om = callOutcome(r: m1);
+    f = f + check(ok: om == "ok" && members.isDone(), what: "scan: SSCAN at its key's node: ${om}");
+
+    // 7000's link is lost after the first page: the cursor is not its new process's, and the scan ends.
+    Opens l = Opens.make();
+    DynamicArray<Dial> d0 = DynamicArray.empty();
+    DynamicArray<Step> l0 = seed(slots: "slots/3");
+    l0.add(item: expect(command: "SCAN 0", answer: scanPage(cursor: "17", key: a)));
+    l0.add(item: Step::Hangup);
+    d0.add(item: Dial::Serve(steps: give l0));
+    DynamicArray<Step> l1 = thenPinged(script: node());
+    l1.add(item: expect(command: "SCAN 17", answer: reply(server: server(), kase: "scan/3")));
+    d0.add(item: Dial::Serve(steps: give l1));
+    l.each(place: "127.0.0.1:7000", dials: give d0);
+    Cluster cl = clustered(o: give l, url: oneSeed(), what: "scan lost: connect", fails: f);
+    Scan lost = Scan.keys();
+    Result<Value, RedisError> q1 = lost.nextIn(cluster: cl);
+    Result<Value, RedisError> q2 = lost.nextIn(cluster: cl);
+    string oq = callOutcome(r: q2);
+    f = f + check(ok: callOutcome(r: q1) == "ok" && oq.contains(substring: "connected again"), what: "scan: a node's link made again mid-scan ends it: ${oq}");
+
+    // A key's slot moves between pages (MOVED, followed to 7004): the cursor is not the new node's, and the scan ends.
+    Opens v = Opens.make();
+    v.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    DynamicArray<Step> v1 = answering(command: "SSCAN ${b} 0", answer: scanPage(cursor: "17", key: "m1"));
+    v1.add(item: expect(command: "SSCAN ${b} 17", answer: topo(kase: "moved-after-failover/3")));
+    v.serve(place: "127.0.0.1:7001", script: give v1);
+    v.serve(place: "127.0.0.1:7004", script: answering(command: "SSCAN ${b} 17", answer: reply(server: server(), kase: "sscan/3")));
+    Cluster cv = clustered(o: give v, url: oneSeed(), what: "scan moved: connect", fails: f);
+    Scan set = Scan.setMembers(key: b);
+    Result<Value, RedisError> w1 = set.nextIn(cluster: cv);
+    Result<Value, RedisError> w2 = set.nextIn(cluster: cv);
+    string ow = callOutcome(r: w2);
+    f = f + check(ok: callOutcome(r: w1) == "ok" && ow.contains(substring: "slot moved"), what: "scan: a key's slot that moves mid-scan ends it: ${ow}");
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
     f = f + routingTests();
@@ -1163,5 +1316,7 @@ unsafe fn int32 clusterTests() {
     f = f + pipelineTests();
     f = f + transactionTests();
     f = f + watchedTests();
+    f = f + replicaTests();
+    f = f + clusterScanTests();
     return f;
 }

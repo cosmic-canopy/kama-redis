@@ -1,4 +1,4 @@
-import { std::collections::DynamicArray, redis::Command, redis::Connection, redis::RedisArg, redis::RedisError,
+import { std::collections::DynamicArray, redis::Command, redis::Connection, redis::Cluster, redis::RedisArg, redis::RedisError,
          redis::resp::Value };
 export { Scan };
 
@@ -10,6 +10,8 @@ export { Scan };
 //       Result<DynamicArray<string>, RedisError> page = reply::<DynamicArray<string>>(result: scan.next(conn: conn));
 //       …
 //   }
+//
+// On a cluster, `nextIn(cluster:)` walks every primary in turn (SCAN), or the node of the key's slot (the others).
 //
 // Each `next` is one round trip, and returns that page's items, an empty page included, so no call makes an unbounded
 // number of them. A cursor belongs to the server process that gave it: once the connection is made again (a restart,
@@ -26,6 +28,14 @@ type resource Scan implements Sendable {
     string trouble = "";
     // The connection's link the scan's cursor came from (Connection.generation); -1 before the first page.
     int64 link = -1;
+    // On a cluster (`nextIn`): the node the cursor belongs to, and for SCAN every primary when the scan began, walked
+    // in turn (`walking` is the one scanned now).
+    string nodeHost = "";
+    int32 nodePort = 0;
+    DynamicArray<string> hosts;
+    DynamicArray<int32> ports;
+    isize walking = 0;
+    bool started = false;
 
     public ctor keys() { return Scan.named(name: "SCAN"); }
     public ctor setMembers(RedisArg key) {
@@ -52,6 +62,8 @@ type resource Scan implements Sendable {
         this.cursor.add(item: 48);
         this.done = false;
         this.trouble = "";
+        this.hosts = DynamicArray.empty();
+        this.ports = DynamicArray.empty();
     }
 
     // Only what matches the glob `pattern` (MATCH).
@@ -88,10 +100,7 @@ type resource Scan implements Sendable {
     public unsafe fn Result<Value, RedisError> next(ref Connection conn) {
         if (this.trouble.length() > 0) { return Result::Err(error: RedisError::Usage(detail: copy this.trouble)); }
         if (this.done) { return Result::Err(error: RedisError::Usage(detail: "the scan is done: the server answered cursor 0")); }
-        Command c = Command.of(name: this.name);
-        c.appendFrom(other: this.key);
-        c.argBytes(bytes: this.cursor.view());
-        c.appendFrom(other: this.options);
+        Command c = this.request();
         Result<Value, RedisError> r = conn.call(command: c);
         int64 now = conn.generation();
         if (this.link >= 0i64 && now != this.link) {
@@ -101,11 +110,80 @@ type resource Scan implements Sendable {
         }
         this.link = now;
         Value v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        bool ended = false;
+        Result<Value, RedisError> items = this.page(v: give v, ended: ended);
+        if (ended) { this.done = true; }
+        return give items;
+    }
+
+    // The next page, on a cluster. SCAN walks every primary the map named when the scan began, in turn, each from
+    // cursor 0 to its 0; SSCAN, HSCAN and ZSCAN go to the primary of their key's slot. Keys that move between nodes
+    // while it runs (a resharding, a failover) may come twice or not at all, as the server documents for any key
+    // added or removed during a scan. A node whose link is made again mid-scan ends the scan with `Usage`, as `next`
+    // does, and so does a key's slot moving to another node. The scan is done after the last primary's last page.
+    public unsafe fn Result<Value, RedisError> nextIn(ref Cluster cluster) {
+        if (this.trouble.length() > 0) { return Result::Err(error: RedisError::Usage(detail: copy this.trouble)); }
+        if (this.done) { return Result::Err(error: RedisError::Usage(detail: "the scan is done: every node answered cursor 0")); }
+        Command c = this.request();
+        bool spread = this.name == "SCAN";
+        if (spread && !this.started) {
+            this.started = true;
+            cluster.primaryPlaces(hosts: this.hosts, ports: this.ports);
+            if (this.hosts.length() == 0) { this.done = true; return Result::Ok(value: Value::Array(items: DynamicArray.empty())); }
+        }
+        string host = "";
+        int32 port = 0;
+        int64 now = -1i64;
+        Result<Value, RedisError> r = Result::Err(error: RedisError::Closed);
+        if (spread) {
+            host = copy this.hosts[this.walking];
+            port = this.ports[this.walking];
+            r = cluster.scanAt(host: host, port: port, command: c, generation: now);
+        } else {
+            r = cluster.scanFor(key: this.key.part(index: 1), command: c, host: host, port: port, generation: now);
+        }
+        bool moved = this.link >= 0i64 && (now != this.link || host != this.nodeHost || port != this.nodePort);
+        if (moved) {
+            Result<Value, RedisError> dropped = give r;
+            this.trouble = "the node this scan's cursor belongs to was connected again, or its key's slot moved to another node, since the scan began: start a new Scan";
+            return Result::Err(error: RedisError::Usage(detail: copy this.trouble));
+        }
+        Value v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        this.link = now;
+        this.nodeHost = copy host;
+        this.nodePort = port;
+        bool ended = false;
+        Result<Value, RedisError> items = this.page(v: give v, ended: ended);
+        if (ended) {
+            if (!spread) {
+                this.done = true;
+            } else {
+                // This node is done, its cursor back at 0: the next node starts from there, on a link of its own.
+                this.walking = this.walking + 1;
+                this.done = this.walking >= this.hosts.length();
+                this.link = -1i64;
+            }
+        }
+        return give items;
+    }
+
+    // The command for the next page: the name, the key, the cursor, the options.
+    fn Command request() {
+        Command c = Command.of(name: this.name);
+        c.appendFrom(other: this.key);
+        c.argBytes(bytes: this.cursor.view());
+        c.appendFrom(other: this.options);
+        return give c;
+    }
+
+    // A page's items, out of the reply `v`: the cursor kept for the next page, and `ended` when it is 0. A reply that
+    // is not a cursor and a page is `Value`.
+    fn Result<Value, RedisError> page(Value v, ref bool ended) {
         DynamicArray<Value> parts = match (give v) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
         if (parts.length() != 2) { return Result::Err(error: notAPage(name: this.name)); }
-        Optional<Value> page = parts.pop();
+        Optional<Value> items0 = parts.pop();
         Optional<Value> next = parts.pop();
-        Value items = match (give page) { case Some(value: x): give x; case None: Value::Null; };
+        Value items = match (give items0) { case Some(value: x): give x; case None: Value::Null; };
         Value at = match (give next) { case Some(value: x): give x; case None: Value::Null; };
         bool list = match (items) { case Array(items: xs): true; case Set(items: xs): true; case _: false; };
         DynamicArray<uint8> moved = match (give at) { case Bulk(bytes: b): give b; case Simple(bytes: b): give b; case _: DynamicArray.empty(); };
@@ -113,7 +191,7 @@ type resource Scan implements Sendable {
             Value dropped = give items;
             return Result::Err(error: notAPage(name: this.name));
         }
-        this.done = moved.length() == 1 && moved[0] == 48;
+        ended = moved.length() == 1 && moved[0] == 48;
         this.cursor = give moved;
         return Result::Ok(value: give items);
     }

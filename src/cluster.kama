@@ -1,7 +1,7 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error, std::memory::Owned, std::random::Rng, std::time::Duration, std::time::Instant,
          std::time::monotonicNow, std::time::sleep, std::memory::replace,
-         redis::Config, redis::UrlTransport, redis::Connection, redis::Dialers, redis::Dialer, redis::Command,
+         redis::Config, redis::UrlTransport, redis::ReadFrom, redis::Connection, redis::Dialers, redis::Dialer, redis::Command,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::RedisError,
          redis::ServerError, redis::ConnectError,
          redis::cluster::SlotMap, redis::cluster::ClusterNode, redis::cluster::Redirect, redis::cluster::RedirectKind,
@@ -116,6 +116,11 @@ type resource NodeLink implements Sendable {
     // `body` run over this node's connection, whose WATCH is in force.
     public unsafe fn Result<Unit, RedisError> build(TxBody body, ref Pipeline tx) { return body.build(conn: ref this.held[0], tx: ref tx); }
     public unsafe fn void close() { if (this.held.length() > 0) { this.held[0].close(); } }
+    // How many times its link was made again (Connection.generation); -1 before it is opened.
+    public const fn int64 generation() {
+        if (this.held.length() == 0) { return -1i64; }
+        return this.held[0].generation();
+    }
 }
 
 // Where each command of a pipeline stands as a cluster sends it: its reply once it has one (until then, the last
@@ -162,6 +167,8 @@ type resource Pending implements Sendable {
         this.targets[index] = -1;
         this.asks[index] = false;
     }
+    // Command `index`'s first send goes to link `at` (a replica, for a read) when it is not -1.
+    public fn void prefer(isize index, isize at) { this.targets[index] = at; }
     // Command `index` goes again, to link `at`, a redirection's, with ASKING first for an ASK.
     public fn void redirect(isize index, Result<Value, RedisError> failure, isize at, bool ask) {
         this.results[index] = give failure;
@@ -209,6 +216,11 @@ type resource Cluster implements Sendable {
     int32 failures = 0;
     Rng jitter;
     bool shut = false;
+    // The link that answered the last routed command (a scan's key, `scanFor`), until the next.
+    isize lastAnswered = -1;
+
+    // A scan on a cluster (src/scan.kama) walks the primaries, or follows its key's slot.
+    friend redis::Scan::nextIn[primaryPlaces, scanAt, scanFor];
 
     // Connect to the cluster `config` names: its hosts are seeds, asked in turn for the map until one gives it. A
     // Sentinel configuration, a unix:// one and reconnect=off are refused (`Config`), as is a server that is not in
@@ -273,7 +285,10 @@ type resource Cluster implements Sendable {
             case Ok(value: o): match (o) { case Some(value: s): s; case None: -1; };
             case Err(error: e): { return Result::Err(error: give e); }
         };
-        return this.routed(slot: at, command: command);
+        bool reads = this.table.at(index: entry).readOnly();
+        // The map read again first, if it is due: a reading can let links go, and a replica's link is picked from it.
+        this.freshen();
+        return this.routedFrom(slot: at, command: command, first: this.replicaFor(slot: at, readOnly: reads));
     }
 
     // Send `command` to the primary of `key`'s slot, whatever the table says of it: a module's command, or one whose
@@ -333,18 +348,22 @@ type resource Cluster implements Sendable {
         isize n = pipeline.length();
         DynamicArray<Command> commands = DynamicArray.empty();
         DynamicArray<isize> slots = DynamicArray.empty();
+        DynamicArray<bool> reads = DynamicArray.empty();
         isize i = 0;
         while (i < n) {
             Command c = Cluster::commandAt(pipeline: pipeline, index: i);
             Result<isize, RedisError> found = this.oneSlot(command: c, index: i, within: "a pipeline");
             isize slot = match (give found) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
             slots.add(item: slot);
+            reads.add(item: this.readsOnly(command: c));
             commands.add(item: give c);
             i = i + 1;
         }
         this.freshen();
         Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
         Pending state = Pending.make(count: n);
+        i = 0;
+        while (i < n) { state.prefer(index: i, at: this.replicaFor(slot: slots[i], readOnly: reads[i])); i = i + 1; }
         while (state.anyLeft()) {
             // This round's batches, a node's at a time, each command in its order.
             DynamicArray<isize> nodes = DynamicArray.empty();
@@ -674,6 +693,51 @@ type resource Cluster implements Sendable {
         };
     }
 
+    // ---- for a Scan (src/scan.kama) ----
+
+    // The primaries' places, in the map's order (of the first slot each serves): what a SCAN of the cluster walks.
+    fn void primaryPlaces(ref DynamicArray<string> hosts, ref DynamicArray<int32> ports) {
+        DynamicArray<isize> primaries = this.map.primaries();
+        isize i = 0;
+        while (i < primaries.length()) {
+            hosts.add(item: copy this.map.node(index: primaries[i]).host());
+            ports.add(item: this.map.node(index: primaries[i]).port());
+            i = i + 1;
+        }
+    }
+
+    // `command` at the node at `host` and `port`, as it is, no redirection followed (a SCAN page has no key); in
+    // `generation`, how many times that node's link was made again.
+    unsafe fn Result<Value, RedisError> scanAt(const ref string host, int32 port, const ref Command command, ref int64 generation) {
+        if (this.shut) { return Result::Err(error: RedisError::Closed); }
+        isize at = this.linkTo(host: host, port: port);
+        bool unsent = false;
+        Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: false, unsent: unsent);
+        generation = this.links[at].generation();
+        return give r;
+    }
+
+    // `command` at the primary of `key`'s slot, as `call` sends it; in `host`, `port` and `generation`, the node that
+    // answered and how many times its link was made again.
+    unsafe fn Result<Value, RedisError> scanFor(ConstView<uint8> key, const ref Command command, ref string host, ref int32 port, ref int64 generation) {
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.lastAnswered = -1;
+        Result<Value, RedisError> r = this.routed(slot: keySlot(key: key), command: command);
+        if (this.lastAnswered >= 0 && this.lastAnswered < this.links.length()) {
+            host = copy this.links[this.lastAnswered].host();
+            port = this.links[this.lastAnswered].port();
+            generation = this.links[this.lastAnswered].generation();
+        }
+        return give r;
+    }
+
+    // Whether the servers flag `command` readonly, so a replica may serve it (after READONLY).
+    unsafe fn bool readsOnly(const ref Command command) {
+        isize entry = this.table.indexOf(command: command);
+        return entry >= 0 && this.table.at(index: entry).readOnly();
+    }
+
     // Command `index` of `pipeline`, read back from its bytes.
     static fn Command commandAt(const ref Pipeline pipeline, isize index) {
         return Command.decoded(bytes: pipeline.commandBytes(index: index));
@@ -722,10 +786,16 @@ type resource Cluster implements Sendable {
     // (nothing was sent), waited out within reconnect_timeout, the map read again when it may have changed. Anything
     // that may have run is the call's, and never sent again.
     unsafe fn Result<Value, RedisError> routed(isize slot, const ref Command command) {
+        return this.routedFrom(slot: slot, command: command, first: -1);
+    }
+
+    // `routed`, its first try at link `first` (a replica, for a read) when it is not -1. A try sent again goes to the
+    // slot's primary, unless a redirection names another node.
+    unsafe fn Result<Value, RedisError> routedFrom(isize slot, const ref Command command, isize first) {
         this.freshen();
         Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
         int32 redirects = 0;
-        isize next = -1;      // the node a redirection named, for the next send
+        isize next = first;   // the node a redirection named (or the replica a read starts at), for the next send
         bool asking = false;
         while (true) {
             isize at = next;
@@ -733,6 +803,7 @@ type resource Cluster implements Sendable {
             if (at < 0) { return Result::Err(error: noPrimary()); }
             bool unsent = false;
             Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: asking, unsent: unsent);
+            this.lastAnswered = at;
             next = -1;
             asking = false;
             bool failed = match (r) { case Ok(value: v): false; case Err(error: e): true; };
@@ -940,7 +1011,20 @@ type resource Cluster implements Sendable {
     const fn Config nodeConfig(const ref string host, int32 port) {
         Config c = this.settings.forNode(host: copy host, port: port);
         Result<Unit, RedisError> once = c.setReconnectTimeout(timeout: Duration.fromMillis(ms: 1i64));
+        // Reads from replicas: every link sends READONLY as it is made, a primary's too (where it changes nothing), so a
+        // node the map later names a replica serves reads at once.
+        if (this.settings.readFrom() == ReadFrom::Replica) { c.replicaReads = true; }
         return give c;
+    }
+
+    // With read_from=replica, the link of a replica of `slot`'s shard, at random, for a command the servers flag
+    // readonly; -1 for a write, a command without keys, a shard without replicas, or read_from=primary.
+    unsafe fn isize replicaFor(isize slot, bool readOnly) {
+        if (!readOnly || slot < 0 || this.settings.readFrom() != ReadFrom::Replica) { return -1; }
+        DynamicArray<isize> replicas = this.map.replicasOf(slot: slot);
+        if (replicas.length() == 0) { return -1; }
+        isize k = this.jitter.below(n: replicas.length());
+        return this.linkOf(node: replicas[k]);
     }
 
     // A MOVED: the map takes it at once, and is read whole again before the next call. The link of the node it names;

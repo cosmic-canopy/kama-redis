@@ -26,7 +26,7 @@ type resource Command implements Sendable {
     friend redis::wire::admit[problem];
     friend redis::cmd[misused];
     friend redis::ScriptCall::finish[appendFrom];
-    friend redis::Scan::next[appendFrom];
+    friend redis::Scan::request[appendFrom];
     friend redis::Subscriber::change[problem];
     friend redis::Cluster::commandAt[decoded];
 

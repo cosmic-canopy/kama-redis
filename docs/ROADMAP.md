@@ -3,7 +3,7 @@
 Where this is, 2026-10-20: phases 0 to 5 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
 v0.9.675 (the newest tag). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
 **Phase 6, Cluster and Sentinel, for 0.2.0, is under way: "Phase 6: where to start", just below, is its plan, and
-steps 0 to 9 are done: Sentinel, and the cluster's core with its pipelines and transactions.**
+steps 0 to 10 are done: Sentinel, and the cluster with its pipelines, transactions, replica reads and SCAN.**
 - cstar's newest build is 0.9.705. Since 0.9.696 unreachable code is an error. The tree now takes
   the forms every compiler accepts (nothing after a `while (true)` or a function's last `panic`), and a test arm that
   stops ends in `stop::<T>(msg:)` (KRD-12). It refuses `fn int32 main()`, which every tag requires (KRD-11), so it is
@@ -71,7 +71,7 @@ does its discipline:
 | 3 | Commands. Arguments through a `RedisArg` contract with `type adapter`s (as `PgParam` is); the `cmd"SET ${key} ${value} EX 10"` tag, whose holes are always whole arguments, never spliced into text; replies read into typed values through `Deserializable` (`reply::<T>`, as `column::<T>`). Pipelining. `MULTI`/`EXEC`/`WATCH`. Scripts and functions (`EVALSHA`, falling back to `EVAL` on `NOSCRIPT`). `SCAN` cursors. Blocking commands with their own deadlines | **done** |
 | 4 | Server push. Pub/sub on a `Subscriber` that owns its connection, under RESP3 and RESP2 (every peer gives pub/sub its own connection). Sharded pub/sub. **0.1.0.** Client-side caching (`CLIENT TRACKING` invalidations, RESP3, a cache per connection) moves to **0.3.0**. See "Phase 4: where to start" | **done** |
 | 5 | TLS through `@kama/tls`: `rediss://`, verification of the chain and the host name, client certificates, SNI. **0.1.0**. See "Phase 5: where to start" | **done** |
-| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–9 done |
+| 6 | Topologies. Cluster: the slot map from `CLUSTER SLOTS`, `MOVED` and `ASK`, commands that span nodes by the server's command tips, reads from replicas, sharded pub/sub that follows its slot. Sentinel: discovery and failover. A multi-node `tools/redis.sh` topology for both. **0.2.0**. See "Phase 6: where to start" | steps 0–10 done |
 | 7a | Reconnection (a connection's, and a subscriber's resubscribing), examples, hardening (a server restart, bounded memory under load), docs. **0.1.0**. See "Phase 7a: where to start" | **done** |
 | 7b | Pool (cross-isolate), and hardening across a failover. **0.3.0**, with client-side caching | |
 | — | Publish 0.1.0 after 4, 5 and 7a; 0.2.0 after 6; 0.3.0 after 7b and client-side caching. Each only on the maintainer's word | 0.1.0 **published** (2026-10-19) |
@@ -859,7 +859,32 @@ Each step ends green before its commit:
      - once it has moved, a pipeline, a transaction and `watched` from clusters whose maps are stale each meet MOVED;
      - each counter ends at its count, so nothing ran twice.
    - **22 mutations (20 unit, 2 live), all caught.**
-10. **Replica reads and the cluster's SCAN.**
+10. **Done (2026-10-20).** **Replica reads and the cluster's SCAN.**
+    - **`read_from=replica`:**
+      - every node's link sends READONLY in its handshake's one write, under both protocols, and again on every link
+        made again, through a flag on the node's `Config` that only the cluster sets. It goes to a primary too, where it
+        changes nothing, so a node the map later names a replica serves reads at once;
+      - a command the servers flag `readonly` goes first to a replica of its slot, at random, and anything that sends it
+        again (MASTERDOWN, the link lost) goes to the primary. A write, a command without keys, and a shard with no
+        replica go to the primary. In a pipeline, each command is chosen alone;
+      - READONLY's refusal on a connection now names `read_from=replica`.
+    - **`Scan.nextIn(cluster:)`:**
+      - SCAN walks every primary the map named when the scan began, in turn, each from cursor 0 to its 0;
+      - SSCAN, HSCAN and ZSCAN go to the primary of their key's slot;
+      - a node whose link is made again mid-scan ends it with `Usage`, as `next` does, and so does a key's slot that
+        moves to another node. Valkey 9.1's CLUSTERSCAN stays deferred, as planned;
+      - `next` and `nextIn` share how a page is read.
+    - **Unit tests:**
+      - a read at the replica and a write at the primary, alone and in a pipeline;
+      - MASTERDOWN sending the read to the primary;
+      - RESP2's READONLY, and READONLY again on a replica's link made again;
+      - SCAN over three primaries (two pages at the first), SSCAN, a link made again mid-scan, and a key's slot that
+        moves mid-scan.
+    - **Live**, on all eight clusters:
+      - a read after WAIT is served by a replica, by the replicas' own `INFO commandstats`;
+      - a SCAN finds all 60 keys across the three primaries;
+      - CLIENT KILL on the scan's first primary, mid-scan, ends it.
+    - **17 mutations (15 unit, 2 live), all caught.**
 11. **`ClusterSubscriber`.** Unit tests through the in-turn path; live through the Poller, a slot moved under a shard
     subscription.
 12. **The cluster live, hardened,** with `examples/cluster`:

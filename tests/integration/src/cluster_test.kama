@@ -5,7 +5,7 @@
 import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Connection, redis::Config, redis::Command,
          redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value, redis::cluster::keySlot,
-         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody,
+         redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan,
          redis::cluster::SlotMap,
          redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl };
 export { clusterTests };
@@ -371,6 +371,114 @@ unsafe fn int32 reshardTests(ref Cluster c) {
     return f;
 }
 
+// How many GETs every replica has served, from each node's INFO commandstats ("cmdstat_get:calls=N,").
+unsafe fn int64 replicaGets(ref Cluster c) {
+    Command info = commandOf(text: "INFO commandstats");
+    Result<DynamicArray<NodeReply>, RedisError> each = c.callEach(command: info, on: ClusterTarget::AllNodes);
+    DynamicArray<NodeReply> replies = match (give each) { case Ok(value: x): give x; case Err(error: e): DynamicArray.empty(); };
+    DynamicArray<isize> primaries = c.topology().primaries();
+    int64 total = 0i64;
+    isize i = 0;
+    while (i < replies.length()) {
+        int32 port = replies[i].node().port();
+        bool primary = false;
+        isize k = 0;
+        while (k < primaries.length()) { if (c.topology().node(index: primaries[k]).port() == port) { primary = true; } k = k + 1; }
+        Result<Value, RedisError> one = replies[i].take();
+        string text = match (one) { case Ok(value: v): shown(v: v); case Err(error: e): ""; };
+        if (!primary) { total = total + getCalls(text: text); }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn int64 getCalls(const ref string text) {
+    string mark = "cmdstat_get:calls=";
+    isize at = 0;
+    while (at + mark.length() <= text.length() && text.substring(start: at, end: at + mark.length()) != mark) { at = at + 1; }
+    if (at + mark.length() > text.length()) { return 0i64; }
+    at = at + mark.length();
+    int64 n = 0i64;
+    while (at < text.length() && text.bytes()[at] >= 48ui8 && text.bytes()[at] <= 57ui8) { n = n * 10i64 + cast<int64>(text.bytes()[at] - 48ui8); at = at + 1; }
+    return n;
+}
+
+// read_from=replica: a read after WAIT is served by a replica, which says so in its own counts.
+unsafe fn int32 replicaTests() {
+    int32 f = 0;
+    Result<Cluster, RedisError> r = reach(url: plainUrl().concat(other: "&read_from=replica"));
+    Cluster c = match (give r) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "replica: connect: ${m}"); } };
+    string set = said(c: c, text: "SET kr:{replica}:k v");
+    string waited = said(c: c, text: "WAIT 1 2000");
+    int64 before = replicaGets(c: c);
+    string got = said(c: c, text: "GET kr:{replica}:k");
+    int64 after = replicaGets(c: c);
+    f = f + check(ok: set == "OK" && got == "v", what: "replica: a write at the primary, then the read at a replica after WAIT: ${set} ${waited} ${got}");
+    f = f + check(ok: after == before + 1i64, what: "replica: the replica served the GET (its count went from ${before} to ${after})");
+    string written = said(c: c, text: "SET kr:{replica}:k w");
+    f = f + check(ok: written == "OK", what: "replica: a write still goes to the primary: ${written}");
+    string wiped = said(c: c, text: "DEL kr:{replica}:k");
+    return f;
+}
+
+// SCAN across the cluster: every key on every primary, once at least; and a node's link made again mid-scan ends it.
+unsafe fn int32 scanTests() {
+    int32 f = 0;
+    Result<Cluster, RedisError> r = reach(url: plainUrl());
+    Cluster c = match (give r) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "scan: connect: ${m}"); } };
+    int64 n = 0i64;
+    while (n < 60i64) {
+        string k = "kr:scan:".concat(other: i64Str(v: n));
+        string s = said(c: c, text: "SET ${k} 1");
+        n = n + 1i64;
+    }
+    Scan all = Scan.keys();
+    all.matching(pattern: "kr:scan:*");
+    all.countHint(count: 5i64);
+    DynamicArray<string> seen = DynamicArray.empty();
+    isize pages = 0;
+    bool failed = false;
+    while (!all.isDone() && pages < 1000) {
+        Result<Value, RedisError> page = all.nextIn(cluster: c);
+        Value v = match (give page) { case Ok(value: x): give x; case Err(error: e): { failed = true; := Value::Null; } };
+        if (failed) { break; }
+        DynamicArray<Value> items = match (give v) { case Array(items: xs): give xs; case _: DynamicArray.empty(); };
+        isize i = 0;
+        while (i < items.length()) {
+            string key = shown(v: items[i]);
+            bool known = false;
+            isize k = 0;
+            while (k < seen.length()) { if (seen[k] == key) { known = true; } k = k + 1; }
+            if (!known) { seen.add(item: give key); } else { string dup = give key; }
+            i = i + 1;
+        }
+        pages = pages + 1;
+    }
+    isize count = seen.length();
+    f = f + check(ok: !failed && count == 60, what: "scan: every key of every primary, in ${pages} pages: ${count} of 60");
+
+    // The first primary's normal clients killed after a page: the scan's link to it is made again, and the scan ends.
+    Scan cut = Scan.keys();
+    cut.matching(pattern: "kr:scan:*");
+    cut.countHint(count: 1i64);
+    Result<Value, RedisError> p1 = cut.nextIn(cluster: c);
+    DynamicArray<isize> primaries = c.topology().primaries();
+    string first = portOf(c: c, index: primaries[0]);
+    Result<Connection, RedisError> admin = nodeAt(port: first);
+    string killed = match (give admin) { case Ok(value: x): { Connection a = give x; := ask(c: a, text: "CLIENT KILL TYPE normal"); } case Err(error: e): e.message(); };
+    Result<Value, RedisError> p2 = cut.nextIn(cluster: c);
+    string ended = match (p2) { case Ok(value: v): "a page"; case Err(error: e): e.message(); };
+    bool firstOk = match (p1) { case Ok(value: v): true; case Err(error: e): false; };
+    f = f + check(ok: firstOk && ended.contains(substring: "connected again"), what: "scan: a primary's link made again mid-scan ends it (${killed} killed): ${ended}");
+    n = 0i64;
+    while (n < 60i64) {
+        string k = "kr:scan:".concat(other: i64Str(v: n));
+        string d = said(c: c, text: "DEL ${k}");
+        n = n + 1i64;
+    }
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
     Result<Cluster, RedisError> r = reach(url: plainUrl());
@@ -379,6 +487,8 @@ unsafe fn int32 clusterTests() {
             Cluster cl = give c;
             f = f + spreadTests(c: cl);
             f = f + reshardTests(c: cl);
+            f = f + replicaTests();
+            f = f + scanTests();
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster: connect: ${m}"); }
     };

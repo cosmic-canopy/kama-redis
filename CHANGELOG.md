@@ -38,6 +38,10 @@ Phase 6: Cluster and Sentinel, for 0.2.0 (docs/ROADMAP.md, "Phase 6: where to st
   only its own commands. `Cluster.transact` and `Cluster.watched`: at the node of the keys' slot, which they must
   share; a redirection while queueing sends the whole transaction again, and a slot half moved under its keys is waited
   out.
+- Reads from a cluster's replicas, with `read_from=replica`: a command the servers flag readonly goes to a replica of
+  its slot, at random, READONLY sent on every node's link as it is made; one the replica will not serve goes to the
+  primary.
+- `Scan.nextIn(cluster:)`: SCAN across every primary in turn, and SSCAN, HSCAN and ZSCAN at their key's node.
 - `redis::cluster`:
   - `CommandTable`: a command's keys (`keysOf`, as COMMAND GETKEYS finds them) and its slot (`slotOf`), from every
     server's key specifications, checked against every server's GETKEYS;
