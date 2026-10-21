@@ -126,6 +126,9 @@ printed first.
     crc16tab and its tag examples, plus `CLUSTER KEYSLOT` on all eight servers, which must agree.
   - `tools/gen-url-vectors.sh` writes `url_vectors.kama` from redis-cli 8.10 and valkey-cli 9.1, given each URL
     beside a recorder. Its `misread` rules are the URLs this package refuses although the CLI accepts them.
+  - `tools/gen-command-table.sh` writes the cluster's command table and, since phase 7b, `src/wire/cacheable.kama`: the
+    commands a client-side cache may hold, by the rule in its header (every server's flags, tips and key specs), never
+    a hand-kept list. Two commands pass the rule and are left out by name, each with its reason.
   - `tools/gen-server-vectors.sh` writes `server_vectors.kama`, for the connection's tests to replay:
     - the error codes each server can send, read out of its own binary in the image (each `-CODE message` literal,
       and MOVED and ASK from cluster.c's format); `ServerCode` must name every one;
@@ -151,6 +154,9 @@ printed first.
       checks the names and counts and records one canonical order (`canonical()`); the unit test plays every order.
       Two cluster nodes joined by hand (ADDSLOTSRANGE, CLUSTER MEET: `redis-cli --cluster create` wants three)
       give CROSSSLOT, MOVED and the server's own sunsubscribe. Run it twice: the two outputs must be the same.
+    - caching, re-authentication and the put-back (phase 7b): scenes as pub/sub's, under both protocols where both
+      apply. A cached read's EXEC records its PTTL as the 100000 ms its setup set (`pinned()` checks it read within a
+      second): timing moves it by one. The script requires each fact the cache, the provider and the pool rest on.
     A case that needs a server setting Redis lacks (Valkey's `extended-redis-compatibility`) is started by
     product: Redis 8 passes a setting it does not know to its modules and fails only after daemonizing.
   - The live parts run in throwaway `--network none` containers of the matrix's images. They never touch the

@@ -21,6 +21,10 @@
 #     sentinel wants; then a SENTINEL FAILOVER: the +switch-master message (under RESP2 and RESP3), the clients of the
 #     old master and of the promoted replica let go without a byte, a BLPOP unblocked, the new master's address, and
 #     the old master's READONLY and ROLE once it is a replica.
+#   - Client-side caching across both failovers (phase 7b): a tracking client (RESP3, OPTIN) that read a key at each
+#     node of the shard and of the Sentinel group. What the cluster's two get as the shard changes hands (nothing, and
+#     they stay open), and when the new primary writes the key (its invalidation, at both); Sentinel lets its two go,
+#     without a byte, as it does any client. The script requires each.
 #
 # Every case runs under RESP2 and RESP3 ("<case>/2", "<case>/3"), each on a connection of its own. What changes from
 # run to run is made canonical, so two runs give the same file:
@@ -353,6 +357,15 @@ if ($v7) {
         $ssub{$proto} = $s;
     }
 }
+# Client-side caching across the failover (phase 7b): a tracking client (RESP3, OPTIN) that read the shard's key at
+# 7001, its primary, and one at 7004, its replica, after READONLY. What each gets as the shard changes hands, and then
+# when the new primary writes the key.
+my %tracker;
+for my $port (7001, 7004) {
+    my $t = open_to($port); tcall($t, 'HELLO', '3'); tcall($t, 'READONLY') if $port == 7004;
+    tcall($t, 'CLIENT', 'TRACKING', 'ON', 'OPTIN'); tcall($t, 'CLIENT', 'CACHING', 'YES'); tcall($t, 'GET', $kB);
+    $tracker{$port} = $t;
+}
 # A manual failover: 7004 takes shard 1 over from 7001.
 one(7004, 'CLUSTER', 'FAILOVER');
 until_true('7004 taking shard 1 over', 30, sub {
@@ -374,6 +387,17 @@ if ($v7) {
     }
     pair('ssub-shard-moved', 7004, [], ['SSUBSCRIBE', $kB]);
 }
+for my $step ('', '-write') {
+    one(7004, 'SET', $kB, 'after') if $step;
+    for my $port (7001, 7004) {
+        my ($got, $closed) = drain_for($tracker{$port}, 2);
+        my $name = ($port == 7001 ? 'tracked-failover-demoted' : 'tracked-failover-promoted') . $step;
+        my $setup = "HELLO 3, " . ($port == 7004 ? 'READONLY, ' : '') . "CLIENT TRACKING ON OPTIN, CLIENT CACHING YES and GET $kB at $port, then CLUSTER FAILOVER at 7004";
+        record($name, ['(nothing: what arrives)'], $got, [$setup . ($step ? ", then SET $kB at 7004" : '')]);
+        ending($name, $closed);
+    }
+}
+close $tracker{$_}{s} for 7001, 7004;
 pair('slots-after-failover', 7000, [], ['CLUSTER', 'SLOTS']);
 pair('moved-after-failover', 7000, [], ['GET', $kB]);
 pair('moved-from-demoted', 7001, [], ['GET', $kB]);
@@ -487,6 +511,13 @@ for my $proto (2, 3) {
     my $m = open_to(7200); tcall($m, 'HELLO', '3') if $proto == 3; tcall($m, 'PING'); $oldMaster{$proto} = $m;
     my $p = open_to(7201); tcall($p, 'HELLO', '3') if $proto == 3; tcall($p, 'PING'); $promoted{$proto} = $p;
 }
+# And a tracking client (RESP3, OPTIN) that read a key, on each (phase 7b).
+my %trackedNode;
+for my $port (7200, 7201) {
+    my $t = open_to($port); tcall($t, 'HELLO', '3');
+    tcall($t, 'CLIENT', 'TRACKING', 'ON', 'OPTIN'); tcall($t, 'CLIENT', 'CACHING', 'YES'); tcall($t, 'GET', 'kr:k');
+    $trackedNode{$port} = $t;
+}
 my $blocked = open_to(7200);
 print { $blocked->{s} } enc('BLPOP', 'kr:none', '0');
 select(undef, undef, undef, 0.2);
@@ -506,6 +537,12 @@ for my $proto (2, 3) {
 {
     my ($got, $closed) = drain_for($blocked, 2);
     record('demoted-blpop', ['BLPOP', 'kr:none', '0'], $got, ['SENTINEL FAILOVER kr, which made this master a replica']); ending('demoted-blpop', $closed);
+}
+for my $port (7200, 7201) {
+    my ($got, $closed) = drain_for($trackedNode{$port}, 2);
+    my $name = $port == 7200 ? 'tracked-demoted-let-go' : 'tracked-promoted-let-go';
+    record($name, ['(nothing: what arrives)'], $got, ["HELLO 3, CLIENT TRACKING ON OPTIN, CLIENT CACHING YES and GET kr:k at $port, then SENTINEL FAILOVER kr"]);
+    ending($name, $closed);
 }
 pair('get-master-addr-after-failover', 7300, [], ['SENTINEL', 'GET-MASTER-ADDR-BY-NAME', 'kr']);
 pair('demoted-write', 7200, [], ['SET', 'kr:k', 'v']);
@@ -584,7 +621,9 @@ for my $v (@versions) {
         for my $proto (2, 3) { die "gen-topology-vectors: case $must/$proto is not on $v\n" unless exists $hex{"$v $must/$proto"}; }
     }
 }
-for my $must (qw(hello3-node sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted)) {
+for my $must (qw(hello3-node sentinel-hello3 locked-sentinel-hello3-auth demoted-blpop hello3-master hello3-replica hello3-demoted
+                 tracked-failover-demoted tracked-failover-promoted tracked-failover-demoted-write tracked-failover-promoted-write
+                 tracked-demoted-let-go tracked-promoted-let-go)) {
     die "gen-topology-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
 }
 # What the client's design rests on, checked on every server rather than taken from the docs.
@@ -629,6 +668,18 @@ for my $v (@versions) {
             die "gen-topology-vectors: $v: Sentinel left a client open ($c)\n" unless ($ending{"$v $c"} // '') eq 'closed';
         }
     }
+    # Client-side caching across a failover (phase 7b). Sentinel lets a tracking client go as it does any other, so a
+    # cache is flushed with its link. A cluster's manual failover sends a tracking client nothing and keeps it, and the
+    # new primary's write of the key still invalidates it at both nodes, the demoted one through replication.
+    for my $c ('tracked-demoted-let-go', 'tracked-promoted-let-go') {
+        die "gen-topology-vectors: $v sent something as Sentinel let a tracking client go ($c)\n" unless $at->($c) eq '';
+        die "gen-topology-vectors: $v: Sentinel left a tracking client open ($c)\n" unless ($ending{"$v $c"} // '') eq 'closed';
+    }
+    for my $c ('tracked-failover-demoted', 'tracked-failover-promoted') {
+        die "gen-topology-vectors: $v sent a tracking client something as the shard changed hands ($c)\n" unless $at->($c) eq '';
+        die "gen-topology-vectors: $v: a cluster failover closed a tracking client ($c)\n" unless ($ending{"$v $c"} // '') eq 'open';
+        expect($v, "$c-write", qr/\A>2\r\n\$10\r\ninvalidate\r\n\*1\r\n\$\d+\r\n[^\r]+\r\n\z/, "the new primary's write did not invalidate the key ($c)");
+    }
 }
 
 sub lit { my $s = shift; die "gen-topology-vectors: unexpected text '$s'\n" if $s =~ /[^\x20-\x7e]/ || $s =~ /[\\"]|\$\{/; return "\"$s\""; }
@@ -645,7 +696,8 @@ print $o <<"HEAD";
 //   - topologyKeys: for each server, the keys its cluster cases use: kr:a and kr:a2 in shard 0 (7000, 0-5460) in two
 //     slots, kr:b in shard 1 (7001, then 7004 after the failover), kr:c in shard 2 (7002), and the migrated slot's
 //     kr:{m…}x (on its source) and kr:{m…}y (on neither).
-//   - topologyEnding: "<server> <case>" and whether the connection was closed, for the clients Sentinel let go.
+//   - topologyEnding: "<server> <case>" and whether the connection was closed, for the clients Sentinel let go, and for
+//     the tracking clients across the cluster's failover (tracked-failover-*, which stay open).
 // The cluster: 7000-7002 primaries, 7003-7005 their replicas, each node's id written as its port padded with zeros.
 // Sentinel: a master 7200, replicas 7201 and 7202, sentinels 7300-7303 (7303's default user off); values that move
 // with time are 0, and a list's entries are sorted by address (tools/gen-topology-vectors.sh says which).

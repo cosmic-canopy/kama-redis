@@ -1,0 +1,102 @@
+// What phase 7b rests on, as every server sent it (server_vectors.kama, from tools/gen-server-vectors.sh): client-side
+// caching's tracking and cached reads, a re-AUTH on a live connection, and the pool's put-back. Each capture must read
+// as exactly the values its setup says, three bytes at a time, with nothing left over: the cache, the credentials
+// provider and the pool are built on these, so a server that starts answering otherwise fails here first.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode, redis::resp::Limits,
+         redis_unit_tests::check, readAll, unhex, serverVersions, replyNames, replyHex };
+export { trackingTests };
+
+// The capture `kase` from `server`, read three bytes at a time: each value described, joined by " ; ", then how it
+// ended (`|end` when nothing was left over).
+fn string readCase(const ref string server, const ref string kase) {
+    string name = server.concat(other: " ").concat(other: kase);
+    DynamicArray<string> names = replyNames();
+    DynamicArray<string> hex = replyHex();
+    isize i = 0;
+    while (i < names.length()) {
+        if (names[i] == name) {
+            DynamicArray<uint8> bytes = unhex(text: hex[i]);
+            return readAll(input: bytes.view(), chunk: 3, limits: Limits.defaults());
+        }
+        i = i + 1;
+    }
+    return "(no case ${name})";
+}
+
+fn string h(const ref string text) { return hexEncode(bytes: text.bytes()); }
+fn string simple(const ref string text) { return "simple:".concat(other: h(text: text)); }
+fn string bulk(const ref string text) { return "bulk:".concat(other: h(text: text)); }
+// RESP3's invalidation of kr:c, the key every tracking scene reads.
+fn string invalidated() { return "push[".concat(other: bulk(text: "invalidate")).concat(other: ",array[").concat(other: bulk(text: "kr:c")).concat(other: "]]"); }
+
+fn int32 trackingTests() {
+    int32 f = 0;
+    DynamicArray<string> servers = serverVersions();
+    string ok = simple(text: "OK").concat(other: "|end");
+    string pong = simple(text: "PONG");
+    string push = invalidated();
+    string v = bulk(text: "v");
+    isize s = 0;
+    while (s < servers.length()) {
+        string sv = copy servers[s];
+        isize p = 2;
+        while (p <= 3) {
+            // Tracking on, OPTIN; the pool's put-back: UNWATCH, then SELECT 0. Each a plain +OK.
+            string optin = readCase(server: sv, kase: "tracking-optin/${p}");
+            f = f + check(ok: optin == ok, what: "tracking: ${sv} turns tracking on (OPTIN) with +OK under RESP${p} (${optin})");
+            string unwatch = readCase(server: sv, kase: "putback-unwatch/${p}");
+            f = f + check(ok: unwatch == ok, what: "tracking: ${sv} answers the put-back's UNWATCH with +OK under RESP${p} (${unwatch})");
+            string select = readCase(server: sv, kase: "putback-select/${p}");
+            f = f + check(ok: select == ok, what: "tracking: ${sv} answers the put-back's SELECT 0 with +OK under RESP${p} (${select})");
+            // CLIENT CACHING without tracking is an error.
+            string untracked = readCase(server: sv, kase: "caching-untracked/${p}");
+            f = f + check(ok: untracked.startsWith(prefix: "error:".concat(other: h(text: "ERR "))) && untracked.endsWith(suffix: "|end"),
+                          what: "tracking: ${sv} refuses CLIENT CACHING without tracking under RESP${p} (${untracked})");
+            // A refused AUTH on a live connection (a wrong password, a disabled user) leaves it logged in as it was.
+            string wrong = readCase(server: sv, kase: "reauth-wrong/${p}");
+            string off = readCase(server: sv, kase: "reauth-off/${p}");
+            string wrongpass = "error:".concat(other: h(text: "WRONGPASS "));
+            f = f + check(ok: wrong.startsWith(prefix: wrongpass) && off.startsWith(prefix: wrongpass),
+                          what: "tracking: ${sv} refuses a wrong password and a disabled user with WRONGPASS under RESP${p} (${wrong}; ${off})");
+            string who = bulk(text: "kr_acl").concat(other: "|end");
+            string afterWrong = readCase(server: sv, kase: "whoami-after-refused/${p}");
+            string afterOff = readCase(server: sv, kase: "whoami-after-off/${p}");
+            f = f + check(ok: afterWrong == who && afterOff == who,
+                          what: "tracking: ${sv} keeps the connection logged in as before a refused AUTH under RESP${p} (${afterWrong}; ${afterOff})");
+            p = p + 1;
+        }
+        // Under RESP2 tracking delivers nothing: the PING after another client's write answers alone.
+        string resp2 = readCase(server: sv, kase: "tracked-ping/2");
+        f = f + check(ok: resp2 == pong.concat(other: "|end"), what: "tracking: ${sv} delivers no invalidation under RESP2 (${resp2})");
+        // Under RESP3: CACHING YES; a cached read's EXEC with a TTL, without one, on a missing key and on a hash.
+        string yes = readCase(server: sv, kase: "caching-yes/3");
+        f = f + check(ok: yes == ok, what: "tracking: ${sv} answers CLIENT CACHING YES with +OK (${yes})");
+        string ttl = readCase(server: sv, kase: "cached-ttl/3");
+        f = f + check(ok: ttl == "array[int:100000,".concat(other: v).concat(other: "]|end"), what: "tracking: ${sv}'s cached read with a TTL (${ttl})");
+        string persist = readCase(server: sv, kase: "cached-persist/3");
+        f = f + check(ok: persist == "array[int:-1,".concat(other: v).concat(other: "]|end"), what: "tracking: ${sv}'s cached read with no TTL (${persist})");
+        string missing = readCase(server: sv, kase: "cached-missing/3");
+        f = f + check(ok: missing == "array[int:-2,null]|end", what: "tracking: ${sv}'s cached read of a missing key (${missing})");
+        string hash = readCase(server: sv, kase: "cached-hash/3");
+        f = f + check(ok: hash == "array[int:-1,map[".concat(other: bulk(text: "f")).concat(other: ",").concat(other: v).concat(other: "]]|end"),
+                      what: "tracking: ${sv}'s cached read of a hash (${hash})");
+        // The order invalidations come in: a connection's own write's reply, then its push; another client's write's
+        // push before this connection's PING's reply; a FLUSHALL's null.
+        string own = readCase(server: sv, kase: "own-write/3");
+        f = f + check(ok: own == simple(text: "OK").concat(other: " ; ").concat(other: push).concat(other: "|end"),
+                      what: "tracking: ${sv} answers a connection's own write, then invalidates (${own})");
+        string theirs = readCase(server: sv, kase: "tracked-ping/3");
+        f = f + check(ok: theirs == push.concat(other: " ; ").concat(other: pong).concat(other: "|end"),
+                      what: "tracking: ${sv} invalidates before it answers the next PING (${theirs})");
+        string flush = readCase(server: sv, kase: "tracked-flush/3");
+        f = f + check(ok: flush == "push[".concat(other: bulk(text: "invalidate")).concat(other: ",null]|end"),
+                      what: "tracking: ${sv} invalidates everything at a FLUSHALL (${flush})");
+        // A re-AUTH as another user keeps tracking: its invalidations still come.
+        string reauth = readCase(server: sv, kase: "reauth-tracked/3");
+        string still = readCase(server: sv, kase: "reauth-invalidate/3");
+        f = f + check(ok: reauth == ok && still == push.concat(other: "|end"),
+                      what: "tracking: ${sv} keeps tracking across a re-AUTH as another user (${reauth}; ${still})");
+        s = s + 1;
+    }
+    return f;
+}

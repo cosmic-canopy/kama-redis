@@ -450,14 +450,39 @@ Each step ends green before its commit:
 
 0. **Done (2026-10-21).** This plan; repros R1–R12 and probes P1–P5; KRD-13 (found), KRD-14 and KRD-15 filed;
    `tools/mutate.sh`'s per-mutation `timeout` (`7b-s0.json`). The unit gate was green at the start on both compilers.
-1. **Vectors, by script.**
-   - `tools/gen-server-vectors.sh` captures P1, P2, P4 and P5 under both protocols. A TTL is set so that two runs agree:
-     PTTL read 99999 or 100000 by timing.
-   - `tools/gen-topology-vectors.sh` adds a tracking client to the Sentinel failover (P7) and to a cluster failover
-     (P6).
-   - `tools/gen-command-table.sh` writes the cacheable allow-list (`src/wire/cacheable.kama`): a command is on it if it
-     is read-only, keyed, not blocking, not random and not a script runner on every server that has it.
-   - Unit: every capture reads whole, and the allow-list agrees with the table's flags.
+1. **Done (2026-10-21).** **Vectors, by script.** Two runs of each generator give the same files; no earlier capture
+   moved.
+   - `tools/gen-server-vectors.sh`: 27 cases a server, under both protocols where both apply.
+     - Tracking OPTIN, CACHING YES, and CACHING refused without tracking.
+     - A cached read's EXEC with a TTL, without one, on a missing key and on a hash. The TTL is recorded as the
+       100000 ms its setup set (`pinned()`, which checks it read within a second of it).
+     - A connection's own write, another client's write before this one's PING, and a FLUSHALL.
+     - A re-AUTH as another user on a tracking connection, and the invalidation after it.
+     - A refused AUTH (a wrong password, a disabled user) and ACL WHOAMI after it.
+     - The put-back's UNWATCH and SELECT 0.
+     - RESP2's tracking delivering nothing.
+
+     The script requires each of these facts on every server, as phase 7a's are.
+   - `tools/gen-topology-vectors.sh`: a tracking client at each node of the cluster's shard and of the Sentinel group.
+     On all eight servers:
+     - Sentinel lets both go with no bytes, as it does any client, so a cache is flushed with its link.
+     - A manual cluster failover sends neither anything and keeps both open. The new primary's write still
+       invalidates the key at both, the demoted node through replication.
+
+     So a cluster's tracking survives a planned failover. Decision 7's flush when the map moves a node's slots still
+     guards an unplanned one, where the old primary may be cut off.
+   - `tools/gen-command-table.sh` writes the cacheable allow-list (`src/wire/cacheable.kama`, 78 commands). The rule is
+     in the script's header.
+     - Read-only, never blocking, with mandatory keys, and no `nondeterministic_output` tip on any server.
+     - Every key spec from 7.0 on is `RO`, a key, complete, and with a known start and end. That last rule leaves out
+       SORT_RO, whose BY and GET read keys no spec names.
+     - A command only 6.2 has has no specs to judge, and is left out.
+     - TOUCH (its metadata is EXISTS's, but its point is to touch) and MEMORY USAGE (the server's accounting) are left
+       out by name.
+   - Unit (`tracking_test.kama`): every new server capture reads, three bytes at a time, as exactly the values its
+     setup says. The topology captures are the cluster's and the cache's to replay (steps 5 and 6).
+   - No mutations: the step adds no library code. The captures' readers come with steps 2, 3 and 6, whose mutations
+     cover them.
 2. **The credentials provider.**
    - `Config`, `Login`, `Credentials` and `RedisError::Credentials`.
    - The handshake and the redial; the re-AUTH before a call; failing closed.

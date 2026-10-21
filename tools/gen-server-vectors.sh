@@ -25,6 +25,14 @@
 #     (key-load-delay, so the loader serves its event loop between keys). A server sends nothing as it drops a client,
 #     and the script requires that, and that each closed: the client's reconnection rests on it. Each server's
 #     `ACL CAT connection` too, for the commands a connection refuses or records.
+#   - Client-side caching, re-authentication and the pool's put-back (phase 7b): CLIENT TRACKING ON OPTIN and CLIENT
+#     CACHING YES (and CACHING refused without tracking); a cached read's EXEC (CLIENT CACHING YES, MULTI, PTTL, the
+#     command, EXEC) with a TTL, without one, on a missing key and on a hash; a connection's own write (its reply, then
+#     the push); another client's write before this one's PING (the push, then +PONG); a FLUSHALL; a re-AUTH as
+#     another user on a tracking connection, and the invalidation that still comes after it; a refused AUTH on a live
+#     connection, and ACL WHOAMI after it; UNWATCH and SELECT 0 after a WATCH and a SELECT 3. Under RESP2 tracking is
+#     accepted and nothing is delivered (the PING after another client's write answers alone). The script requires each
+#     of these, since the cache, the provider and the pool rest on them.
 #   - Blocking commands: each server's `ACL CAT blocking`, sorted (the server lists them in hash order), and for each
 #     blocking command the server documents (7.0 and later), its arguments as COMMAND DOCS gives them, so the
 #     client's table of where each one's timeout is can be checked against every server.
@@ -427,10 +435,12 @@ sub scene {
             my ($case, $n, @cmd) = @rest;
             my $want = $what eq q(all) ? $n : undef;
             $n = @$want if $want;
+            my $ms = $what eq q(ttl) ? $n : undef;
+            $n = 1 if defined $ms;
             my $c = $what eq q(recb) ? $b : $a;
             print { $c->{s} } enc(map { s/<id>/$id/r } @cmd) if @cmd;
             my @got = reads($c, $n);
-            my $r = $want ? canonical($want, @got) : join(q(), @got);
+            my $r = $want ? canonical($want, @got) : defined $ms ? pinned(join(q(), @got), $ms) : join(q(), @got);
             my @shown = @cmd ? @cmd : ('(nothing: what arrives)');
             @shown = ('(from another connection)', @shown) if $what eq 'recb';
             record("$case/$proto", [@shown], $r, [@setup]);
@@ -709,6 +719,53 @@ if ($up{7014}) {
     }
     close $l->{s};
 }
+# ---- Phase 7b: client-side caching, re-authentication and the pool's put-back ----
+# Scenes, as phase 4's. A cached read is CLIENT CACHING YES, MULTI, PTTL, the command and EXEC. Its EXEC's PTTL reads
+# 99999 or 100000 by timing, so ['ttl', case, ms, @cmd] records it as the `ms` its setup set, after checking that it
+# was within a second of it.
+sub pinned {
+    my ($r, $ms) = @_;
+    $r =~ /\A\*2\r\n:(\d+)\r\n/ or die "pinned: not a cached read's EXEC: " . unpack('H*', $r) . "\n";
+    die "pinned: PTTL $1 is not within a second of $ms\n" unless $1 <= $ms && $ms - $1 < 1000;
+    return "*2\r\n:$ms\r\n" . substr($r, $+[0]);
+}
+{
+    my $tracked = sub { return (['a', 1, 'CLIENT', 'TRACKING', 'ON', 'OPTIN'], ['a', 1, 'CLIENT', 'CACHING', 'YES'], ['a', 1, @_]); };
+    my $cachedRead = sub {
+        my ($case, $ttl, $setup, @cmd) = @_;
+        return (@$setup, ['a', 1, 'CLIENT', 'TRACKING', 'ON', 'OPTIN'], ['a', 1, 'CLIENT', 'CACHING', 'YES'], ['a', 1, 'MULTI'],
+                ['a', 1, 'PTTL', $cmd[1]], ['a', 1, @cmd], [$ttl ? 'ttl' : 'rec', $case, $ttl // 1, 'EXEC']);
+    };
+    for my $proto (2, 3) {
+        scene($proto, 7000, ['rec', 'tracking-optin', 1, 'CLIENT', 'TRACKING', 'ON', 'OPTIN']);
+        scene($proto, 7000, ['rec', 'caching-untracked', 1, 'CLIENT', 'CACHING', 'YES']);
+        # A refused AUTH on a live connection leaves it logged in as it was.
+        scene($proto, 7000, ['a', 1, 'AUTH', 'kr_acl', 'kr_acl_pw'], ['rec', 'reauth-wrong', 1, 'AUTH', 'kr_acl', 'wrong'],
+              ['rec', 'whoami-after-refused', 1, 'ACL', 'WHOAMI']);
+        scene($proto, 7000, ['a', 1, 'AUTH', 'kr_acl', 'kr_acl_pw'], ['rec', 'reauth-off', 1, 'AUTH', 'kr_off', 'kr_off_pw'],
+              ['rec', 'whoami-after-off', 1, 'ACL', 'WHOAMI']);
+        # The pool's put-back: a WATCH in force and database 3, then UNWATCH and SELECT 0.
+        scene($proto, 7000, ['a', 1, 'WATCH', 'kr:w'], ['a', 1, 'SELECT', '3'], ['rec', 'putback-unwatch', 1, 'UNWATCH'],
+              ['rec', 'putback-select', 1, 'SELECT', '0']);
+    }
+    # Caching is RESP3's: under RESP2 tracking is accepted, and a PING after another client's write answers alone.
+    scene(2, 7000, ['b', 1, 'SET', 'kr:c', 'v'], $tracked->('GET', 'kr:c'), ['b', 1, 'SET', 'kr:c', 'theirs'],
+          ['rec', 'tracked-ping', 1, 'PING']);
+    scene(3, 7000, ['a', 1, 'CLIENT', 'TRACKING', 'ON', 'OPTIN'], ['rec', 'caching-yes', 1, 'CLIENT', 'CACHING', 'YES']);
+    scene(3, 7000, $cachedRead->('cached-ttl', 100000, [['b', 1, 'SET', 'kr:c', 'v', 'PX', '100000']], 'GET', 'kr:c'));
+    scene(3, 7000, $cachedRead->('cached-persist', undef, [['b', 1, 'SET', 'kr:c', 'v']], 'GET', 'kr:c'));
+    scene(3, 7000, $cachedRead->('cached-missing', undef, [['b', 1, 'DEL', 'kr:c']], 'GET', 'kr:c'));
+    scene(3, 7000, $cachedRead->('cached-hash', undef, [['b', 1, 'DEL', 'kr:h'], ['b', 1, 'HSET', 'kr:h', 'f', 'v']], 'HGETALL', 'kr:h'));
+    # The order invalidations come in: a connection's own write's reply, then its push; another client's write's push
+    # before this connection's PING's reply; a FLUSHALL's null.
+    scene(3, 7000, ['b', 1, 'SET', 'kr:c', 'v'], $tracked->('GET', 'kr:c'), ['rec', 'own-write', 2, 'SET', 'kr:c', 'mine']);
+    scene(3, 7000, ['b', 1, 'SET', 'kr:c', 'v'], $tracked->('GET', 'kr:c'), ['b', 1, 'SET', 'kr:c', 'theirs'],
+          ['rec', 'tracked-ping', 2, 'PING']);
+    scene(3, 7000, ['b', 1, 'SET', 'kr:c', 'v'], $tracked->('GET', 'kr:c'), ['b', 1, 'FLUSHALL'], ['rec', 'tracked-flush', 1]);
+    # A re-AUTH as another user keeps tracking: its invalidations still come.
+    scene(3, 7000, ['b', 1, 'SET', 'kr:c', 'v'], $tracked->('GET', 'kr:c'), ['rec', 'reauth-tracked', 1, 'AUTH', 'kr_acl', 'kr_acl_pw'],
+          ['b', 1, 'SET', 'kr:c', 'theirs'], ['rec', 'reauth-invalidate', 1]);
+}
 # The connection category, sorted, so the client's table of what it refuses or records can be checked against it.
 {
     my $c = open_to(7000);
@@ -812,6 +869,32 @@ for my $v (@versions) {
     die "gen-server-vectors: ${v}'s port did not refuse while the server was down\n" unless ($ending{"$v restart-refused"} // '') eq 'refused';
 }
 die "gen-server-vectors: a server gave no connection category\n" unless @connection == @versions && !grep { $_->[1] eq '-' } @connection;
+# Client-side caching, re-authentication and the pool's put-back (phase 7b): the cache, the provider and the pool rest
+# on each of these, so a server that answers otherwise fails this script rather than the client.
+for my $must ((map { ("tracking-optin/$_", "caching-untracked/$_", "reauth-wrong/$_", "whoami-after-refused/$_", "reauth-off/$_",
+                      "whoami-after-off/$_", "putback-unwatch/$_", "putback-select/$_") } 2, 3),
+              qw(tracked-ping/2 caching-yes/3 cached-ttl/3 cached-persist/3 cached-missing/3 cached-hash/3 own-write/3 tracked-ping/3
+                 tracked-flush/3 reauth-tracked/3 reauth-invalidate/3)) {
+    die "gen-server-vectors: case $must is not on every server\n" unless ($count{$must} // 0) == @versions;
+}
+my $push = qr/>2\r\n\$10\r\ninvalidate\r\n\*1\r\n\$4\r\nkr:c\r\n/;
+for my $r (@replies) {
+    my ($version, $case) = split / /, $r->[0];
+    my $b = pack('H*', $r->[2]);
+    my $wrong = sub { die "gen-server-vectors: $version answered $case with " . unpack('H*', $b) . ", not $_[0]\n"; };
+    $wrong->('+OK') if $case =~ m{^(tracking-optin|putback-unwatch|putback-select)/[23]$|^(caching-yes|reauth-tracked)/3$} && $b ne "+OK\r\n";
+    $wrong->('an ERR') if $case =~ m{^caching-untracked/} && $b !~ /\A-ERR /;
+    $wrong->('WRONGPASS') if $case =~ m{^reauth-(wrong|off)/} && $b !~ /\A-WRONGPASS /;
+    $wrong->('kr_acl, the user it was') if $case =~ m{^whoami-after-(refused|off)/} && $b ne "\$6\r\nkr_acl\r\n";
+    $wrong->('+PONG alone') if $case eq 'tracked-ping/2' && $b ne "+PONG\r\n";
+    $wrong->('the push, then +PONG') if $case eq 'tracked-ping/3' && $b !~ /\A$push\+PONG\r\n\z/;
+    $wrong->('+OK, then the push') if $case eq 'own-write/3' && $b !~ /\A\+OK\r\n$push\z/;
+    $wrong->('the push') if $case eq 'reauth-invalidate/3' && $b !~ /\A$push\z/;
+    $wrong->("FLUSHALL's null") if $case eq 'tracked-flush/3' && $b ne ">2\r\n\$10\r\ninvalidate\r\n_\r\n";
+    $wrong->('-2 and a null') if $case eq 'cached-missing/3' && $b ne "*2\r\n:-2\r\n_\r\n";
+    $wrong->('-1 and the value') if $case eq 'cached-persist/3' && $b ne "*2\r\n:-1\r\n\$1\r\nv\r\n";
+    $wrong->('100000 and the value') if $case eq 'cached-ttl/3' && $b ne "*2\r\n:100000\r\n\$1\r\nv\r\n";
+}
 my %docServers; $docServers{(split / /, $_->[0])[0]}++ for @docs;
 die "gen-server-vectors: no COMMAND DOCS from any server\n" unless %docServers;
 for my $code (qw(ERR WRONGTYPE NOAUTH WRONGPASS NOPERM NOPROTO MOVED ASK)) {
@@ -895,6 +978,10 @@ print $o <<"HEAD";
 //     refused while it was down; the loading-* cases ran while the server reloaded its dataset: the handshake's
 //     commands are answered, PING and a read are -LOADING.
 //   - connectionServers / connectionNames: each server's `ACL CAT connection`, sorted.
+//   - Caching, re-authentication and the put-back (tracking-optin/2, cached-ttl/3, own-write/3, tracked-ping/3,
+//     reauth-tracked/3, reauth-wrong/2, putback-select/3, …): scenes as pub/sub's. A cached read's EXEC records its
+//     PTTL as the 100000 ms its setup set (the script checked it was within a second). tracked-ping/2 is RESP2's
+//     tracking delivering nothing: the PING after another client's write answers alone.
 //   - proxyNames / proxyHex: Envoy's redis proxy's answers to HELLO, read from its source (v1.32.0, v1.36.0,
 //     v1.39.0), with and without a password required, and to PING, which it answers itself.
 import { std::collections::DynamicArray };
