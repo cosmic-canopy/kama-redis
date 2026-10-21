@@ -3,7 +3,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          std::time::monotonicNow, std::time::sleep, std::memory::replace,
          redis::Config, redis::UrlTransport, redis::ReadFrom, redis::Connection, redis::Dialers, redis::Dialer, redis::Command,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::RedisError,
-         redis::ServerError, redis::ConnectError,
+         redis::ServerError, redis::ConnectError, redis::CacheStats,
          redis::cluster::SlotMap, redis::cluster::ClusterNode, redis::cluster::Redirect, redis::cluster::RedirectKind,
          redis::cluster::keySlot,
          redis::wire::Commands, redis::wire::Keys, redis::wire::keysOf, redis::wire::slotIn, redis::wire::Request,
@@ -84,6 +84,8 @@ type resource NodeLink implements Sendable {
     string hostText;
     int32 portNumber;
     DynamicArray<Connection> held;
+    // The cluster's count of map changes when this link's cache last made a round trip after one (resyncAfter).
+    int64 cacheSeen = 0;
 
     public ctor make(string host, int32 port) { this.hostText = give host; this.portNumber = port; this.held = DynamicArray.empty(); }
 
@@ -103,6 +105,11 @@ type resource NodeLink implements Sendable {
 
     public fn void attach(Connection connection) { this.held.add(item: give connection); }
     public unsafe fn Result<Value, RedisError> call(const ref Command command) { return this.held[0].call(command: command); }
+    public unsafe fn Result<Value, RedisError> cached(const ref Command command, Duration ttl) { return this.held[0].cached(command: command, ttl: ttl); }
+    public const fn CacheStats cacheStats() {
+        if (this.held.length() == 0) { return CacheStats.zero(); }
+        return this.held[0].cacheStats();
+    }
     public unsafe fn Result<Replies, RedisError> run(const ref Pipeline pipeline) { return this.held[0].run(pipeline: pipeline); }
     public unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {
         return this.held[0].begin(pipeline: pipeline, unsent: unsent);
@@ -137,7 +144,18 @@ type resource NodeLink implements Sendable {
         Optional<Connection> c = this.held.pop();
         match (give c) { case Some(value: conn): { Connection gone = give conn; gone.close(); } case None: { } };
     }
-    friend Cluster[putBack, probeIdle];
+    // Before a cached read: when the map changed since this link last saw it, the connection's next hit makes a round
+    // trip first (Connection.unsync). A node that took a slot over sent its invalidations of the old primary's writes,
+    // which reached it by replication, before it took the slot, and on its own link they come before that reply, while
+    // nothing orders them against the redirection that brought the read here, which came on another link.
+    unsafe fn void resyncAfter(int64 changes) {
+        if (this.cacheSeen == changes) { return; }
+        this.cacheSeen = changes;
+        if (this.held.length() > 0) { this.held[0].unsync(); }
+    }
+    // Its cache emptied: the map took a slot from its node (Cluster.forgetLost).
+    unsafe fn void forget() { if (this.held.length() > 0) { this.held[0].forgetCache(); } }
+    friend Cluster[putBack, probeIdle, resyncAfter, forget];
 
     // How many times its link was made again (Connection.generation); -1 before it is opened.
     public const fn int64 generation() {
@@ -237,6 +255,9 @@ type resource Cluster implements Sendable {
     DynamicArray<NodeLink> links;
     // A MOVED changed the map: it is read whole again before the next call, but not within a second of the last try.
     bool stale = false;
+    // How many times the map changed (a MOVED, or a reading adopted): a cached read on a link that has not seen the
+    // latest makes a round trip before a hit (NodeLink.resyncAfter).
+    int64 mapChanges = 0;
     Instant lastRead;
     // How many tries in a row have failed: the backoff between tries grows with it, across calls, as a redial's does.
     int32 failures = 0;
@@ -317,7 +338,48 @@ type resource Cluster implements Sendable {
         bool reads = this.table.at(index: entry).readOnly();
         // The map read again first, if it is due: a reading can let links go, and a replica's link is picked from it.
         this.freshen();
-        return this.routedFrom(slot: at, command: command, first: this.replicaFor(slot: at, readOnly: reads));
+        return this.routedFrom(slot: at, command: command, first: this.replicaFor(slot: at, readOnly: reads), ttl: Optional::None);
+    }
+
+    // `command`, a read on the cache's list (src/wire/cacheable.kama), from the client-side cache of the connection to
+    // its slot's node (Connection.cached; Config.setCache gives each node's connection one), routed, redirected and
+    // waited out as `call` does. A try that follows ASK is sent uncached: the slot is moving, and ASKING admits one
+    // command, not a transaction. After the map changed, the node's connection makes a round trip before its next hit
+    // (NodeLink.resyncAfter). `Usage` for a cluster made with no cache, and for keys in more than one slot.
+    public unsafe fn Result<Value, RedisError> cached(const ref Command command, Duration ttl) {
+        Result<Unit, RedisError> admitted = this.admitted(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        bool caching = match (this.settings.cache()) { case Some(value: c): true; case None: false; };
+        if (!caching) {
+            return Result::Err(error: RedisError::Usage(detail: "this cluster has no client-side cache: set one on its Config (setCache) before connecting"));
+        }
+        isize entry = this.table.indexOf(command: command);
+        if (entry < 0) { return Result::Err(error: unknownCommand()); }
+        Keys keys = keysOf(info: this.table.at(index: entry), command: command, notKeys: true);
+        Result<Optional<isize>, RedisError> slot = slotIn(command: command, keys: keys);
+        isize at = match (give slot) {
+            case Ok(value: o): match (o) { case Some(value: s): s; case None: -1; };
+            case Err(error: e): { return Result::Err(error: give e); }
+        };
+        this.freshen();
+        return this.routedFrom(slot: at, command: command, first: this.replicaFor(slot: at, readOnly: true), ttl: Optional::Some(value: ttl));
+    }
+
+    // What the client-side caches of this cluster's open node connections have done, summed.
+    public const fn CacheStats cacheStats() {
+        CacheStats total = CacheStats.zero();
+        isize i = 0;
+        while (i < this.links.length()) {
+            CacheStats s = this.links[i].cacheStats();
+            total.hits = total.hits + s.hits;
+            total.misses = total.misses + s.misses;
+            total.entries = total.entries + s.entries;
+            total.bytes = total.bytes + s.bytes;
+            total.evicted = total.evicted + s.evicted;
+            total.flushes = total.flushes + s.flushes;
+            i = i + 1;
+        }
+        return total;
     }
 
     // Send `command` to the primary of `key`'s slot, whatever the table says of it: a module's command, or one whose
@@ -843,12 +905,13 @@ type resource Cluster implements Sendable {
     // (nothing was sent), waited out within reconnect_timeout, the map read again when it may have changed. Anything
     // that may have run is the call's, and never sent again.
     unsafe fn Result<Value, RedisError> routed(isize slot, const ref Command command) {
-        return this.routedFrom(slot: slot, command: command, first: -1);
+        return this.routedFrom(slot: slot, command: command, first: -1, ttl: Optional::None);
     }
 
-    // `routed`, its first try at link `first` (a replica, for a read) when it is not -1. A try sent again goes to the
-    // slot's primary, unless a redirection names another node.
-    unsafe fn Result<Value, RedisError> routedFrom(isize slot, const ref Command command, isize first) {
+    // `routed`, its first try at link `first` (a replica, for a read) when it is not -1, and read through the link's
+    // cache when `ttl` is given (`cached`). A try sent again goes to the slot's primary, unless a redirection names
+    // another node.
+    unsafe fn Result<Value, RedisError> routedFrom(isize slot, const ref Command command, isize first, Optional<Duration> ttl) {
         this.freshen();
         Deadline window = Deadline.within(span: this.settings.reconnectTimeout());
         int32 redirects = 0;
@@ -859,7 +922,7 @@ type resource Cluster implements Sendable {
             if (at < 0) { at = this.linkFor(slot: slot); }
             if (at < 0) { return Result::Err(error: noPrimary()); }
             bool unsent = false;
-            Result<Value, RedisError> r = this.sendTo(at: at, command: command, asking: asking, unsent: unsent);
+            Result<Value, RedisError> r = this.readAt(at: at, command: command, asking: asking, unsent: unsent, ttl: ttl);
             this.lastAnswered = at;
             next = -1;
             asking = false;
@@ -1042,6 +1105,18 @@ type resource Cluster implements Sendable {
         return replies.take(index: 1);
     }
 
+    // `command` from link `at`'s cache (Connection.cached) when `ttl` is given and the try does not follow ASK, else
+    // sent (sendTo).
+    unsafe fn Result<Value, RedisError> readAt(isize at, const ref Command command, bool asking, ref bool unsent, Optional<Duration> ttl) {
+        Duration life = match (ttl) { case Some(value: d): d; case None: Duration.zero(); };
+        bool caching = match (ttl) { case Some(value: d): !asking; case None: false; };
+        if (!caching) { return this.sendTo(at: at, command: command, asking: asking, unsent: unsent); }
+        Result<Unit, RedisError> open = this.opened(at: at);
+        match (give open) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
+        this.links[at].resyncAfter(changes: this.mapChanges);
+        return this.links[at].cached(command: command, ttl: life);
+    }
+
     // Link `at`'s connection, opened when it is not yet: the cluster's Config for that node, through a dialer of the
     // caller's when it gave some. The error is the connect's.
     unsafe fn Result<Unit, RedisError> opened(isize at) {
@@ -1095,10 +1170,48 @@ type resource Cluster implements Sendable {
     // A MOVED: the map takes it at once, and is read whole again before the next call. The link of the node it names;
     // -1 when the map holds as many nodes as a cluster can.
     unsafe fn isize follow(const ref Redirect redirect) {
+        isize was = this.map.primaryOf(slot: redirect.slot());
+        string wasHost = "";
+        int32 wasPort = -1;
+        if (was >= 0) { wasHost = copy this.map.node(index: was).host(); wasPort = this.map.node(index: was).port(); }
         isize node = this.map.moved(slot: redirect.slot(), host: copy redirect.host(), port: redirect.port());
         if (node < 0) { return -1; }
         this.stale = true;
+        this.mapChanges = this.mapChanges + 1i64;
+        if (wasPort >= 0 && !(wasPort == redirect.port() && wasHost == redirect.host())) { this.forgetAt(host: wasHost, port: wasPort); }
         return this.linkTo(host: redirect.host(), port: redirect.port());
+    }
+
+    // The cache of the link to the node at `host` and `port`, if there is one, emptied: the map took a slot from that
+    // node. A read a later map sends there (a reading a moment behind a failover) then misses and goes to the node,
+    // which redirects it; a hit would never ask, and the node learns of the new primary's writes only by replication.
+    unsafe fn void forgetAt(const ref string host, int32 port) {
+        isize i = 0;
+        while (i < this.links.length()) {
+            if (this.links[i].isAt(host: host, port: port)) { this.links[i].forget(); }
+            i = i + 1;
+        }
+    }
+
+    // Every node the change from `before` to the current map took a slot from, its link's cache emptied (forgetAt).
+    unsafe fn void forgetLost(const ref SlotMap before) {
+        DynamicArray<isize> lost = DynamicArray.empty();
+        isize s = 0;
+        while (s < 16384) {
+            isize was = before.primaryOf(slot: s);
+            if (was >= 0 && !lost.contains(item: was)) {
+                isize now = this.map.primaryOf(slot: s);
+                bool same = now >= 0 && this.map.node(index: now).port() == before.node(index: was).port()
+                            && this.map.node(index: now).host() == before.node(index: was).host();
+                if (!same) { lost.add(item: was); }
+            }
+            s = s + 1;
+        }
+        isize k = 0;
+        while (k < lost.length()) {
+            this.forgetAt(host: before.node(index: lost[k]).host(), port: before.node(index: lost[k]).port());
+            k = k + 1;
+        }
     }
 
     // Wait before the next try, a redial's backoff, unless it would end past `window`: then false, and the call ends.
@@ -1195,9 +1308,11 @@ type resource Cluster implements Sendable {
 
     // `next` is the map from now on: the links of nodes it does not name are closed and let go.
     unsafe fn void adopt(SlotMap next) {
-        this.map = give next;
+        SlotMap before = replace::<SlotMap>(place: this.map, with: give next);
+        this.forgetLost(before: before);
         this.stale = false;
         this.lastRead = monotonicNow();
+        this.mapChanges = this.mapChanges + 1i64;
         isize i = this.links.length();
         while (i > 0) {
             i = i - 1;

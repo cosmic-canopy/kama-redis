@@ -662,19 +662,55 @@ Each step ends green before its commit:
      `lib/` and `include/`, since its working tree held KR-230 uncommitted), and the integration matrix on all eight
      servers. After the acquire check was removed, the unit gate and the mutations ran again, and
      `pool_failover_test.kama` ran live on all eight.
-6. **Client-side caching** (phase 4's step 5).
-   - `CacheConfig` and `CacheStats`; tracking in the handshake.
-   - `cached`: its pending entries, and `CACHING YES`, MULTI, PTTL, the command and EXEC in one write.
-   - An LRU bounded in entries and bytes; invalidations sorted in `setAside`.
-   - Every flush rule; the sync rule; `Cluster.cached`.
-   - Unit: step 1's vectors, and the race.
-   - Live:
-     - another client's write;
-     - FLUSHALL;
-     - a TTL;
-     - one's own write, read across leases;
-     - the bounds;
-     - a cluster failover.
+6. **Done (2026-10-21).** **Client-side caching** (phase 4's step 5).
+   - **What was built:**
+     - `CacheConfig` (`maxEntries` 10 000, `maxBytes` 16 MiB) and `CacheStats` (src/cache.kama); `Config.setCache`
+       and `cache()`, kept by a copy and a cluster node's `Config`, dropped by a sentinel's;
+     - the cache (src/wire/cache.kama): a slab of entries with a generation each, an index by the command's bytes and
+       one by key, an LRU through the stored entries, and `Ticket`s that hold a pending read's place;
+     - tracking in the handshake (`CLIENT TRACKING ON OPTIN`, in the HELLO write, on every link made); a server that
+       refuses it fails the connect, and `protocol=2` with a cache is `Config`;
+     - `Connection.cached(command:, ttl:)`: a miss writes `CLIENT CACHING YES`, MULTI, PTTL of each key, the command
+       and EXEC at once and keeps the reply until the shorter of `ttl` and the keys' TTLs; invalidations are applied
+       in `setAside`, so in wire order, and one before the reply leaves nothing kept;
+     - the sync rule by count: `Wire.written()` against the count after a cached read's last round trip, so a hit
+       after any other write PINGs first, and `putBack` resets it, so each lease's first hit does too;
+     - emptied on a lost link, a null invalidation, `select` of another database, `authenticate`, and any login as
+       another user (in `loggedIn`, which a connect, a fresh login and a subscriber's re-login all pass);
+     - `Cluster.cached`, routed and redirected as `call` (a try after ASK sent uncached), and `cacheStats()` summed;
+       a node a change of the map takes a slot from has its cache emptied, and after any change each node link's next
+       hit makes a round trip first (both found by step 7: see there);
+     - `Commands.cacheable()`: the table's entries for the allow-list alone, for each cache's keys;
+     - the subscriber's `Name` became the wire's `ByteKey`, one hashed bytes key for both.
+   - **Revised from phase 4's decision:** `select` and `authenticate` are allowed on a caching connection and empty
+     its cache, rather than refused: a pool's put-back sends SELECT, and a provider's login may change the user.
+     `cached` refuses a WATCH in force instead, whose transaction its MULTI and EXEC would end.
+   - **Unit** (`cache_test.kama`, with every reply from the vectors): tracking on every server's handshake, and its
+     refusal; a miss and a hit for a string, a missing key and a hash; `ttl`; another client's write, the race, one's
+     own write and the round trip after it, FLUSHALL; every flush and what keeps the cache; `maxEntries` by recency,
+     `maxBytes`, a value too large to keep; the refusals and a command refused as it is queued; a lease's first hit;
+     RESP2 behind a proxy; and on a scripted cluster, each read at its key's node.
+   - **Live** (`cache_test.kama`, all eight servers): another client's write, one's own write, FLUSHALL, the server's
+     TTL and the caller's, WRONGTYPE, the bounds, `protocol=2`, a pool's next lease reading another client's write,
+     and a cluster's reads and its own write.
+   - **Mutations** (`7b-s6.json`): 29, every one CAUGHT: 28 unit (H1–H24, H26–H29) and one live (HI1, on Redis 8.10).
+     - H12 (tracking left out of the handshake) passed at first: the script's TRACKING step just went unconsumed. A
+       PING after the handshake now meets that step when TRACKING was not sent.
+     - H16 (no check that a pending entry still holds) is one the program dies of (`PANICKED`): a fill of an entry an
+       invalidation removed reads past its command.
+     - H25 (an expired entry left in place by a lookup) survived: the miss's pending entry removes it anyway, so the
+       removal in `lookup` went.
+     - H27–H29 came with step 7's findings: the resync after a change of the map, and a node's cache emptied when the
+       map takes a slot from it.
+     - HI1 (the server's TTL not bounding an entry) survived on a standalone server, which expires the key within about
+       100 ms and invalidates it. It is now a cluster case, with active expiry off on the key's primary (`DEBUG
+       SET-ACTIVE-EXPIRE 0`; the standalone servers refuse DEBUG).
+     - Two live mutations went (HI2, no resync at a lease's release; HI3, no round trip after a write): live, the
+       invalidation is on the socket before the next read, so only the scripted server stages the race, where H4 and
+       H5 are CAUGHT.
+   - **Gates:** `tools/test.sh` debug and release on v0.9.707 and on cstar's committed 0.9.716, and the integration
+     matrix on all eight servers, with step 7's hardening; the live cache and hardening tests ran again on all eight
+     after their last changes.
 7. **Live hardening across failovers** (`pool_hardening_test.kama`).
    - Repeated SENTINEL and CLUSTER FAILOVERs, each waited out, with four isolates on one pool, the cache and a provider
      on.

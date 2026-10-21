@@ -51,6 +51,8 @@ comptime isize CATCH_UP_READS = 64;
 type resource Wire implements Sendable {
     Owned<Transport> link;
     Reader reader;
+    // How many writes this link has begun: a client-side cache's sync rule counts them (Connection.cached).
+    int64 writes = 0;
 
     public ctor over(Owned<Transport> transport, Limits limits) {
         this.link = give transport;
@@ -79,6 +81,7 @@ type resource Wire implements Sendable {
     // forever on a long pipeline. Once the server has stopped sending (EOF, an error), only writing is waited for;
     // the reader meets the end when it gets there.
     public unsafe fn Result<Unit, RedisError> send(ConstView<uint8> bytes, Deadline deadline) {
+        this.writes = this.writes + 1i64;
         isize sent = 0;
         bool reading = true;
         while (sent < bytes.length()) {
@@ -101,6 +104,9 @@ type resource Wire implements Sendable {
         }
         return Result::Ok(value: Unit::Unit);
     }
+
+    // How many writes this link has begun.
+    public const fn int64 written() { return this.writes; }
 
     // Whether no reply is in progress: nothing buffered, nothing half read.
     public const fn bool isIdle() { return this.reader.isIdle(); }

@@ -1,0 +1,39 @@
+export { CacheConfig, CacheStats };
+
+// Client-side caching (docs/ROADMAP.md, "Phase 7b", decision 4): a cache per connection, set on its Config
+// (`Config.setCache`), and read through with `Connection.cached` and `Cluster.cached`. src/wire/cache.kama holds the
+// cache itself and its rules.
+
+// How large a connection's cache may grow: at most `maxEntries` values, holding at most `maxBytes` bytes (each value's
+// bytes, its command's and its keys'). Past either, the least recently used goes. The peers keep 10 000 entries;
+// rueidis's 128 MiB a connection would be maxSize times that in a pool, so this keeps 16 MiB.
+type value CacheConfig implements Sendable {
+    public isize maxEntries;
+    public int64 maxBytes;
+
+    public ctor defaults() {
+        this.maxEntries = 10000;
+        this.maxBytes = 16i64 * 1024i64 * 1024i64;
+    }
+}
+
+// What a cache has done since its connection was made. `entries` and `bytes` are what it holds now; the rest only
+// grow: reads served from it, reads sent to the server, values let go to stay within the bounds, and times it was
+// emptied whole (a lost link, FLUSHALL, a change of database or user).
+type value CacheStats implements Sendable {
+    public int64 hits;
+    public int64 misses;
+    public int64 entries;
+    public int64 bytes;
+    public int64 evicted;
+    public int64 flushes;
+
+    public ctor zero() {
+        this.hits = 0;
+        this.misses = 0;
+        this.entries = 0;
+        this.bytes = 0;
+        this.evicted = 0;
+        this.flushes = 0;
+    }
+}

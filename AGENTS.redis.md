@@ -282,6 +282,25 @@ printed first.
   - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process: a live
     descriptor count uses IP addresses.
 
+- **A client-side cache is one per connection** (src/wire/cache.kama; phase 7b, decision 4), set on the `Config`
+  (`setCache`) so that every link the connection makes turns tracking on in its handshake.
+  - Invalidations are applied in wire order, in `setAside` (`invalidated`): every push a connection reads passes there,
+    a subscriber's included. A miss makes its pending entry before it writes; a reply is kept only if its `Ticket`
+    still holds.
+  - The sync rule counts writes: `Wire.written()` against `syncedAt`, so any write on the link (a call, a pipeline, a
+    put-back) makes the next hit PING first, and `putBack` resets it for the next lease. A new way to write needs
+    nothing; a new kind of session change that makes cached values wrong (a database, a user) calls `forgetCache`.
+  - On a cluster, a hit never asks the node whether it still serves the slot, so the map's changes guard it (found by
+    step 7's hardening, where a read right after its own INCR hit a demoted primary's entry):
+    - a node a change takes a slot from has its link's cache emptied (`follow`'s patch, `adopt`'s `forgetLost`), so a
+      read that a reading of the map a moment behind a failover sends back there misses, and the node redirects it;
+    - every change counts in `mapChanges`, and a cached read on a link that has not seen the latest unsyncs it first
+      (`NodeLink.resyncAfter`): a node that took a slot over sent its invalidations of the replicated writes on its
+      own link, and the MOVED that sent the read there came on another.
+  - `cached` refuses a WATCH in force: its MULTI/EXEC would end it.
+  - Its unit tests read every value from the vectors; a hit's script has nothing left, so a hit that wrote would time
+    out.
+
 - **A `Subscriber` reaches its connection only through the private members `Connection` grants it, method by
   method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, for reconnecting `lost` and `ready`, and
   `rawHandle` for a `ClusterSubscriber`'s `Poller`). Nothing on
@@ -357,11 +376,11 @@ printed first.
   - `Err`, `Ok`, `Some` and `None` are language names: no type may take one.
   - A contract-typed parameter (`RedisArg names`) is a borrow: pass a value to it as it is, never with `give` or `copy`.
   - A `DynamicArray<uint8>` is `Equatable` but not `Hashable`: a std `Set` of byte names needs a small key type that
-    hashes them (`Name` in src/subscriber.kama).
+    hashes them (`ByteKey` in src/wire/cache.kama, which the cache and a subscriber's sets share).
   - A `Deque` gives O(1) push and pop at both ends (`pushBack` is `unsafe`): the bounded queues use it.
   - A field cannot be the `const ref` argument of a method that writes `this`: copy it into a local first
     (`Config c = copy this.settings;`), as a redial does.
-  - A `Set` iterates its keys only when the key is `Copyable`: `Name` has a copy constructor for that.
+  - A `Set` iterates its keys only when the key is `Copyable`: `ByteKey` has a copy constructor for that.
   - A project's name is its root module, so a project named like a dependency's module is refused (KRD-10).
   - `kama check` passes an `Optional<R>` given where a resource `R` is wanted, and only the C compiler refuses it
     (KRD-13). `pop()` answers an `Optional`: take the value out with `match (give p) { case Some(value: x): … }`, and

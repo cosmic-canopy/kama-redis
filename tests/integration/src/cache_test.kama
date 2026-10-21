@@ -1,0 +1,255 @@
+// Client-side caching, live (docs/ROADMAP.md, "Phase 7b", step 6): another client's write, this connection's own,
+// FLUSHALL, the server's TTL and the caller's, the bounds, a pool's next lease, an error in the read, and a cluster.
+// Every read that must see a change follows something this connection wrote, so the round trip the cache makes before
+// a hit orders the invalidation first: no case waits on a clock for an invalidation to come.
+import { std::collections::DynamicArray, std::time::Duration, std::time::sleep,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::CacheConfig, redis::CacheStats,
+         redis::Cluster, redis::resp::Value, redis::pool::Pool, redis::pool::PoolOptions, redis::pool::Lease,
+         redis::cluster::keySlot,
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl,
+         plainUrl, said, portOf };
+export { cacheTests };
+
+fn Result<Config, RedisError> caching(const ref string url, isize entries) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    CacheConfig cc = CacheConfig.defaults();
+    cc.maxEntries = entries;
+    Result<Unit, RedisError> set = config.setCache(cache: cc);
+    match (give set) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+    return Result::Ok(value: give config);
+}
+
+unsafe fn Result<Connection, RedisError> cachedAt(const ref string url, isize entries) {
+    Result<Config, RedisError> c = caching(url: url, entries: entries);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Connection.connect(config: config);
+}
+
+// `text` read through the cache, kept for at most `ttlMs`: the reply shown, "(error) CODE", or "(failed) …".
+unsafe fn string read(ref Connection c, const ref string text, int64 ttlMs) {
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.cached(command: command, ttl: Duration.fromMillis(ms: ttlMs));
+    return shownOr(r: r);
+}
+
+unsafe fn string readOn(ref Cluster c, const ref string text, int64 ttlMs) {
+    Command command = commandOf(text: text);
+    Result<Value, RedisError> r = c.cached(command: command, ttl: Duration.fromMillis(ms: ttlMs));
+    return shownOr(r: r);
+}
+
+fn string shownOr(const ref Result<Value, RedisError> r) {
+    return match (r) {
+        case Ok(value: v): shown(v: v);
+        case Err(error: e): match (e) { case Server(error: s): "(error) ".concat(other: s.codeText()); case _: "(failed) ".concat(other: e.message()); };
+    };
+}
+
+fn string countsOf(CacheStats s) {
+    int64 h = s.hits;
+    int64 m = s.misses;
+    int64 e = s.entries;
+    int64 x = s.evicted;
+    return "hits ${h} misses ${m} entries ${e} evicted ${x}";
+}
+
+unsafe fn void wait(int64 ms) { sleep(d: Duration.fromMillis(ms: ms)); }
+
+unsafe fn int32 connectionTests() {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: "");
+    Result<Connection, RedisError> cr = cachedAt(url: url, entries: 1000);
+    Result<Connection, RedisError> orr = open(url: url);
+    match (give cr) {
+        case Ok(value: x): {
+            Connection c = give x;
+            match (give orr) {
+                case Ok(value: y): {
+                    Connection o = give y;
+                    // Another client's write: once this connection has written anything, its next hit is fresh.
+                    string a1 = read(c: c, text: "GET kr:cache:a", ttlMs: 60000i64);
+                    string a2 = read(c: c, text: "GET kr:cache:a", ttlMs: 60000i64);
+                    string set = ask(c: o, text: "SET kr:cache:a 1");
+                    string ping = ask(c: c, text: "PING");
+                    string a3 = read(c: c, text: "GET kr:cache:a", ttlMs: 60000i64);
+                    CacheStats s1 = c.cacheStats();
+                    f = f + check(ok: a1 == "(nil)" && a2 == "(nil)" && set == "OK" && ping == "PONG" && a3 == "1" && s1.hits == 1i64 && s1.misses == 2i64,
+                                  what: "cache: another client's write invalidates (${a1}; ${a2}; ${a3}; ${s1.hits} hits)");
+                    // This connection's own write is read back at once.
+                    string b1 = read(c: c, text: "GET kr:cache:b", ttlMs: 60000i64);
+                    string own = ask(c: c, text: "SET kr:cache:b 2");
+                    string b2 = read(c: c, text: "GET kr:cache:b", ttlMs: 60000i64);
+                    f = f + check(ok: b1 == "(nil)" && own == "OK" && b2 == "2", what: "cache: its own write is read back (${b1}; ${b2})");
+                    // FLUSHALL empties it.
+                    string c1 = read(c: c, text: "GET kr:cache:a", ttlMs: 60000i64);
+                    string fl = ask(c: o, text: "FLUSHALL");
+                    string ping2 = ask(c: c, text: "PING");
+                    string c2 = read(c: c, text: "GET kr:cache:a", ttlMs: 60000i64);
+                    CacheStats s2 = c.cacheStats();
+                    f = f + check(ok: c1 == "1" && fl == "OK" && c2 == "(nil)" && s2.flushes >= 1i64,
+                                  what: "cache: FLUSHALL empties it (${c1}; ${c2}; ${s2.flushes} flushes)");
+                    // The server's TTL bounds an entry, whatever the caller's.
+                    string px = ask(c: o, text: "SET kr:cache:t v PX 400");
+                    string t1 = read(c: c, text: "GET kr:cache:t", ttlMs: 60000i64);
+                    wait(ms: 800i64);
+                    string t2 = read(c: c, text: "GET kr:cache:t", ttlMs: 60000i64);
+                    f = f + check(ok: px == "OK" && t1 == "v" && t2 == "(nil)", what: "cache: the server's TTL ends an entry (${t1}; ${t2})");
+                    // The caller's ttl too: a hit within it, a miss after it.
+                    string lset = ask(c: o, text: "SET kr:cache:l x");
+                    CacheStats before = c.cacheStats();
+                    string l1 = read(c: c, text: "GET kr:cache:l", ttlMs: 300i64);
+                    string l2 = read(c: c, text: "GET kr:cache:l", ttlMs: 300i64);
+                    wait(ms: 600i64);
+                    string l3 = read(c: c, text: "GET kr:cache:l", ttlMs: 300i64);
+                    CacheStats after = c.cacheStats();
+                    int64 hits = after.hits - before.hits;
+                    int64 misses = after.misses - before.misses;
+                    f = f + check(ok: l1 == "x" && l2 == "x" && l3 == "x" && hits == 1i64 && misses == 2i64,
+                                  what: "cache: the caller's ttl ends an entry (${hits} hits, ${misses} misses)");
+                    // An error in the read is the server's, and nothing is kept; the connection goes on.
+                    string h = ask(c: o, text: "HSET kr:cache:h f v");
+                    string wrong = read(c: c, text: "GET kr:cache:h", ttlMs: 60000i64);
+                    string field = read(c: c, text: "HGET kr:cache:h f", ttlMs: 60000i64);
+                    string field2 = read(c: c, text: "HGET kr:cache:h f", ttlMs: 60000i64);
+                    f = f + check(ok: h == "1" && wrong == "(error) WRONGTYPE" && field == "v" && field2 == "v",
+                                  what: "cache: a read the server refuses is its error, and the connection goes on (${wrong}; ${field})");
+                    // What it cannot hold.
+                    string write = read(c: c, text: "SET kr:cache:a 1", ttlMs: 60000i64);
+                    f = f + check(ok: write.startsWith(prefix: "(failed) "), what: "cache: a write is refused (${write})");
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cache: the other client: ${m}"); }
+            };
+        }
+        case Err(error: e): { Result<Connection, RedisError> unused = give orr; string m = e.message(); f = f + check(ok: false, what: "cache: connect: ${m}"); }
+    };
+    return f;
+}
+
+unsafe fn int32 boundTests() {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: "");
+    Result<Connection, RedisError> cr = cachedAt(url: url, entries: 3);
+    match (give cr) {
+        case Ok(value: x): {
+            Connection c = give x;
+            isize i = 0;
+            bool all = true;
+            while (i < 5) {
+                string key = "GET kr:cache:n${i}";
+                string r = read(c: c, text: key, ttlMs: 60000i64);
+                all = all && r == "(nil)";
+                i = i + 1;
+            }
+            string n = countsOf(s: c.cacheStats());
+            f = f + check(ok: all && n == "hits 0 misses 5 entries 3 evicted 2", what: "cache: maxEntries 3 keeps 3 (${n})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cache: bounds: ${m}"); }
+    };
+    // A RESP2 configuration cannot have one.
+    Result<Connection, RedisError> two = cachedAt(url: mainUrl(userinfo: "", tail: "?protocol=2"), entries: 10);
+    bool refused = match (two) { case Err(error: e): match (e) { case Config(detail: d): true; case _: false; }; case Ok(value: c): false; };
+    f = f + check(ok: refused, what: "cache: protocol=2 with a cache is Config");
+    return f;
+}
+
+// A pool's next lease reads another client's write, though it was cached in the lease before.
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    string url = mainUrl(userinfo: "", tail: "");
+    Result<Config, RedisError> pc = caching(url: url, entries: 100);
+    Result<Connection, RedisError> orr = open(url: url);
+    match (give pc) {
+        case Ok(value: config): {
+            match (give orr) {
+                case Ok(value: y): {
+                    Connection o = give y;
+                    PoolOptions options = PoolOptions.defaults();
+                    options.maxSize = 1;
+                    Result<Pool, RedisError> made = Pool.make(config: config, options: options);
+                    match (give made) {
+                        case Ok(value: p): {
+                            Pool pool = give p;
+                            string first = "";
+                            string second = "";
+                            { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { first = read(c: conn, text: "GET kr:cache:p", ttlMs: 60000i64); } } case Err(error: e): { first = e.message(); } }; }
+                            string set = ask(c: o, text: "SET kr:cache:p 9");
+                            { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { second = read(c: conn, text: "GET kr:cache:p", ttlMs: 60000i64); } } case Err(error: e): { second = e.message(); } }; }
+                            f = f + check(ok: first == "(nil)" && set == "OK" && second == "9", what: "cache: a pool's next lease reads another client's write (${first}; ${second})");
+                        }
+                        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cache: pool: ${m}"); }
+                    };
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cache: pool's other client: ${m}"); }
+            };
+        }
+        case Err(error: e): { Result<Connection, RedisError> unused = give orr; string m = e.message(); f = f + check(ok: false, what: "cache: pool config: ${m}"); }
+    };
+    return f;
+}
+
+// A cluster's nodes each keep a cache; a read routed to its node, and the cluster's own write read back.
+unsafe fn int32 clusterTests() {
+    int32 f = 0;
+    Result<Config, RedisError> cc = caching(url: plainUrl(), entries: 100);
+    match (give cc) {
+        case Ok(value: config): {
+            Result<Cluster, RedisError> made = Cluster.connect(config: config);
+            match (give made) {
+                case Ok(value: x): {
+                    Cluster c = give x;
+                    string a1 = readOn(c: c, text: "GET kr:cache:{x}", ttlMs: 60000i64);
+                    string a2 = readOn(c: c, text: "GET kr:cache:{x}", ttlMs: 60000i64);
+                    string set = said(c: c, text: "SET kr:cache:{x} 5");
+                    string a3 = readOn(c: c, text: "GET kr:cache:{x}", ttlMs: 60000i64);
+                    string b1 = readOn(c: c, text: "GET kr:cache:{y}", ttlMs: 60000i64);
+                    string cross = readOn(c: c, text: "MGET kr:cache:{x} kr:cache:{y}", ttlMs: 60000i64);
+                    CacheStats s = c.cacheStats();
+                    f = f + check(ok: a2 == a1 && set == "OK" && a3 == "5" && b1 == "(nil)" && cross.startsWith(prefix: "(failed) ") && s.hits == 1i64 && s.misses == 3i64,
+                                  what: "cluster cache: reads routed to their nodes, the cluster's own write read back (${a1}; ${a3}; ${b1}; ${cross}; ${s.hits} hits, ${s.misses} misses)");
+                    string cleanup = said(c: c, text: "DEL kr:cache:{x}");
+                    f = f + serverTtl(c: c);
+                }
+                case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: connect: ${m}"); }
+            };
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: config: ${m}"); }
+    };
+    return f;
+}
+
+// The server's TTL bounds an entry even while the server has not yet expired the key: with active expiry off on the
+// key's primary (DEBUG SET-ACTIVE-EXPIRE 0, which the cluster's nodes allow), nothing invalidates it when its time
+// passes, and only the PTTL read with the value ends it here.
+unsafe fn int32 serverTtl(ref Cluster c) {
+    string key = "kr:cache:{ttl}";
+    isize slot = keySlot(key: key.bytes());
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    isize owner = c.topology().primaryOf(slot: slot);
+    if (owner < 0) { return check(ok: false, what: "cluster cache: the server's TTL: no primary for the key"); }
+    string port = portOf(c: c, index: owner);
+    Result<Connection, RedisError> nr = open(url: "redis://127.0.0.1:".concat(other: port));
+    return match (give nr) {
+        case Ok(value: x): {
+            Connection node = give x;
+            string off = ask(c: node, text: "DEBUG SET-ACTIVE-EXPIRE 0");
+            string set = said(c: c, text: "SET kr:cache:{ttl} v PX 400");
+            string t1 = readOn(c: c, text: "GET kr:cache:{ttl}", ttlMs: 60000i64);
+            sleep(d: Duration.fromMillis(ms: 800i64));
+            string t2 = readOn(c: c, text: "GET kr:cache:{ttl}", ttlMs: 60000i64);
+            string on = ask(c: node, text: "DEBUG SET-ACTIVE-EXPIRE 1");
+            := check(ok: off == "OK" && set == "OK" && t1 == "v" && t2 == "(nil)" && on == "OK",
+                     what: "cluster cache: the server's TTL ends an entry, with nothing invalidating it (${off}; ${t1}; ${t2})");
+        }
+        case Err(error: e): { string m = e.message(); := check(ok: false, what: "cluster cache: the server's TTL: ${m}"); }
+    };
+}
+
+unsafe fn int32 cacheTests() {
+    int32 f = 0;
+    f = f + connectionTests();
+    f = f + boundTests();
+    f = f + poolTests();
+    f = f + clusterTests();
+    return f;
+}

@@ -37,6 +37,15 @@ What a caller of 0.2.0 may need to change:
   at most maxSize connections to each node. Release puts back what the lease changed on each node's connection and lets
   a lost one go; a cluster re-authenticated by hand is closed. The maintenance probes each node's connection in turn.
 
+- Client-side caching: `Config.setCache(CacheConfig)` gives each connection a cache (`maxEntries` 10 000, `maxBytes`
+  16 MiB, least recently used first), its handshake turns tracking on (`CLIENT TRACKING ON OPTIN`), and
+  `Connection.cached(command:, ttl:)` and `Cluster.cached` read through it: a miss sends `CLIENT CACHING YES`, MULTI,
+  PTTL, the read and EXEC in one write, a value lives until the shorter of the server's TTL and `ttl`, and the
+  server's invalidations are applied in wire order. A hit after another write, the first of a pool lease, or on a
+  cluster the first after the map changed, makes a round trip first, and a node the map takes a slot from has its cache
+  emptied. Emptied on a lost link, FLUSHALL, another database, `authenticate` and a login as another user.
+  `cacheStats()` (`CacheStats`). The commands it may hold are generated from every server (src/wire/cacheable.kama).
+
 ### Fixed
 - A `Scan` told links apart by a count of each connection's redials, which starts at 0 on every connection, so a scan
   continued over another connection (another lease's) sent its cursor to another link without a word. Each link now

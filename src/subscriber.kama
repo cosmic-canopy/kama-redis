@@ -3,7 +3,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::collectio
          std::encoding::utf8::Utf8Error,
          redis::Config, redis::Connection, redis::Dialer, redis::Protocol, redis::RedisError, redis::ServerError,
          redis::RedisArg, redis::Command, redis::cluster::keySlot, redis::cluster::ClusterNode, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
-         redis::wire::serverError, redis::resp::Value, redis::Login, redis::CredentialsError };
+         redis::wire::serverError, redis::wire::ByteKey, redis::resp::Value, redis::Login, redis::CredentialsError };
 export { Subscriber, Delivery, Message, ChannelKind };
 
 // Pub/sub on a connection of its own, under RESP3 and RESP2 alike (docs/ROADMAP.md, "Decided, and why", "Phase 4").
@@ -103,9 +103,9 @@ type resource Subscriber implements Sendable {
     int64 pendingBytes = 0;
     int64 pendingLimit = 0;
     // The names subscribed, as the server confirmed them, each once.
-    Set<Name> channels;
-    Set<Name> patterns;
-    Set<Name> shards;
+    Set<ByteKey> channels;
+    Set<ByteKey> patterns;
+    Set<ByteKey> shards;
     // What ended the last connection, for `Reconnected`: zero or one.
     DynamicArray<RedisError> lostBy;
 
@@ -297,9 +297,9 @@ type resource Subscriber implements Sendable {
     fn DynamicArray<DynamicArray<uint8>> namesOf(ChannelKind kind) {
         DynamicArray<DynamicArray<uint8>> names = DynamicArray.empty();
         match (kind) {
-            case Channel: { foreach (Name n in this.channels) { names.add(item: copy n.bytes); } }
-            case Pattern: { foreach (Name n in this.patterns) { names.add(item: copy n.bytes); } }
-            case Shard: { foreach (Name n in this.shards) { names.add(item: copy n.bytes); } }
+            case Channel: { foreach (ByteKey n in this.channels) { names.add(item: n.toArray()); } }
+            case Pattern: { foreach (ByteKey n in this.patterns) { names.add(item: n.toArray()); } }
+            case Shard: { foreach (ByteKey n in this.shards) { names.add(item: n.toArray()); } }
         };
         sortNames(names: ref names);
         return give names;
@@ -503,15 +503,15 @@ type resource Subscriber implements Sendable {
 
     fn void keep(ChannelKind kind, ConstView<uint8> name) {
         match (kind) {
-            case Channel: { this.channels.add(key: Name.of(bytes: name)); }
-            case Pattern: { this.patterns.add(key: Name.of(bytes: name)); }
-            case Shard: { this.shards.add(key: Name.of(bytes: name)); }
+            case Channel: { this.channels.add(key: ByteKey.of(bytes: name)); }
+            case Pattern: { this.patterns.add(key: ByteKey.of(bytes: name)); }
+            case Shard: { this.shards.add(key: ByteKey.of(bytes: name)); }
         };
     }
 
     // Whether `name` was kept, which it no longer is.
     fn bool forget(ChannelKind kind, ConstView<uint8> name) {
-        Name key = Name.of(bytes: name);
+        ByteKey key = ByteKey.of(bytes: name);
         return match (kind) {
             case Channel: this.channels.remove(key: key);
             case Pattern: this.patterns.remove(key: key);
@@ -523,9 +523,9 @@ type resource Subscriber implements Sendable {
     fn DynamicArray<DynamicArray<uint8>> takeKind(ChannelKind kind) {
         DynamicArray<DynamicArray<uint8>> names = DynamicArray.empty();
         match (kind) {
-            case Channel: { foreach (Name n in this.channels) { names.add(item: copy n.bytes); } }
-            case Pattern: { foreach (Name n in this.patterns) { names.add(item: copy n.bytes); } }
-            case Shard: { foreach (Name n in this.shards) { names.add(item: copy n.bytes); } }
+            case Channel: { foreach (ByteKey n in this.channels) { names.add(item: n.toArray()); } }
+            case Pattern: { foreach (ByteKey n in this.patterns) { names.add(item: n.toArray()); } }
+            case Shard: { foreach (ByteKey n in this.shards) { names.add(item: n.toArray()); } }
         };
         this.dropKind(kind: kind);
         sortNames(names: ref names);
@@ -541,7 +541,7 @@ type resource Subscriber implements Sendable {
     }
 
     const fn bool kept(ChannelKind kind, ConstView<uint8> name) {
-        Name key = Name.of(bytes: name);
+        ByteKey key = ByteKey.of(bytes: name);
         return match (kind) {
             case Channel: this.channels.contains(key: key);
             case Pattern: this.patterns.contains(key: key);
@@ -921,32 +921,4 @@ fn bool isInteger(const ref Value v) { return match (v) { case Integer(value: x)
 fn DynamicArray<uint8> takeBytes(ref DynamicArray<Value> items, isize at) {
     Value v = replace::<Value>(place: items[at], with: Value::Null);
     return match (give v) { case Bulk(bytes: b): give b; case _: DynamicArray.empty(); };
-}
-
-// A channel or pattern name as a set's key: its bytes, hashed with FNV-1a, as std hashes a string. It copies, so
-// that a set of them can be walked (a subscriber's resubscribing).
-type resource Name implements Hashable, Equatable<This>, Sendable, Copyable<This>(bare: give) {
-    DynamicArray<uint8> bytes;
-
-    friend redis::Subscriber::takeKind[bytes];
-    friend redis::Subscriber::namesOf[bytes];
-
-    public ctor of(ConstView<uint8> bytes) {
-        this.bytes = DynamicArray.empty();
-        this.bytes.addAll(items: bytes);
-    }
-
-    public ctor copy(ref Name source) { this.bytes = copy source.bytes; }
-
-    public const fn uint64 hash() {
-        uint64 h = 14695981039346656037ui64;
-        isize i = 0;
-        while (i < this.bytes.length()) {
-            h = (h ^ cast<uint64>(this.bytes[i])) * 1099511628211ui64;
-            i = i + 1;
-        }
-        return h;
-    }
-
-    public const fn bool equals(const ref Name other) { return this.bytes.equals(other: other.bytes); }
 }

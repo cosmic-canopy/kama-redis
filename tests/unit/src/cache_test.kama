@@ -1,0 +1,572 @@
+// Client-side caching (src/wire/cache.kama; docs/ROADMAP.md, "Phase 7b", decision 4) over the scripted server, every
+// reply a real server's (server_vectors.kama): tracking in the handshake, a miss's one write and a hit's none, every
+// invalidation and the order it comes in, the race a pending entry settles, every flush, the bounds, and the
+// refusals. A hit that wrote anything would meet a script with nothing left, and time out; a write the script does
+// not expect is answered with an error, and the server hangs up.
+import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration, std::time::sleep,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::CacheConfig, redis::CacheStats,
+         redis::Protocol, redis::Credentials, redis::resp::Value, redis::Transport, redis::Dialer,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::Lease, redis::PoolDialers,
+         redis_unit_tests::check, FakeServer, Step, Dial, ScriptDialer, expect, reply, proxy, welcome, configOf,
+         commandOf, textOf, pushIn, callOutcome, serverVersions, frameOf, joined, send, ScriptCredentials, Answer,
+         answerList, ScriptPoolDialers };
+export { cacheTests, cachingConfig, tracking, missOf };
+
+fn string server() { return "redis-8.10.2"; }
+fn DynamicArray<uint8> v(const ref string kase) { return reply(server: server(), kase: kase); }
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+fn DynamicArray<Dial> dials() { return DynamicArray.empty(); }
+
+// A handshake with a cache: HELLO 3, the two SETINFOs, then CLIENT TRACKING ON OPTIN, as `sv` answers each.
+fn DynamicArray<Step> tracking(const ref string sv) {
+    DynamicArray<Step> s = welcome(server: sv);
+    s.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: sv, kase: "tracking-optin/3")));
+    return give s;
+}
+
+// A cached read's miss: CLIENT CACHING YES, MULTI, PTTL of `key`, `command`, then EXEC, answered with `exec`.
+fn void missOf(ref DynamicArray<Step> s, const ref string command, const ref string key, DynamicArray<uint8> exec) {
+    s.add(item: expect(command: "CLIENT CACHING YES", answer: v(kase: "caching-yes/3")));
+    s.add(item: expect(command: "MULTI", answer: v(kase: "multi/3")));
+    s.add(item: expect(command: "PTTL ".concat(other: key), answer: v(kase: "queued/3")));
+    s.add(item: expect(command: command, answer: v(kase: "queued/3")));
+    s.add(item: expect(command: "EXEC", answer: give exec));
+}
+
+// GET `key`'s miss, its EXEC the value "v" with no TTL.
+fn void getMiss(ref DynamicArray<Step> s, const ref string key) {
+    missOf(s: s, command: "GET ".concat(other: key), key: key, exec: v(kase: "cached-persist/3"));
+}
+
+fn Config cachingConfig(const ref string url, isize entries, int64 bytes) {
+    Config c = configOf(url: url);
+    CacheConfig cc = CacheConfig.defaults();
+    cc.maxEntries = entries;
+    cc.maxBytes = bytes;
+    Result<Unit, RedisError> set = c.setCache(cache: cc);
+    match (give set) { case Ok(value: u): { } case Err(error: e): { string m = e.message(); panic(msg: "cache_test: ${m}"); } };
+    return give c;
+}
+
+fn Config cachedUrl() { return cachingConfig(url: "redis://", entries: 10000, bytes: 1048576i64); }
+
+unsafe fn Result<Connection, RedisError> overWith(DynamicArray<Step> script, const ref Config config) {
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// The connection a script must give; panics otherwise, naming the test.
+unsafe fn Connection cachedOver(DynamicArray<Step> script, const ref Config config, const ref string what) {
+    Result<Connection, RedisError> r = overWith(script: give script, config: config);
+    Connection c = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); panic(msg: "cache_test: ${what}: ${m}"); }
+    };
+    return give c;
+}
+
+// The same over scripted dials, for a connection that makes its link again.
+unsafe fn Connection cachedDialed(DynamicArray<Dial> d, const ref Config config, const ref string what) {
+    Owned<Dialer> dialer = new ScriptDialer.make(dials: give d);
+    Result<Connection, RedisError> r = Connection.connectWith(dialer: give dialer, config: config);
+    Connection c = match (give r) {
+        case Ok(value: x): give x;
+        case Err(error: e): { string m = e.message(); panic(msg: "cache_test: ${what}: ${m}"); }
+    };
+    return give c;
+}
+
+// `text` read through the cache, kept for at most `ttlMs`.
+unsafe fn Result<Value, RedisError> read(ref Connection c, const ref string text, int64 ttlMs) {
+    Command command = commandOf(text: text);
+    return c.cached(command: command, ttl: Duration.fromMillis(ms: ttlMs));
+}
+
+// What a read gave: a string's text, "nil", "map", "array", or "(error) …" ("(usage) …", "(server) CODE").
+fn string got(const ref Result<Value, RedisError> r) {
+    return match (r) {
+        case Ok(value: x): match (x) {
+            case Bulk(bytes: b): textOf(b: b.view());
+            case Null: "nil";
+            case Map(entries: m): "map";
+            case Array(items: a): "array";
+            case _: "?";
+        };
+        case Err(error: e): match (e) {
+            case Usage(detail: d): "(usage) ".concat(other: d);
+            case Server(error: s): "(server) ".concat(other: s.codeText());
+            case _: { string m = e.message(); := "(error) ${m}"; }
+        };
+    };
+}
+
+// The cache's counts: "hits H misses M entries E evicted X flushes F".
+fn string countsOf(const ref Connection c) {
+    CacheStats s = c.cacheStats();
+    int64 h = s.hits;
+    int64 m = s.misses;
+    int64 e = s.entries;
+    int64 x = s.evicted;
+    int64 fl = s.flushes;
+    return "hits ${h} misses ${m} entries ${e} evicted ${x} flushes ${fl}";
+}
+
+fn string counts(int64 h, int64 m, int64 e, int64 x, int64 fl) { return "hits ${h} misses ${m} entries ${e} evicted ${x} flushes ${fl}"; }
+
+unsafe fn void wait(int64 ms) { sleep(d: Duration.fromMillis(ms: ms)); }
+
+// ---- the handshake ----
+
+unsafe fn int32 handshakeTests() {
+    int32 f = 0;
+    // Every server takes tracking on, OPTIN, in the handshake's one write.
+    DynamicArray<string> servers = serverVersions();
+    isize i = 0;
+    while (i < servers.length()) {
+        string sv = copy servers[i];
+        Config config = cachedUrl();
+        // A PING after it: a handshake that left tracking out would meet the script's TRACKING step with it.
+        DynamicArray<Step> s = tracking(sv: sv);
+        s.add(item: expect(command: "PING", answer: reply(server: sv, kase: "ping")));
+        Result<Connection, RedisError> r = overWith(script: give s, config: config);
+        string how = match (give r) {
+            case Ok(value: c): { Connection conn = give c; := callOutcome(r: send(c: conn, text: "PING")); }
+            case Err(error: e): e.message();
+        };
+        f = f + check(ok: how == "ok", what: "cache: ${sv} takes CLIENT TRACKING ON OPTIN in the handshake (${how})");
+        i = i + 1;
+    }
+    // A server that will not track (a user who may not run CLIENT) fails the connect: a cache nothing invalidates
+    // would serve stale values.
+    DynamicArray<Step> refused = welcome(server: server());
+    refused.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: v(kase: "noperm")));
+    Config rc = cachedUrl();
+    Result<Connection, RedisError> rr = overWith(script: give refused, config: rc);
+    string code = match (rr) { case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: e.message(); }; case Ok(value: c): "ok"; };
+    f = f + check(ok: code == "NOPERM", what: "cache: tracking refused fails the connect (${code})");
+    // protocol=2 cannot carry invalidations: refused before anything is written.
+    Config two = cachingConfig(url: "redis://?protocol=2", entries: 10, bytes: 1000i64);
+    Result<Connection, RedisError> r2 = overWith(script: steps(), config: two);
+    bool configErr = match (r2) { case Err(error: e): match (e) { case Config(detail: d): d.contains(substring: "RESP3"); case _: false; }; case Ok(value: c): false; };
+    f = f + check(ok: configErr, what: "cache: protocol=2 with a cache is Config, nothing sent");
+    // The bounds' checks.
+    Config b = configOf(url: "redis://");
+    CacheConfig none = CacheConfig.defaults();
+    none.maxEntries = 0;
+    Result<Unit, RedisError> e0 = b.setCache(cache: none);
+    CacheConfig empty = CacheConfig.defaults();
+    empty.maxBytes = 0i64;
+    Result<Unit, RedisError> b0 = b.setCache(cache: empty);
+    bool both = match (e0) { case Err(error: x): true; case Ok(value: u): false; } && match (b0) { case Err(error: x): true; case Ok(value: u): false; };
+    bool unset = match (b.cache()) { case Some(value: c): false; case None: true; };
+    CacheConfig d = CacheConfig.defaults();
+    f = f + check(ok: both && unset && d.maxEntries == 10000 && d.maxBytes == 16777216i64,
+                  what: "cache: maxEntries and maxBytes below 1 are Config; the defaults are 10 000 and 16 MiB");
+    // A proxy that refuses HELLO: the RESP2 path, which carries no invalidations, sends a cached read as a plain one.
+    string old = "redis-6.2.24";
+    DynamicArray<Step> px = steps();
+    px.add(item: expect(command: "HELLO 3", answer: proxy(name: "envoy-1.39.0 HELLO 3")));
+    px.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-name")));
+    px.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-ver")));
+    px.add(item: Step::Any(reply: reply(server: old, kase: "setinfo-ver")));
+    px.add(item: expect(command: "PING", answer: proxy(name: "envoy-1.39.0 PING")));
+    px.add(item: expect(command: "GET kr:k", answer: reply(server: old, kase: "get-hit/2")));
+    px.add(item: expect(command: "GET kr:k", answer: reply(server: old, kase: "get-hit/2")));
+    Config pc = cachedUrl();
+    Connection p = cachedOver(script: give px, config: pc, what: "proxy");
+    string p1 = got(r: read(c: p, text: "GET kr:k", ttlMs: 60000i64));
+    string p2 = got(r: read(c: p, text: "GET kr:k", ttlMs: 60000i64));
+    string pn = countsOf(c: p);
+    f = f + check(ok: p.protocol() == Protocol::Resp2 && p1 != "" && !p1.startsWith(prefix: "(") && p1 == p2 && pn == counts(h: 0i64, m: 0i64, e: 0i64, x: 0i64, fl: 0i64),
+                  what: "cache: under RESP2 a cached read is a plain one, each time (${p1}; ${p2}; ${pn})");
+    return f;
+}
+
+// ---- hits and misses ----
+
+unsafe fn int32 hitTests() {
+    int32 f = 0;
+    // A miss writes once, and the hit after it writes nothing.
+    DynamicArray<Step> s = tracking(sv: server());
+    getMiss(s: s, key: "kr:c");
+    missOf(s: s, command: "GET kr:none", key: "kr:none", exec: v(kase: "cached-missing/3"));
+    missOf(s: s, command: "HGETALL kr:h", key: "kr:h", exec: v(kase: "cached-hash/3"));
+    Config config = cachedUrl();
+    Connection c = cachedOver(script: give s, config: config, what: "hits");
+    string a = got(r: read(c: c, text: "GET kr:c", ttlMs: 60000i64));
+    string b = got(r: read(c: c, text: "GET kr:c", ttlMs: 60000i64));
+    string n1 = got(r: read(c: c, text: "GET kr:none", ttlMs: 60000i64));
+    string n2 = got(r: read(c: c, text: "GET kr:none", ttlMs: 60000i64));
+    string h1 = got(r: read(c: c, text: "HGETALL kr:h", ttlMs: 60000i64));
+    string h2 = got(r: read(c: c, text: "HGETALL kr:h", ttlMs: 60000i64));
+    string after = countsOf(c: c);
+    f = f + check(ok: a == "v" && b == "v" && n1 == "nil" && n2 == "nil" && h1 == "map" && h2 == "map"
+                      && after == counts(h: 3i64, m: 3i64, e: 3i64, x: 0i64, fl: 0i64),
+                  what: "cache: a miss reads through, and the next read is a hit that writes nothing: a string, a missing key, a hash (${a} ${b}; ${n1} ${n2}; ${h1} ${h2}; ${after})");
+
+    // `ttl` bounds an entry: past it, the next read is a miss.
+    DynamicArray<Step> t = tracking(sv: server());
+    getMiss(s: t, key: "kr:c");
+    getMiss(s: t, key: "kr:c");
+    Config tc = cachedUrl();
+    Connection tl = cachedOver(script: give t, config: tc, what: "ttl");
+    string t1 = got(r: read(c: tl, text: "GET kr:c", ttlMs: 200i64));
+    wait(ms: 400i64);
+    string t2 = got(r: read(c: tl, text: "GET kr:c", ttlMs: 200i64));
+    string tn = countsOf(c: tl);
+    f = f + check(ok: t1 == "v" && t2 == "v" && tn == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 0i64),
+                  what: "cache: an entry past its ttl is read again (${t1}; ${t2}; ${tn})");
+    return f;
+}
+
+// ---- invalidations ----
+
+unsafe fn int32 invalidationTests() {
+    int32 f = 0;
+    DynamicArray<uint8> theirs = pushIn(b: v(kase: "tracked-ping/3"));
+
+    // Another client's write: the push that came while the connection sat is read first, and the read misses.
+    DynamicArray<Step> o = tracking(sv: server());
+    getMiss(s: o, key: "kr:c");
+    o.add(item: Step::Send(bytes: copy theirs));
+    getMiss(s: o, key: "kr:c");
+    Config oc = cachedUrl();
+    Connection other = cachedOver(script: give o, config: oc, what: "theirs");
+    string o1 = got(r: read(c: other, text: "GET kr:c", ttlMs: 60000i64));
+    string o2 = got(r: read(c: other, text: "GET kr:c", ttlMs: 60000i64));
+    string on = countsOf(c: other);
+    f = f + check(ok: o1 == "v" && o2 == "v" && on == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 0i64) && other.pendingPushes() == 0,
+                  what: "cache: another client's write invalidates, and the push is not set aside (${o1}; ${o2}; ${on})");
+
+    // The race: an invalidation before the EXEC's reply. The value is handed back and not kept.
+    DynamicArray<Step> race = tracking(sv: server());
+    missOf(s: race, command: "GET kr:c", key: "kr:c", exec: joined(a: theirs, b: v(kase: "cached-persist/3")));
+    getMiss(s: race, key: "kr:c");
+    Config rc = cachedUrl();
+    Connection rcn = cachedOver(script: give race, config: rc, what: "race");
+    string r1 = got(r: read(c: rcn, text: "GET kr:c", ttlMs: 60000i64));
+    string mid = countsOf(c: rcn);
+    string r2 = got(r: read(c: rcn, text: "GET kr:c", ttlMs: 60000i64));
+    f = f + check(ok: r1 == "v" && r2 == "v" && mid == counts(h: 0i64, m: 1i64, e: 0i64, x: 0i64, fl: 0i64),
+                  what: "cache: an invalidation before the reply leaves nothing kept (${r1}; ${mid}; ${r2})");
+
+    // A write of this connection's own: the next hit first makes a round trip, whose reply comes after the push.
+    DynamicArray<Step> w = tracking(sv: server());
+    getMiss(s: w, key: "kr:c");
+    w.add(item: expect(command: "SET kr:c mine", answer: frameOf(b: v(kase: "own-write/3"), index: 0)));
+    w.add(item: expect(command: "PING", answer: v(kase: "tracked-ping/3")));
+    getMiss(s: w, key: "kr:c");
+    Config wc = cachedUrl();
+    Connection own = cachedOver(script: give w, config: wc, what: "own write");
+    string w1 = got(r: read(c: own, text: "GET kr:c", ttlMs: 60000i64));
+    string set = callOutcome(r: send(c: own, text: "SET kr:c mine"));
+    string w2 = got(r: read(c: own, text: "GET kr:c", ttlMs: 60000i64));
+    string wn = countsOf(c: own);
+    f = f + check(ok: w1 == "v" && set == "ok" && w2 == "v" && wn == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 0i64),
+                  what: "cache: after a write, a hit makes a round trip first, and the invalidation before its reply makes it a miss (${w1}; ${set}; ${w2}; ${wn})");
+
+    // The same round trip, when nothing changed: the hit is served after it.
+    DynamicArray<Step> q = tracking(sv: server());
+    getMiss(s: q, key: "kr:c");
+    q.add(item: expect(command: "SET kr:other mine", answer: frameOf(b: v(kase: "own-write/3"), index: 0)));
+    q.add(item: expect(command: "PING", answer: v(kase: "ping")));
+    Config qc = cachedUrl();
+    Connection quiet = cachedOver(script: give q, config: qc, what: "quiet");
+    string q1 = got(r: read(c: quiet, text: "GET kr:c", ttlMs: 60000i64));
+    string qs = callOutcome(r: send(c: quiet, text: "SET kr:other mine"));
+    string q2 = got(r: read(c: quiet, text: "GET kr:c", ttlMs: 60000i64));
+    string q3 = got(r: read(c: quiet, text: "GET kr:c", ttlMs: 60000i64));
+    string qn = countsOf(c: quiet);
+    f = f + check(ok: q1 == "v" && qs == "ok" && q2 == "v" && q3 == "v" && qn == counts(h: 2i64, m: 1i64, e: 1i64, x: 0i64, fl: 0i64),
+                  what: "cache: the round trip after a write, then hits with no other (${q1}; ${qs}; ${q2}; ${q3}; ${qn})");
+
+    // FLUSHALL's null invalidation empties the cache.
+    DynamicArray<Step> fl = tracking(sv: server());
+    getMiss(s: fl, key: "kr:c");
+    getMiss(s: fl, key: "kr:d");
+    fl.add(item: Step::Send(bytes: v(kase: "tracked-flush/3")));
+    getMiss(s: fl, key: "kr:c");
+    Config flc = cachedUrl();
+    Connection flushed = cachedOver(script: give fl, config: flc, what: "flushall");
+    string f1 = got(r: read(c: flushed, text: "GET kr:c", ttlMs: 60000i64));
+    string f2 = got(r: read(c: flushed, text: "GET kr:d", ttlMs: 60000i64));
+    string f3 = got(r: read(c: flushed, text: "GET kr:c", ttlMs: 60000i64));
+    string fln = countsOf(c: flushed);
+    f = f + check(ok: f1 == "v" && f2 == "v" && f3 == "v" && fln == counts(h: 0i64, m: 3i64, e: 1i64, x: 0i64, fl: 1i64),
+                  what: "cache: FLUSHALL's null invalidation empties the cache (${fln})");
+    return f;
+}
+
+// ---- what empties the cache ----
+
+unsafe fn int32 flushTests() {
+    int32 f = 0;
+    // A lost link: the cache goes with it, and the link made again turns tracking on again.
+    DynamicArray<Step> first = tracking(sv: server());
+    getMiss(s: first, key: "kr:c");
+    first.add(item: Step::Hangup);
+    DynamicArray<Step> second = tracking(sv: server());
+    second.add(item: expect(command: "PING", answer: v(kase: "ping")));
+    getMiss(s: second, key: "kr:c");
+    DynamicArray<Dial> d = dials();
+    d.add(item: Dial::Serve(steps: give first));
+    d.add(item: Dial::Serve(steps: give second));
+    Config lc = cachedUrl();
+    Connection lost = cachedDialed(d: give d, config: lc, what: "lost");
+    string l1 = got(r: read(c: lost, text: "GET kr:c", ttlMs: 60000i64));
+    string l2 = got(r: read(c: lost, text: "GET kr:c", ttlMs: 60000i64));
+    string ln = countsOf(c: lost);
+    f = f + check(ok: l1 == "v" && l2 == "v" && ln == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 1i64),
+                  what: "cache: a lost link empties it, and the redial tracks again (${l1}; ${l2}; ${ln})");
+
+    // Another database: its values are not the old one's.
+    DynamicArray<Step> s = tracking(sv: server());
+    getMiss(s: s, key: "kr:c");
+    s.add(item: expect(command: "SELECT 1", answer: v(kase: "select1")));
+    getMiss(s: s, key: "kr:c");
+    Config sc = cachedUrl();
+    Connection sel = cachedOver(script: give s, config: sc, what: "select");
+    string s1 = got(r: read(c: sel, text: "GET kr:c", ttlMs: 60000i64));
+    Result<Unit, RedisError> chosen = sel.select(db: 1i64);
+    bool selected = match (chosen) { case Ok(value: u): true; case Err(error: e): false; };
+    string s2 = got(r: read(c: sel, text: "GET kr:c", ttlMs: 60000i64));
+    string sn = countsOf(c: sel);
+    f = f + check(ok: selected && s1 == "v" && s2 == "v" && sn == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 1i64),
+                  what: "cache: SELECT of another database empties it (${s1}; ${s2}; ${sn})");
+
+    // The same database again keeps it; the hit makes its round trip.
+    DynamicArray<Step> same = tracking(sv: server());
+    getMiss(s: same, key: "kr:c");
+    same.add(item: expect(command: "SELECT 0", answer: v(kase: "putback-select/3")));
+    same.add(item: expect(command: "PING", answer: v(kase: "ping")));
+    Config smc = cachedUrl();
+    Connection kept = cachedOver(script: give same, config: smc, what: "select same");
+    string k1 = got(r: read(c: kept, text: "GET kr:c", ttlMs: 60000i64));
+    Result<Unit, RedisError> again = kept.select(db: 0i64);
+    string k2 = got(r: read(c: kept, text: "GET kr:c", ttlMs: 60000i64));
+    string kn = countsOf(c: kept);
+    f = f + check(ok: k1 == "v" && k2 == "v" && kn == counts(h: 1i64, m: 1i64, e: 1i64, x: 0i64, fl: 0i64),
+                  what: "cache: SELECT of the same database keeps it (${k1}; ${k2}; ${kn})");
+
+    // authenticate: what one user read is not served to another.
+    DynamicArray<Step> a = tracking(sv: server());
+    getMiss(s: a, key: "kr:c");
+    a.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: v(kase: "reauth-tracked/3")));
+    getMiss(s: a, key: "kr:c");
+    Config ac = cachedUrl();
+    Connection au = cachedOver(script: give a, config: ac, what: "authenticate");
+    string a1 = got(r: read(c: au, text: "GET kr:c", ttlMs: 60000i64));
+    Optional<string> user = Optional::Some(value: "kr_acl");
+    Result<Unit, RedisError> logged = au.authenticate(user: give user, password: "kr_acl_pw");
+    string a2 = got(r: read(c: au, text: "GET kr:c", ttlMs: 60000i64));
+    string an = countsOf(c: au);
+    bool loggedIn = match (logged) { case Ok(value: u): true; case Err(error: e): false; };
+    f = f + check(ok: loggedIn && a1 == "v" && a2 == "v" && an == counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 1i64),
+                  what: "cache: authenticate empties it (${a1}; ${a2}; ${an})");
+
+    // A provider's fresh login as another user empties it; as the same user, it is kept.
+    f = f + reloginCase(nextUser: "kr_ro", flushed: true);
+    f = f + reloginCase(nextUser: "kr_acl", flushed: false);
+    return f;
+}
+
+// A provider that logs in as kr_acl for 200 ms, then as `nextUser`: the cache is emptied (`flushed`) or kept.
+unsafe fn int32 reloginCase(const ref string nextUser, bool flushed) {
+    DynamicArray<Answer> answers = answerList();
+    answers.add(item: Answer::Give(user: "kr_acl", password: "one", refreshMs: 200i64));
+    answers.add(item: Answer::Give(user: copy nextUser, password: "two", refreshMs: 0i64));
+    Config config = cachedUrl();
+    Owned<Credentials> p = new ScriptCredentials.make(answers: give answers);
+    Result<Unit, RedisError> set = config.setCredentials(provider: give p);
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3 AUTH kr_acl one", answer: v(kase: "hello3-auth")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: v(kase: "setinfo-name")));
+    s.add(item: Step::Any(reply: v(kase: "setinfo-ver")));
+    s.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: v(kase: "tracking-optin/3")));
+    getMiss(s: s, key: "kr:c");
+    s.add(item: expect(command: "AUTH ".concat(other: nextUser).concat(other: " two"), answer: v(kase: "auth2")));
+    if (flushed) { getMiss(s: s, key: "kr:c"); }
+    else { s.add(item: expect(command: "PING", answer: v(kase: "ping"))); }
+    Connection c = cachedOver(script: give s, config: config, what: "relogin");
+    string r1 = got(r: read(c: c, text: "GET kr:c", ttlMs: 60000i64));
+    wait(ms: 400i64);
+    string r2 = got(r: read(c: c, text: "GET kr:c", ttlMs: 60000i64));
+    string n = countsOf(c: c);
+    string want = flushed ? counts(h: 0i64, m: 2i64, e: 1i64, x: 0i64, fl: 1i64) : counts(h: 1i64, m: 1i64, e: 1i64, x: 0i64, fl: 0i64);
+    string how = flushed ? "another user empties it" : "the same user keeps it";
+    return check(ok: r1 == "v" && r2 == "v" && n == want, what: "cache: a provider's fresh login as ${how} (${r1}; ${r2}; ${n})");
+}
+
+// ---- the bounds ----
+
+unsafe fn int32 boundTests() {
+    int32 f = 0;
+    // maxEntries 2: the least recently used goes; a hit makes an entry the most recent.
+    DynamicArray<Step> s = tracking(sv: server());
+    getMiss(s: s, key: "kr:a");
+    getMiss(s: s, key: "kr:b");
+    getMiss(s: s, key: "kr:c");
+    getMiss(s: s, key: "kr:b");
+    Config ec = cachingConfig(url: "redis://", entries: 2, bytes: 1048576i64);
+    Connection c = cachedOver(script: give s, config: ec, what: "entries");
+    string order = "";
+    DynamicArray<string> reads = DynamicArray.empty();
+    reads.add(item: "kr:a"); reads.add(item: "kr:b"); reads.add(item: "kr:a"); reads.add(item: "kr:c"); reads.add(item: "kr:a"); reads.add(item: "kr:b");
+    isize i = 0;
+    while (i < reads.length()) {
+        string key = copy reads[i];
+        string r = got(r: read(c: c, text: "GET ".concat(other: key), ttlMs: 60000i64));
+        order = order.concat(other: r);
+        i = i + 1;
+    }
+    string en = countsOf(c: c);
+    f = f + check(ok: order == "vvvvvv" && en == counts(h: 2i64, m: 4i64, e: 2i64, x: 2i64, fl: 0i64),
+                  what: "cache: maxEntries keeps the most recently used (${order}; ${en})");
+
+    // maxBytes: one entry's size fits one, a byte less fits none; the read is answered either way.
+    DynamicArray<Step> one = tracking(sv: server());
+    getMiss(s: one, key: "kr:a");
+    Config oc = cachedUrl();
+    Connection sizing = cachedOver(script: give one, config: oc, what: "sizing");
+    string sz = got(r: read(c: sizing, text: "GET kr:a", ttlMs: 60000i64));
+    int64 size = sizing.cacheStats().bytes;
+
+    DynamicArray<Step> fits = tracking(sv: server());
+    getMiss(s: fits, key: "kr:a");
+    getMiss(s: fits, key: "kr:b");
+    getMiss(s: fits, key: "kr:a");
+    Config fc = cachingConfig(url: "redis://", entries: 100, bytes: size);
+    Connection bytesBound = cachedOver(script: give fits, config: fc, what: "bytes");
+    string b1 = got(r: read(c: bytesBound, text: "GET kr:a", ttlMs: 60000i64));
+    string b2 = got(r: read(c: bytesBound, text: "GET kr:b", ttlMs: 60000i64));
+    string b3 = got(r: read(c: bytesBound, text: "GET kr:b", ttlMs: 60000i64));
+    string b4 = got(r: read(c: bytesBound, text: "GET kr:a", ttlMs: 60000i64));
+    string bn = countsOf(c: bytesBound);
+
+    DynamicArray<Step> small = tracking(sv: server());
+    getMiss(s: small, key: "kr:a");
+    getMiss(s: small, key: "kr:a");
+    Config tc = cachingConfig(url: "redis://", entries: 100, bytes: size - 1i64);
+    Connection tooBig = cachedOver(script: give small, config: tc, what: "too big");
+    string t1 = got(r: read(c: tooBig, text: "GET kr:a", ttlMs: 60000i64));
+    string t2 = got(r: read(c: tooBig, text: "GET kr:a", ttlMs: 60000i64));
+    string tn = countsOf(c: tooBig);
+    f = f + check(ok: sz == "v" && size > 0i64 && b1 == "v" && b2 == "v" && b3 == "v" && b4 == "v"
+                      && bn == counts(h: 1i64, m: 3i64, e: 1i64, x: 2i64, fl: 0i64)
+                      && t1 == "v" && t2 == "v" && tn == counts(h: 0i64, m: 2i64, e: 0i64, x: 0i64, fl: 0i64),
+                  what: "cache: maxBytes holds what fits, and a value past it alone is not kept (${size} bytes; ${bn}; ${tn})");
+    return f;
+}
+
+// ---- refusals and errors ----
+
+fn bool isUsage(const ref Result<Value, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: x): false; };
+}
+
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    // No cache: Usage, nothing sent.
+    DynamicArray<Step> plain = welcome(server: server());
+    Config pc = configOf(url: "redis://");
+    Connection p = cachedOver(script: give plain, config: pc, what: "no cache");
+    Result<Value, RedisError> nc = read(c: p, text: "GET kr:c", ttlMs: 1000i64);
+    f = f + check(ok: isUsage(r: nc) && got(r: nc).contains(substring: "setCache"), what: "cache: a connection with no cache refuses cached");
+
+    // What a cache cannot hold, a ttl of 0, and a WATCH in force are Usage, nothing sent. Tracking by hand is refused.
+    DynamicArray<Step> s = tracking(sv: server());
+    s.add(item: expect(command: "WATCH kr:w", answer: v(kase: "watch/3")));
+    Config sc = cachedUrl();
+    Connection c = cachedOver(script: give s, config: sc, what: "refusals");
+    Result<Value, RedisError> write = read(c: c, text: "SET kr:c v", ttlMs: 1000i64);
+    Result<Value, RedisError> keyless = read(c: c, text: "DBSIZE", ttlMs: 1000i64);
+    Result<Value, RedisError> zero = read(c: c, text: "GET kr:c", ttlMs: 0i64);
+    Result<Value, RedisError> track = send(c: c, text: "CLIENT TRACKING ON");
+    Result<Value, RedisError> caching = send(c: c, text: "CLIENT CACHING YES");
+    string watched = callOutcome(r: send(c: c, text: "WATCH kr:w"));
+    Result<Value, RedisError> inWatch = read(c: c, text: "GET kr:c", ttlMs: 1000i64);
+    string trackWords = got(r: track);
+    f = f + check(ok: isUsage(r: write) && isUsage(r: keyless) && isUsage(r: zero) && isUsage(r: track) && isUsage(r: caching)
+                      && trackWords.contains(substring: "setCache") && watched == "ok" && isUsage(r: inWatch),
+                  what: "cache: a write, a keyless command, a ttl of 0, tracking by hand and a WATCH in force are Usage (${trackWords})");
+
+    // A command the server refuses as it queues it: its own error, EXEC's EXECABORT read, nothing kept, and the
+    // connection goes on.
+    DynamicArray<Step> q = tracking(sv: server());
+    q.add(item: expect(command: "CLIENT CACHING YES", answer: v(kase: "caching-yes/3")));
+    q.add(item: expect(command: "MULTI", answer: v(kase: "multi/3")));
+    q.add(item: expect(command: "PTTL kr:c", answer: v(kase: "queued/3")));
+    q.add(item: expect(command: "GET kr:c", answer: v(kase: "queued-error/3")));
+    q.add(item: expect(command: "EXEC", answer: v(kase: "execabort")));
+    getMiss(s: q, key: "kr:c");
+    Config qc = cachedUrl();
+    Connection queued = cachedOver(script: give q, config: qc, what: "queued error");
+    string e1 = got(r: read(c: queued, text: "GET kr:c", ttlMs: 60000i64));
+    string mid = countsOf(c: queued);
+    string e2 = got(r: read(c: queued, text: "GET kr:c", ttlMs: 60000i64));
+    f = f + check(ok: e1 == "(server) ERR" && mid == counts(h: 0i64, m: 1i64, e: 0i64, x: 0i64, fl: 0i64) && e2 == "v",
+                  what: "cache: a command refused as it is queued is its own error, nothing kept (${e1}; ${mid}; ${e2})");
+    return f;
+}
+
+// ---- a pool's leases ----
+
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    // The first hit of each lease makes a round trip first: another lease's write, on another connection, would
+    // otherwise be read stale. A later hit in the same lease makes none.
+    DynamicArray<Step> s = tracking(sv: server());
+    getMiss(s: s, key: "kr:c");
+    s.add(item: expect(command: "PING", answer: v(kase: "ping")));
+    s.add(item: expect(command: "GET kr:after", answer: v(kase: "get-hit/3")));
+    DynamicArray<Dial> one = dials();
+    one.add(item: Dial::Serve(steps: give s));
+    DynamicArray<DynamicArray<Dial>> conns = DynamicArray.empty();
+    conns.add(item: give one);
+    Owned<PoolDialers> pd = new ScriptPoolDialers.make(connections: give conns);
+    PoolOptions options = PoolOptions.defaults();
+    options.maxSize = 1;
+    Config config = cachedUrl();
+    Result<Pool, RedisError> made = Pool.makeWith(dialers: give pd, config: config, options: options);
+    Pool pool = match (give made) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); panic(msg: "cache_test: pool: ${m}"); } };
+    string first = "";
+    string second = "";
+    string third = "";
+    string after = "";
+    {
+        Result<Lease, RedisError> r = pool.acquire();
+        match (give r) {
+            case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { first = got(r: read(c: conn, text: "GET kr:c", ttlMs: 60000i64)); } }
+            case Err(error: e): { first = e.message(); }
+        };
+    }
+    {
+        Result<Lease, RedisError> r = pool.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                borrow lease.conn() as conn {
+                    second = got(r: read(c: conn, text: "GET kr:c", ttlMs: 60000i64));
+                    third = got(r: read(c: conn, text: "GET kr:c", ttlMs: 60000i64));
+                    after = callOutcome(r: send(c: conn, text: "GET kr:after"));
+                }
+            }
+            case Err(error: e): { second = e.message(); }
+        };
+    }
+    f = f + check(ok: first == "v" && second == "v" && third == "v" && after == "ok",
+                  what: "cache: a lease's first hit makes a round trip, the next none (${first}; ${second}; ${third}; ${after})");
+    return f;
+}
+
+unsafe fn int32 cacheTests() {
+    int32 f = 0;
+    f = f + handshakeTests();
+    f = f + hitTests();
+    f = f + invalidationTests();
+    f = f + flushTests();
+    f = f + boundTests();
+    f = f + refusalTests();
+    f = f + poolTests();
+    return f;
+}

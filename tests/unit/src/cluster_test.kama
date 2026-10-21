@@ -12,7 +12,8 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex,
          Answer, loginAs, providing, answerList, ScriptPoolDialers, redis::PoolDialers,
-         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::ClusterPool, redis::pool::ClusterLease };
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::ClusterPool, redis::pool::ClusterLease,
+         redis::CacheStats, cachingConfig, missOf };
 export { clusterTests };
 
 fn string server() { return "redis-8.10.2"; }
@@ -1582,5 +1583,170 @@ unsafe fn int32 clusterTests() {
     f = f + replicaTests();
     f = f + clusterScanTests();
     f = f + clusterSubscriberTests();
+    f = f + clusterCacheTests();
+    return f;
+}
+
+// A cluster with a client-side cache (Config.setCache): each node's connection turns tracking on in its handshake and
+// keeps its own cache; a cached read goes to its key's node, and its hit to none.
+unsafe fn int32 clusterCacheTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    DynamicArray<Step> s0 = node();
+    s0.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    s0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    missOf(s: s0, command: "GET ${a}", key: a, exec: reply(server: server(), kase: "cached-persist/3"));
+    DynamicArray<Step> s1 = node();
+    s1.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    missOf(s: s1, command: "GET ${b}", key: b, exec: reply(server: server(), kase: "cached-missing/3"));
+    Opens o = Opens.make();
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    o.serve(place: "127.0.0.1:7001", script: give s1);
+    Owned<Dialers> d = o.dialers();
+    Config config = cachingConfig(url: oneSeed(), entries: 100, bytes: 1048576i64);
+    Result<Cluster, RedisError> made = Cluster.connectWith(dialers: give d, config: config);
+    match (give made) {
+        case Ok(value: x): {
+            Cluster c = give x;
+            Command ga = commandOf(text: "GET ${a}");
+            Command gb = commandOf(text: "GET ${b}");
+            Duration ttl = Duration.fromSecs(s: 60i64);
+            Result<Value, RedisError> a1 = c.cached(command: ga, ttl: ttl);
+            Result<Value, RedisError> a2 = c.cached(command: ga, ttl: ttl);
+            Result<Value, RedisError> b1 = c.cached(command: gb, ttl: ttl);
+            Result<Value, RedisError> b2 = c.cached(command: gb, ttl: ttl);
+            Command both = commandOf(text: "MGET ${a} ${b}");
+            Result<Value, RedisError> cross = c.cached(command: both, ttl: ttl);
+            CacheStats s = c.cacheStats();
+            string o1 = callOutcome(r: a1);
+            string o3 = callOutcome(r: b1);
+            f = f + check(ok: isBulk(r: a1, text: "v") && isBulk(r: a2, text: "v") && isNull(r: b1) && isNull(r: b2)
+                              && isUsage(r: cross, words: "slot") && s.hits == 2i64 && s.misses == 2i64 && s.entries == 2i64,
+                          what: "cluster cache: each read at its key's node, each node's cache its own, a hit sends nothing (${o1}; ${o3})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: connect: ${m}"); }
+    };
+    // A MOVED met on another node changes the map, and a node connection's next hit makes a round trip first, though
+    // it wrote nothing: an invalidation its node sent by replication before it took a slot over comes before the reply.
+    DynamicArray<Step> m0 = node();
+    m0.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    m0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    missOf(s: m0, command: "GET ${a}", key: a, exec: reply(server: server(), kase: "cached-persist/3"));
+    m0.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    m0.add(item: expect(command: "GET ${a}", answer: reply(server: server(), kase: "get-hit/3")));
+    DynamicArray<Step> m1 = node();
+    m1.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    m1.add(item: expect(command: "GET ${b}", answer: topo(kase: "moved-after-failover/3")));
+    DynamicArray<Step> m4 = node();
+    m4.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    m4.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    Opens mo = Opens.make();
+    mo.serve(place: "127.0.0.1:7000", script: give m0);
+    mo.serve(place: "127.0.0.1:7001", script: give m1);
+    mo.serve(place: "127.0.0.1:7004", script: give m4);
+    Owned<Dialers> md = mo.dialers();
+    Config mc = cachingConfig(url: oneSeed(), entries: 100, bytes: 1048576i64);
+    Result<Cluster, RedisError> mm = Cluster.connectWith(dialers: give md, config: mc);
+    match (give mm) {
+        case Ok(value: x): {
+            Cluster c = give x;
+            Command ga = commandOf(text: "GET ${a}");
+            Duration ttl = Duration.fromSecs(s: 60i64);
+            Result<Value, RedisError> h1 = c.cached(command: ga, ttl: ttl);
+            Result<Value, RedisError> h2 = c.cached(command: ga, ttl: ttl);
+            Result<Value, RedisError> moved = callText(c: c, text: "GET ${b}");
+            Result<Value, RedisError> h3 = c.cached(command: ga, ttl: ttl);
+            Result<Value, RedisError> plain = callText(c: c, text: "GET ${a}");
+            CacheStats s = c.cacheStats();
+            string op = callOutcome(r: plain);
+            f = f + check(ok: isBulk(r: h1, text: "v") && isBulk(r: h2, text: "v") && isNull(r: moved) && isBulk(r: h3, text: "v")
+                              && op == "ok" && s.hits == 2i64 && s.misses == 1i64,
+                          what: "cluster cache: after the map changed, a node connection's next hit makes a round trip first (${op})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: connect, moved: ${m}"); }
+    };
+
+    // A node the map takes a slot from has its cache emptied: when a later reading of the map sends the slot back to it
+    // (a node's view a moment behind a failover), a read there misses and asks the node, never hits what it held.
+    string bb = keyAt(index: 2);
+    DynamicArray<Step> l0 = node();
+    l0.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    l0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    l0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    DynamicArray<Step> l1 = node();
+    l1.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    missOf(s: l1, command: "GET ${bb}", key: bb, exec: reply(server: server(), kase: "cached-missing/3"));
+    l1.add(item: expect(command: "GET ${bb}", answer: topo(kase: "moved-after-failover/3")));
+    missOf(s: l1, command: "GET ${bb}", key: bb, exec: reply(server: server(), kase: "cached-missing/3"));
+    DynamicArray<Step> l4 = node();
+    l4.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    l4.add(item: expect(command: "GET ${bb}", answer: reply(server: server(), kase: "get-missing/3")));
+    Opens lo = Opens.make();
+    lo.serve(place: "127.0.0.1:7000", script: give l0);
+    lo.serve(place: "127.0.0.1:7001", script: give l1);
+    lo.serve(place: "127.0.0.1:7004", script: give l4);
+    Owned<Dialers> ld = lo.dialers();
+    Config lc = cachingConfig(url: oneSeed(), entries: 100, bytes: 1048576i64);
+    Result<Cluster, RedisError> lm = Cluster.connectWith(dialers: give ld, config: lc);
+    match (give lm) {
+        case Ok(value: x): {
+            Cluster c = give x;
+            Command gb = commandOf(text: "GET ${bb}");
+            Duration ttl = Duration.fromSecs(s: 60i64);
+            Result<Value, RedisError> first = c.cached(command: gb, ttl: ttl);
+            Result<Value, RedisError> moved = callText(c: c, text: "GET ${bb}");
+            sleep(d: Duration.fromMillis(ms: 1100i64));
+            Result<Value, RedisError> back = c.cached(command: gb, ttl: ttl);
+            CacheStats s = c.cacheStats();
+            string ob = callOutcome(r: back);
+            f = f + check(ok: isNull(r: first) && isNull(r: moved) && isNull(r: back) && s.hits == 0i64 && s.misses == 2i64,
+                          what: "cluster cache: a node the map took a slot from has its cache emptied, and a lagging map's read there misses (${ob})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: connect, lost slot: ${m}"); }
+    };
+
+    // The same when a reading of the map moves the slot (a failover seen by refreshTopology), then a later one moves it
+    // back.
+    DynamicArray<Step> r0 = node();
+    r0.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    r0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    r0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots-after-failover/3")));
+    r0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    DynamicArray<Step> r1 = node();
+    r1.add(item: expect(command: "CLIENT TRACKING ON OPTIN", answer: reply(server: server(), kase: "tracking-optin/3")));
+    missOf(s: r1, command: "GET ${bb}", key: bb, exec: reply(server: server(), kase: "cached-missing/3"));
+    missOf(s: r1, command: "GET ${bb}", key: bb, exec: reply(server: server(), kase: "cached-missing/3"));
+    Opens ro = Opens.make();
+    ro.serve(place: "127.0.0.1:7000", script: give r0);
+    ro.serve(place: "127.0.0.1:7001", script: give r1);
+    Owned<Dialers> rd = ro.dialers();
+    Config rc = cachingConfig(url: oneSeed(), entries: 100, bytes: 1048576i64);
+    Result<Cluster, RedisError> rm = Cluster.connectWith(dialers: give rd, config: rc);
+    match (give rm) {
+        case Ok(value: x): {
+            Cluster c = give x;
+            Command gb = commandOf(text: "GET ${bb}");
+            Duration ttl = Duration.fromSecs(s: 60i64);
+            Result<Value, RedisError> first = c.cached(command: gb, ttl: ttl);
+            Result<Unit, RedisError> away = c.refreshTopology();
+            Result<Unit, RedisError> home = c.refreshTopology();
+            Result<Value, RedisError> again = c.cached(command: gb, ttl: ttl);
+            CacheStats s = c.cacheStats();
+            string og = callOutcome(r: again);
+            bool read = match (away) { case Ok(value: u): true; case Err(error: e): false; } && match (home) { case Ok(value: u): true; case Err(error: e): false; };
+            f = f + check(ok: read && isNull(r: first) && isNull(r: again) && s.hits == 0i64 && s.misses == 2i64,
+                          what: "cluster cache: a reading of the map that took a slot from a node empties its cache (${og})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "cluster cache: connect, read map: ${m}"); }
+    };
+
+    // No cache: Usage.
+    Opens p = Opens.make();
+    p.serve(place: "127.0.0.1:7000", script: seed(slots: "slots/3"));
+    Cluster plain = clustered(o: give p, url: oneSeed(), what: "cluster cache: connect, no cache", fails: f);
+    Command g = commandOf(text: "GET ${a}");
+    Result<Value, RedisError> none = plain.cached(command: g, ttl: Duration.fromSecs(s: 1i64));
+    f = f + check(ok: isUsage(r: none, words: "setCache"), what: "cluster cache: a cluster with no cache refuses cached");
     return f;
 }

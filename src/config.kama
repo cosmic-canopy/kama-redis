@@ -1,5 +1,5 @@
 import { std::collections::ConstView, std::collections::DynamicArray, std::memory::Owned, std::time::Duration, redis::RedisUrl,
-         redis::UrlTransport, redis::UrlError, redis::RedisError, redis::Credentials, redis::resp::Limits };
+         redis::UrlTransport, redis::UrlError, redis::RedisError, redis::Credentials, redis::CacheConfig, redis::resp::Limits };
 export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socketPathMax };
 
 // How to reach a server and what to ask of it: from a URL (`Config.parse`), or from a host or a socket and typed
@@ -34,7 +34,7 @@ export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socket
 // The URL's user and password are the server's. The sentinels' own, when they want one, are set in code
 // (`setSentinelAuth`), never in a URL. Credentials that change while a connection lives come from a provider
 // (`setCredentials`, src/credentials.kama), which then is the server's one source: a URL's password and `setAuth`
-// are refused beside it.
+// are refused beside it. A client-side cache is set in code too (`setCache`, src/cache.kama).
 //
 // Over TLS (rediss://, valkeys://) as well (docs/ROADMAP.md, "Phase 5"); each is refused on redis:// and unix://:
 //   tls_verify=full|chain|none   full (the default): the certificate chains to a trusted root and names the server;
@@ -163,6 +163,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     bool replicaReads = false;
     // The server's credentials provider (setCredentials): zero or one. A copy holds a fork of it.
     DynamicArray<Owned<Credentials>> provider;
+    // The client-side cache each connection made from this keeps (setCache), if any.
+    Optional<CacheConfig> cacheChoice;
 
     // A connection through sentinels asks each one with `forSentinel`, and reaches the server it names with `forNode`.
     friend redis::Connection::askSentinels[forSentinel, forNode];
@@ -211,6 +213,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.readChoice = Optional::None;
         this.redirectChoice = Optional::None;
         this.provider = DynamicArray.empty();
+        this.cacheChoice = Optional::None;
     }
 
     public ctor copy(ref Config source) {
@@ -253,6 +256,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.replicaReads = source.replicaReads;
         this.provider = DynamicArray.empty();
         if (source.provider.length() > 0) { this.provider.add(item: source.provider[0].fork()); }
+        this.cacheChoice = source.cacheChoice;
     }
 
     // A connection URL: redis://, valkey://, rediss://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://
@@ -586,6 +590,18 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     }
     public const fn bool hasCredentials() { return this.provider.length() > 0; }
 
+    // A client-side cache for each connection made from this (src/cache.kama, src/wire/cache.kama): its handshake turns
+    // the server's tracking on, and `Connection.cached` reads through it. RESP3 carries the server's invalidations, so a
+    // connection that speaks RESP2 (protocol=2 is refused with a cache; a proxy that refuses HELLO) sends every cached
+    // read as a plain one. A bound below 1 is `Config`.
+    public fn Result<Unit, RedisError> setCache(CacheConfig cache) {
+        if (cache.maxEntries < 1) { return Result::Err(error: RedisError::Config(detail: "a cache's maxEntries must be at least 1")); }
+        if (cache.maxBytes < 1i64) { return Result::Err(error: RedisError::Config(detail: "a cache's maxBytes must be at least 1")); }
+        this.cacheChoice = Optional::Some(value: cache);
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn Optional<CacheConfig> cache() { return this.cacheChoice; }
+
     // The provider, taken out (zero or one): a connection keeps it beside its link.
     fn DynamicArray<Owned<Credentials>> takeCredentials() {
         DynamicArray<Owned<Credentials>> taken = DynamicArray.empty();
@@ -648,6 +664,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         c.sentinelSecret = Optional::None;
         c.dbIndex = 0i64;
         c.serverNameText = Optional::None;
+        c.cacheChoice = Optional::None;
         return give c;
     }
 

@@ -4,7 +4,7 @@
 // The cases that need a live server are in tests/integration. A failing case prints its name, so the log says WHICH,
 // not just that.
 import { core::println, respTests, slotTests, urlTests, errorTests, configTests, connectionTests, argTests, replyTests, pipelineTests, blockingTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, reconnectTests,
-         topologyTests, sentinelTests, routeTests, mapTests, clusterTests, trackingTests, credentialsTests, poolTests };
+         topologyTests, sentinelTests, routeTests, mapTests, clusterTests, trackingTests, credentialsTests, poolTests, cacheTests };
 export { check };
 
 fn int32 check(bool ok, string what) {
@@ -38,6 +38,7 @@ fn uint8 main() {
     failed = failed + trackingTests();
     failed = failed + credentialsTests();
     failed = failed + poolTests();
+    failed = failed + cacheTests();
     if (failed != 0) { println(s: "redis unit tests: ${failed} failed"); return 1; }
     println(s: "redis unit tests: OK");
     return 0;

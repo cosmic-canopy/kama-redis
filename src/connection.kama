@@ -5,7 +5,8 @@ import { std::collections::DynamicArray, std::collections::Deque, std::io::IoErr
          redis::ConnectError, redis::ConnectAttempt, redis::ReconnectError, redis::SentinelError, redis::SentinelRole,
          redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo, redis::TlsSession,
-         redis::Credentials, redis::Login, redis::CredentialsError,
+         redis::Credentials, redis::Login, redis::CredentialsError, redis::CacheStats,
+         redis::wire::Cache, redis::wire::Ticket, redis::wire::ByteKey,
          redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig, tls::TlsError,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::watchEffect, redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
@@ -92,6 +93,11 @@ type resource Connection implements Sendable {
     Optional<Instant> loginDue;
     Optional<string> loginUser;
     bool authenticatedByHand = false;
+    // The client-side cache (Config.setCache; src/wire/cache.kama): zero or one. How many writes the link had begun when
+    // a cached read last made a round trip: a hit after any other write, or in a new lease, makes one first (a PING), so
+    // that the invalidation of every write already answered has come before a value is served.
+    DynamicArray<Cache> cache;
+    int64 syncedAt = -1;
 
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
@@ -118,6 +124,8 @@ type resource Connection implements Sendable {
     // A pooled cluster's node links do the same, link by link.
     friend redis::NodeLink::putBack[putBack, byHand];
     friend redis::NodeLink::probeIdle[probeIdle];
+    friend redis::NodeLink::resyncAfter[unsync];
+    friend redis::NodeLink::forget[forgetCache];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -136,6 +144,8 @@ type resource Connection implements Sendable {
         this.linkId = cast<int64>(this.jitter.next() >> 1);
         this.loginDue = Optional::None;
         this.loginUser = Optional::None;
+        this.cache = DynamicArray.empty();
+        match (config.cache()) { case Some(value: c): { this.cache.add(item: Cache.make(config: c)); } case None: { } };
     }
 
     // Connect to the server `config` names, over a socket of this client's.
@@ -460,6 +470,48 @@ type resource Connection implements Sendable {
         return this.exchange(command: command);
     }
 
+    // `command`, a read on the cache's list (src/wire/cacheable.kama), from this connection's client-side cache
+    // (Config.setCache) while it holds the value, or else sent and its reply kept for at most `ttl` (docs/ROADMAP.md,
+    // "Phase 7b", decision 4; src/wire/cache.kama has the rules). A miss writes `CLIENT CACHING YES`, MULTI, PTTL of each
+    // key, the command and EXEC at once, so the value comes back with the server's own TTL, which shortens `ttl`.
+    // What came while the connection sat is read first, invalidations with it, and a hit after any other write of this
+    // connection (or the first of a pool's lease, or the first after its cluster's map changed) makes a round trip first
+    // (PING), so that a write already answered, here or on another connection, is never read stale. A read not on the list, or with a key the table cannot find,
+    // is `Usage`, and so is a connection with no cache, a `ttl` that is not more than 0, and a WATCH in force (the
+    // transaction would end it). Under RESP2 (a proxy that refused HELLO), which carries no invalidations, it is `call`.
+    public unsafe fn Result<Value, RedisError> cached(const ref Command command, Duration ttl) {
+        Result<Unit, RedisError> admitted = admit(command: command);
+        match (give admitted) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (this.cache.length() == 0) {
+            return Result::Err(error: RedisError::Usage(detail: "this connection has no client-side cache: set one on its Config (setCache) before connecting"));
+        }
+        if (ttl.asNanos() <= 0i64) { return Result::Err(error: RedisError::Usage(detail: "a cached read's ttl must be more than 0")); }
+        if (this.watching) {
+            return Result::Err(error: RedisError::Usage(detail: "a cached read sends MULTI and EXEC, which would end the WATCH in force: read with call inside a WATCH"));
+        }
+        Result<DynamicArray<ByteKey>, RedisError> read = this.cache[0].keysOf(command: command);
+        DynamicArray<ByteKey> keys = match (give read) { case Ok(value: k): give k; case Err(error: e): { return Result::Err(error: give e); } };
+        if (this.speaking == Protocol::Resp2) { return this.exchange(command: command); }
+        Result<Unit, RedisError> up = this.prepared();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.outbox.clear();
+        command.encode(into: this.outbox);
+        ByteKey name = ByteKey.of(bytes: this.outbox.view());
+        if (this.syncedAt != this.wire.written() && this.cache[0].holds(command: name, now: monotonicNow())) {
+            Result<Unit, RedisError> synced = this.sync();
+            match (give synced) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        Optional<Value> hit = this.cache[0].lookup(command: name, now: monotonicNow());
+        match (give hit) { case Some(value: v): { return Result::Ok(value: give v); } case None: { } };
+        return this.fetch(command: command, name: give name, keys: give keys, ttl: ttl);
+    }
+
+    // What this connection's client-side cache has done (zero for a connection with none).
+    public const fn CacheStats cacheStats() {
+        if (this.cache.length() == 0) { return CacheStats.zero(); }
+        return this.cache[0].stats();
+    }
+
     // Change the database this connection uses: SELECT, and every reconnect selects it too. A database the Config
     // would refuse (below 0) is `Config`, and nothing is sent; an error reply (past the server's last database) is
     // `Server`, and nothing changes.
@@ -471,6 +523,8 @@ type resource Connection implements Sendable {
         choose.argInt(value: db);
         Result<Value, RedisError> r = this.exchange(command: choose);
         match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };
+        // A cache holds the old database's values, which its invalidations name only by key.
+        if (this.settings.database() != db) { this.forgetCache(); }
         this.settings = give next;
         return Result::Ok(value: Unit::Unit);
     }
@@ -498,7 +552,7 @@ type resource Connection implements Sendable {
             Config before = replace::<Config>(place: this.settings, with: give next);
             Result<Unit, RedisError> up = this.ready();
             match (give up) {
-                case Ok(value: u): { this.authenticatedByHand = true; return Result::Ok(value: Unit::Unit); }
+                case Ok(value: u): { this.authenticatedByHand = true; this.forgetCache(); return Result::Ok(value: Unit::Unit); }
                 case Err(error: e): { this.settings = give before; return Result::Err(error: give e); }
             };
         }
@@ -510,6 +564,8 @@ type resource Connection implements Sendable {
         this.settings = give next;
         this.loginUser = copy user;
         this.authenticatedByHand = true;
+        // What one user read is not served to another (the server's tracking goes on across AUTH).
+        this.forgetCache();
         return Result::Ok(value: Unit::Unit);
     }
 
@@ -806,6 +862,110 @@ type resource Connection implements Sendable {
         }
     }
 
+    // A cached read's round trip before a hit: a PING, whose reply comes after every invalidation the server sent before
+    // it (pushes on the way are applied as they come).
+    unsafe fn Result<Unit, RedisError> sync() {
+        Deadline deadline = Deadline.within(span: this.commandLimit);
+        this.outbox.clear();
+        Command ping = Command.of(name: "PING");
+        ping.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        Result<Value, RedisError> got = this.nextReply(deadline: deadline);
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (v.isError()) { ServerError refused = serverError(v: v); return Result::Err(error: RedisError::Server(error: give refused)); }
+        this.syncedAt = this.wire.written();
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A cached read's miss: a pending entry, then `CLIENT CACHING YES`, MULTI, PTTL of each key, `command` and EXEC in
+    // one write. The reply is kept until the shorter of `ttl` and the keys' TTLs, unless an invalidation came first.
+    unsafe fn Result<Value, RedisError> fetch(const ref Command command, ByteKey name, DynamicArray<ByteKey> keys, Duration ttl) {
+        Instant began = monotonicNow();
+        Deadline deadline = Deadline.within(span: this.commandLimit);
+        this.outbox.clear();
+        Command caching = Command.of(name: "CLIENT");
+        caching.arg(text: "CACHING"); caching.arg(text: "YES");
+        caching.encode(into: this.outbox);
+        Command multi = Command.of(name: "MULTI");
+        multi.encode(into: this.outbox);
+        isize n = keys.length();
+        isize k = 0;
+        while (k < n) {
+            Command pttl = Command.of(name: "PTTL");
+            pttl.argBytes(bytes: keys[k].view());
+            pttl.encode(into: this.outbox);
+            k = k + 1;
+        }
+        command.encode(into: this.outbox);
+        Command exec = Command.of(name: "EXEC");
+        exec.encode(into: this.outbox);
+        Ticket ticket = this.cache[0].pend(command: give name, keys: give keys, now: began);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        // CLIENT CACHING, MULTI, a QUEUED for each PTTL and the command, then EXEC: every reply is read, whatever comes.
+        DynamicArray<Value> replies = DynamicArray.empty();
+        isize want = n + 4;
+        while (replies.length() < want) {
+            Result<Value, RedisError> got = this.nextReply(deadline: deadline);
+            match (give got) { case Ok(value: v): { replies.add(item: give v); } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        Result<Value, RedisError> answer = this.readFetch(replies: give replies, keys: n, ttl: ttl, began: began, ticket: ticket);
+        match (answer) { case Ok(value: v): { } case Err(error: e): { this.cache[0].cancel(ticket: ticket); } };
+        this.syncedAt = this.wire.written();
+        return give answer;
+    }
+
+    // A miss's replies, in order: CACHING's OK (anything else and the connection is lost: its tracking is not what this
+    // client set), MULTI's, the QUEUED ones (an error there is the command's own, and EXEC is then EXECABORT), then
+    // EXEC's array: each key's PTTL and the command's reply, which is kept if `ticket` still holds.
+    unsafe fn Result<Value, RedisError> readFetch(DynamicArray<Value> replies, isize keys, Duration ttl, Instant began, Ticket ticket) {
+        if (!isStatus(v: replies[0], text: "OK") || !isStatus(v: replies[1], text: "OK")) {
+            this.lose();
+            if (replies[0].isError()) { ServerError refused = serverError(v: replies[0]); return Result::Err(error: RedisError::Server(error: give refused)); }
+            return Result::Err(error: RedisError::Unexpected(detail: "CLIENT CACHING YES and MULTI answered with something other than OK"));
+        }
+        isize q = 2;
+        while (q < keys + 3) {
+            if (replies[q].isError()) { ServerError refused = serverError(v: replies[q]); return Result::Err(error: RedisError::Server(error: give refused)); }
+            q = q + 1;
+        }
+        Value exec = replace::<Value>(place: replies[keys + 3], with: Value::Null);
+        if (exec.isError()) { ServerError refused = serverError(v: exec); return Result::Err(error: RedisError::Server(error: give refused)); }
+        DynamicArray<Value> items = match (give exec) {
+            case Array(items: xs): give xs;
+            case _: { this.lose(); return Result::Err(error: RedisError::Unexpected(detail: "a cached read's EXEC answered with something other than an array")); }
+        };
+        if (items.length() != keys + 1) {
+            this.lose();
+            return Result::Err(error: RedisError::Unexpected(detail: "a cached read's EXEC answered with another count of replies than it queued"));
+        }
+        Value v = replace::<Value>(place: items[keys], with: Value::Null);
+        if (v.isError()) { ServerError refused = serverError(v: v); return Result::Err(error: RedisError::Server(error: give refused)); }
+        Duration life = ttl;
+        isize i = 0;
+        while (i < keys) {
+            int64 ms = match (items[i]) { case Integer(value: x): x; case _: -3i64; };
+            if (ms == -3i64) {
+                this.lose();
+                return Result::Err(error: RedisError::Unexpected(detail: "a cached read's PTTL answered with something other than an integer"));
+            }
+            if (ms >= 0i64 && Duration.fromMillis(ms: ms) < life) { life = Duration.fromMillis(ms: ms); }
+            i = i + 1;
+        }
+        this.cache[0].fill(ticket: ticket, value: v, expires: began + life);
+        return Result::Ok(value: give v);
+    }
+
+    // The next cached hit makes a round trip first, as after a write (a cluster's map changed: NodeLink.resyncAfter).
+    fn void unsync() { this.syncedAt = -1; }
+
+    // Empty the client-side cache: nothing it read can be trusted from here on.
+    unsafe fn void forgetCache() {
+        if (this.cache.length() > 0) { this.cache[0].flush(); }
+        this.syncedAt = -1;
+    }
+
     // Close the connection. It sends no QUIT, which is deprecated since 7.2. Closing twice is harmless.
     public unsafe fn void close() { this.shut = true; this.lose(); }
 
@@ -853,6 +1013,7 @@ type resource Connection implements Sendable {
 
     // Keep `push` for `takePushes`, dropping the oldest while the set-aside ones are past a bound.
     unsafe fn void setAside(Value push) {
+        if (this.invalidated(push: push)) { return; }
         this.pushBytes = this.pushBytes + footprint(v: push);
         this.pushes.pushBack(item: give push);
         while (this.pushes.length() > MAX_PUSHES || (this.pushBytes > this.pushBudget && this.pushes.length() > 1)) {
@@ -862,6 +1023,33 @@ type resource Connection implements Sendable {
                 case None: { }
             };
         }
+    }
+
+    // A tracking invalidation (`>2 invalidate [keys]`, or a null for a flushed keyspace), applied to the cache: true when
+    // `push` was one, and the cache is this connection's. Without a cache it is any other push.
+    unsafe fn bool invalidated(const ref Value push) {
+        if (this.cache.length() == 0) { return false; }
+        bool tracked = match (push) {
+            case Push(items: xs): xs.length() == 2 && match (xs[0]) { case Bulk(bytes: b): sameText(b: b, text: "invalidate"); case _: false; };
+            case _: false;
+        };
+        if (!tracked) { return false; }
+        match (push) {
+            case Push(items: xs): {
+                match (xs[1]) {
+                    case Array(items: keys): {
+                        isize i = 0;
+                        while (i < keys.length()) {
+                            match (keys[i]) { case Bulk(bytes: k): { this.cache[0].invalidate(key: k.view()); } case _: { this.cache[0].flush(); } };
+                            i = i + 1;
+                        }
+                    }
+                    case _: { this.cache[0].flush(); }
+                };
+            }
+            case _: { }
+        };
+        return true;
     }
 
     // How long each later call may take; zero is no limit. It starts as the config's `command_timeout`.
@@ -924,6 +1112,14 @@ type resource Connection implements Sendable {
         if (readonly) {
             Command ro = Command.of(name: "READONLY");
             ro.encode(into: this.outbox);
+            after = after + 1;
+        }
+        // A client-side cache's tracking, on every link made: only the reads `cached` marks (OPTIN) are tracked.
+        bool tracking = this.cache.length() > 0;
+        if (tracking) {
+            Command track = Command.of(name: "CLIENT");
+            track.arg(text: "TRACKING"); track.arg(text: "ON"); track.arg(text: "OPTIN");
+            track.encode(into: this.outbox);
             after = after + 1;
         }
         Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
@@ -991,6 +1187,12 @@ type resource Connection implements Sendable {
         if (readonly) {
             Result<Unit, RedisError> ro = this.expectOk(what: "READONLY", deadline: deadline);
             match (give ro) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        }
+        if (tracking) {
+            // A server that will not track (a user who may not run CLIENT, a proxy) cannot keep a cache true: the
+            // connect fails rather than serve values nothing invalidates.
+            Result<Unit, RedisError> on = this.expectOk(what: "CLIENT TRACKING", deadline: deadline);
+            match (give on) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
         }
         this.speaking = Protocol::Resp3;
         this.identified.add(item: give info);
@@ -1104,8 +1306,11 @@ type resource Connection implements Sendable {
         };
     }
 
-    // `login` is in force: it holds until its refreshAfter passes.
+    // `login` is in force: it holds until its refreshAfter passes. A login as another user empties the cache: what one
+    // user read is not served to another (the server's tracking goes on across AUTH). Every login passes here: a
+    // connect's, a fresh one before a call, and a subscriber's.
     unsafe fn void loggedIn(const ref Login login) {
+        if (!sameUser(a: this.loginUser, b: login.user())) { this.forgetCache(); }
         Optional<Duration> after = login.refreshAfter();
         this.loginDue = match (after) { case Some(value: d): Optional::Some(value: monotonicNow() + d); case None: Optional::None; };
         this.loginUser = login.user();
@@ -1176,6 +1381,7 @@ type resource Connection implements Sendable {
         if (this.shut || !this.live || this.authenticatedByHand) { return false; }
         if (!this.idleIntact()) { return false; }
         this.commandLimit = config.commandTimeout();
+        this.syncedAt = -1;
         this.watchLost = false;
         this.dropPushes();
         this.outbox.clear();
@@ -1296,6 +1502,7 @@ type resource Connection implements Sendable {
     unsafe fn void lose() {
         if (!this.live) { return; }
         this.live = false;
+        this.forgetCache();
         if (this.watching) { this.watching = false; this.watchLost = true; }
         this.wire.shutdown();
     }
@@ -1452,6 +1659,13 @@ type resource Connection implements Sendable {
     }
 }
 
+// Whether `a` and `b` name the same user, no user being `default`.
+fn bool sameUser(const ref Optional<string> a, const ref Optional<string> b) {
+    string x = match (a) { case Some(value: u): copy u; case None: "default"; };
+    string y = match (b) { case Some(value: u): copy u; case None: "default"; };
+    return x == y;
+}
+
 // Whether `v` is the status `text` (+OK, +QUEUED), an attribute around it included.
 fn bool isStatus(const ref Value v, const ref string text) {
     return match (v) {
@@ -1506,6 +1720,16 @@ fn Optional<RedisError> oneServer(const ref Config config) {
     }
     if (config.hostCount() > 1 && !config.viaSentinel()) {
         return Optional::Some(value: RedisError::Config(detail: "several hosts are a cluster's seeds, or sentinels: connect to a cluster with Cluster.connect, or through sentinels with redis-sentinel://; a connection takes one host"));
+    }
+    return resp2Cache(config: config);
+}
+
+// `Config` for a client-side cache over protocol=2: only RESP3 carries the server's invalidations.
+fn Optional<RedisError> resp2Cache(const ref Config config) {
+    bool resp2 = match (config.protocol()) { case Some(value: p): p == Protocol::Resp2; case None: false; };
+    bool caching = match (config.cache()) { case Some(value: c): true; case None: false; };
+    if (resp2 && caching) {
+        return Optional::Some(value: RedisError::Config(detail: "a client-side cache needs RESP3, which carries the server's invalidations: protocol=2 cannot have one"));
     }
     return Optional::None;
 }

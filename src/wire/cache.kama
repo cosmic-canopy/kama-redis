@@ -1,0 +1,312 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::collections::Map, std::memory::replace,
+         std::time::Instant,
+         redis::Command, redis::RedisError, redis::CacheConfig, redis::CacheStats, redis::resp::Value,
+         footprint, Commands, Keys, keysOf };
+export { Cache, Ticket, ByteKey };
+
+// A connection's client-side cache (docs/ROADMAP.md, "Phase 7b", decision 4, after "Phase 4"'s rules; rueidis's design).
+// The connection turns tracking on in its handshake (`CLIENT TRACKING ON OPTIN`), so the server tracks a key for it
+// only when a read follows `CLIENT CACHING YES`, and tells it when that key changes (`>2 invalidate`). Values and
+// invalidations come down the one connection in the order the server sent them, so applying every frame in wire order
+// is all the consistency there is to keep:
+//   - A read that misses makes a pending entry before anything is written. An invalidation of one of its keys that
+//     comes before the reply removes the entry, and the reply is then handed to the caller but not kept.
+//   - An entry lives as long as the shorter of the caller's `ttl` and the server's own TTL of each key it read (PTTL,
+//     in the same transaction as the read).
+//   - Everything goes at once on a null invalidation (FLUSHALL, FLUSHDB), and when the connection says so: its link is
+//     lost, or its database or user changes.
+//   - It holds at most `maxEntries` values and `maxBytes` bytes, the least recently used going first. A pending entry
+//     is never evicted, and there is only ever one: a connection runs one call at a time.
+//
+// Entries live in a slab, by index, each with a generation, so that a pending read can tell its entry from a later one
+// in the same place. `byCommand` finds an entry by its command's bytes, and `byKey` every entry that read a key. The
+// recency list runs through the stored entries, newest to oldest.
+
+// Bytes as a map's or a set's key: a command's encoding, a Redis key, a channel's or pattern's name. FNV-1a, as std
+// hashes a string. It copies, so that a set of them can be walked (a subscriber's resubscribing).
+type resource ByteKey implements Hashable, Equatable<This>, Sendable, Copyable<This>(bare: give) {
+    DynamicArray<uint8> bytes;
+
+    public ctor of(ConstView<uint8> bytes) {
+        this.bytes = DynamicArray.empty();
+        this.bytes.addAll(items: bytes);
+    }
+
+    public ctor copy(ref ByteKey source) { this.bytes = copy source.bytes; }
+
+    public const fn ConstView<uint8> view() { return this.bytes.view(); }
+    public const fn isize length() { return this.bytes.length(); }
+    public const fn DynamicArray<uint8> toArray() { return copy this.bytes; }
+
+    public const fn uint64 hash() {
+        uint64 h = 14695981039346656037ui64;
+        isize i = 0;
+        while (i < this.bytes.length()) {
+            h = (h ^ cast<uint64>(this.bytes[i])) * 1099511628211ui64;
+            i = i + 1;
+        }
+        return h;
+    }
+
+    public const fn bool equals(const ref ByteKey other) { return this.bytes.equals(other: other.bytes); }
+}
+
+// A pending read's hold on its entry: the place, and the generation the entry was made in.
+type value Ticket implements Sendable {
+    public isize at;
+    public int64 gen;
+    public ctor of(isize at, int64 gen) { this.at = at; this.gen = gen; }
+}
+
+// One place in the slab: free, pending (a read written, its reply not yet come), or stored.
+type resource Entry implements Sendable {
+    DynamicArray<ByteKey> command;   // zero (free) or one
+    DynamicArray<ByteKey> keys;
+    DynamicArray<Value> value;       // zero, or one once stored
+    Instant expires;
+    int64 bytes = 0;
+    int64 gen = 0;
+    bool pending = false;
+    isize newer = -1;
+    isize older = -1;
+
+    ctor make(Instant now) {
+        this.command = DynamicArray.empty();
+        this.keys = DynamicArray.empty();
+        this.value = DynamicArray.empty();
+        this.expires = now;
+    }
+    const fn bool used() { return this.command.length() > 0; }
+    friend Cache[make, used, command, keys, value, expires, bytes, gen, pending, newer, older];
+}
+
+type resource Cache implements Sendable {
+    DynamicArray<Entry> slab;
+    DynamicArray<isize> unused;
+    Map<ByteKey, isize> byCommand;
+    Map<ByteKey, DynamicArray<isize>> byKey;
+    // The cacheable commands' entries in the table of commands, for their keys.
+    Commands known;
+    isize newest = -1;
+    isize oldest = -1;
+    isize maxEntries;
+    int64 maxBytes;
+    isize stored = 0;
+    int64 held = 0;
+    int64 gens = 0;
+    int64 hits = 0;
+    int64 misses = 0;
+    int64 evictions = 0;
+    int64 flushes = 0;
+
+    public unsafe ctor make(CacheConfig config) {
+        this.slab = DynamicArray.empty();
+        this.unused = DynamicArray.empty();
+        this.byCommand = Map.empty();
+        this.byKey = Map.empty();
+        this.known = Commands.cacheable();
+        this.maxEntries = config.maxEntries;
+        this.maxBytes = config.maxBytes;
+    }
+
+    // The keys `command` reads, when it is a read this cache may hold: on the allow-list (src/wire/cacheable.kama), with
+    // at least one key, every one found where the server looks. `Usage` otherwise, saying why.
+    public unsafe fn Result<DynamicArray<ByteKey>, RedisError> keysOf(const ref Command command) {
+        isize at = this.known.indexOf(command: command);
+        if (at < 0) {
+            return Result::Err(error: RedisError::Usage(detail: "only a read whose every key the server tracks can be cached (src/wire/cacheable.kama lists them): send this one with call"));
+        }
+        Keys keys = keysOf(info: this.known.at(index: at), command: command, notKeys: false);
+        if (keys.count() == 0 || keys.partial()) {
+            return Result::Err(error: RedisError::Usage(detail: "a cached read names each of its keys where the server looks for it, and this one does not: send it with call"));
+        }
+        DynamicArray<ByteKey> found = DynamicArray.empty();
+        isize i = 0;
+        while (i < keys.count()) {
+            found.add(item: ByteKey.of(bytes: command.part(index: keys.at(index: i))));
+            i = i + 1;
+        }
+        return Result::Ok(value: give found);
+    }
+
+    // Whether a value is stored for `command` (its encoding), still within its time at `now`.
+    public unsafe const fn bool holds(const ref ByteKey command, Instant now) {
+        Optional<isize> found = this.byCommand.get(key: command);
+        return match (found) { case Some(value: at): !this.slab[at].pending && now < this.slab[at].expires; case None: false; };
+    }
+
+    // The value stored for `command`, still within its time, made the most recently used; None when there is none.
+    // Counts a hit or a miss. A value past its time stays until the read that misses it makes its pending entry (pend),
+    // or it is evicted.
+    public unsafe fn Optional<Value> lookup(const ref ByteKey command, Instant now) {
+        Optional<isize> found = this.byCommand.get(key: command);
+        isize at = match (found) { case Some(value: i): i; case None: -1; };
+        if (at >= 0 && !this.slab[at].pending && now < this.slab[at].expires) {
+            this.unlink(at: at);
+            this.linkNewest(at: at);
+            this.hits = this.hits + 1i64;
+            return Optional::Some(value: copy this.slab[at].value[0]);
+        }
+        this.misses = this.misses + 1i64;
+        return Optional::None;
+    }
+
+    // A pending entry for `command`'s read of `keys`, about to be written. An entry already held for it goes.
+    public unsafe fn Ticket pend(ByteKey command, DynamicArray<ByteKey> keys, Instant now) {
+        Optional<isize> old = this.byCommand.get(key: command);
+        match (old) { case Some(value: i): { this.remove(at: i); } case None: { } };
+        isize at = this.place(now: now);
+        this.gens = this.gens + 1i64;
+        this.slab[at].gen = this.gens;
+        this.slab[at].pending = true;
+        this.byCommand.put(key: copy command, value: at);
+        isize k = 0;
+        while (k < keys.length()) {
+            if (!this.byKey.contains(key: keys[k])) { this.byKey.put(key: copy keys[k], value: DynamicArray.empty()); }
+            borrow this.byKey.getRefMut(key: keys[k]) as readers { readers.add(item: at); }
+            k = k + 1;
+        }
+        this.slab[at].command.add(item: give command);
+        this.slab[at].keys = give keys;
+        return Ticket.of(at: at, gen: this.gens);
+    }
+
+    // The reply to `ticket`'s read, kept until `expires` if its entry is still pending: nothing invalidated it and
+    // nothing emptied the cache since it was written. Then the least recently used values go while the cache is past a
+    // bound. A value past maxBytes on its own is not kept.
+    public unsafe fn void fill(Ticket ticket, const ref Value value, Instant expires) {
+        if (!this.pendingFor(ticket: ticket)) { return; }
+        isize at = ticket.at;
+        int64 size = footprint(v: value) + cast<int64>(this.slab[at].command[0].length()) + keyBytes(keys: this.slab[at].keys);
+        if (size > this.maxBytes) { this.remove(at: at); return; }
+        this.slab[at].value.add(item: copy value);
+        this.slab[at].expires = expires;
+        this.slab[at].bytes = size;
+        this.slab[at].pending = false;
+        this.stored = this.stored + 1;
+        this.held = this.held + size;
+        this.linkNewest(at: at);
+        while ((this.stored > this.maxEntries || this.held > this.maxBytes) && this.oldest >= 0 && this.oldest != at) {
+            this.remove(at: this.oldest);
+            this.evictions = this.evictions + 1i64;
+        }
+    }
+
+    // `ticket`'s read failed: its entry goes, if it is still there.
+    public unsafe fn void cancel(Ticket ticket) {
+        if (this.pendingFor(ticket: ticket)) { this.remove(at: ticket.at); }
+    }
+
+    // The server's word that `key` changed: every entry that read it goes, a pending one too.
+    public unsafe fn void invalidate(ConstView<uint8> key) {
+        ByteKey name = ByteKey.of(bytes: key);
+        Optional<DynamicArray<isize>> readers = this.byKey.remove(key: name);
+        match (give readers) {
+            case Some(value: list): {
+                isize i = 0;
+                while (i < list.length()) {
+                    if (this.slab[list[i]].used()) { this.remove(at: list[i]); }
+                    i = i + 1;
+                }
+            }
+            case None: { }
+        };
+    }
+
+    // Everything goes: the server emptied its keyspace, or the connection can no longer trust what it read.
+    public unsafe fn void flush() {
+        if (this.byCommand.length() == 0) { return; }
+        this.slab = DynamicArray.empty();
+        this.unused = DynamicArray.empty();
+        this.byCommand.clear();
+        this.byKey.clear();
+        this.newest = -1;
+        this.oldest = -1;
+        this.stored = 0;
+        this.held = 0;
+        this.flushes = this.flushes + 1i64;
+    }
+
+    public const fn CacheStats stats() {
+        CacheStats s = CacheStats.zero();
+        s.hits = this.hits;
+        s.misses = this.misses;
+        s.entries = cast<int64>(this.stored);
+        s.bytes = this.held;
+        s.evicted = this.evictions;
+        s.flushes = this.flushes;
+        return s;
+    }
+
+    // ---- the slab ----
+
+    const fn bool pendingFor(Ticket ticket) {
+        if (ticket.at < 0 || ticket.at >= this.slab.length()) { return false; }
+        return this.slab[ticket.at].used() && this.slab[ticket.at].pending && this.slab[ticket.at].gen == ticket.gen;
+    }
+
+    // A free place in the slab.
+    unsafe fn isize place(Instant now) {
+        Optional<isize> free = this.unused.pop();
+        match (free) { case Some(value: i): { return i; } case None: { } };
+        this.slab.add(item: Entry.make(now: now));
+        return this.slab.length() - 1;
+    }
+
+    // The entry at `at` goes: out of both indexes and the recency list, its place free.
+    unsafe fn void remove(isize at) {
+        if (!this.slab[at].pending) {
+            this.unlink(at: at);
+            this.stored = this.stored - 1;
+            this.held = this.held - this.slab[at].bytes;
+        }
+        Optional<ByteKey> name = this.slab[at].command.pop();
+        match (give name) { case Some(value: c): { Optional<isize> gone = this.byCommand.remove(key: c); } case None: { } };
+        DynamicArray<ByteKey> keys = replace::<DynamicArray<ByteKey>>(place: this.slab[at].keys, with: DynamicArray.empty());
+        isize k = 0;
+        while (k < keys.length()) { this.unindex(key: keys[k], at: at); k = k + 1; }
+        this.slab[at].value = DynamicArray.empty();
+        this.slab[at].pending = false;
+        this.slab[at].bytes = 0;
+        this.unused.add(item: at);
+    }
+
+    // `at` no longer reads `key`; the key leaves the index with its last reader.
+    unsafe fn void unindex(const ref ByteKey key, isize at) {
+        if (!this.byKey.contains(key: key)) { return; }
+        bool empty = false;
+        borrow this.byKey.getRefMut(key: key) as readers {
+            isize i = readers.indexOf(item: at);
+            if (i >= 0) {
+                readers.swap(i: i, j: readers.length() - 1);
+                Optional<isize> dropped = readers.pop();
+            }
+            empty = readers.length() == 0;
+        }
+        if (empty) { Optional<DynamicArray<isize>> gone = this.byKey.remove(key: key); }
+    }
+
+    fn void linkNewest(isize at) {
+        this.slab[at].older = this.newest;
+        this.slab[at].newer = -1;
+        if (this.newest >= 0) { this.slab[this.newest].newer = at; }
+        this.newest = at;
+        if (this.oldest < 0) { this.oldest = at; }
+    }
+
+    fn void unlink(isize at) {
+        isize n = this.slab[at].newer;
+        isize o = this.slab[at].older;
+        if (n >= 0) { this.slab[n].older = o; } else { this.newest = o; }
+        if (o >= 0) { this.slab[o].newer = n; } else { this.oldest = n; }
+        this.slab[at].newer = -1;
+        this.slab[at].older = -1;
+    }
+}
+
+fn int64 keyBytes(const ref DynamicArray<ByteKey> keys) {
+    int64 total = 0;
+    isize i = 0;
+    while (i < keys.length()) { total = total + cast<int64>(keys[i].length()); i = i + 1; }
+    return total;
+}

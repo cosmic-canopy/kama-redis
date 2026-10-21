@@ -1,0 +1,263 @@
+[
+ {
+  "id": "H1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.invalidated(push: push)) { return; }\n",
+  "new": "",
+  "expect": "cache: another client's write invalidates",
+  "timeout": 300
+ },
+ {
+  "id": "H2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Bulk(bytes: k): { this.cache[0].invalidate(key: k.view()); }",
+  "new": "case Bulk(bytes: k): { }",
+  "expect": "cache: another client's write invalidates",
+  "timeout": 300
+ },
+ {
+  "id": "H3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    case _: { this.cache[0].flush(); }\n                };",
+  "new": "                    case _: { }\n                };",
+  "expect": "cache: FLUSHALL's null invalidation empties the cache",
+  "timeout": 300
+ },
+ {
+  "id": "H4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "if (this.syncedAt != this.wire.written() && this.cache[0].holds(command: name, now: monotonicNow())) {",
+  "new": "if (false && this.cache[0].holds(command: name, now: monotonicNow())) {",
+  "expect": "cache: after a write, a hit makes a round trip first",
+  "timeout": 300
+ },
+ {
+  "id": "H5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.commandLimit = config.commandTimeout();\n        this.syncedAt = -1;",
+  "new": "        this.commandLimit = config.commandTimeout();",
+  "expect": "cache: a lease's first hit makes a round trip",
+  "timeout": 300
+ },
+ {
+  "id": "H6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.live = false;\n        this.forgetCache();",
+  "new": "        this.live = false;",
+  "expect": "cache: a lost link empties it",
+  "timeout": 300
+ },
+ {
+  "id": "H7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.settings.database() != db) { this.forgetCache(); }",
+  "new": "",
+  "expect": "cache: SELECT of another database empties it",
+  "timeout": 300
+ },
+ {
+  "id": "H8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.settings.database() != db) { this.forgetCache(); }",
+  "new": "        this.forgetCache();",
+  "expect": "cache: SELECT of the same database keeps it",
+  "timeout": 300
+ },
+ {
+  "id": "H9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.authenticatedByHand = true;\n        // What one user read is not served to another (the server's tracking goes on across AUTH).\n        this.forgetCache();",
+  "new": "        this.authenticatedByHand = true;",
+  "expect": "cache: authenticate empties it",
+  "timeout": 300
+ },
+ {
+  "id": "H10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!sameUser(a: this.loginUser, b: login.user())) { this.forgetCache(); }",
+  "new": "",
+  "expect": "cache: a provider's fresh login as another user empties it",
+  "timeout": 300
+ },
+ {
+  "id": "H11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!sameUser(a: this.loginUser, b: login.user())) { this.forgetCache(); }",
+  "new": "        this.forgetCache();",
+  "expect": "cache: a provider's fresh login as the same user keeps it",
+  "timeout": 300
+ },
+ {
+  "id": "H12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool tracking = this.cache.length() > 0;",
+  "new": "        bool tracking = false;",
+  "expect": "takes CLIENT TRACKING ON OPTIN in the handshake",
+  "timeout": 300
+ },
+ {
+  "id": "H13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            match (give on) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };",
+  "new": "            match (give on) { case Ok(value: u): { } case Err(error: e): { } };",
+  "expect": "cache: tracking refused fails the connect",
+  "timeout": 300
+ },
+ {
+  "id": "H14",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "    if (resp2 && caching) {",
+  "new": "    if (false) {",
+  "expect": "cache: protocol=2 with a cache is Config",
+  "timeout": 300
+ },
+ {
+  "id": "H15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.speaking == Protocol::Resp2) { return this.exchange(command: command); }\n",
+  "new": "",
+  "expect": "cache: under RESP2 a cached read is a plain one",
+  "timeout": 300
+ },
+ {
+  "id": "H16",
+  "suite": "unit",
+  "file": "src/wire/cache.kama",
+  "old": "        if (!this.pendingFor(ticket: ticket)) { return; }\n        isize at = ticket.at;",
+  "new": "        isize at = ticket.at;",
+  "expect": "PANICKED",
+  "timeout": 300
+ },
+ {
+  "id": "H17",
+  "suite": "unit",
+  "file": "src/wire/cache.kama",
+  "old": "        if (at >= 0 && !this.slab[at].pending && now < this.slab[at].expires) {",
+  "new": "        if (at >= 0 && !this.slab[at].pending) {",
+  "expect": "cache: an entry past its ttl is read again",
+  "timeout": 300
+ },
+ {
+  "id": "H18",
+  "suite": "unit",
+  "file": "src/wire/cache.kama",
+  "old": "            this.unlink(at: at);\n            this.linkNewest(at: at);\n            this.hits",
+  "new": "            this.hits",
+  "expect": "cache: maxEntries keeps the most recently used",
+  "timeout": 300
+ },
+ {
+  "id": "H19",
+  "suite": "unit",
+  "file": "src/wire/cache.kama",
+  "old": "        while ((this.stored > this.maxEntries || this.held > this.maxBytes) && this.oldest >= 0 && this.oldest != at) {",
+  "new": "        while (false && this.oldest != at) {",
+  "expect": "cache: maxEntries keeps the most recently used",
+  "timeout": 300
+ },
+ {
+  "id": "H20",
+  "suite": "unit",
+  "file": "src/wire/cache.kama",
+  "old": "        if (size > this.maxBytes) { this.remove(at: at); return; }",
+  "new": "",
+  "expect": "cache: maxBytes holds what fits",
+  "timeout": 300
+ },
+ {
+  "id": "H21",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.watching) {\n            return Result::Err(error: RedisError::Usage(detail: \"a cached read sends MULTI",
+  "new": "        if (false) {\n            return Result::Err(error: RedisError::Usage(detail: \"a cached read sends MULTI",
+  "expect": "cache: a write, a keyless command, a ttl of 0, tracking by hand and a WATCH in force are Usage",
+  "timeout": 300
+ },
+ {
+  "id": "H22",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (replies[q].isError()) { ServerError refused = serverError(v: replies[q]); return Result::Err(error: RedisError::Server(error: give refused)); }",
+  "new": "",
+  "expect": "cache: a command refused as it is queued is its own error",
+  "timeout": 300
+ },
+ {
+  "id": "H23",
+  "suite": "unit",
+  "file": "src/wire/route.kama",
+  "old": "                    if (wanted.contains(key: c.name())) {",
+  "new": "                    if (true) {",
+  "expect": "cache: a write, a keyless command, a ttl of 0, tracking by hand and a WATCH in force are Usage",
+  "timeout": 300
+ },
+ {
+  "id": "H24",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        bool caching = match (ttl) { case Some(value: d): !asking; case None: false; };",
+  "new": "        bool caching = false;",
+  "expect": "cluster cache: each read at its key's node",
+  "timeout": 300
+ },
+ {
+  "id": "H26",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Ticket ticket = this.cache[0].pend(command: give name, keys: give keys, now: began);",
+  "new": "        Ticket ticket = this.cache[0].pend(command: give name, keys: DynamicArray.empty(), now: began);",
+  "expect": "cache: another client's write invalidates",
+  "timeout": 300
+ },
+ {
+  "id": "HI1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "            if (ms >= 0i64 && Duration.fromMillis(ms: ms) < life) { life = Duration.fromMillis(ms: ms); }",
+  "new": "",
+  "expect": "cluster cache: the server's TTL ends an entry",
+  "timeout": 300
+ },
+ {
+  "id": "H27",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        this.links[at].resyncAfter(changes: this.mapChanges);\n",
+  "new": "",
+  "expect": "cluster cache: after the map changed, a node connection's next hit makes a round trip first",
+  "timeout": 300
+ },
+ {
+  "id": "H28",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (wasPort >= 0 && !(wasPort == redirect.port() && wasHost == redirect.host())) { this.forgetAt(host: wasHost, port: wasPort); }\n",
+  "new": "",
+  "expect": "cluster cache: a node the map took a slot from has its cache emptied",
+  "timeout": 300
+ },
+ {
+  "id": "H29",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        this.forgetLost(before: before);\n",
+  "new": "",
+  "expect": "cluster cache: a reading of the map that took a slot from a node empties its cache",
+  "timeout": 300
+ }
+]

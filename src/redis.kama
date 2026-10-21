@@ -10,11 +10,14 @@
 //                    (src/script.kama), Scan (src/scan.kama), Subscriber, Delivery, Message and ChannelKind
 //                    (src/subscriber.kama), ServerInfo (src/server.kama), the Transport, Dialer and Dialers
 //                    contracts (src/transport.kama), RedisUrl (src/url.kama), Cluster, ClusterTarget and NodeReply
-//                    (src/cluster.kama), ClusterSubscriber (src/cluster_subscriber.kama)
+//                    (src/cluster.kama), ClusterSubscriber (src/cluster_subscriber.kama), Credentials, Login and
+//                    CredentialsError (src/credentials.kama), CacheConfig and CacheStats (src/cache.kama)
 //   redis::wire      internal: a deadline, RESP over a transport and what a value holds in memory, the commands a
 //                    connection does not carry and the blocking commands' timeouts (src/wire/known.kama), the
 //                    server's integer grammar, what Sentinel answers (src/wire/sentinel.kama), the table of commands
-//                    and their keys (src/wire/commands.kama, route.kama), and what is tried again (src/wire/retry.kama)
+//                    and their keys (src/wire/commands.kama, route.kama), what is tried again (src/wire/retry.kama),
+//                    and a connection's client-side cache and the commands it may hold (src/wire/cache.kama,
+//                    cacheable.kama)
 //   redis::secure    internal: TLS over any transport, and the TlsConfig each connect attempt builds
 //   redis::resp      the protocol: RESP2 and RESP3 values, their reader and writer
 //   redis::cluster   key slots (src/cluster/slot.kama), the table of commands' keys and slots (CommandTable,

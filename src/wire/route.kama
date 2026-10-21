@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::Map, std::collections::ConstView, std::encoding::utf8::decode,
          std::encoding::utf8::Utf8Error, std::fmt::i64Str, redis::Command, redis::RedisError, redis::cluster::keySlot,
-         commandTable };
+         commandTable, cacheableCommands };
 export { CommandInfo, KeySpec, Begin, Find, Request, Response, Commands, Keys, keysOf, slotIn };
 
 // Where a command's keys are, as the servers describe them (COMMAND's key specifications; key-specs.md), and how a
@@ -92,6 +92,32 @@ type resource Commands implements Sendable {
         while (i < this.table.length()) {
             this.byName.put(key: copy this.table[i].name(), value: i);
             i = i + 1;
+        }
+    }
+
+    // The entries of the commands a client-side cache may hold (src/wire/cacheable.kama) alone, for a connection's cache.
+    public ctor cacheable() {
+        DynamicArray<string> names = cacheableCommands();
+        Map<string, bool> wanted = Map.withCapacity(capacity: names.length());
+        isize n = 0;
+        while (n < names.length()) { wanted.put(key: copy names[n], value: true); n = n + 1; }
+        DynamicArray<CommandInfo> all = commandTable();
+        this.table = DynamicArray.empty();
+        this.byName = Map.withCapacity(capacity: names.length());
+        bool more = true;
+        while (more) {
+            Optional<CommandInfo> next = all.pop();
+            match (give next) {
+                case Some(value: c): {
+                    if (wanted.contains(key: c.name())) {
+                        this.byName.put(key: copy c.name(), value: this.table.length());
+                        this.table.add(item: give c);
+                    } else {
+                        CommandInfo unused = give c;
+                    }
+                }
+                case None: { more = false; }
+            };
         }
     }
 

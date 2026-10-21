@@ -571,6 +571,53 @@ match (give got) {
   `unix://` configuration and `reconnect=off` are `Config` for a `ClusterPool`, and a cluster's configuration is
   `Config` for a `Pool`.
 
+## A client-side cache
+
+A connection can keep the values of reads the server tracks for it, and serve them again with no round trip until the
+server says a key changed: `Config.setCache` gives each connection made from the configuration a cache of its own,
+and `cached` reads through it (rueidis's design).
+
+```kama
+// Each connection made from `config` caches at most 10 000 values and 16 MiB.
+Result<Unit, RedisError> set = config.setCache(cache: CacheConfig.defaults());
+// …
+Command get = cmd"GET ${key}";
+// From the cache while it holds the value (at most a minute), or else from the server.
+Result<string, RedisError> name = reply::<string>(result: conn.cached(command: get, ttl: Duration.fromSecs(s: 60i64)));
+CacheStats stats = conn.cacheStats();
+```
+
+- **What it holds:** reads whose every key the server tracks: `GET`, `HGET`, `HGETALL`, `MGET`, `SMEMBERS`, `ZRANGE`
+  and the rest that only read, never block, answer the same each time and name their keys where the server looks
+  (src/wire/cacheable.kama, generated from every server's `COMMAND`). Anything else is `Usage`: send it with `call`.
+- **How it stays true.** The handshake turns tracking on (`CLIENT TRACKING ON OPTIN`), and a miss sends
+  `CLIENT CACHING YES`, `MULTI`, the key's `PTTL`, the read and `EXEC` in one write, so the server tracks the key and
+  the value comes back with the server's own TTL. A value lives until the shorter of that TTL and the `ttl` given. The
+  server's invalidations come down the same connection and are applied in the order they were sent, so one that
+  comes before the reply means the value is handed back and not kept.
+- **Reading your own writes.** A hit after any other write of the connection makes one round trip first (`PING`), and
+  so does the first hit of each pool lease: the invalidation of every write already answered, on this connection or
+  another, comes before its reply. Otherwise a hit sends nothing, and another client's write is seen once its
+  invalidation arrives, as with every client-side cache.
+- **It is emptied** when the link is lost, on `FLUSHALL` or `FLUSHDB`, by `select` of another database, by
+  `authenticate`, and by a provider's fresh login as another user: values read as one user are not served to another.
+- **Its bounds** (`CacheConfig`): `maxEntries` (10 000) and `maxBytes` (16 MiB) a connection, the least recently used
+  going first. A pool keeps one cache per connection, so `maxSize` times that at most. `cacheStats()` gives the hits,
+  misses, entries, bytes, values evicted and times emptied.
+- **RESP3 only:** RESP2 carries no invalidations, so `protocol=2` with a cache is `Config`, and over a proxy that
+  refuses `HELLO` a cached read is sent as a plain one. A server that will not turn tracking on (a user who may not
+  run `CLIENT`) fails the connect. A `WATCH` in force refuses `cached`, whose transaction would end it.
+- **On a cluster** `Cluster.cached` reads through the cache of the connection to the key's node, following `MOVED` as
+  `call` does; a try that follows `ASK` is sent uncached, and keys in more than one slot are `Usage`. A failover is
+  followed with care, since a hit never asks the node whether it still serves the slot:
+  - a node the map takes a slot from has its cache emptied, so a read that a reading of the map a moment behind the
+    failover sends back there asks the node, which redirects it;
+  - after any change of the map, each node connection's next hit makes a round trip first: a node that took a slot
+    over sent its invalidations of the writes it was sent by replication before it did, on its own connection, and
+    nothing orders them against the redirection, which came on another.
+
+  `Cluster.cacheStats()` sums its nodes'.
+
 ## Pub/sub
 
 ```kama
@@ -679,8 +726,8 @@ fn uint8 main() {
 - **`Delivery` is `@nonExhaustive`**: a `match` on one needs `case _:`, since a later release may add a kind.
 - **Pushes that are not pub/sub** (an invalidation another connection's `CLIENT TRACKING … REDIRECT` sends) are set
   aside on the connection: `Connection.takePushes()` hands them over, at most 1024 and within `maxReplyBytes`, and
-  `droppedPushes()` counts any past that. `CLIENT TRACKING` and `CLIENT CACHING` are refused until client-side
-  caching comes (0.3.0).
+  `droppedPushes()` counts any past that. `CLIENT TRACKING` and `CLIENT CACHING` are refused: a client-side cache's
+  invalidations are the cache's (`Config.setCache`).
 
 ## Underneath
 
