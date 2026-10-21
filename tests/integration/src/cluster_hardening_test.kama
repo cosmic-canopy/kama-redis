@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::time::Duration, std::time::sleep, 
          std::fmt::i64Str,
          redis::Cluster, redis::Connection, redis::Command, redis::RedisError, redis::resp::Value, redis::cluster::keySlot,
          redis_integration_tests::check, open, ask, shown, versionPrefix, productWanted, openDescriptors,
-         reach, plainUrl, said, portOf, nodeAt };
+         reach, plainUrl, said, portOf, nodeAt, settled };
 export { hardeningTests };
 
 // What a run of INCRs saw: answers in order, failures, and whether each answer was the last plus one (or two, right
@@ -104,6 +104,7 @@ unsafe fn int32 failoverTests(ref Cluster c) {
     string wrongText = seen.wrongText();
     f = f + check(ok: seen.right(), what: "failover: each INCR ran once (${failures} failed): ${wrongText}");
     f = f + check(ok: moved && seen.run() >= 10, what: "failover: the calls end at the replica now primary, ten in a row");
+    f = f + check(ok: settled(secs: 30i64), what: "failover: every node agrees on the map again");
     return f;
 }
 
@@ -131,6 +132,7 @@ unsafe fn int32 sleepTests(ref Cluster c) {
     // The sleeper wakes and rejoins, as a replica: wait for it, so the next test meets a whole cluster.
     Instant woken = began + Duration.fromSecs(s: 14i64);
     if (monotonicNow() < woken) { sleep(d: woken - monotonicNow()); }
+    f = f + check(ok: settled(secs: 30i64), what: "sleep: every node agrees on the map again, the sleeper awake");
     return f;
 }
 
@@ -157,8 +159,8 @@ unsafe fn int32 restartTests(ref Cluster c) {
     }
     string got = said(c: c, text: "GET ${key}");
     f = f + check(ok: streak >= 10 && got == "x", what: "restart: the calls are answered again once the primary is back (${failed} failed): ${got}");
-    // Its replica resyncs from it, now empty: wait until the shard is whole again.
-    sleep(d: Duration.fromSecs(s: 3i64));
+    // Its replica resyncs from it, now empty: wait until the shard is whole again and every node agrees.
+    f = f + check(ok: settled(secs: 30i64), what: "restart: every node agrees on the map again");
     return f;
 }
 
@@ -207,7 +209,7 @@ unsafe fn int32 atomicTests(ref Cluster c) {
     if (valkey9) { back = "CLUSTER MIGRATESLOTS SLOTSRANGE ${slotText} ${slotText} NODE ${fromId}"; backAt = copy toPort; }
     Result<Connection, RedisError> admin = open(url: "redis://127.0.0.1:".concat(other: backAt).concat(other: "?connect_timeout=2"));
     match (give admin) { case Ok(value: a): { Connection conn = give a; string done = ask(c: conn, text: back); } case Err(error: e): { } };
-    sleep(d: Duration.fromSecs(s: 2i64));
+    f = f + check(ok: settled(secs: 30i64), what: "atomic: every node agrees on the map again, the slot back");
     string wiped = said(c: c, text: "DEL ${key}");
     return f;
 }

@@ -11,8 +11,9 @@ also run on cstar's newest build, which the registry publishes with. The package
 KRD-9's workaround, the reader moving its unread bytes one at a time. On cstar's `0.9.690` and `0.9.692` (2026-10-20) the library
 checks clean, and the unit gate is green only with KRD-11's edit (`fn uint8 main()`); KRD-9 is still open there. On
 `0.9.696` to `0.9.707` (2026-10-20) the library and both test programs check clean but for KRD-11, with KRD-12's
-workaround; what fails there is `@kama/tls` 0.1.5: four statements after a `while (true)`, and from 0.9.706 a
-`string.find` whose type changed (KRD-11). It needs a release of its own.
+workaround. `@kama/tls` 0.1.5 did not build there (four statements after a `while (true)`, and from 0.9.706 a
+`string.find` whose type changed); 0.1.6 does, and this package needs `^0.1.6` now. On 0.9.707, with KRD-11's edit,
+the unit gate and every example are green.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design

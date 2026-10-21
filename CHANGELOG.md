@@ -64,6 +64,8 @@ What a caller of 0.1.0 may need to change:
   - `Redirect` and `RedirectKind`, what a MOVED or ASK says.
 
 ### Changed
+- Needs `@kama/tls` ^0.1.6 (was ^0.1.3). 0.1.6 builds on kama 0.9.696 and later, where the earlier releases do not, and
+  its own floor is still kama 0.9.523, so this package's stays v0.9.667.
 - `Replies` holds a result per command: on a cluster a reply can be the failure of a node's link as well as the server's
   error reply. `take` is unchanged.
 - A `Connection` (and a `Subscriber`) refuses a configuration with several hosts or a cluster's options, before it

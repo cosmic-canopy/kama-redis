@@ -6,11 +6,12 @@ import { core::println, std::collections::DynamicArray, std::fmt::i64Str,
          redis::Cluster, redis::ClusterTarget, redis::NodeReply, redis::Connection, redis::Config, redis::Command,
          redis::RedisError, redis::Script, redis::ScriptCall, redis::resp::Value, redis::cluster::keySlot,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan, redis::ClusterSubscriber,
-         redis::Delivery, std::time::Duration, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         redis::Delivery, std::time::Duration, std::time::Instant, std::time::monotonicNow, std::time::sleep,
+         std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::cluster::SlotMap,
          redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, mainUrl,
          versionPrefix };
-export { clusterTests, reach, plainUrl, said, portOf, nodeAt, keysPerShard };
+export { clusterTests, reach, plainUrl, said, portOf, nodeAt, keysPerShard, settled };
 
 unsafe fn Result<Cluster, RedisError> reach(const ref string url) {
     Result<Config, RedisError> c = Config.parse(url: url);
@@ -142,6 +143,47 @@ unsafe fn string tlsPortOf(const ref string port) {
     isize i = 0;
     while (i < plain.length()) { if (plain[i] == port && i < tls.length()) { return copy tls[i]; } i = i + 1; }
     return "";
+}
+
+// The cluster agrees, within `secs`: every node says it is ok and names the same primary, by port, for every slot. A
+// test that moved a slot or failed a node over waits for it before it ends, so the next meets a cluster whose nodes
+// have all heard of the change. (A failover a moment after a slot came back once promoted a replica that had not heard
+// of it yet, and the slot was served by no one.)
+unsafe fn bool settled(int64 secs) {
+    Instant until = monotonicNow() + Duration.fromSecs(s: secs);
+    while (monotonicNow() < until) {
+        if (agreed()) { return true; }
+        sleep(d: Duration.fromMillis(ms: 250i64));
+    }
+    return false;
+}
+
+unsafe fn bool agreed() {
+    DynamicArray<string> ports = listOf(text: setting(name: "REDISTEST_CLUSTER_PORTS"));
+    DynamicArray<int32> first = DynamicArray.empty();
+    isize n = 0;
+    while (n < ports.length()) {
+        Result<Connection, RedisError> r = nodeAt(port: ports[n]);
+        Connection c = match (give r) { case Ok(value: x): give x; case Err(error: e): { return false; } };
+        string info = ask(c: c, text: "CLUSTER INFO");
+        if (!info.contains(substring: "cluster_state:ok")) { return false; }
+        Command slots = commandOf(text: "CLUSTER SLOTS");
+        Result<Value, RedisError> got = c.call(command: slots);
+        Value v = match (give got) { case Ok(value: x): give x; case Err(error: e): { return false; } };
+        Result<SlotMap, RedisError> read = SlotMap.fromSlots(reply: v, asked: "127.0.0.1");
+        SlotMap m = match (give read) { case Ok(value: x): give x; case Err(error: e): { return false; } };
+        if (m.coverage() != 16384) { return false; }
+        isize s = 0;
+        while (s < 16384) {
+            isize owner = m.primaryOf(slot: s);
+            int32 port = -1;
+            if (owner >= 0) { port = m.node(index: owner).port(); }
+            if (n == 0) { first.add(item: port); } else if (first[s] != port) { return false; }
+            s = s + 1;
+        }
+        n = n + 1;
+    }
+    return true;
 }
 
 fn DynamicArray<string> listOf(const ref string text) {
@@ -369,6 +411,7 @@ unsafe fn int32 reshardTests(ref Cluster c) {
     f = f + check(ok: back == "OK" && ended == "OK", what: "reshard: the slot moved back: ${back} ${ended}");
     string home = said(c: c, text: "GET ${fresh}");
     f = f + check(ok: home == "f", what: "reshard: MOVED back: ${home}");
+    f = f + check(ok: settled(secs: 20i64), what: "reshard: every node agrees on the map again");
     string wiped = said(c: c, text: "DEL ${here} ${fresh} ${pipedKey} ${counted} ${watchedKey}");
     return f;
 }
@@ -468,8 +511,16 @@ unsafe fn int32 scanTests() {
     string first = portOf(c: c, index: primaries[0]);
     Result<Connection, RedisError> admin = nodeAt(port: first);
     string killed = match (give admin) { case Ok(value: x): { Connection a = give x; := ask(c: a, text: "CLIENT KILL TYPE normal"); } case Err(error: e): e.message(); };
+    // Right after the kill the page either finds the close before it writes (the link is made again: the scan ends) or
+    // fails on I/O (the close landed after); then the next page makes the link again, and the scan ends.
     Result<Value, RedisError> p2 = cut.nextIn(cluster: c);
+    bool io = match (p2) { case Err(error: e): match (e) { case Io(error: x): true; case _: false; }; case Ok(value: v): false; };
     string ended = match (p2) { case Ok(value: v): "a page"; case Err(error: e): e.message(); };
+    if (io) {
+        Result<Value, RedisError> p3 = cut.nextIn(cluster: c);
+        string after = match (p3) { case Ok(value: v): "a page"; case Err(error: e): e.message(); };
+        ended = ended.concat(other: ", then ").concat(other: after);
+    }
     bool firstOk = match (p1) { case Ok(value: v): true; case Err(error: e): false; };
     f = f + check(ok: firstOk && ended.contains(substring: "connected again"), what: "scan: a primary's link made again mid-scan ends it (${killed} killed): ${ended}");
     n = 0i64;
@@ -590,6 +641,7 @@ unsafe fn int32 subscriberTests(ref Cluster c) {
                         string home = finishMove(from: to, to: from, toPort: fromPort, slot: slot);
                         string returned = nextOf(sub: sub, secs: 5i64);
                         f = f + check(ok: returned == "moved ${ch} ${fromPort}", what: "subscriber: and back: ${back} ${home} ${returned}");
+                        f = f + check(ok: settled(secs: 20i64), what: "subscriber: every node agrees on the map again");
                     }
                     case Err(error: e): { f = f + check(ok: false, what: "subscriber: connect to the new owner"); }
                 };
@@ -613,6 +665,7 @@ unsafe fn int32 subscriberTests(ref Cluster c) {
 
 unsafe fn int32 clusterTests() {
     int32 f = 0;
+    f = f + check(ok: settled(secs: 60i64), what: "cluster: every node agrees on the map before the tests");
     Result<Cluster, RedisError> r = reach(url: plainUrl());
     match (give r) {
         case Ok(value: c): {
