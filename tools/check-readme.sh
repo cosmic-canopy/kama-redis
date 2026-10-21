@@ -1,5 +1,5 @@
 #!/bin/sh
-# check-readme.sh — build every complete program in README.md (each ```kama block with a `fn int32 main()`) against
+# check-readme.sh — build every complete program in README.md (each ```kama block with a `fn uint8 main()`) against
 # this package, and run it against a live server. The only change made to an example is its URL: the test server's
 # host and port take the place of 127.0.0.1:6379, its TLS port that of 127.0.0.1:6380, the test PKI's files those
 # under /etc/redis/, its sentinel topology's URL that of redis-sentinel://127.0.0.1:26379?master_name=mymaster, and its
@@ -43,7 +43,7 @@ perl -e '
     my $n = 0;
     while ($text =~ /```kama\n(.*?)```/gs) {
         my $code = $1;
-        next unless $code =~ /fn int32 main\(\)/;
+        next unless $code =~ /fn uint8 main\(\)/;
         $n++;
         open my $o, ">", "$dir/ex$n.kama" or die; print $o $code; close $o;
     }
@@ -60,7 +60,7 @@ for ex in "$work"/ex*.kama; do
         -e "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" -e "s#127\.0\.0\.1:6380#$REDISTEST_HOST:$REDISTEST_TLS_PORT#g" \
         -e "s#/etc/redis/#$REDISTEST_CERTDIR/#g" "$ex" > "$project/src/main.kama"
     cat > "$project/kama.json" <<EOF
-{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.667",
+{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.690",
   "entry": "src/main.kama", "dependencies": { "@kama/redis": { "path": "../../.." } },
   "modules": { ".": { "visibility": "internal" } } }
 EOF

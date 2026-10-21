@@ -17,7 +17,7 @@ unsafe fn string sentinelUrl() {
     return match (give v) { case Some(value: u): give u; case None: "redis-sentinel://127.0.0.1:26379?master_name=mymaster"; };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: sentinelUrl());
     Config config = match (give parsed) {
         case Ok(value: c): give c;

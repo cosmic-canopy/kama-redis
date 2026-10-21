@@ -25,7 +25,7 @@ unsafe fn string setting(string name) {
     };
 }
 
-fn int32 main() {
+fn uint8 main() {
     int32 failed = flush();
     failed = failed + connectTests();
     failed = failed + authTests();

@@ -15,7 +15,7 @@ unsafe fn string clusterUrl() {
     return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:7000,127.0.0.1:7001"; };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: clusterUrl());
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
     Result<Cluster, RedisError> opened = Cluster.connect(config: config);

@@ -6,7 +6,7 @@
 import { core::println, std::collections::DynamicArray, std::collections::FixedArray, std::collections::View,
          std::collections::ConstView, std::io::IoError, std::net::TcpListener, std::net::TcpStream, std::net::Poller,
          std::net::Interest, std::net::SocketAddr, std::time::Duration, std::time::monotonicNow, std::time::Instant,
-         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::SendResult,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::Undelivered,
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::Connection, redis::Config, redis::RedisError, redis::Protocol, redis::TlsVersion, redis::TlsSession,
          redis::Subscriber, redis::Message, redis::Pipeline, redis::Replies, redis::Command, redis::resp::Value,
@@ -149,13 +149,13 @@ type resource SniRelay implements Sendable {
     public unsafe fn void run() {
         Result<Unit, IoError> nb = this.listener.setNonBlocking(on: true);
         Result<Poller, IoError> made = Poller.create();
-        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { SendResult<string> r = this.seen.send(item: "poller"); return; } };
+        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { Result<Unit, Undelivered<string>> r = this.seen.send(item: "poller"); return; } };
         p.add(fd: this.listener.rawHandle(), interest: Interest::Read);
         int32 served = 0;
         while (served < this.count) {
             Result<int32, IoError> w = p.wait(timeoutMs: 10000);
             int32 ready = match (w) { case Ok(value: k): k; case Err(error: e): 0; };
-            if (ready == 0) { SendResult<string> r = this.seen.send(item: "no connection"); return; }
+            if (ready == 0) { Result<Unit, Undelivered<string>> r = this.seen.send(item: "no connection"); return; }
             Result<TcpStream, IoError> accepted = this.listener.accept();
             match (give accepted) {
                 case Ok(value: c): {
@@ -175,7 +175,7 @@ type resource SniRelay implements Sendable {
                             whole = hello.length() >= 5 && hello.length() >= 5 + cast<isize>(hello[3]) * 256 + cast<isize>(hello[4]);
                         }
                     }
-                    SendResult<string> sent = this.seen.send(item: sniOf(b: hello.view()));
+                    Result<Unit, Undelivered<string>> sent = this.seen.send(item: sniOf(b: hello.view()));
                     Result<TcpStream, IoError> up = TcpStream.connect(host: "127.0.0.1", port: this.upstream);
                     match (give up) {
                         case Ok(value: s): {

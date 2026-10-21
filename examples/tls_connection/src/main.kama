@@ -14,7 +14,7 @@ unsafe fn string serverUrl() {
     return match (give v) { case Some(value: u): give u; case None: "rediss://localhost:6380?tls_ca=/etc/redis/ca.crt"; };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
     Result<Connection, RedisError> opened = Connection.connect(config: config);

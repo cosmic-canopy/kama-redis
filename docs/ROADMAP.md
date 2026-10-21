@@ -1,14 +1,15 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0 to 6 and 7a are done, on kama v0.9.667 (the floor and CI's pin), and verified on
-the v0.9.690 tag. **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`). **0.2.0,
-Cluster and Sentinel, is ready but for its publish:** "Phase 6: where to start", just below, has what each step did.
-- cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` answers
-  `Optional<isize>` (KRD-11: no form builds on both a tag and it). The tree takes the forms every compiler accepts
-  (nothing after a `while (true)` or a function's last `panic`), and a test arm that stops ends in `stop::<T>(msg:)`
-  (KRD-12). It refuses `fn int32 main()`, which every tag requires (KRD-11), so it is gated on a copy whose ten `main`s
-  say `fn uint8 main()`. `@kama/tls` 0.1.6 (2026-10-20) builds there, and the package needs `^0.1.6` now: on 0.9.707
-  the library checks and builds, and the unit program and every example are green, debug and release.
+Where this is, 2026-10-20: phases 0 to 6 and 7a are done, on kama v0.9.690 (the floor and CI's pin) and cstar's
+0.9.707. **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`). **0.2.0, Cluster and
+Sentinel, is ready but for its publish:** "Phase 6: where to start", just below, has what each step did.
+- The floor moved from v0.9.667 to v0.9.690 on 2026-10-20 (the maintainer's word), which closed KRD-11: from 0.9.684
+  kama requires `fn uint8 main()` and every earlier tag refuses it. The ten `main`s, the README's programs and the live
+  program's channel `send` (0.9.680) took the new forms, and the tree builds unedited on both compilers.
+- cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` has
+  another type, which nothing here calls. The tree takes the forms both accept (nothing after a `while (true)` or a
+  function's last `panic`), and a test arm that stops ends in `stop::<T>(msg:)` (KRD-12). `@kama/tls` 0.1.6
+  (2026-10-20) builds there, and the package needs `^0.1.6` now.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -46,10 +47,9 @@ Cluster and Sentinel, is ready but for its publish:** "Phase 6: where to start",
   `ClusterSubscriber`. `tools/redis.sh --topology cluster|sentinel` runs both on all eight servers; the vectors come
   from `tools/gen-topology-vectors.sh` and `tools/gen-command-table.sh`; the live suite drives failovers, a sleeping
   primary, restarts, resharding and the atomic migrations.
-- Gates (0.2.0): `tools/test.sh` is green, debug and release, the examples built, on kama 0.9.667 (the floor and CI's
-  pin), and on the v0.9.690 tag and cstar's 0.9.707 through KRD-11's scratch copy; `tools/test-integration.sh` on all eight servers, alone,
-  under Sentinel and as a cluster; the README's programs and the examples live. Every step proven by mutation
-  (`tools/mutate.sh`). Phase 6 is not pushed: that is the maintainer's word.
+- Gates (0.2.0): `tools/test.sh` is green, debug and release, the examples built, on kama v0.9.690 (the floor and CI's
+  pin) and cstar's 0.9.707; `tools/test-integration.sh` on all eight servers, alone, under Sentinel and as a cluster;
+  the README's programs and the examples live. Every step proven by mutation (`tools/mutate.sh`). Pushed 2026-10-20.
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
 - Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, std has no in-place copy, and cstar's
@@ -961,8 +961,11 @@ Each step ends green before its commit:
       before the cluster tests start, until all six nodes say `cluster_state:ok` and name the same primary for every
       slot (`settled` in tests/integration/src/cluster_test.kama).
     - **`kama publish --dry-run`** lists no certificate and no agent file.
-    - **Left, each the maintainer's word:** the push and CI; the publish; and whether the floor moves to v0.9.690
-      (KRD-11).
+    - **The floor moved to v0.9.690** (the maintainer's word, 2026-10-20), and CI's pin with it: the ten `main`s and
+      the README's programs say `fn uint8 main()`, and the live program's relays take a channel `send`'s `Result`.
+      KRD-11 is closed. The gates ran again from a clean clone, on v0.9.690 and on 0.9.707 with no scratch copy, and
+      live on the tag.
+    - **Left, the maintainer's word:** the publish.
 
 **If the session runs long:** steps 0–6 (Sentinel complete), then 7–10, then 11–13.
 

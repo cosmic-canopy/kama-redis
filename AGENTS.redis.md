@@ -17,7 +17,7 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.667**, declared as `"kama"` in every manifest here, and CI pins `v0.9.667`. That is the
+**The package needs kama ≥ 0.9.690**, declared as `"kama"` in every manifest here, and CI pins `v0.9.690`. That is the
 first tagged compiler with everything this package relies on (users install tagged releases):
 - the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
 - `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
@@ -30,20 +30,22 @@ first tagged compiler with everything this package relies on (users install tagg
 - `DeErrorKind`, `failWith(kind:)` and `DeError.field()` (0.9.569), which the reply reader implements;
 - the `Deserializer` members `peekKind`/`readNumberText`, `unknownField` and `atKeyedMap` (all in v0.9.667), which the
   reader implements too, and `std::memory::replace`, which `ServerInfo` reads its HELLO reply with (v0.9.667's
-  borrow rule refuses a borrow of a field across a call that may write it).
+  borrow rule refuses a borrow of a field across a call that may write it);
+- `fn uint8 main()`, the exit status in the platform's own type (0.9.684, KRD-11): the ten `main`s (`tests/*/src`,
+  `examples/*/src`) and the README's programs say it, and no tag before v0.9.690 takes it;
+- a channel's `send` answering `Result<Unit, Undelivered<T>>` (0.9.680), which the live program's relays use.
 
-Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on v0.9.667, the
-v0.9.690 tag and cstar's 0.9.707 (2026-10-20; the last two through KRD-11's scratch copy, since they refuse `fn int32
-main()`), with `@kama/tls` ^0.1.6, the first release that builds on 0.9.696 and later. So the floor and the pin stay:
-`ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on v0.9.690 and cstar's
+0.9.707 (2026-10-20), with `@kama/tls` ^0.1.6, the first release that builds on 0.9.696 and later. `ci.yml` moves the
+pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
 gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
-(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.667`), and run the gates with `KAMA=<dir>/bin/kama`.
-- **KRD-11, since cstar's 0.9.684:** it refuses `fn int32 main()`, which every tag requires, and every tag refuses `fn uint8
-  main()`. The library is unaffected. Gate the newest build on a scratch copy whose ten `main`s (`tests/*/src/main.kama`,
-  `examples/*/src/main.kama`) say `fn uint8 main()`. When a tag carries the rule, the floor, CI's pin and the `main`s
-  move in one commit.
+(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.690`), and run the gates with `KAMA=<dir>/bin/kama`.
+- **Two rules of 0.9.696 and later that no tag has yet:** unreachable code is an error, and a value-producing arm may
+  end in `panic`. The tree takes the forms both accept: nothing after a `while (true)` or a function's last `panic`,
+  and a test arm that stops ends in `stop::<T>(msg:)` (KRD-12). `string.find` changed type in 0.9.706; nothing here
+  calls it.
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
 live ones): each mutation of the source must make the case it names fail, or the test is not good yet. A step adds

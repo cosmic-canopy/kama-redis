@@ -18,7 +18,7 @@ fn T stop<T>(const ref string msg) {
     panic(msg: msg);
 }
 
-fn int32 main() {
+fn uint8 main() {
     int32 failed = 0;
     failed = failed + respTests();
     failed = failed + slotTests();

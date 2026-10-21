@@ -28,7 +28,7 @@ unsafe fn int32 allowed(ref Connection conn, const ref Script script, const ref 
     return match (verdict) { case Ok(value: n): cast<int32>(n); case Err(error: e): { println(s: e.message()); := -1; } };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
     Result<Connection, RedisError> opened = Connection.connect(config: config);

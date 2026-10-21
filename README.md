@@ -11,7 +11,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 > master, and every reconnect asks again. A cluster sends each command where its keys are, follows MOVED and ASK,
 > spreads a command over its nodes as the servers' own command tips say, and reads from replicas when asked. It is
 > tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under Sentinel and as a cluster. See the
-> [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.667**.
+> [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.690**.
 
 ## Connecting
 
@@ -19,7 +19,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 import { core::println, redis::Config, redis::Connection, redis::Command, redis::RedisError, redis::cmd,
          redis::reply, redis::replyOpt };
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379/0?client_name=example");
     Config config = match (give parsed) {
         case Ok(value: c): give c;
@@ -100,7 +100,7 @@ vendors Mbed TLS: still nothing to install.
 ```kama
 import { core::println, redis::Config, redis::Connection, redis::RedisError, redis::cmd, redis::reply };
 
-fn int32 main() {
+fn uint8 main() {
     // The server's certificate must chain to this CA and name 127.0.0.1; a client certificate goes with it.
     string url = "rediss://127.0.0.1:6380?tls_ca=/etc/redis/ca.crt&tls_cert=/etc/redis/client.crt&tls_key=/etc/redis/client.key";
     Result<Config, RedisError> parsed = Config.parse(url: url);
@@ -156,7 +156,7 @@ and the servers both).
 ```kama
 import { core::println, redis::Config, redis::Connection, redis::RedisError, redis::cmd, redis::reply };
 
-fn int32 main() {
+fn uint8 main() {
     // The sentinels (26379 unless one says otherwise), and the name they monitor the master by.
     Result<Config, RedisError> parsed = Config.parse(url: "redis-sentinel://127.0.0.1:26379?master_name=mymaster");
     Config config = match (give parsed) {
@@ -199,7 +199,7 @@ fn int32 main() {
 import { core::println, redis::Config, redis::Cluster, redis::Pipeline, redis::TxOutcome, redis::RedisError,
          redis::cmd, redis::reply, redis::resp::Value };
 
-fn int32 main() {
+fn uint8 main() {
     // Seeds, asked in turn for the map; each node's connection opens when a call first goes there.
     Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:7000,127.0.0.1:7001");
     Config config = match (give parsed) {
@@ -320,7 +320,7 @@ type resource Popped {
     public const fn string describe() { return copy this.list.concat(other: " gave ").concat(other: this.item); }
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379");
     Config config = match (give parsed) {
         case Ok(value: c): give c;
@@ -477,7 +477,7 @@ fn string describe(const ref Message m) {
     };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379");
     Config config = match (give parsed) {
         case Ok(value: c): give c;

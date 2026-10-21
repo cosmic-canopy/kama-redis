@@ -12,7 +12,7 @@ unsafe fn string serverUrl() {
     return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
     Config config = match (give parsed) {
         case Ok(value: c): give c;

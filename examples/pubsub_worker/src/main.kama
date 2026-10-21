@@ -69,7 +69,7 @@ unsafe fn int32 work(ref Subscriber sub) {
     }
 }
 
-fn int32 main() {
+fn uint8 main() {
     Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
     Result<Subscriber, RedisError> made = Subscriber.connect(config: config);
