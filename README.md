@@ -649,7 +649,9 @@ examples/quickstart/kama.json`.
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
 - **0.1.0, one server, complete.**
 - **0.2.0, topologies:** Cluster and Sentinel. This release.
-- **0.3.0, scale:** a connection pool shared across isolates, and client-side caching.
+- **0.3.0, scale:** a connection pool shared across isolates, client-side caching, and a credentials provider.
+- **0.4.0, typed commands:** a method per command, and the Redis 8 modules (JSON, search, time series, probabilistic)
+  with typed replies.
 
 ## Tests
 
