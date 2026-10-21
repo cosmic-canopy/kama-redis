@@ -50,8 +50,10 @@ gate on that build too before calling a release ready. Install a tag beside your
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
 live ones): each mutation of the source must make the case it names fail, or the test is not good yet. A step adds
-its file (`tools/mutations/7a-sN.json`); re-run the older files when their code changes, since a `BAD-PATTERN` means
-the source moved on. Run the live mutations after the matrix, not beside it: both use the same servers.
+its file (`tools/mutations/7b-sN.json`); re-run the older files when their code changes, since a `BAD-PATTERN` means
+the source moved on. Run the live mutations after the matrix, not beside it: both use the same servers. An entry may
+set `"timeout"` (seconds, 900 by default): a pool mutant can deadlock, and a run that is stopped is judged by what it
+printed first.
 
 ## What is true here and nowhere else
 
@@ -305,6 +307,13 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
     (`Config c = copy this.settings;`), as a redial does.
   - A `Set` iterates its keys only when the key is `Copyable`: `Name` has a copy constructor for that.
   - A project's name is its root module, so a project named like a dependency's module is refused (KRD-10).
+  - `kama check` passes an `Optional<R>` given where a resource `R` is wanted, and only the C compiler refuses it
+    (KRD-13). `pop()` answers an `Optional`: take the value out with `match (give p) { case Some(value: x): … }`, and
+    build before trusting a check.
+  - A grant names the accessor, then the granting type's own members: `friend redis::pool::Core::release[putBack];`
+    in `Connection` lets that one method reach `putBack`.
+  - A `ref` cannot be handed out from inside an enum payload: a lease holds its `Connection` (or `Cluster`) itself.
+  - `cpuCount()` answers `int32`.
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates

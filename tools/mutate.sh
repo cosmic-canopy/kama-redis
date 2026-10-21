@@ -9,13 +9,15 @@
 #
 # A mutation file is a JSON list. Each entry is
 #   {"id": "M1", "suite": "unit" | "integration", "file": "src/…", "old": "…", "new": "…", "expect": "…"}
-# and `old` must occur exactly once in `file`. `expect` is part of the check's name (what `check` prints after FAIL).
+# and `old` must occur exactly once in `file`. `expect` is part of the check's name (what `check` prints after FAIL),
+# or PANICKED for a mutation the program must die of. An entry may add "env": {"NAME": "value", …} for its run, and
+# "timeout": seconds (900 by default); a run that times out is judged by what it printed before it was stopped.
 #
 # The tree is copied to a scratch directory (without .git and out/), so the working tree is never touched. For each
 # mutation, the copy's file is changed, the suite is built in debug and run, and the file is put back. The verdict:
 #   CAUGHT            the targeted case failed;
 #   FAILED-ELSEWHERE  other cases failed, not that one (strengthen the targeted case);
-#   PANICKED          the run died before any case could fail;
+#   PANICKED          the program died (a panic, a signal) before any case failed, and `expect` is not PANICKED;
 #   SURVIVED          nothing failed;
 #   BAD-PATTERN       `old` is not in the file exactly once (the source moved on: update the mutation);
 #   BUILD-FAILED      the mutation does not compile.
@@ -92,14 +94,18 @@ for m in json.load(open(path)):
             continue
         work = tempfile.mkdtemp(dir=sockets)
         try:
-            r = subprocess.run([exe], capture_output=True, text=True, timeout=900,
+            r = subprocess.run([exe], capture_output=True, text=True, timeout=m.get("timeout", 900),
                                env=dict(env, REDISTEST_SOCKDIR=work, **m.get("env", {})))
             fails = [l.strip()[5:] for l in r.stdout.splitlines() if l.strip().startswith("FAIL ")]
             # A run that ends badly with no case failed died before one could: a panic, or a signal.
             if not fails and r.returncode != 0:
                 fails = ["PANICKED: " + (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]]
-        except subprocess.TimeoutExpired:
-            fails = ["(timed out)"]
+        except subprocess.TimeoutExpired as e:
+            # A mutant may fail its case and then hang (a deadlock it causes later): what it printed still counts.
+            out = e.stdout or ""
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", "replace")
+            fails = [l.strip()[5:] for l in out.splitlines() if l.strip().startswith("FAIL ")] + ["(timed out)"]
         hits = [f for f in fails if m["expect"] in f]
         if hits:
             verdict, shown = "CAUGHT", hits[0]

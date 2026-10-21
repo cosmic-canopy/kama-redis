@@ -1,0 +1,11 @@
+[
+ {
+  "id": "T1",
+  "suite": "unit",
+  "file": "src/resp/reader.kama",
+  "old": "                this.buf.viewMut().copyWithin(from: this.start, to: 0, count: unread);",
+  "new": "                this.buf.viewMut().copyWithin(from: this.start, to: 0, count: unread - 1);",
+  "expect": "resp slide",
+  "timeout": 5
+ }
+]

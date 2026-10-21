@@ -8,7 +8,7 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 **Current compiler:** `kama 0.9.707` (tag `v0.9.707`), which CI pins and the manifests' floor names. It moved from
 `v0.9.667` to `v0.9.690` on 2026-10-20, which closed KRD-11, and to `v0.9.707` on 2026-10-21, which closed KRD-9 and
 KRD-12: the tree carries no workaround. Each repro is also run on cstar's newest build, which the registry publishes
-with; on 2026-10-21 that is the tag's own build. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
+with: on 2026-10-21, at phase 7b's start, `0.9.713+g03d52a6b`. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
 statements after a `while (true)`, and from 0.9.706 a `string.find` whose type changed); 0.1.6 does, and this
 package needs `^0.1.6`.
 
@@ -16,7 +16,7 @@ package needs `^0.1.6`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-13, KRD-14 and KRD-15. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -32,7 +32,107 @@ the commit that made it pass.
 
 ## OPEN
 
-None.
+### KRD-13 · MED · `kama check` takes an `Optional<R>` where a resource `R` is wanted, and only the C compiler refuses it
+
+**Found** 2026-10-21, on `0.9.707` (tag `v0.9.707`) and cstar's `0.9.713+g03d52a6b`, writing phase 7b's first repro:
+`taken.add(item: this.provider.pop())`, which is wrong, since `pop()` answers `Optional<T>`. For a number the checker
+refuses the same mistake, in good words: "a local is declared `int32`, so it cannot be initialized with an
+`Optional<int32>` — take its value out with `match`". It also refuses an unrelated resource ("argument `b` expects a
+`Box`, so it cannot be given a `Other`"). But an `Optional` of the very resource wanted passes `kama check`, as a
+local's initializer and as an argument. `kama build` then fails in clang, in the generated C's names.
+
+**Repro**, a whole program:
+
+```kama
+import { std::collections::DynamicArray };
+type resource Box { int32 n; public ctor make(int32 n) { this.n = n; } }
+fn void keep(Box b) { }
+fn uint8 main() {
+    DynamicArray<Box> from = DynamicArray.empty();
+    from.add(item: Box.make(n: 1));
+    from.add(item: Box.make(n: 2));
+    Box b = from.pop();      // an Optional<Box> where a Box is wanted
+    keep(b: from.pop());     // and as an argument
+    return 0;
+}
+```
+
+| | `kama check` | `kama build` |
+|---|---|---|
+| `v0.9.707`, `0.9.713+g03d52a6b` | `OK (4 units analyzed)` | clang: "assigning to 'k_Fkrd13__Box' … from incompatible type 'kama__Optional_k_Fkrd13__Box'" at 8:9, and "passing 'kama__Optional_k_Fkrd13__Box' to parameter of incompatible type 'k_Fkrd13__Box'" at 9:20 |
+
+**Why MED:** the registry checks a publish with `kama check`, so a package with this mistake on a path its own build
+never compiles (a `@compileFor` arm, say) would pass the registry and fail for every consumer. Here the build caught
+it at once, so nothing is worked around.
+
+**What would close it:** the number case's refusal, for a resource payload too.
+
+**Workaround:** none needed; the code takes the value out with `match (give p) { case Some(value: x): … }`, as it
+should.
+
+### KRD-14 · MED · An isolate cannot wait on a socket and a channel at once, so a connection shared by isolates cannot multiplex
+
+**Found** 2026-10-21, planning 0.3.0 (docs/ROADMAP.md, "Phase 7b: where to start"). An absence, so it cites cstar's
+files rather than a repro.
+
+**What it costs.** Five of the eight Redis clients surveyed share one connection per server among their callers and
+pipeline what they send. rueidis does this by default (`PipelineMultiplex`); node-redis writes a tick's commands as one
+batch; GLIDE and Lettuce multiplex; go-redis 9.22 offers it as an option. 0.3.0 ships a pool instead, as redis-py,
+go-redis and Jedis do. A pool is production-grade, but under concurrency each command pays a whole round trip.
+
+**Measured** on an Apple M4 (10 cores), on `0.9.713+g03d52a6b`, release, against Redis 8.10.2 in podman:
+
+| | each |
+|---|---|
+| a channel round trip between two isolates (two bounded channels, 100 000 rounds) | 2.5 µs |
+| PING over a `Connection`, one at a time, through podman's port forwarder | 220 µs |
+| the same, inside the container (`redis-benchmark -c 1 -P 1`) | 70 µs |
+| PING over a `Connection`, pipelined 100 at a time | 2.4 µs |
+| the same, inside the container (`-P 100`) | 0.9 µs |
+
+So the hop to an isolate that owns the socket costs about one pipelined command, and 1–4 % of a round trip. With many
+isolates sending at once, it would pay for itself many times over.
+
+**What blocks it.** An isolate that owns the socket must wait for two things together: its callers' requests and the
+server's replies. `std::net::Poller` waits on descriptors only (`lib/std/net/poll.kama:31-74`, `add(fd:)` and
+`wait`). A `Channel` is a mutex with a condition variable and has no descriptor or waker
+(`lib/std/concurrent/channel.kama:21-22`, with `recv`, `tryRecv` and `recvTimeout` only). So the owner can only
+alternate a channel wait and a socket wait, each with a timeout, which adds latency to every call, or spin.
+
+**What would close it**, in either order:
+- **A channel a `Poller` can wait on** (its readiness as a descriptor: eventfd, or kqueue's `EVFILT_USER`). A
+  socket-owning isolate with auto-pipelining becomes possible today, at about one hop a call.
+- **KR-3 (fibers, thread-per-core)** removes the hop as well: one multiplexed connection per core, its callers fibers
+  on the same scheduler.
+
+Either one makes a multiplexed client the better design here, and this package would add one beside the pool.
+
+**Workaround:** none. The pool is the design until one lands (ROADMAP, phase 7b, decision 1).
+
+### KRD-15 · MED · No shared mutable state across isolates: a cache per pool, a shared slot map and a shared master hint wait for KR-226
+
+**Found** 2026-10-21, planning 0.3.0. An absence: cstar's ROADMAP KR-226 (`Locked<T>`, a lock window), which names "a
+shared cache, a connection table" as its case.
+
+**What it costs.** Isolates share nothing mutable. `Shared` is not `Sendable`, and `Atomic<T>` holds a scalar
+(`lib/std/concurrent/atomic.kama`). So state that a pool's isolates would share must live behind an owner isolate, at
+a channel round trip (2.5 µs, KRD-14) per access. That defeats the four designs the peers use:
+- **One client-side cache per pool,** as redis-py, go-redis, Jedis and node-redis keep. A local cache's hit should cost
+  a hash lookup, not a hop. 0.3.0 keeps one cache per connection instead (rueidis's design, production-grade on its
+  own), at the price of hits split across the pool's connections and a cache's memory per connection.
+- **One slot map and per-node pools under one cluster client** (go-redis, redis-py, Jedis). 0.3.0's cluster pool
+  leases whole `Cluster`s instead. Each costs about 320 KiB resident and a link to every primary it uses (measured: 64
+  Clusters on a three-primary cluster held 21.9 MiB and 256 sockets), and each reads the map and follows MOVED alone.
+- **A found-master hint shared by a pool's connections,** so a Sentinel failover is asked of the sentinels once, not
+  once per pooled connection.
+- **One token cache across a credentials provider's forks,** so a provider that fetches tokens over the network
+  fetches once per pool, not once per connection.
+
+**What would close it:** KR-226 as designed, a `Sendable` `Locked<T>` whose payload is reached only inside a `borrow`
+window.
+
+**Workaround:** none built. The per-connection cache, the whole-`Cluster` lease and the per-connection provider fork
+are designs of their own, documented with their costs, not stand-ins to delete.
 
 ## FIXED — kept for the record
 
