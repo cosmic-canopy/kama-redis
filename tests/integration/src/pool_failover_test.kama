@@ -1,0 +1,229 @@
+// Pools across a failover, live (docs/ROADMAP.md, "Phase 7b", step 5): four isolates share a pool through a SENTINEL
+// FAILOVER, and a ClusterPool through a CLUSTER FAILOVER and a primary put to sleep (DEBUG SLEEP past
+// cluster-node-timeout). Nothing is sent twice, so the count is at most the INCRs answered and those that failed (one
+// that failed may have run). It may be fewer than those answered: a failover discards what the old primary took after
+// the new one was chosen (Sentinel promotes before it reconfigures the old master, and a primary asleep answers what it
+// ran before the sleep once it wakes), as both say of themselves; the message counts what was lost. Once the topology
+// has settled, every lease works again.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::Isolate, std::concurrent::RecvError, std::time::Duration, std::time::Instant, std::time::monotonicNow, std::time::sleep,
+         redis::Connection, redis::Config, redis::Cluster, redis::Command, redis::RedisError, redis::resp::Value,
+         redis::cluster::keySlot,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
+         redis::pool::ClusterPool, redis::pool::ClusterPoolShare, redis::pool::ClusterLease,
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, digitsOf,
+         sentinelSettled, failOver, masterPort, sentinelUrl, settled, portOf };
+export { poolFailoverTests };
+
+// A worker's tally: INCRs answered and failed, and how many failed after the topology had settled (none should).
+type value Tally implements Sendable {
+    public int64 answered;
+    public int64 failed;
+    public int64 lateFailures;
+    public ctor zero() { this.answered = 0i64; this.failed = 0i64; this.lateFailures = 0i64; }
+}
+
+// When the workers stop, and from when a failure counts as late: the main isolate's word, over a channel.
+type enum Word implements Sendable { Settled, Stop }
+
+// One isolate's INCRs through a shared pool, every 20 ms, until told to stop.
+type resource PoolWorker implements Sendable {
+    PoolShare share;
+    Receiver<Word> told;
+    Sender<Tally> report;
+    string key;
+    public ctor make(PoolShare share, Receiver<Word> told, Sender<Tally> report, string key) { this.share = give share; this.told = give told; this.report = give report; this.key = give key; }
+    public unsafe fn void run() {
+        Pool p = Pool.join(share: this.share);
+        Tally t = Tally.zero();
+        bool late = false;
+        bool going = true;
+        while (going) {
+            Result<Word, RecvError> w = this.told.tryRecv();
+            match (w) { case Ok(value: x): { match (x) { case Settled: { late = true; } case Stop: { going = false; } }; } case Err(error: e): { } };
+            Result<Lease, RedisError> r = p.acquire();
+            bool ok = match (give r) {
+                case Ok(value: l): { Lease lease = give l; Command incr = Command.of(name: "INCR"); incr.arg(text: this.key); Result<Value, RedisError> v = lease.conn().call(command: incr); := match (v) { case Ok(value: x): true; case Err(error: e): false; }; }
+                case Err(error: e): false;
+            };
+            if (ok) { t.answered = t.answered + 1i64; } else { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } }
+            sleep(d: Duration.fromMillis(ms: 20i64));
+        }
+        _ = this.report.send(item: t);
+    }
+}
+unsafe fn void poolWork(PoolWorker job) { job.run(); }
+
+// The same through a shared ClusterPool.
+type resource ClusterWorker implements Sendable {
+    ClusterPoolShare share;
+    Receiver<Word> told;
+    Sender<Tally> report;
+    string key;
+    public ctor make(ClusterPoolShare share, Receiver<Word> told, Sender<Tally> report, string key) { this.share = give share; this.told = give told; this.report = give report; this.key = give key; }
+    public unsafe fn void run() {
+        ClusterPool p = ClusterPool.join(share: this.share);
+        Tally t = Tally.zero();
+        bool late = false;
+        bool going = true;
+        while (going) {
+            Result<Word, RecvError> w = this.told.tryRecv();
+            match (w) { case Ok(value: x): { match (x) { case Settled: { late = true; } case Stop: { going = false; } }; } case Err(error: e): { } };
+            Result<ClusterLease, RedisError> r = p.acquire();
+            bool ok = match (give r) {
+                case Ok(value: l): { ClusterLease lease = give l; Command incr = Command.of(name: "INCR"); incr.arg(text: this.key); Result<Value, RedisError> v = lease.cluster().call(command: incr); := match (v) { case Ok(value: x): true; case Err(error: e): false; }; }
+                case Err(error: e): false;
+            };
+            if (ok) { t.answered = t.answered + 1i64; } else { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } }
+            sleep(d: Duration.fromMillis(ms: 20i64));
+        }
+        _ = this.report.send(item: t);
+    }
+}
+unsafe fn void clusterWork(ClusterWorker job) { job.run(); }
+
+// The tallies of `n` workers, summed.
+unsafe fn Tally summed(ref Receiver<Tally> reports, isize n) {
+    Tally sum = Tally.zero();
+    isize k = 0;
+    while (k < n) {
+        Optional<Tally> t = reports.recv();
+        match (t) { case Some(value: x): { sum.answered = sum.answered + x.answered; sum.failed = sum.failed + x.failed; sum.lateFailures = sum.lateFailures + x.lateFailures; } case None: { } };
+        k = k + 1;
+    }
+    return sum;
+}
+
+unsafe fn void tellAll(ref DynamicArray<Sender<Word>> to, Word w) {
+    isize i = 0;
+    while (i < to.length()) { _ = to[i].send(item: w); i = i + 1; }
+}
+
+unsafe fn int32 sentinelPoolTests() {
+    int32 f = 0;
+    f = f + check(ok: sentinelSettled(secs: 30i64), what: "pool failover: the sentinel group settled before");
+    string key = "kr:pool:sentinel";
+    Result<Config, RedisError> pc = Config.parse(url: sentinelUrl(options: "&command_timeout=2&reconnect_timeout=10"));
+    Config config = match (give pc) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "pool failover: ${m}"); } };
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 2;
+    o.acquireTimeout = Duration.fromSecs(s: 10i64);
+    Result<Pool, RedisError> made = Pool.make(config: config, options: o);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { string m = e.message(); return check(ok: false, what: "pool failover: ${m}"); } };
+    { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; Command del = commandOf(text: "DEL ".concat(other: key)); Result<Value, RedisError> x = lease.conn().call(command: del); } case Err(error: e): { } }; }
+    string before = masterPort();
+    Channel<Tally> reports = Channel.bounded(capacity: 4);
+    Receiver<Tally> heard = reports.receiver();
+    DynamicArray<Sender<Word>> words = DynamicArray.empty();
+    DynamicArray<Isolate> workers = DynamicArray.empty();
+    int32 k = 0;
+    while (k < 4) {
+        Channel<Word> w = Channel.bounded(capacity: 4);
+        words.add(item: w.sender());
+        Result<PoolShare, RedisError> s = pool.share();
+        match (give s) { case Ok(value: sh): { PoolWorker job = PoolWorker.make(share: give sh, told: w.receiver(), report: reports.sender(), key: copy key); Isolate i = spawn poolWork(job: give job); workers.add(item: give i); } case Err(error: e): { } };
+        k = k + 1;
+    }
+    sleep(d: Duration.fromSecs(s: 1i64));
+    string asked = failOver();
+    bool settledAfter = sentinelSettled(secs: 40i64);
+    tellAll(to: words, w: Word::Settled);
+    sleep(d: Duration.fromSecs(s: 2i64));
+    tellAll(to: words, w: Word::Stop);
+    Tally sum = summed(reports: heard, n: 4);
+    workers.clear();
+    string after = masterPort();
+    string total = "-";
+    { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; Command get = commandOf(text: "GET ".concat(other: key)); Result<Value, RedisError> v = lease.conn().call(command: get); total = match (v) { case Ok(value: x): shown(v: x); case Err(error: e): e.message(); }; } case Err(error: e): { total = e.message(); } }; }
+    int64 n = digitsOf(text: total);
+    int64 answered = sum.answered;
+    int64 failed = sum.failed;
+    int64 late = sum.lateFailures;
+    f = f + check(ok: asked == "OK" && settledAfter && after != before, what: "pool failover: SENTINEL FAILOVER moved the master (${before} to ${after})");
+    int64 lost = answered - n;
+    f = f + check(ok: n >= 0i64 && n <= answered + failed && late == 0i64 && answered > 0i64,
+                  what: "pool failover: through SENTINEL FAILOVER no INCR ran twice, and every lease after it works (${answered} answered, ${failed} failed, ${late} after; ${total}; ${lost} lost to the failover)");
+    return f;
+}
+
+// The port of a node whose role in `slot`'s shard is asked: the primary (`primary`), or its first replica.
+unsafe fn string shardPort(ref Cluster c, isize slot, bool primary) {
+    Result<Unit, RedisError> fetched = c.refreshTopology();
+    if (primary) {
+        isize owner = c.topology().primaryOf(slot: slot);
+        if (owner < 0) { return ""; }
+        return portOf(c: c, index: owner);
+    }
+    DynamicArray<isize> replicas = c.topology().replicasOf(slot: slot);
+    if (replicas.length() == 0) { return ""; }
+    return portOf(c: c, index: replicas[0]);
+}
+
+unsafe fn string askNode(const ref string port, const ref string text, const ref string tail) {
+    Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: tail));
+    return match (give r) { case Ok(value: c): { Connection n = give c; := ask(c: n, text: text); } case Err(error: e): e.message(); };
+}
+
+unsafe fn int32 clusterPoolTests() {
+    int32 f = 0;
+    f = f + check(ok: settled(secs: 30i64), what: "pool failover: the cluster settled before");
+    string key = "kr:{poolfailover}:n";
+    isize slot = keySlot(key: key.bytes());
+    string url = setting(name: "REDISTEST_CLUSTER_URL").concat(other: "?connect_timeout=2&command_timeout=2&reconnect_timeout=10");
+    Result<Config, RedisError> pc = Config.parse(url: url);
+    Config config = match (give pc) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "cluster pool failover: ${m}"); } };
+    Result<Cluster, RedisError> ar = Cluster.connect(config: config);
+    Cluster admin = match (give ar) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "cluster pool failover: admin: ${m}"); } };
+    Command del = commandOf(text: "DEL ".concat(other: key));
+    Result<Value, RedisError> cleared = admin.call(command: del);
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 2;
+    o.acquireTimeout = Duration.fromSecs(s: 10i64);
+    Result<ClusterPool, RedisError> made = ClusterPool.make(config: config, options: o);
+    ClusterPool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { string m = e.message(); return check(ok: false, what: "cluster pool failover: ${m}"); } };
+    Channel<Tally> reports = Channel.bounded(capacity: 4);
+    Receiver<Tally> heard = reports.receiver();
+    DynamicArray<Sender<Word>> words = DynamicArray.empty();
+    DynamicArray<Isolate> workers = DynamicArray.empty();
+    int32 k = 0;
+    while (k < 4) {
+        Channel<Word> w = Channel.bounded(capacity: 4);
+        words.add(item: w.sender());
+        Result<ClusterPoolShare, RedisError> s = pool.share();
+        match (give s) { case Ok(value: sh): { ClusterWorker job = ClusterWorker.make(share: give sh, told: w.receiver(), report: reports.sender(), key: copy key); Isolate i = spawn clusterWork(job: give job); workers.add(item: give i); } case Err(error: e): { } };
+        k = k + 1;
+    }
+    sleep(d: Duration.fromSecs(s: 1i64));
+    // A manual failover at the slot's replica, then the new primary put to sleep past cluster-node-timeout.
+    string replica = shardPort(c: admin, slot: slot, primary: false);
+    string failedOver = askNode(port: replica, text: "CLUSTER FAILOVER", tail: "?connect_timeout=2");
+    bool settledOnce = settled(secs: 30i64);
+    string primary = shardPort(c: admin, slot: slot, primary: true);
+    string slept = askNode(port: primary, text: "DEBUG SLEEP 5", tail: "?connect_timeout=2&command_timeout=10");
+    bool settledTwice = settled(secs: 40i64);
+    tellAll(to: words, w: Word::Settled);
+    sleep(d: Duration.fromSecs(s: 2i64));
+    tellAll(to: words, w: Word::Stop);
+    Tally sum = summed(reports: heard, n: 4);
+    workers.clear();
+    Command get = commandOf(text: "GET ".concat(other: key));
+    Result<Value, RedisError> v = admin.call(command: get);
+    string total = match (v) { case Ok(value: x): shown(v: x); case Err(error: e): e.message(); };
+    int64 n = digitsOf(text: total);
+    int64 answered = sum.answered;
+    int64 failed = sum.failed;
+    int64 late = sum.lateFailures;
+    f = f + check(ok: failedOver == "OK" && slept == "OK" && settledOnce && settledTwice,
+                  what: "cluster pool failover: CLUSTER FAILOVER and DEBUG SLEEP taken, and the cluster settled after each (${failedOver}; ${slept})");
+    int64 lost = answered - n;
+    f = f + check(ok: n >= 0i64 && n <= answered + failed && late == 0i64 && answered > 0i64,
+                  what: "cluster pool failover: no INCR ran twice, and every lease after works (${answered} answered, ${failed} failed, ${late} after; ${total}; ${lost} lost to the failover)");
+    return f;
+}
+
+unsafe fn int32 poolFailoverTests() {
+    int32 f = 0;
+    f = f + sentinelPoolTests();
+    f = f + clusterPoolTests();
+    return f;
+}

@@ -11,7 +11,8 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::cluster::keySlot,
          redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex,
-         Answer, loginAs, providing, answerList };
+         Answer, loginAs, providing, answerList, ScriptPoolDialers, redis::PoolDialers,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::ClusterPool, redis::pool::ClusterLease };
 export { clusterTests };
 
 fn string server() { return "redis-8.10.2"; }
@@ -1458,8 +1459,115 @@ unsafe fn int32 providerTests() {
     return f;
 }
 
+// A body that changes who its node's connection is (authenticate), then fails: watched unwatches and ends.
+type resource Reauths implements TxBody {
+    public ctor make() { }
+    public unsafe fn Result<Unit, RedisError> build(ref Connection conn, ref Pipeline tx) {
+        Result<Unit, RedisError> a = conn.authenticate(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw");
+        return Result::Err(error: RedisError::Value(detail: "the body refused, after authenticate"));
+    }
+}
+
+// A ClusterPool's connections, in the order its clusters open them: each the next connection's one dial.
+unsafe fn ClusterPool clusterPooled(DynamicArray<DynamicArray<Step>> scripts, const ref string url, isize maxSize, const ref string what) {
+    DynamicArray<DynamicArray<Dial>> all = DynamicArray.empty();
+    while (scripts.length() > 0) {
+        DynamicArray<Dial> d = DynamicArray.empty();
+        d.add(item: Dial::Serve(steps: scripts.remove(index: 0)));
+        all.add(item: give d);
+    }
+    Owned<PoolDialers> dialers = new ScriptPoolDialers.make(connections: give all);
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = maxSize;
+    o.acquireTimeout = Duration.fromMillis(ms: 300i64);
+    Config c = configOf(url: url);
+    Result<ClusterPool, RedisError> r = ClusterPool.makeWith(dialers: give dialers, config: c, options: o);
+    return match (give r) {
+        case Ok(value: p): give p;
+        case Err(error: e): { string m = e.message(); panic(msg: "cluster_test: ${what}: ${m}"); }
+    };
+}
+
+unsafe fn string onLease(ref ClusterLease lease, const ref string text) {
+    Command c = commandOf(text: text);
+    return callOutcome(r: lease.cluster().call(command: c));
+}
+
+// A pool of whole clusters (src/pool/pool.kama; docs/ROADMAP.md, "Phase 7b", step 5): a lease is a Cluster whose
+// node links outlive it; a release lets a lost link go, for the cluster to open again when a call needs it; a cluster
+// one of whose nodes a lease re-authenticated by hand is not kept.
+unsafe fn int32 clusterPoolTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    DynamicArray<DynamicArray<Step>> scripts = DynamicArray.empty();
+    // The pool's one cluster: its seed, 7000 (the map, then GET a in each lease)...
+    DynamicArray<Step> s0 = seed(slots: "slots/3");
+    s0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    s0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    scripts.add(item: give s0);
+    // ...7001, opened by the first lease, kept across the release, then lost by the second lease's GET...
+    DynamicArray<Step> s1 = answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3"));
+    s1.add(item: Step::Close);
+    scripts.add(item: give s1);
+    // ...and 7001 opened again by the third lease, after the second's release let the lost link go.
+    scripts.add(item: answering(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    ClusterPool p = clusterPooled(scripts: give scripts, url: oneSeed(), maxSize: 1, what: "cluster pool");
+    string l1a = "-"; string l1b = "-"; string l2a = "-"; string l2b = "-"; string l3b = "-";
+    { Result<ClusterLease, RedisError> r = p.acquire(); match (give r) { case Ok(value: l): { ClusterLease lease = give l; l1a = onLease(lease: lease, text: "GET ${a}"); l1b = onLease(lease: lease, text: "GET ${b}"); } case Err(error: e): { l1a = e.message(); } }; }
+    { Result<ClusterLease, RedisError> r = p.acquire(); match (give r) { case Ok(value: l): { ClusterLease lease = give l; l2a = onLease(lease: lease, text: "GET ${a}"); l2b = onLease(lease: lease, text: "GET ${b}"); } case Err(error: e): { l2a = e.message(); } }; }
+    { Result<ClusterLease, RedisError> r = p.acquire(); match (give r) { case Ok(value: l): { ClusterLease lease = give l; l3b = onLease(lease: lease, text: "GET ${b}"); } case Err(error: e): { l3b = e.message(); } }; }
+    f = f + check(ok: l1a == "ok" && l1b == "ok" && l2a == "ok" && l2b != "ok" && l3b == "ok",
+                  what: "cluster pool: a lease's cluster keeps its node links across leases, and a lost one is let go and opened again (${l1a}; ${l1b}; ${l2a}; ${l2b}; ${l3b})");
+
+    // A lease that re-authenticated a node's connection by hand (through watched's body): the cluster is not kept, and
+    // the next lease is a new cluster.
+    DynamicArray<DynamicArray<Step>> s2 = DynamicArray.empty();
+    DynamicArray<Step> first = seed(slots: "slots/3");
+    first.add(item: expect(command: "WATCH ${a}", answer: reply(server: server(), kase: "watch/3")));
+    first.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "auth2")));
+    first.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "unwatch/3")));
+    s2.add(item: give first);
+    DynamicArray<Step> second = seed(slots: "slots/3");
+    second.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    s2.add(item: give second);
+    ClusterPool p2 = clusterPooled(scripts: give s2, url: oneSeed(), maxSize: 1, what: "cluster pool, re-authenticated");
+    string watched = "-";
+    {
+        Result<ClusterLease, RedisError> r = p2.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                ClusterLease lease = give l;
+                Command watch = commandOf(text: "WATCH ${a}");
+                Reauths body = Reauths.make();
+                watched = txOutcome(r: lease.cluster().watched(watch: watch, body: body, attempts: 1));
+            }
+            case Err(error: e): { watched = e.message(); }
+        };
+    }
+    string fresh = "-";
+    { Result<ClusterLease, RedisError> r = p2.acquire(); match (give r) { case Ok(value: l): { ClusterLease lease = give l; fresh = onLease(lease: lease, text: "GET ${a}"); } case Err(error: e): { fresh = e.message(); } }; }
+    f = f + check(ok: watched.contains(substring: "the body refused") && fresh == "ok",
+                  what: "cluster pool: a cluster a lease re-authenticated by hand is not kept (${watched}; ${fresh})");
+
+    // What cannot make a ClusterPool, and a Pool of a cluster's seeds.
+    PoolOptions d = PoolOptions.defaults();
+    Result<ClusterPool, RedisError> r1 = ClusterPool.make(config: configOf(url: "redis-sentinel://127.0.0.1:26379?master_name=kr"), options: d);
+    Result<ClusterPool, RedisError> r2 = ClusterPool.make(config: configOf(url: "unix:///tmp/redis.sock"), options: d);
+    Result<ClusterPool, RedisError> r3 = ClusterPool.make(config: configOf(url: "redis://127.0.0.1:7000?reconnect=off"), options: d);
+    Result<Pool, RedisError> r4 = Pool.make(config: configOf(url: "redis://127.0.0.1:7000,127.0.0.1:7001"), options: d);
+    bool c1 = match (r1) { case Err(error: e): match (e) { case Config(detail: x): true; case _: false; }; case Ok(value: x): false; };
+    bool c2 = match (r2) { case Err(error: e): match (e) { case Config(detail: x): true; case _: false; }; case Ok(value: x): false; };
+    bool c3 = match (r3) { case Err(error: e): match (e) { case Config(detail: x): true; case _: false; }; case Ok(value: x): false; };
+    string m4 = match (r4) { case Err(error: e): e.message(); case Ok(value: x): "made"; };
+    f = f + check(ok: c1 && c2 && c3 && m4.contains(substring: "ClusterPool"),
+                  what: "cluster pool: a Sentinel or unix:// configuration and reconnect=off are Config, and a Pool of seeds names ClusterPool (${m4})");
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
+    f = f + clusterPoolTests();
     f = f + providerTests();
     f = f + routingTests();
     f = f + redirectTests();

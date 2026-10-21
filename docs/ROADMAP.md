@@ -617,11 +617,51 @@ Each step ends green before its commit:
    - **Gates:** `tools/test.sh` debug and release on v0.9.707 and 0.9.715, and the integration matrix on all eight
      servers. The mutations ran on v0.9.707: by then cstar's tree held KR-230's `Poller` change, uncommitted, which
      its build reads from `lib/`, and nothing that uses `std::net::Ready` compiled with it.
-5. **The pool under Sentinel and on a cluster.**
-   - `ClusterPool`, `ClusterLease` and `ClusterPoolShare`; the cluster's put-back and probe; the dialers adapter.
-   - Unit: a scripted failover with idle pooled connections, and a per-link put-back.
-   - Live: four isolates INCR through a SENTINEL FAILOVER, a CLUSTER FAILOVER and a DEBUG SLEEP. Every later lease
-     works, and the successes ≤ the final count ≤ the successes + the failures.
+5. **Done (2026-10-21).** **The pool under Sentinel and on a cluster.**
+   - **What was built:**
+     - `ClusterPool`, `ClusterLease` (`cluster()`) and `ClusterPoolShare`, over the same core: the pool holds `Held`
+       (`One` connection or a `Whole` cluster), and `Pool` and `ClusterPool` share the rest through `Plant`;
+     - three free functions over `Held`, each granted its members of `Connection` and of `Cluster`: `keepable`
+       (release, `putBack`), `lendable` (acquire's zero-time check of a connection, `settleIdle`) and `probed` (the
+       maintenance, `probeIdle`). A cluster is lent as it is: its release let every lost link go, and each call settles
+       its node's link before it writes;
+     - `Cluster.putBack`: each node link's own put-back (`LinkFate`): kept, let go when lost (the cluster opens it
+       again when a call needs it), or the whole cluster discarded when a lease called `authenticate` on a node;
+     - `NodeDialers`: a pooled cluster's nodes dial through a fork of the pool's `PoolDialers`;
+     - the refusals: a Sentinel or `unix://` configuration and `reconnect=off` are `Config` for a `ClusterPool`, and a
+       cluster's configuration for a `Pool` names `ClusterPool`.
+   - **Unit:**
+     - a lease's cluster keeps its node links across leases, and a lost one is let go and opened again;
+     - a cluster a lease re-authenticated by hand is not kept;
+     - the refusals;
+     - through sentinels, a pooled connection Sentinel let go at a failover is replaced through the sentinels, on the
+       new master.
+   - **Live** (`pool_failover_test.kama`, all eight servers): four isolates INCR through a pool across a SENTINEL
+     FAILOVER, and through a `ClusterPool` across a CLUSTER FAILOVER and a DEBUG SLEEP past cluster-node-timeout. No
+     INCR runs twice (each count is at most those answered and those failed), and none fails once the topology has
+     settled.
+     - A count may end below the INCRs answered, and the message says by how many. Sentinel promotes the replica
+       before it reconfigures the old master, and the old master's writes in between are discarded when it resyncs;
+       step 7's first run, three failovers at about 180 INCRs a second, lost 1639 of 9163. A primary woken from DEBUG
+       SLEEP answers what it ran before it slept, after its replica took over. Both servers document this ("last
+       failover wins"; `min-replicas-to-write` narrows it).
+     - Here the window runs from the promotion until Sentinel converts the old master and kills its clients (phase 6,
+       decision 4: the kill and the redial follow a failover, with no `+switch-master` subscription), which comes on
+       a later INFO poll, up to 10 s on. The peers that listen (GR, JE, NR, RU) drop their connections to the old
+       master at `+switch-master`, which can come sooner; their window starts at the promotion too. Raised with the
+       maintainer, since it bears on that decision.
+   - **Mutations** (`7b-s5.json`): eight, every one CAUGHT, all unit (C1–C7, C9). Step 5's restructuring moved what
+     seven older ones named (`7b-s3.json` P10, P11, P16, P18 and IP2; `7b-s4.json` K3, K14 and KI2): each was pointed at
+     the new code and run again, every one CAUGHT. Making them caught changed the code:
+     - C2 (a lost link kept at the release) and C8 (no check of a pooled cluster at acquire) each survived, because
+       each check covered for the other. A `ClusterPool`'s reconnect is on and every call settles its link before it
+       writes, so a check at acquire was the same work twice: it was removed (`Cluster.settleIdle`), and C2 is caught.
+     - S1 (no check of a pooled connection at acquire) matters only with `reconnect=off`, which the scripted server
+       cannot stage between a release and an acquire: IP2, live, is that case, and S1 was dropped.
+   - **Gates:** `tools/test.sh` debug and release on v0.9.707 and on cstar's committed 0.9.716 (`d1ed4554` with its own
+     `lib/` and `include/`, since its working tree held KR-230 uncommitted), and the integration matrix on all eight
+     servers. After the acquire check was removed, the unit gate and the mutations ran again, and
+     `pool_failover_test.kama` ran live on all eight.
 6. **Client-side caching** (phase 4's step 5).
    - `CacheConfig` and `CacheStats`; tracking in the handshake.
    - `cached`: its pending entries, and `CACHING YES`, MULTI, PTTL, the command and EXEC in one write.

@@ -6,7 +6,9 @@ import { std::collections::DynamicArray, std::memory::Owned,
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Dialer,
          redis::Scan, redis::TxOutcome, redis::libraryVersion, redis::resp::Value,
          redis_unit_tests::check, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
-         commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport, Answer, loginAs, providing, answerList };
+         commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport, Answer, loginAs, providing, answerList,
+         ScriptPoolDialers, redis::PoolDialers, redis::pool::Pool, redis::pool::PoolOptions, redis::pool::Lease,
+         std::time::Duration };
 export { sentinelTests, topo };
 
 fn string server() { return "redis-8.10.2"; }
@@ -501,8 +503,49 @@ unsafe fn int32 providerTests() {
     return f;
 }
 
+// A pool through sentinels (step 5): a pooled connection Sentinel lets go at a failover (it kills the clients of the
+// node it reconfigures) is not kept; the next lease is a new connection, which asks the sentinels again and finds the
+// new master. Each pooled connection's dials, in order: a sentinel, then the server it names.
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    DynamicArray<DynamicArray<Dial>> all = DynamicArray.empty();
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    d1.add(item: Dial::Serve(steps: names7200()));
+    DynamicArray<Step> m1 = asMaster();
+    m1.add(item: expect(command: "GET kr:k", answer: reply(server: server(), kase: "get-hit/3")));
+    m1.add(item: Step::Hangup);
+    d1.add(item: Dial::Serve(steps: give m1));
+    all.add(item: give d1);
+    DynamicArray<Dial> d2 = DynamicArray.empty();
+    d2.add(item: Dial::Serve(steps: names7201()));
+    DynamicArray<Step> m2 = asMaster();
+    m2.add(item: expect(command: "GET kr:k", answer: reply(server: server(), kase: "get-hit/3")));
+    d2.add(item: Dial::Serve(steps: give m2));
+    all.add(item: give d2);
+    Owned<PoolDialers> dialers = new ScriptPoolDialers.make(connections: give all);
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 1;
+    o.acquireTimeout = Duration.fromMillis(ms: 300i64);
+    Config config = configOf(url: "redis-sentinel://127.0.0.1:7300?master_name=kr");
+    Result<Pool, RedisError> made = Pool.makeWith(dialers: give dialers, config: config, options: o);
+    match (give made) {
+        case Ok(value: p): {
+            Pool pool = give p;
+            string first = "-";
+            string second = "-";
+            { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; Command g = commandOf(text: "GET kr:k"); first = callOutcome(r: lease.conn().call(command: g)); } case Err(error: e): { first = e.message(); } }; }
+            { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; Command g = commandOf(text: "GET kr:k"); second = callOutcome(r: lease.conn().call(command: g)); } case Err(error: e): { second = e.message(); } }; }
+            f = f + check(ok: first == "ok" && second == "ok",
+                          what: "sentinel pool: a pooled connection let go at a failover is replaced through the sentinels, on the new master (${first}; ${second})");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sentinel pool: ${m}"); }
+    };
+    return f;
+}
+
 unsafe fn int32 sentinelTests() {
     int32 f = 0;
+    f = f + poolTests();
     f = f + providerTests();
     f = f + findingTests();
     f = f + listTests();

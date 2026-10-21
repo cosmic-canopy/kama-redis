@@ -20,7 +20,8 @@
 //   redis::cluster   key slots (src/cluster/slot.kama), the table of commands' keys and slots (CommandTable,
 //                    src/cluster/keys.kama), the slot map and redirections (SlotMap, ClusterNode, Redirect,
 //                    src/cluster/map.kama)
-//   redis::pool      a connection pool shared by isolates (src/pool/pool.kama): Pool, Lease, PoolShare, PoolOptions
+//   redis::pool      connections, or whole clusters, shared by isolates (src/pool/pool.kama): Pool, Lease, PoolShare,
+//                    ClusterPool, ClusterLease, ClusterPoolShare, PoolOptions
 //
 // The rules every module holds:
 //   - Nothing from the server is trusted: every length is bounded before it is used, and a malformed reply

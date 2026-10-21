@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::time::Duration, std::time::sleep, 
          redis::Cluster, redis::Connection, redis::Command, redis::RedisError, redis::resp::Value, redis::cluster::keySlot,
          redis_integration_tests::check, open, ask, shown, versionPrefix, productWanted, openDescriptors,
          reach, plainUrl, said, portOf, nodeAt, settled };
-export { hardeningTests };
+export { hardeningTests, digitsOf };
 
 // What a run of INCRs saw: answers in order, failures, and whether each answer was the last plus one (or two, right
 // after a failure: that call may have run).

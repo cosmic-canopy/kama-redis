@@ -10,7 +10,7 @@ import { std::collections::DynamicArray, std::concurrent::Channel, std::concurre
          redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
          redis_unit_tests::check, Step, Dial, ScriptDialer, expect, reply, welcome, configOf, callOutcome, commandOf,
          again, transaction, setThenIncr, Answer, loginAs, providing, answerList };
-export { poolTests };
+export { poolTests, ScriptPoolDialers };
 
 fn string server() { return "redis-8.10.2"; }
 

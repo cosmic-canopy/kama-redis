@@ -112,9 +112,12 @@ type resource Connection implements Sendable {
     friend redis::NodeLink::transact[transactAt];
     friend redis::NodeLink::generation[generation];
     // A pool takes a connection back and checks one it leases (src/pool/pool.kama).
-    friend redis::pool::PoolCore::release[putBack];
-    friend redis::pool::PoolCore::checkout[settleIdle];
-    friend redis::pool::PoolCore::round[probeIdle];
+    friend redis::pool::keepable[putBack];
+    friend redis::pool::lendable[settleIdle];
+    friend redis::pool::probed[probeIdle];
+    // A pooled cluster's node links do the same, link by link.
+    friend redis::NodeLink::putBack[putBack, byHand];
+    friend redis::NodeLink::probeIdle[probeIdle];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -1208,6 +1211,9 @@ type resource Connection implements Sendable {
         this.dropPushes();
         return true;
     }
+
+    // Whether `authenticate` changed who this connection is.
+    const fn bool byHand() { return this.authenticatedByHand; }
 
     // For a pool's acquire: whether an idle connection's link is still up, found with no round trip.
     unsafe fn bool settleIdle() {

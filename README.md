@@ -555,6 +555,21 @@ match (give got) {
 - **A scan stays on its link.** A `Scan` continued on another lease's connection ends with `Usage`, since its cursor
   means nothing on another link.
 - **`Pool.makeWith(dialers:)`** opens each connection's transports through a dialer of yours (`PoolDialers`).
+- **Through Sentinel**, a `Pool` of a `redis-sentinel://` configuration asks the sentinels for the master at each
+  connect. At a failover Sentinel lets every client of both servers go, so the idle connections are found lost when
+  next lent and replaced on the new master, and a lease's connection makes its link again on the new master. Until
+  Sentinel reconfigures the old master, which can be seconds after the promotion, it still takes writes, and they are
+  discarded when it follows the new one: Sentinel's own rule, "last failover wins". `min-replicas-to-write` on the
+  server narrows that window.
+- **On a cluster, `ClusterPool`** (`make`, `makeWith`, `join`, `share`, `acquire`) lends a whole `Cluster` as a
+  `ClusterLease` (`lease.cluster()`), so pipelines across nodes, transactions, `watched` and a scan all work on a
+  lease. It holds at most `maxSize` clusters, so at most `maxSize` connections to each node, the bound that the
+  peers' pool per node keeps. Each pooled cluster keeps its own map and follows `MOVED` on its own: about 320 KiB
+  and a connection to each primary it has used (64 of them on three primaries held 21.9 MiB and 256 sockets). Release
+  puts back what the lease changed on each node's connection, and lets a lost one go, for the cluster to open again
+  when a call needs it. A cluster on one of whose nodes the lease called `authenticate` is closed. A Sentinel or
+  `unix://` configuration and `reconnect=off` are `Config` for a `ClusterPool`, and a cluster's configuration is
+  `Config` for a `Pool`.
 
 ## Pub/sub
 

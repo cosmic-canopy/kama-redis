@@ -8,7 +8,11 @@ import { core::println, std::collections::DynamicArray, std::time::Duration, std
          redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::Subscriber, redis::Delivery,
          redis::resp::Value,
          redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown };
-export { sentinelTests };
+export { sentinelTests, sentinelSettled, failOver, masterPort, sentinelUrl };
+
+// For other tests (a pool across a failover): the plain group settled, and its URL.
+unsafe fn bool sentinelSettled(int64 secs) { return settled(secs: secs); }
+unsafe fn string sentinelUrl(const ref string options) { return plainUrl(options: options); }
 
 // The first of a comma-separated list of ports ("18103,18104,18105").
 fn string firstOf(const ref string list) {

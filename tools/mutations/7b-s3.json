@@ -84,8 +84,8 @@
   "id": "P10",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "                    if (!past(expires: until) && conn.settleIdle()) {",
-  "new": "                    if (conn.settleIdle()) {",
+  "old": "                    if (past(expires: until)) { closeHeld(held: give c); }",
+  "new": "                    if (false) { closeHeld(held: give c); }",
   "expect": "pool: a connection past its lifetime",
   "timeout": 300
  },
@@ -93,8 +93,8 @@
   "id": "P11",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "        back.close();\n        Connection gone = give back;\n        this.ends.put(slot: Slot::Empty);",
-  "new": "        back.close();\n        Connection gone = give back;",
+  "old": "        Optional<Held> back = keepable(held: give held, config: this.config);\n        match (give back) {\n            case Some(value: h): {\n                Instant now = monotonicNow();\n                this.ends.put(slot: Slot::Idle(held: give h, expires: expires, checked: now));\n            }\n            case None: { this.ends.put(slot: Slot::Empty); }\n        };",
+  "new": "        Optional<Held> back = keepable(held: give held, config: this.config);\n        match (give back) {\n            case Some(value: h): {\n                Instant now = monotonicNow();\n                this.ends.put(slot: Slot::Idle(held: give h, expires: expires, checked: now));\n            }\n            case None: { }\n        };",
   "expect": "pool: a put-back the server refuses",
   "timeout": 300
  },
@@ -138,8 +138,8 @@
   "id": "P16",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "        return Result::Err(error: RedisError::Usage(detail: \"a pool joined from a PoolShare cannot be shared again",
-  "new": "        return Result::Err(error: RedisError::Config(detail: \"a pool joined from a PoolShare cannot be shared again",
+  "old": "        return Result::Err(error: RedisError::Usage(detail: \"a pool joined from a share cannot be shared again",
+  "new": "        return Result::Err(error: RedisError::Config(detail: \"a pool joined from a share cannot be shared again",
   "expect": "pool: a pool joined from a share cannot be shared again",
   "timeout": 300
  },
@@ -156,7 +156,7 @@
   "id": "P18",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "            case Some(value: conn): { this.home.core().release(conn: give conn, expires: this.expires); }",
+  "old": "            case Some(value: conn): { this.home.core().release(held: Held::One(conn: give conn), expires: this.expires); }",
   "new": "            case Some(value: conn): { Connection gone = give conn; }",
   "expect": "pool: one lease at a time keeps using one connection",
   "timeout": 300
@@ -210,8 +210,8 @@
   "id": "IP2",
   "suite": "integration",
   "file": "src/pool/pool.kama",
-  "old": "                    if (!past(expires: until) && conn.settleIdle()) {",
-  "new": "                    if (!past(expires: until)) {",
+  "old": "            if (k.settleIdle()) { return Optional::Some(value: Held::One(conn: give k)); }",
+  "new": "            if (true) { return Optional::Some(value: Held::One(conn: give k)); }",
   "expect": "pool: with reconnect=off, an idle connection the server killed is not lent",
   "timeout": 300
  },

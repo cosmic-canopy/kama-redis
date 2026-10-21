@@ -21,8 +21,8 @@
   "id": "K3",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "                                keep = conn.probeIdle(timeout: this.settings.pingTimeout);",
-  "new": "                                keep = true;",
+  "old": "                                Optional<Held> alive = probed(held: give c, timeout: this.settings.pingTimeout);",
+  "new": "                                Optional<Held> alive = Optional::Some(value: give c);",
   "expect": "pool maintenance: a probe not answered closes the connection",
   "timeout": 300
  },
@@ -120,8 +120,8 @@
   "id": "K14",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "                            else {\n                                Connection gone = give conn;\n                                gone.close();\n                                this.ends.put(slot: Slot::Empty);\n                                count = count - 1;\n                            }",
-  "new": "                            else {\n                                Connection gone = give conn;\n                                gone.close();\n                                this.ends.put(slot: Slot::Empty);\n                            }",
+  "old": "                                    case None: {\n                                        this.ends.put(slot: Slot::Empty);\n                                        count = count - 1;\n                                    }",
+  "new": "                                    case None: {\n                                        this.ends.put(slot: Slot::Empty);\n                                    }",
   "expect": "pool maintenance: a probe not answered closes the connection",
   "timeout": 300
  },
@@ -138,8 +138,8 @@
   "id": "KI2",
   "suite": "integration",
   "file": "src/pool/pool.kama",
-  "old": "                                keep = conn.probeIdle(timeout: this.settings.pingTimeout);",
-  "new": "                                keep = true;",
+  "old": "                                Optional<Held> alive = probed(held: give c, timeout: this.settings.pingTimeout);",
+  "new": "                                Optional<Held> alive = Optional::Some(value: give c);",
   "expect": "pool maintenance: minIdle at the start, pruned back to it",
   "timeout": 300
  },

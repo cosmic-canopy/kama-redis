@@ -250,7 +250,16 @@ printed first.
 - **`redis::pool` is @kama/postgres's S3 shape, copied** (src/pool/pool.kama): two bounded channels (`slots`,
   `permits`), no lock, a `Lease` released only by its destructor through `Shared<Home>`, and `share`/`join` across
   isolates.
-  - It reaches `Connection` through two grants: `putBack` (release) and `settleIdle` (acquire's zero-time check).
+  - It reaches `Connection` and `Cluster` through grants, each to one free function over `Held` (`One` or `Whole`):
+    `keepable` (release, `putBack`), `lendable` (acquire's zero-time check, `Connection.settleIdle`) and `probed` (the
+    maintenance, `probeIdle`). `Pool` and `ClusterPool` share everything else through `Plant`.
+  - A cluster is lent as it is. Its release lets every lost link go, and each call settles its node's link before it
+    writes, redialing one lost while idle (a `ClusterPool`'s reconnect is on), so a check at acquire would be the same
+    work twice. Mutations C2 and C8 showed the two checks covering for each other; the release's was kept, as a
+    `Pool`'s.
+  - A `ClusterPool` lends a whole `Cluster` (decision 2). `Cluster.putBack` puts back each node's link (`LinkFate`:
+    kept, let go when lost, so the cluster opens it again, or the whole cluster discarded when a lease called
+    `authenticate`). A pooled cluster's nodes dial through `NodeDialers`, a fork of the pool's `PoolDialers`.
   - A pool never redials on its own time, and a lease redials as any connection does (phase 7b, decision 6).
   - A release puts back only what changed, sent at the release (decision 3). `Connection` tracks what a lease can
     leave (`watching`, `watchLost`, `settings.database()`, `authenticatedByHand`); a new piece of session state must
@@ -265,6 +274,11 @@ printed first.
     and "close", and answers PING whenever it comes: a round's timing cannot be scripted.
   - The scripted server acts only when the client reads or waits. A close between a release and the next acquire
     cannot be staged there, so the acquire's own check is a live case (with `reconnect=off`).
+  - `pool_failover_test.kama` (live) runs four isolates' INCRs through a SENTINEL FAILOVER and a CLUSTER FAILOVER plus
+    a DEBUG SLEEP. No INCR may run twice (the count is at most those answered and those failed) and none may fail once
+    the topology has settled. The count may end below those answered: a failover discards what the old primary took
+    after the promotion (Sentinel reconfigures the old master seconds later), so the check reports that, never
+    requires it.
   - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process: a live
     descriptor count uses IP addresses.
 
@@ -352,8 +366,8 @@ printed first.
   - `kama check` passes an `Optional<R>` given where a resource `R` is wanted, and only the C compiler refuses it
     (KRD-13). `pop()` answers an `Optional`: take the value out with `match (give p) { case Some(value: x): … }`, and
     build before trusting a check.
-  - A grant names the accessor, then the granting type's own members: `friend redis::pool::Core::release[putBack];`
-    in `Connection` lets that one method reach `putBack`.
+  - A grant names the accessor, then the granting type's own members: `friend redis::pool::keepable[putBack];` in
+    `Connection` lets that one function reach `putBack`.
   - A `ref` cannot be handed out from inside an enum payload: a lease holds its `Connection` (or `Cluster`) itself.
   - `cpuCount()` answers `int32`.
 

@@ -116,12 +116,38 @@ type resource NodeLink implements Sendable {
     // `body` run over this node's connection, whose WATCH is in force.
     public unsafe fn Result<Unit, RedisError> build(TxBody body, ref Pipeline tx) { return body.build(conn: ref this.held[0], tx: ref tx); }
     public unsafe fn void close() { if (this.held.length() > 0) { this.held[0].close(); } }
+
+    // For a pooled cluster (Cluster.putBack): Kept (its connection put back, or none opened), LetGo (its connection
+    // lost, or its put-back failed: the cluster opens it again when a call needs it), or Discard (a lease's
+    // `authenticate` changed who it is: the whole cluster is not kept).
+    unsafe fn LinkFate putBack(const ref Config config) {
+        if (this.held.length() == 0) { return LinkFate::Kept; }
+        if (this.held[0].byHand()) { return LinkFate::Discard; }
+        if (this.held[0].putBack(config: config)) { return LinkFate::Kept; }
+        this.letGo();
+        return LinkFate::LetGo;
+    }
+    // Its connection, if opened, probed (Connection.probeIdle); one that fails is let go.
+    unsafe fn void probeIdle(Duration timeout) {
+        if (this.held.length() == 0) { return; }
+        if (!this.held[0].probeIdle(timeout: timeout)) { this.letGo(); }
+    }
+    // Its connection, closed and dropped: the cluster opens it again when a call needs it.
+    unsafe fn void letGo() {
+        Optional<Connection> c = this.held.pop();
+        match (give c) { case Some(value: conn): { Connection gone = give conn; gone.close(); } case None: { } };
+    }
+    friend Cluster[putBack, probeIdle];
+
     // How many times its link was made again (Connection.generation); -1 before it is opened.
     public const fn int64 generation() {
         if (this.held.length() == 0) { return -1i64; }
         return this.held[0].generation();
     }
 }
+
+// What a pooled cluster's release does with a node's link (NodeLink.putBack).
+type enum LinkFate implements Sendable { Kept, LetGo, Discard }
 
 // Where each command of a pipeline stands as a cluster sends it: its reply once it has one (until then, the last
 // failure that sends it again), how many redirections it has followed, and the node a redirection named for its next
@@ -766,6 +792,34 @@ type resource Cluster implements Sendable {
     public const fn bool isClosed() { return this.shut; }
 
     unsafe ~Cluster() { this.close(); }
+
+    // ---- for a pool (src/pool/pool.kama; docs/ROADMAP.md, "Phase 7b", step 5) ----
+
+    // Whether this cluster can go back to a pool whose clusters `config` makes. Not one the caller closed, nor one a
+    // node of which a lease re-authenticated by hand. Otherwise each node's link puts back what the lease changed
+    // (Connection.putBack), and one lost, or whose put-back failed, is let go: the cluster opens it again when a call
+    // needs it, as it opens any node's.
+    unsafe fn bool putBack(const ref Config config) {
+        if (this.shut) { return false; }
+        isize i = 0;
+        while (i < this.links.length()) {
+            LinkFate fate = this.links[i].putBack(config: config);
+            if (fate == LinkFate::Discard) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // For a pool's maintenance: each node's link probed (Connection.probeIdle), one that fails let go.
+    unsafe fn bool probeIdle(Duration timeout) {
+        if (this.shut) { return false; }
+        isize i = 0;
+        while (i < this.links.length()) { this.links[i].probeIdle(timeout: timeout); i = i + 1; }
+        return true;
+    }
+
+    friend redis::pool::keepable[putBack];
+    friend redis::pool::probed[probeIdle];
 
     // What `call`, `callFor` and `callEach` refuse before anything is written: what a connection refuses, and what is
     // the cluster's own to send.

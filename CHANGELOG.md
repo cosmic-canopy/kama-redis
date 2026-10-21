@@ -33,6 +33,9 @@ What a caller of 0.2.0 may need to change:
   hand, past its lifetime or whose put-back failed is closed and its place reused. An idle connection the server let
   go is found with no round trip and not lent. `RedisError::PoolTimeout`.
 - `PoolDialers`, a contract for a pool's dialers: `another()` for each connection, `fork()` for each isolate.
+- `ClusterPool`, `ClusterLease` (`cluster()`) and `ClusterPoolShare`: a pool of whole `Cluster`s, at most maxSize, so
+  at most maxSize connections to each node. Release puts back what the lease changed on each node's connection and lets
+  a lost one go; a cluster re-authenticated by hand is closed. The maintenance probes each node's connection in turn.
 
 ### Fixed
 - A `Scan` told links apart by a count of each connection's redials, which starts at 0 on every connection, so a scan

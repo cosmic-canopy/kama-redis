@@ -1,0 +1,74 @@
+[
+ {
+  "id": "C1",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            if (fate == LinkFate::Discard) { return false; }",
+  "new": "",
+  "expect": "cluster pool: a cluster a lease re-authenticated by hand is not kept",
+  "timeout": 300
+ },
+ {
+  "id": "C2",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        this.letGo();\n        return LinkFate::LetGo;",
+  "new": "        return LinkFate::Kept;",
+  "expect": "cluster pool: a lease's cluster keeps its node links across leases",
+  "timeout": 300
+ },
+ {
+  "id": "C3",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "        if (this.held[0].byHand()) { return LinkFate::Discard; }",
+  "new": "",
+  "expect": "cluster pool: a cluster a lease re-authenticated by hand is not kept",
+  "timeout": 300
+ },
+ {
+  "id": "C4",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "    if (config.viaSentinel()) { return Optional::Some(value: \"a Sentinel configuration finds one server: pool its connections with Pool\"); }",
+  "new": "",
+  "expect": "cluster pool: a Sentinel or unix:// configuration",
+  "timeout": 300
+ },
+ {
+  "id": "C5",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "    if (!config.reconnect()) { return Optional::Some(value: \"a cluster makes its nodes",
+  "new": "    if (false) { return Optional::Some(value: \"a cluster makes its nodes",
+  "expect": "cluster pool: a Sentinel or unix:// configuration",
+  "timeout": 300
+ },
+ {
+  "id": "C6",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        if (this.whole) {\n            Result<Cluster, RedisError> made = this.openCluster();",
+  "new": "        if (false) {\n            Result<Cluster, RedisError> made = this.openCluster();",
+  "expect": "cluster pool: a lease's cluster keeps its node links across leases",
+  "timeout": 300
+ },
+ {
+  "id": "C7",
+  "suite": "unit",
+  "file": "src/cluster.kama",
+  "old": "            LinkFate fate = this.links[i].putBack(config: config);",
+  "new": "            LinkFate fate = LinkFate::Kept;",
+  "expect": "cluster pool: a cluster a lease re-authenticated by hand is not kept",
+  "timeout": 300
+ },
+ {
+  "id": "C9",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "            Owned<Dialers> d = new NodeDialers.make(source: this.dialers[0].fork());\n            return Cluster.connectWith(dialers: give d, config: this.config);",
+  "new": "            return Cluster.connect(config: this.config);",
+  "expect": "cluster pool: a lease's cluster keeps its node links across leases",
+  "timeout": 300
+ }
+]
