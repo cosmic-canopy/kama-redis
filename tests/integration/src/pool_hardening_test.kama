@@ -1,0 +1,571 @@
+// Hardening across failovers, live (docs/ROADMAP.md, "Phase 7b", step 7): four isolates share a pool with a
+// client-side cache and a credentials provider on, its login refreshed every second, through repeated SENTINEL
+// FAILOVERs, repeated CLUSTER FAILOVERs, a restart of the server, and its maxclients reached. Each worker INCRs a key
+// of its own, then reads it back through the cache on the same lease, and reads keys every worker shares, more of
+// them than the cache holds. What must hold:
+//   - nothing is sent twice: each count is at most the INCRs answered and those that failed (one that failed may
+//     have run). Through CLUSTER FAILOVER, which waits for the replica to catch up, it is at least those answered too;
+//     through a SENTINEL FAILOVER and a restart without saving, the server may discard what it answered (step 5's
+//     note in docs/ROADMAP.md), and the message counts what was lost;
+//   - a read through the cache right after its lease's INCR is never a hit: the INCR's invalidation comes first, on
+//     the same link or with a link made again (stale reads: none). A value read back older than the INCR is not
+//     counted, since a failover can discard the INCR itself;
+//   - once the topology has settled, every lease works (late failures: none);
+//   - each connection's cache within its bounds, and nothing dropped from its pushes;
+//   - once the pool drops, every descriptor it opened is closed.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::Isolate, std::concurrent::RecvError, std::memory::Owned, std::time::Duration, std::time::sleep,
+         redis::Connection, redis::Config, redis::Cluster, redis::Command, redis::RedisError, redis::Credentials,
+         redis::Login, redis::CacheConfig, redis::CacheStats, redis::resp::Value, redis::cluster::keySlot,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
+         redis::pool::ClusterPool, redis::pool::ClusterPoolShare, redis::pool::ClusterLease,
+         redis_integration_tests::check, redis_integration_tests::setting, open, ask, commandOf, shown, digitsOf,
+         mainUrl, sentinelSettled, failOver, masterPort, sentinelUrl, settled, portOf, openDescriptors, restart };
+export { hardeningPoolTests };
+
+// The cache each pooled connection keeps: small, so the shared reads evict.
+comptime isize CACHE_ENTRIES = 8;
+comptime int64 CACHE_BYTES = 65536;
+comptime isize SHARED_KEYS = 12;
+
+// kr_acl's login, to be asked again after a second, every time: the pool re-authenticates all through the run.
+type resource Rotating implements Credentials, Sendable {
+    public ctor make() { }
+    public unsafe fn Result<Login, RedisError> login() {
+        return Login.of(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw", refreshAfter: Optional::Some(value: Duration.fromSecs(s: 1i64)));
+    }
+    public unsafe fn Owned<Credentials> fork() {
+        Owned<Credentials> o = new Rotating.make();
+        return give o;
+    }
+}
+
+// `url`, with the cache and the provider on.
+unsafe fn Result<Config, RedisError> hardened(const ref string url) {
+    Result<Config, RedisError> parsed = Config.parse(url: url);
+    Config c = match (give parsed) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    CacheConfig cache = CacheConfig.defaults();
+    cache.maxEntries = CACHE_ENTRIES;
+    cache.maxBytes = CACHE_BYTES;
+    Result<Unit, RedisError> cached = c.setCache(cache: cache);
+    match (give cached) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Credentials> p = new Rotating.make();
+    Result<Unit, RedisError> provided = c.setCredentials(provider: give p);
+    match (give provided) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+    return Result::Ok(value: give c);
+}
+
+// A worker's tally: INCRs answered and failed, failures after the topology settled, reads through the cache older
+// than the INCR before them, and the most any cache held, set aside or dropped.
+type value Tally implements Sendable {
+    public int64 answered;
+    public int64 failed;
+    public int64 lateFailures;
+    public int64 stale;
+    public int64 reads;
+    public int64 mostEntries;
+    public int64 mostBytes;
+    public int64 mostPushes;
+    public int64 dropped;
+    public ctor zero() {
+        this.answered = 0i64; this.failed = 0i64; this.lateFailures = 0i64; this.stale = 0i64; this.reads = 0i64;
+        this.mostEntries = 0i64; this.mostBytes = 0i64; this.mostPushes = 0i64; this.dropped = 0i64;
+    }
+}
+
+type enum Word implements Sendable { Settled, Unsettled, Stop }
+
+// An INCR's reply as a number; -1 for anything else.
+fn int64 counted(const ref Result<Value, RedisError> r) {
+    return match (r) { case Ok(value: v): match (v) { case Integer(value: n): n; case _: -1i64; }; case Err(error: e): -1i64; };
+}
+
+// A read's reply as a number (a bulk of digits); -2 for a failure, -1 for anything else.
+fn int64 readBack(const ref Result<Value, RedisError> r) {
+    return match (r) {
+        case Ok(value: v): match (v) { case Bulk(bytes: b): { string s = shown(v: v); := digitsOf(text: s); } case _: -1i64; };
+        case Err(error: e): -2i64;
+    };
+}
+
+// One round on a connection: INCR `key`, read it back through the cache, then one shared key through it.
+unsafe fn void roundOn(ref Connection conn, const ref string key, isize turn, bool late, ref Tally t) {
+    Command incr = Command.of(name: "INCR");
+    incr.arg(text: key);
+    Result<Value, RedisError> r = conn.call(command: incr);
+    int64 n = counted(r: r);
+    if (n >= 0i64) { t.answered = t.answered + 1i64; }
+    else { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } return; }
+    Command get = Command.of(name: "GET");
+    get.arg(text: key);
+    int64 hitsBefore = conn.cacheStats().hits;
+    Result<Value, RedisError> back = conn.cached(command: get, ttl: Duration.fromSecs(s: 60i64));
+    int64 seen = readBack(r: back);
+    if (seen >= 0i64) { t.reads = t.reads + 1i64; if (conn.cacheStats().hits > hitsBefore) { t.stale = t.stale + 1i64; } }
+    isize s = turn % SHARED_KEYS;
+    Command shared = Command.of(name: "GET");
+    shared.arg(text: "kr:{hard}:shared:${s}");
+    Result<Value, RedisError> other = conn.cached(command: shared, ttl: Duration.fromSecs(s: 60i64));
+    CacheStats st = conn.cacheStats();
+    if (st.entries > t.mostEntries) { t.mostEntries = st.entries; }
+    if (st.bytes > t.mostBytes) { t.mostBytes = st.bytes; }
+    int64 pushes = cast<int64>(conn.pendingPushes());
+    if (pushes > t.mostPushes) { t.mostPushes = pushes; }
+    if (conn.droppedPushes() > t.dropped) { t.dropped = conn.droppedPushes(); }
+}
+
+// What the main isolate says, read without waiting: whether to stop, and whether failures count as late from here.
+fn bool heard(ref Receiver<Word> told, ref bool late) {
+    bool going = true;
+    bool more = true;
+    while (more) {
+        Result<Word, RecvError> w = told.tryRecv();
+        match (w) {
+            case Ok(value: x): { match (x) { case Settled: { late = true; } case Unsettled: { late = false; } case Stop: { going = false; } }; }
+            case Err(error: e): { more = false; }
+        };
+    }
+    return going;
+}
+
+type resource PoolWorker implements Sendable {
+    PoolShare share;
+    Receiver<Word> told;
+    Sender<Tally> report;
+    string key;
+    public ctor make(PoolShare share, Receiver<Word> told, Sender<Tally> report, string key) { this.share = give share; this.told = give told; this.report = give report; this.key = give key; }
+    public unsafe fn void run() {
+        Pool p = Pool.join(share: this.share);
+        Tally t = Tally.zero();
+        bool late = true;
+        isize turn = 0;
+        while (heard(told: this.told, late: late)) {
+            Result<Lease, RedisError> r = p.acquire();
+            match (give r) {
+                case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { roundOn(conn: conn, key: this.key, turn: turn, late: late, t: t); } }
+                case Err(error: e): { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } }
+            };
+            turn = turn + 1;
+            sleep(d: Duration.fromMillis(ms: 10i64));
+        }
+        _ = this.report.send(item: t);
+    }
+}
+unsafe fn void poolWork(PoolWorker job) { job.run(); }
+
+// One round on a cluster: the same, through the cluster's caches.
+unsafe fn void roundOnCluster(ref Cluster c, const ref string key, isize turn, bool late, ref Tally t) {
+    Command incr = Command.of(name: "INCR");
+    incr.arg(text: key);
+    Result<Value, RedisError> r = c.call(command: incr);
+    int64 n = counted(r: r);
+    if (n >= 0i64) { t.answered = t.answered + 1i64; }
+    else { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } return; }
+    Command get = Command.of(name: "GET");
+    get.arg(text: key);
+    int64 hitsBefore = c.cacheStats().hits;
+    Result<Value, RedisError> back = c.cached(command: get, ttl: Duration.fromSecs(s: 60i64));
+    int64 seen = readBack(r: back);
+    if (seen >= 0i64) { t.reads = t.reads + 1i64; if (c.cacheStats().hits > hitsBefore) { t.stale = t.stale + 1i64; } }
+    isize s = turn % SHARED_KEYS;
+    Command shared = Command.of(name: "GET");
+    shared.arg(text: "kr:{hard}:shared:${s}");
+    Result<Value, RedisError> other = c.cached(command: shared, ttl: Duration.fromSecs(s: 60i64));
+    CacheStats st = c.cacheStats();
+    if (st.bytes > t.mostBytes) { t.mostBytes = st.bytes; }
+}
+
+type resource ClusterWorker implements Sendable {
+    ClusterPoolShare share;
+    Receiver<Word> told;
+    Sender<Tally> report;
+    string key;
+    public ctor make(ClusterPoolShare share, Receiver<Word> told, Sender<Tally> report, string key) { this.share = give share; this.told = give told; this.report = give report; this.key = give key; }
+    public unsafe fn void run() {
+        ClusterPool p = ClusterPool.join(share: this.share);
+        Tally t = Tally.zero();
+        bool late = true;
+        isize turn = 0;
+        while (heard(told: this.told, late: late)) {
+            Result<ClusterLease, RedisError> r = p.acquire();
+            match (give r) {
+                case Ok(value: l): { ClusterLease lease = give l; borrow lease.cluster() as c { roundOnCluster(c: c, key: this.key, turn: turn, late: late, t: t); } }
+                case Err(error: e): { t.failed = t.failed + 1i64; if (late) { t.lateFailures = t.lateFailures + 1i64; } }
+            };
+            turn = turn + 1;
+            sleep(d: Duration.fromMillis(ms: 10i64));
+        }
+        _ = this.report.send(item: t);
+    }
+}
+unsafe fn void clusterWork(ClusterWorker job) { job.run(); }
+
+unsafe fn Tally summed(ref Receiver<Tally> reports, isize n) {
+    Tally sum = Tally.zero();
+    isize k = 0;
+    while (k < n) {
+        Optional<Tally> got = reports.recv();
+        match (got) {
+            case Some(value: x): {
+                sum.answered = sum.answered + x.answered; sum.failed = sum.failed + x.failed;
+                sum.lateFailures = sum.lateFailures + x.lateFailures; sum.stale = sum.stale + x.stale; sum.reads = sum.reads + x.reads;
+                if (x.mostEntries > sum.mostEntries) { sum.mostEntries = x.mostEntries; }
+                if (x.mostBytes > sum.mostBytes) { sum.mostBytes = x.mostBytes; }
+                if (x.mostPushes > sum.mostPushes) { sum.mostPushes = x.mostPushes; }
+                sum.dropped = sum.dropped + x.dropped;
+            }
+            case None: { }
+        };
+        k = k + 1;
+    }
+    return sum;
+}
+
+// After `Unsettled`, before anything is disrupted: long enough for every worker to have read the word at the top of a
+// round (a round takes milliseconds), so a call that a disruption breaks never counts as late.
+unsafe fn void unsettle() { sleep(d: Duration.fromMillis(ms: 200i64)); }
+
+unsafe fn void tellAll(ref DynamicArray<Sender<Word>> to, Word w) {
+    isize i = 0;
+    while (i < to.length()) { _ = to[i].send(item: w); i = i + 1; }
+}
+
+fn string keyOf(const ref string prefix, int32 k) { return prefix.concat(other: ":w${k}"); }
+
+// The sum of the workers' counts, read with `c`; -1 when one cannot be read.
+unsafe fn int64 totalOn(ref Connection c, const ref string prefix) {
+    int64 total = 0;
+    int32 k = 0;
+    while (k < 4) {
+        string key = keyOf(prefix: prefix, k: k);
+        string v = ask(c: c, text: "GET ".concat(other: key));
+        if (v == "(nil)") { v = "0"; }
+        int64 n = digitsOf(text: v);
+        if (n < 0i64) { return -1i64; }
+        total = total + n;
+        k = k + 1;
+    }
+    return total;
+}
+
+unsafe fn int64 totalOnCluster(ref Cluster c, const ref string prefix) {
+    int64 total = 0;
+    int32 k = 0;
+    while (k < 4) {
+        string key = keyOf(prefix: prefix, k: k);
+        Command get = commandOf(text: "GET ".concat(other: key));
+        Result<Value, RedisError> r = c.call(command: get);
+        string v = match (r) { case Ok(value: x): shown(v: x); case Err(error: e): "-"; };
+        if (v == "(nil)") { v = "0"; }
+        int64 n = digitsOf(text: v);
+        if (n < 0i64) { return -1i64; }
+        total = total + n;
+        k = k + 1;
+    }
+    return total;
+}
+
+// What every scenario checks, once its workers have stopped: `n` is the counts' sum read after, or -1 where the
+// server lost them (a restart without saving), and `kept` whether the server keeps every write it answered.
+fn int32 invariants(const ref string what, Tally sum, int64 n, bool cluster, bool kept) {
+    int32 f = 0;
+    int64 answered = sum.answered;
+    int64 failed = sum.failed;
+    int64 late = sum.lateFailures;
+    int64 stale = sum.stale;
+    int64 reads = sum.reads;
+    int64 lost = answered - n;
+    bool once = n < 0i64 || n <= answered + failed;
+    bool all = n < 0i64 || !kept || answered <= n;
+    f = f + check(ok: answered > 0i64 && once && all && late == 0i64,
+                  what: "${what}: no INCR ran twice, and every lease after the topology settled works (${answered} answered, ${failed} failed, ${late} after; ${n}; ${lost} lost)");
+    f = f + check(ok: stale == 0i64 && reads > 0i64, what: "${what}: no read through the cache right after its lease's INCR was a hit (${stale} of ${reads})");
+    int64 entries = sum.mostEntries;
+    int64 bytes = sum.mostBytes;
+    int64 pushes = sum.mostPushes;
+    int64 dropped = sum.dropped;
+    int64 most = cast<int64>(CACHE_ENTRIES);
+    bool bounded = cluster ? bytes <= CACHE_BYTES * 6i64 : entries <= most && bytes <= CACHE_BYTES;
+    f = f + check(ok: bounded && pushes <= 1024i64 && dropped == 0i64,
+                  what: "${what}: each cache within its bounds, and no push dropped (${entries} entries, ${bytes} bytes, ${pushes} pushes, ${dropped} dropped)");
+    return f;
+}
+
+// ---- through repeated SENTINEL FAILOVERs ----
+
+unsafe fn int32 sentinelHardening() {
+    int32 f = 0;
+    f = f + check(ok: sentinelSettled(secs: 30i64), what: "hardening, sentinel: settled before");
+    isize fds = openDescriptors();
+    string prefix = "kr:hard:sentinel";
+    {
+        Result<Config, RedisError> pc = hardened(url: sentinelUrl(options: "&command_timeout=2&reconnect_timeout=10"));
+        Config config = match (give pc) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, sentinel: ${m}"); } };
+        PoolOptions o = PoolOptions.defaults();
+        o.maxSize = 3;
+        o.acquireTimeout = Duration.fromSecs(s: 10i64);
+        o.minIdle = 1;
+        o.healthCheck = Duration.fromSecs(s: 1i64);
+        Result<Pool, RedisError> made = Pool.make(config: config, options: o);
+        Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, sentinel: ${m}"); } };
+        int64 before = -1i64;
+        { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { before = totalOn(c: conn, prefix: prefix); } } case Err(error: e): { } }; }
+        Channel<Tally> reports = Channel.bounded(capacity: 4);
+        Receiver<Tally> heardFrom = reports.receiver();
+        DynamicArray<Sender<Word>> words = DynamicArray.empty();
+        DynamicArray<Isolate> workers = DynamicArray.empty();
+        int32 k = 0;
+        while (k < 4) {
+            Channel<Word> w = Channel.bounded(capacity: 8);
+            words.add(item: w.sender());
+            Result<PoolShare, RedisError> s = pool.share();
+            match (give s) { case Ok(value: sh): { PoolWorker job = PoolWorker.make(share: give sh, told: w.receiver(), report: reports.sender(), key: keyOf(prefix: prefix, k: k)); Isolate i = spawn poolWork(job: give job); workers.add(item: give i); } case Err(error: e): { } };
+            k = k + 1;
+        }
+        sleep(d: Duration.fromSecs(s: 1i64));
+        // Three failovers, each waited out, spaced past twice failover-timeout (3 s), when Sentinel takes the next.
+        string moves = "";
+        int32 round = 0;
+        bool allSettled = true;
+        while (round < 3) {
+            tellAll(to: words, w: Word::Unsettled);
+        unsettle();
+            string from = masterPort();
+            string asked = failOver();
+            bool ok = sentinelSettled(secs: 40i64);
+            allSettled = allSettled && ok && asked == "OK";
+            string to = masterPort();
+            moves = moves.concat(other: from).concat(other: ">").concat(other: to).concat(other: " ");
+            tellAll(to: words, w: Word::Settled);
+            sleep(d: Duration.fromSecs(s: 7i64));
+            round = round + 1;
+        }
+        tellAll(to: words, w: Word::Stop);
+        Tally sum = summed(reports: heardFrom, n: 4);
+        workers.clear();
+        int64 after = -1i64;
+        { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; borrow lease.conn() as conn { after = totalOn(c: conn, prefix: prefix); } } case Err(error: e): { } }; }
+        f = f + check(ok: allSettled, what: "hardening, sentinel: three SENTINEL FAILOVERs, each settled (${moves})");
+        f = f + invariants(what: "hardening, sentinel", sum: sum, n: after - before, cluster: false, kept: false);
+    }
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    isize left = openDescriptors();
+    f = f + check(ok: left == fds, what: "hardening, sentinel: the pool's descriptors closed with it (${fds} before, ${left} after)");
+    return f;
+}
+
+// ---- through repeated CLUSTER FAILOVERs ----
+
+// The port of `slot`'s first replica. Right after a failover the map can list the shard without one for a moment,
+// until the old primary rejoins as a replica: it is read again, for up to ten seconds.
+unsafe fn string replicaPortOf(ref Cluster c, isize slot) {
+    int32 tries = 0;
+    while (tries < 50) {
+        Result<Unit, RedisError> fetched = c.refreshTopology();
+        DynamicArray<isize> replicas = c.topology().replicasOf(slot: slot);
+        if (replicas.length() > 0) { return portOf(c: c, index: replicas[0]); }
+        sleep(d: Duration.fromMillis(ms: 200i64));
+        tries = tries + 1;
+    }
+    return "";
+}
+
+unsafe fn string askNode(const ref string port, const ref string text) {
+    Result<Connection, RedisError> r = open(url: "redis://127.0.0.1:".concat(other: port).concat(other: "?connect_timeout=2"));
+    return match (give r) { case Ok(value: c): { Connection n = give c; := ask(c: n, text: text); } case Err(error: e): e.message(); };
+}
+
+unsafe fn int32 clusterHardening() {
+    int32 f = 0;
+    f = f + check(ok: settled(secs: 30i64), what: "hardening, cluster: settled before");
+    isize fds = openDescriptors();
+    string prefix = "kr:{hard}";
+    isize slot = keySlot(key: prefix.bytes());
+    string url = setting(name: "REDISTEST_CLUSTER_URL").concat(other: "?connect_timeout=2&command_timeout=2&reconnect_timeout=10");
+    {
+        Result<Config, RedisError> pc = hardened(url: url);
+        Config config = match (give pc) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, cluster: ${m}"); } };
+        Result<Cluster, RedisError> ar = Cluster.connect(config: config);
+        Cluster admin = match (give ar) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, cluster: admin: ${m}"); } };
+        int64 before = totalOnCluster(c: admin, prefix: prefix);
+        PoolOptions o = PoolOptions.defaults();
+        o.maxSize = 3;
+        o.acquireTimeout = Duration.fromSecs(s: 10i64);
+        o.healthCheck = Duration.fromSecs(s: 1i64);
+        Result<ClusterPool, RedisError> made = ClusterPool.make(config: config, options: o);
+        ClusterPool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, cluster: ${m}"); } };
+        Channel<Tally> reports = Channel.bounded(capacity: 4);
+        Receiver<Tally> heardFrom = reports.receiver();
+        DynamicArray<Sender<Word>> words = DynamicArray.empty();
+        DynamicArray<Isolate> workers = DynamicArray.empty();
+        int32 k = 0;
+        while (k < 4) {
+            Channel<Word> w = Channel.bounded(capacity: 8);
+            words.add(item: w.sender());
+            Result<ClusterPoolShare, RedisError> s = pool.share();
+            match (give s) { case Ok(value: sh): { ClusterWorker job = ClusterWorker.make(share: give sh, told: w.receiver(), report: reports.sender(), key: keyOf(prefix: prefix, k: k)); Isolate i = spawn clusterWork(job: give job); workers.add(item: give i); } case Err(error: e): { } };
+            k = k + 1;
+        }
+        sleep(d: Duration.fromSecs(s: 1i64));
+        // Three manual failovers of the keys' shard, each at its replica of the moment, each waited out.
+        string answers = "";
+        int32 round = 0;
+        bool allSettled = true;
+        while (round < 3) {
+            tellAll(to: words, w: Word::Unsettled);
+        unsettle();
+            string replica = replicaPortOf(c: admin, slot: slot);
+            string asked = askNode(port: replica, text: "CLUSTER FAILOVER");
+            bool ok = settled(secs: 30i64);
+            allSettled = allSettled && ok && asked == "OK";
+            answers = answers.concat(other: replica).concat(other: ":").concat(other: asked).concat(other: " ");
+            tellAll(to: words, w: Word::Settled);
+            sleep(d: Duration.fromSecs(s: 3i64));
+            round = round + 1;
+        }
+        tellAll(to: words, w: Word::Stop);
+        Tally sum = summed(reports: heardFrom, n: 4);
+        workers.clear();
+        int64 after = totalOnCluster(c: admin, prefix: prefix);
+        f = f + check(ok: allSettled, what: "hardening, cluster: three CLUSTER FAILOVERs, each settled (${answers})");
+        f = f + invariants(what: "hardening, cluster", sum: sum, n: after - before, cluster: true, kept: true);
+    }
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    isize left = openDescriptors();
+    f = f + check(ok: left == fds, what: "hardening, cluster: the pool's descriptors closed with it (${fds} before, ${left} after)");
+    return f;
+}
+
+// ---- a restart, and maxclients reached ----
+
+// How many of the server's clients are the pool's (name=kr-hard), and how many there are in all.
+unsafe fn isize clientsNamed(ref Connection admin, const ref string name) {
+    string list = ask(c: admin, text: "CLIENT LIST");
+    isize n = 0;
+    isize start = 0;
+    isize i = 0;
+    while (i <= list.length()) {
+        if (i == list.length() || list.bytes()[i] == 10ui8) {
+            string line = list.substring(start: start, end: i);
+            if (line.startsWith(prefix: "id=") && (name.length() == 0 || line.contains(substring: name))) { n = n + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The last run of digits in `text` ("[maxclients 10000]"); -1 when there is none.
+fn int64 lastNumber(const ref string text) {
+    isize end = text.length();
+    while (end > 0 && (text.bytes()[end - 1] < 48ui8 || text.bytes()[end - 1] > 57ui8)) { end = end - 1; }
+    isize start = end;
+    while (start > 0 && text.bytes()[start - 1] >= 48ui8 && text.bytes()[start - 1] <= 57ui8) { start = start - 1; }
+    if (start == end) { return -1i64; }
+    return digitsOf(text: text.substring(start: start, end: end));
+}
+
+// Kill the pool's clients (name=kr-hard), by id.
+unsafe fn void killHard(ref Connection admin) {
+    string list = ask(c: admin, text: "CLIENT LIST");
+    isize start = 0;
+    isize i = 0;
+    while (i <= list.length()) {
+        if (i == list.length() || list.bytes()[i] == 10ui8) {
+            string line = list.substring(start: start, end: i);
+            if (line.contains(substring: "name=kr-hard ") && line.startsWith(prefix: "id=")) {
+                isize sp = 3;
+                while (sp < line.length() && line.bytes()[sp] != 32ui8) { sp = sp + 1; }
+                string id = line.substring(start: 3, end: sp);
+                string killed = ask(c: admin, text: "CLIENT KILL ID ".concat(other: id));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+unsafe fn int32 standaloneHardening() {
+    int32 f = 0;
+    isize fds = openDescriptors();
+    string prefix = "kr:hard:standalone";
+    string maxWas = "";
+    {
+        Result<Connection, RedisError> ar = open(url: mainUrl(userinfo: "", tail: ""));
+        Connection admin = match (give ar) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, standalone: admin: ${m}"); } };
+        Result<Config, RedisError> pc = hardened(url: mainUrl(userinfo: "", tail: "?client_name=kr-hard&command_timeout=2&reconnect_timeout=10"));
+        Config config = match (give pc) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, standalone: ${m}"); } };
+        PoolOptions o = PoolOptions.defaults();
+        o.maxSize = 4;
+        o.acquireTimeout = Duration.fromSecs(s: 5i64);
+        o.healthCheck = Duration.fromSecs(s: 1i64);
+        Result<Pool, RedisError> made = Pool.make(config: config, options: o);
+        Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { string m = e.message(); return check(ok: false, what: "hardening, standalone: ${m}"); } };
+        Channel<Tally> reports = Channel.bounded(capacity: 4);
+        Receiver<Tally> heardFrom = reports.receiver();
+        DynamicArray<Sender<Word>> words = DynamicArray.empty();
+        DynamicArray<Isolate> workers = DynamicArray.empty();
+        int32 k = 0;
+        while (k < 4) {
+            Channel<Word> w = Channel.bounded(capacity: 8);
+            words.add(item: w.sender());
+            Result<PoolShare, RedisError> s = pool.share();
+            match (give s) { case Ok(value: sh): { PoolWorker job = PoolWorker.make(share: give sh, told: w.receiver(), report: reports.sender(), key: keyOf(prefix: prefix, k: k)); Isolate i = spawn poolWork(job: give job); workers.add(item: give i); } case Err(error: e): { } };
+            k = k + 1;
+        }
+        sleep(d: Duration.fromSecs(s: 1i64));
+        // A restart: SHUTDOWN NOSAVE, and the server back, empty, half a second later.
+        tellAll(to: words, w: Word::Unsettled);
+        unsettle();
+        restart(admin: admin);
+        string back = ask(c: admin, text: "PING");
+        // The closes of the links the restart dropped reach the client through the port forwarder a moment later; a
+        // call written into one before then fails on I/O, and is never sent again.
+        sleep(d: Duration.fromSecs(s: 1i64));
+        tellAll(to: words, w: Word::Settled);
+        sleep(d: Duration.fromSecs(s: 2i64));
+        // maxclients reached: the pool's connections killed, with room left for one of them, so the others' redials
+        // meet the limit (a server takes a limit below its count of clients, and refuses new ones until it is under).
+        tellAll(to: words, w: Word::Unsettled);
+        unsettle();
+        maxWas = ask(c: admin, text: "CONFIG GET maxclients");
+        isize all = clientsNamed(admin: admin, name: "");
+        isize pooled = clientsNamed(admin: admin, name: "name=kr-hard ");
+        isize room = all - pooled + 1;
+        string lowered = ask(c: admin, text: "CONFIG SET maxclients ${room}");
+        killHard(admin: admin);
+        sleep(d: Duration.fromSecs(s: 2i64));
+        int64 was = lastNumber(text: maxWas);
+        string raised = ask(c: admin, text: "CONFIG SET maxclients ${was}");
+        tellAll(to: words, w: Word::Settled);
+        sleep(d: Duration.fromSecs(s: 2i64));
+        tellAll(to: words, w: Word::Stop);
+        Tally sum = summed(reports: heardFrom, n: 4);
+        workers.clear();
+        // The connects maxclients refused gave their places back: the pool still lends maxSize connections at once.
+        DynamicArray<Lease> held = DynamicArray.empty();
+        string refused = "";
+        while (held.length() < 4 && refused.length() == 0) {
+            Result<Lease, RedisError> r = pool.acquire();
+            match (give r) { case Ok(value: l): { held.add(item: give l); } case Err(error: e): { refused = e.message(); } };
+        }
+        isize lent = held.length();
+        held.clear();
+        f = f + check(ok: lent == 4, what: "hardening, standalone: after maxclients the pool still lends all four connections at once (${lent}; ${refused})");
+        f = f + check(ok: back == "PONG" && lowered == "OK" && raised == "OK" && was > 0i64,
+                      what: "hardening, standalone: the server restarted, and maxclients lowered to ${room} and raised again (${back}; ${lowered}; ${raised})");
+        f = f + invariants(what: "hardening, standalone", sum: sum, n: -1i64, cluster: false, kept: false);
+    }
+    sleep(d: Duration.fromMillis(ms: 300i64));
+    isize left = openDescriptors();
+    f = f + check(ok: left == fds, what: "hardening, standalone: the pool's descriptors closed with it (${fds} before, ${left} after)");
+    return f;
+}
+
+unsafe fn int32 hardeningPoolTests() {
+    int32 f = 0;
+    f = f + sentinelHardening();
+    f = f + clusterHardening();
+    f = f + standaloneHardening();
+    return f;
+}

@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::concu
          redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Command, redis::Pipeline,
          redis::Replies, redis::RedisError, redis::resp::Value,
          redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask, commandOf };
-export { restartTests, openDescriptors };
+export { restartTests, openDescriptors, restart };
 
 unsafe fn Connection reach(const ref string url, const ref string what) {
     Result<Connection, RedisError> r = open(url: url);

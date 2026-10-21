@@ -711,12 +711,41 @@ Each step ends green before its commit:
    - **Gates:** `tools/test.sh` debug and release on v0.9.707 and on cstar's committed 0.9.716, and the integration
      matrix on all eight servers, with step 7's hardening; the live cache and hardening tests ran again on all eight
      after their last changes.
-7. **Live hardening across failovers** (`pool_hardening_test.kama`).
-   - Repeated SENTINEL and CLUSTER FAILOVERs, each waited out, with four isolates on one pool, the cache and a provider
-     on.
-   - A restart, and maxclients.
-   - What it checks: the INCR invariants, `/dev/fd` back to its count, and the cache's bytes and the pushes within
-     their bounds.
+7. **Done (2026-10-21).** **Live hardening across failovers** (`pool_hardening_test.kama`).
+   - **What it runs:** four isolates share a pool with a client-side cache (eight entries and 64 KiB, so the shared
+     reads evict) and a credentials provider (`kr_acl`, its login refreshed every second). Each worker INCRs a key of its
+     own, reads it back through the cache on the same lease, then reads one of twelve shared keys through it:
+     - through a `Pool` across three SENTINEL FAILOVERs, each waited out and spaced past twice failover-timeout;
+     - through a `ClusterPool` across three CLUSTER FAILOVERs of the keys' shard, each waited out;
+     - through a `Pool` across a restart (SHUTDOWN NOSAVE) and maxclients reached (the pool's connections killed with
+       room left for one).
+   - **What it checks:** no INCR ran twice; through CLUSTER FAILOVER, which waits for the replica, every INCR answered
+     counted; none failed once the topology had settled; the read right after a lease's own INCR was never a hit; each
+     cache within its bounds, and no push dropped; after maxclients, the pool still lends maxSize connections at once;
+     every descriptor closed with the pool.
+   - **What it found** (on Redis 7.2, from step 6's code):
+     - **A cluster's cached read could hit a demoted primary's entry,** right after its own INCR (one or two in about
+       2500 reads, in one run of three). The INCR met MOVED and ran on the new primary; the reading of the map that
+       follows a MOVED came from a node a moment behind the failover and gave the slot back to the old primary; the
+       read was a hit there, and a hit never asks the node. Fixed in step 6's code: a node a change of the map takes a
+       slot from has its cache emptied, and after any change a node link's next hit makes a round trip first (a node
+       that took a slot over sent its invalidations of the replicated writes on its own link, while the MOVED came on
+       another). Unit tests and mutations H27–H29 cover both; fifteen runs on Redis 7.2 after the fix found none.
+     - **Sentinel discards acknowledged writes** (step 5's note): 2020 of 10855 INCRs through three failovers on
+       Redis 8.10. The check reports what was lost and requires what the client guarantees.
+     - The test's own timing, each fixed in the test: a worker reads its `Unsettled` word at the top of a round, so a
+       call already in flight when a disruption came counted as late (the workers are now told 200 ms before); the
+       restart's closes reach the client through the port forwarder a moment later (a second's wait after the server
+       is back); right after a failover the map can list a shard without a replica for a moment (read again until it
+       has one).
+     - The first stale check, "a value read back older than the INCR", proved nothing: a failover can discard the
+       INCR itself. A hit right after the lease's own INCR is the evidence, whatever the server kept.
+   - **Mutations** (`7b-s7.json`): one, live, CAUGHT. HH2 (a refused connect not giving its place back) survived until
+     the test required the pool to lend all four connections at once after maxclients. HH1 (a lost link's cache kept)
+     went: a pooled connection is almost always lost while idle and replaced at the next acquire, so its cache is never
+     read again; H6, unit, covers that line.
+   - **Gates:** with step 6's: `tools/test.sh` on both compilers and the integration matrix on all eight servers; the
+     hardening and cache tests again on all eight after the capacity check.
 8. **Docs, examples and 0.3.0.**
    - `examples/pool`, `examples/cache`, and a README program with a provider.
    - The README's error table gains `PoolTimeout` and `Credentials`.

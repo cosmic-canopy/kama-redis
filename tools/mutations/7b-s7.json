@@ -1,0 +1,11 @@
+[
+ {
+  "id": "HH2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "            case Err(error: e): {\n                this.ends.put(slot: Slot::Empty);\n                return Result::Err(error: give e);\n            }",
+  "new": "            case Err(error: e): {\n                return Result::Err(error: give e);\n            }",
+  "expect": "hardening, standalone: after maxclients the pool still lends all four connections at once",
+  "timeout": 900
+ }
+]

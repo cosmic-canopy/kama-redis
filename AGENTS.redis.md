@@ -279,6 +279,12 @@ printed first.
     the topology has settled. The count may end below those answered: a failover discards what the old primary took
     after the promotion (Sentinel reconfigures the old master seconds later), so the check reports that, never
     requires it.
+  - `pool_hardening_test.kama` (live, phase 7b step 7) does the same with the cache and a provider on, through three
+    SENTINEL FAILOVERs, three CLUSTER FAILOVERs (which wait for the replica, so there every answered INCR must count),
+    a restart and maxclients reached. Each worker reads its own key back through the cache after each INCR, and that
+    read must never be a hit: the INCR's invalidation comes first. (A value older than the INCR proves nothing, since
+    a failover can discard the INCR itself.) Workers are told `Unsettled` 200 ms before each disruption, so a call it
+    breaks never counts as late. It runs before `restart_test.kama`, since it restarts the server too.
   - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process: a live
     descriptor count uses IP addresses.
 
