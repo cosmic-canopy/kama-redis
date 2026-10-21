@@ -1,6 +1,6 @@
 // Authentication, live: one ACL user per case (tests/integration/server/redis.conf), and the locked server, whose
 // default user has a password (locked.conf).
-import { std::collections::DynamicArray, redis::Connection, redis::RedisError, redis::Protocol, redis_integration_tests::check, redis_integration_tests::stop,
+import { std::collections::DynamicArray, redis::Connection, redis::RedisError, redis::Protocol, redis_integration_tests::check,
          redis_integration_tests::setting, mainUrl, lockedUrl, open, attempt, ask, codeOf };
 export { authTests };
 
@@ -76,7 +76,7 @@ unsafe fn int32 authTests() {
         Result<Connection, RedisError> opened = open(url: mainUrl(userinfo: "", tail: tail));
         Connection switcher = match (give opened) {
             case Ok(value: v): give v;
-            case Err(error: e): { string m = e.message(); return stop::<int32>(msg: "auth_test: authenticate: ${m}"); }
+            case Err(error: e): { string m = e.message(); panic(msg: "auth_test: authenticate: ${m}"); }
         };
         Result<Unit, RedisError> bad = switcher.authenticate(user: Optional::Some(value: "kr_acl"), password: "wrong");
         string badCode = match (bad) { case Err(error: e): match (e) { case Server(error: s): s.codeText(); case _: e.message(); }; case Ok(value: u): "ok"; };

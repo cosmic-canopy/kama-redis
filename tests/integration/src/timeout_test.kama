@@ -3,7 +3,7 @@
 import { std::io::IoError, std::net::TcpListener, std::time::monotonicNow, std::time::Instant, std::time::Duration,
          std::time::sleep, std::concurrent::Isolate,
          redis::Connection, redis::Command, redis::RedisError, redis::resp::Value,
-         redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, mainUrl, open, attempt, ask };
+         redis_integration_tests::check, redis_integration_tests::setting, mainUrl, open, attempt, ask };
 export { timeoutTests };
 
 // A connection of its own, opened or the test fails by name.
@@ -11,7 +11,7 @@ unsafe fn Connection reach(const ref string tail, const ref string what) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "timeout_test: ${what}: connect: ${m}"); }
+        case Err(error: e): { string m = e.message(); panic(msg: "timeout_test: ${what}: connect: ${m}"); }
     };
     return give c;
 }

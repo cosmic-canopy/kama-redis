@@ -11,7 +11,7 @@ The Redis and Valkey client for [kama](https://kama-lang.org). It speaks RESP2 a
 > master, and every reconnect asks again. A cluster sends each command where its keys are, follows MOVED and ASK,
 > spreads a command over its nodes as the servers' own command tips say, and reads from replicas when asked. It is
 > tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under Sentinel and as a cluster. See the
-> [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.690**.
+> [roadmap](https://github.com/cosmic-canopy/kama-redis/blob/main/docs/ROADMAP.md). Needs **kama ≥ 0.9.707**.
 
 ## Connecting
 

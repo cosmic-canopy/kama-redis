@@ -1,7 +1,7 @@
 // Scripts against the server, under RESP3 and RESP2: our SHA-1 is the server's, the first call loads the script
 // (NOSCRIPT, then EVAL), the next is a hit, the read-only forms from 7.0, and EVAL in a pipeline and a transaction.
 import { redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Script,
-         redis::ScriptCall, redis::TxOutcome, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::stop,
+         redis::ScriptCall, redis::TxOutcome, redis::resp::Value, redis_integration_tests::check,
          redis_integration_tests::setting, open, mainUrl, ask, shown };
 export { scriptTests };
 
@@ -9,7 +9,7 @@ unsafe fn Connection reach(const ref string tail, const ref string what) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "script_test: ${what}: connect: ${m}"); }
+        case Err(error: e): { string m = e.message(); panic(msg: "script_test: ${what}: connect: ${m}"); }
     };
     return give c;
 }

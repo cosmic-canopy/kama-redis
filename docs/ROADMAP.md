@@ -1,15 +1,17 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0 to 6 and 7a are done, on kama v0.9.690 (the floor and CI's pin) and cstar's
-0.9.707. **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`). **0.2.0, Cluster and
-Sentinel, is ready but for its publish:** "Phase 6: where to start", just below, has what each step did.
+Where this is, 2026-10-21: phases 0 to 6 and 7a are done, on kama v0.9.707 (the floor, CI's pin, the newest tag and
+cstar's newest build). **0.1.0, a complete client for one server, is published** (2026-10-19, from `146a4d8`).
+**0.2.0, Cluster and Sentinel, is ready but for its publish:** "Phase 6: where to start", just below, has what each
+step did.
 - The floor moved from v0.9.667 to v0.9.690 on 2026-10-20 (the maintainer's word), which closed KRD-11: from 0.9.684
   kama requires `fn uint8 main()` and every earlier tag refuses it. The ten `main`s, the README's programs and the live
-  program's channel `send` (0.9.680) took the new forms, and the tree builds unedited on both compilers.
-- cstar's newest build is 0.9.707. Since 0.9.696 unreachable code is an error, and since 0.9.706 `string.find` has
-  another type, which nothing here calls. The tree takes the forms both accept (nothing after a `while (true)` or a
-  function's last `panic`), and a test arm that stops ends in `stop::<T>(msg:)` (KRD-12). `@kama/tls` 0.1.6
-  (2026-10-20) builds there, and the package needs `^0.1.6` now.
+  program's channel `send` (0.9.680) took the new forms.
+- It moved again, to v0.9.707, on 2026-10-21, when that tag came out: it closed KRD-9 (`View.copyWithin`, so the
+  reader slides its unread bytes in one call) and KRD-12 (an arm may end in `panic`, so the test programs' `stop` went).
+  0.2.0 carries no workaround for kama, and a consumer moves the floor once, not twice. Since 0.9.706 `string.find`
+  has another type, which nothing here calls. `@kama/tls` 0.1.6 (2026-10-20) builds there, and the package needs
+  `^0.1.6`; its own tests are green on the tag.
 - `tools/redis.sh` runs every server in the matrix with TLS on and one ACL user per authentication case.
   `tools/redis.sh smoke` passes all 16 checks on Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10 and 8.10.2, and on Valkey
   7.2.14, 8.1.10 and 9.1.2.
@@ -47,16 +49,14 @@ Sentinel, is ready but for its publish:** "Phase 6: where to start", just below,
   `ClusterSubscriber`. `tools/redis.sh --topology cluster|sentinel` runs both on all eight servers; the vectors come
   from `tools/gen-topology-vectors.sh` and `tools/gen-command-table.sh`; the live suite drives failovers, a sleeping
   primary, restarts, resharding and the atomic migrations.
-- Gates (0.2.0): `tools/test.sh` is green, debug and release, the examples built, on kama v0.9.690 (the floor and CI's
-  pin) and cstar's 0.9.707; `tools/test-integration.sh` on all eight servers, alone, under Sentinel and as a cluster;
+- Gates (0.2.0): `tools/test.sh` is green, debug and release, the examples built, on kama v0.9.707 (the floor and CI's
+  pin); `tools/test-integration.sh` on all eight servers, alone, under Sentinel and as a cluster;
   the README's programs and the examples live. Every step proven by mutation (`tools/mutate.sh`). Pushed 2026-10-20.
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
-- Open gaps here (both found 2026-10-19, neither blocking 0.1.0): KRD-9, std has no in-place copy, and cstar's
-  0.9.675 refuses the reader's copy between two windows of its buffer; the reader moves those bytes one at a time
-  until std has one, so the package builds on 0.9.675 too, which the registry checks with (its first publish stopped
-  there). KRD-10, an application named like a dependency's module breaks that dependency's imports (an application
-  named `tls` cannot use this package). KRD-7, KRD-8
+- No gap is open here (KAMA_GAPS.md). KRD-9 (std had no in-place copy, and 0.9.675 refused the reader's copy between
+  two windows of its buffer) and KRD-12 closed with v0.9.707; KRD-10 (an application named like a dependency's module
+  broke that dependency's imports) is refused by name since 0.9.693; KRD-11 closed with v0.9.690. KRD-7, KRD-8
   and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor and CI pin moved there, `RedisArg`
   gained its bytes, list and Uuid adapters, the one-conversion-file rule is gone, and the reply reader implements
   0.9.569's `Deserializer` (`DeErrorKind`, a missing field named by its path).
@@ -965,6 +965,10 @@ Each step ends green before its commit:
       the README's programs say `fn uint8 main()`, and the live program's relays take a channel `send`'s `Result`.
       KRD-11 is closed. The gates ran again from a clean clone, on v0.9.690 and on 0.9.707 with no scratch copy, and
       live on the tag.
+    - **The floor moved again, to v0.9.707** (2026-10-21, the day it was tagged): `Reader.spare` slides with one
+      `copyWithin` (KRD-9, `tools/mutations/krd9-slide.json` aimed at the call), and the 39 test arms that stop end in
+      `panic` (KRD-12). The gates ran again from a clean clone on the tag, and live; `@kama/tls` 0.1.6's own tests are
+      green on it, so nothing changes there.
     - **Left, the maintainer's word:** the publish.
 
 **If the session runs long:** steps 0–6 (Sentinel complete), then 7–10, then 11–13.

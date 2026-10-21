@@ -4,7 +4,7 @@
 import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::io::IoError,
          std::io::IoErrorKind, redis::RedisError, redis::ServerError, redis::ServerCode, redis::ConnectError,
          redis::ConnectAttempt, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
-         redis_unit_tests::check, redis_unit_tests::stop, unhex, sentCodes, replyNames, replyHex, proxyNames, proxyHex };
+         redis_unit_tests::check, unhex, sentCodes, replyNames, replyHex, proxyNames, proxyHex };
 export { errorTests, errorOf };
 
 fn ServerError ofText(const ref string line) { return ServerError.of(bytes: line.bytes()); }
@@ -17,9 +17,9 @@ fn ServerError errorOf(ConstView<uint8> reply) {
     return match (give got) {
         case Complete(value: v): match (give v) {
             case Error(bytes: b): ServerError.of(bytes: b.view());
-            case _: { := stop::<ServerError>(msg: "errorOf: not an error reply"); }
+            case _: { panic(msg: "errorOf: not an error reply"); }
         };
-        case _: { := stop::<ServerError>(msg: "errorOf: not a whole reply"); }
+        case _: { panic(msg: "errorOf: not a whole reply"); }
     };
 }
 

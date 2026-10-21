@@ -5,19 +5,18 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.690` (tag `v0.9.690`), which CI pins and the manifests' floor names; it moved from
-`v0.9.667` on 2026-10-20, which closed KRD-11. Each repro is also run on cstar's newest build, which the registry
-publishes with. The package was last verified on `v0.9.690` and on cstar's `0.9.707+g789c49cc` (2026-10-20), the
-unit gate and every example on both and the live gates on the tag, debug and release. It uses KRD-9's workaround (the
-reader moves its unread bytes one at a time, until a tag has `copyWithin`) and KRD-12's. `@kama/tls` 0.1.5 did not
-build on 0.9.696 and later (four statements after a `while (true)`, and from 0.9.706 a `string.find` whose type
-changed); 0.1.6 does, and this package needs `^0.1.6`.
+**Current compiler:** `kama 0.9.707` (tag `v0.9.707`), which CI pins and the manifests' floor names. It moved from
+`v0.9.667` to `v0.9.690` on 2026-10-20, which closed KRD-11, and to `v0.9.707` on 2026-10-21, which closed KRD-9 and
+KRD-12: the tree carries no workaround. Each repro is also run on cstar's newest build, which the registry publishes
+with; on 2026-10-21 that is the tag's own build. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
+statements after a `while (true)`, and from 0.9.706 a `string.find` whose type changed); 0.1.6 does, and this
+package needs `^0.1.6`.
 
 **Reporter:** the `@kama/redis` repo. Each open entry names the workaround this package uses, so the workaround
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-9 (answered, until a tag has the answer), KRD-12. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -33,7 +32,57 @@ the commit that made it pass.
 
 ## OPEN
 
-### KRD-9 · MED · 0.9.675 refuses copying between two windows of one buffer, and std has no in-place copy
+None.
+
+## FIXED — kept for the record
+
+KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
+the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
+same change, the first tag with all three.
+
+### KRD-12 · MED · A value-producing `match` arm that ends in `panic` has no form both kinds of compiler take — FIXED in 0.9.696, tagged in v0.9.707
+
+**Found** 2026-10-20, on cstar's `0.9.696+gc86f3e82`, a build of work then staged and not yet committed (its
+VERSION and SPEC.md, *Unreachable code is an error*). The new rule refuses a statement after one that never
+completes, a `panic` among them, and lets a value-producing arm end in a `panic`. The tags take neither half: an arm
+must end in `:=` or in `return`, `break` or `continue`. So an arm that can only stop the program builds on one kind of
+compiler or the other, never both. The test programs had 37 such arms (`{ …; panic(msg: …); := x; }` and
+`{ …; panic(msg: …); return x; }`).
+
+**Repro**, a whole program (`fn uint8 main()` on 0.9.696, KRD-11):
+
+```kama
+import { core::println };
+fn int32 viaArm(Optional<int32> o) {
+    return match (o) {
+        case Some(value: v): v;
+        case None: { panic(msg: "none"); := -1; }   // 0.9.696: `{ panic(msg: "none"); }`
+    };
+}
+fn int32 main() { int32 w = viaArm(o: Optional::Some(value: 4)); println(s: "${w}"); return 0; }
+```
+
+| | `{ panic(…); := -1; }` | `{ panic(…); }` |
+|---|---|---|
+| `v0.9.667`, `v0.9.675` | prints `4` | refused: "a value-producing `match` arm block must end in `:= <expr>;` or diverge (return/break/continue)" |
+| `0.9.696+gc86f3e82` | refused: "unreachable code — the `panic` … never returns" | prints `4` |
+
+The rest of the rule has forms every compiler takes, and the tree uses them: nothing after a `while (true)` with no
+`break` (13 places in the library, 2 in the examples), nothing after a `panic` that ends a function, nothing after a
+`match` whose every arm returns. The tags accept each of those as the function's end.
+
+**What would close it:** a tag that counts a `panic` as divergence in an arm, as 0.9.696 does; or, in the new rule, a
+window that takes `:=` after a `panic` with a word naming the new form.
+
+**Workaround, since 2026-10-20:** each test program has `fn T stop<T>(const ref string msg) { panic(msg: msg); }`
+(a function may end in `panic` on every compiler), and an arm that stops ends `:= stop::<T>(msg: …)`, or
+`return stop::<R>(msg: …)`. When a tag counts a `panic` in an arm, the arms say `{ …; panic(msg: …); }` and `stop`
+goes.
+
+**Closed** 2026-10-21: v0.9.707 carries the rule, and the floor moved there. The 39 arms that stop say
+`{ …; panic(msg: …); }`, and `stop` is gone from both test programs.
+
+### KRD-9 · MED · 0.9.675 refuses copying between two windows of one buffer, and std has no in-place copy — FIXED in 0.9.694, tagged in v0.9.707
 
 **Found** 2026-10-19, on cstar's `0.9.675+g4afcda97`, at its first build of this package. It is a regression of
 `ada8bd36` ("check: a `ref` argument that holds the receiver is refused, and a contract receiver is judged"). The
@@ -99,50 +148,9 @@ registry checks with. Refusing two windows of one buffer is defensible, so the a
 test (`resp slide`) makes the reader slide with part of a line unread, and a mutation of the loop fails it
 (`tools/mutations/krd9-slide.json`).
 
-### KRD-12 · MED · A value-producing `match` arm that ends in `panic` has no form both kinds of compiler take
-
-**Found** 2026-10-20, on cstar's `0.9.696+gc86f3e82`, a build of work then staged and not yet committed (its
-VERSION and SPEC.md, *Unreachable code is an error*). The new rule refuses a statement after one that never
-completes, a `panic` among them, and lets a value-producing arm end in a `panic`. The tags take neither half: an arm
-must end in `:=` or in `return`, `break` or `continue`. So an arm that can only stop the program builds on one kind of
-compiler or the other, never both. The test programs had 37 such arms (`{ …; panic(msg: …); := x; }` and
-`{ …; panic(msg: …); return x; }`).
-
-**Repro**, a whole program (`fn uint8 main()` on 0.9.696, KRD-11):
-
-```kama
-import { core::println };
-fn int32 viaArm(Optional<int32> o) {
-    return match (o) {
-        case Some(value: v): v;
-        case None: { panic(msg: "none"); := -1; }   // 0.9.696: `{ panic(msg: "none"); }`
-    };
-}
-fn int32 main() { int32 w = viaArm(o: Optional::Some(value: 4)); println(s: "${w}"); return 0; }
-```
-
-| | `{ panic(…); := -1; }` | `{ panic(…); }` |
-|---|---|---|
-| `v0.9.667`, `v0.9.675` | prints `4` | refused: "a value-producing `match` arm block must end in `:= <expr>;` or diverge (return/break/continue)" |
-| `0.9.696+gc86f3e82` | refused: "unreachable code — the `panic` … never returns" | prints `4` |
-
-The rest of the rule has forms every compiler takes, and the tree uses them: nothing after a `while (true)` with no
-`break` (13 places in the library, 2 in the examples), nothing after a `panic` that ends a function, nothing after a
-`match` whose every arm returns. The tags accept each of those as the function's end.
-
-**What would close it:** a tag that counts a `panic` as divergence in an arm, as 0.9.696 does; or, in the new rule, a
-window that takes `:=` after a `panic` with a word naming the new form.
-
-**Workaround, since 2026-10-20:** each test program has `fn T stop<T>(const ref string msg) { panic(msg: msg); }`
-(a function may end in `panic` on every compiler), and an arm that stops ends `:= stop::<T>(msg: …)`, or
-`return stop::<R>(msg: …)`. When a tag counts a `panic` in an arm, the arms say `{ …; panic(msg: …); }` and `stop`
-goes.
-
-## FIXED — kept for the record
-
-KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
-the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
-same change, the first tag with all three.
+**Closed** 2026-10-21: v0.9.707 is the first tag with `copyWithin`, and the floor and CI's pin moved there. `Reader.spare`
+slides its unread bytes with one call, `this.buf.viewMut().copyWithin(from: this.start, to: 0, count: unread)`, the
+byte loop is gone, and `tools/mutations/krd9-slide.json` aims at the call (`resp slide` catches it).
 
 ### KRD-11 · MED · `main`'s type changed with no overlap: every tag refuses `fn uint8 main()`, and 0.9.684 refuses `fn int32 main()` — CLOSED by the floor's move to v0.9.690
 

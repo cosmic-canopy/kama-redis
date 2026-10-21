@@ -2,14 +2,14 @@
 // back whole across many pages, with MATCH, COUNT and TYPE; NOVALUES where the server has it.
 import { std::collections::DynamicArray, std::collections::Map, std::collections::Set, std::fmt::i64Str,
          redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::Scan, redis::RedisError, redis::reply,
-         redis::resp::Value, redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, open, mainUrl, ask };
+         redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open, mainUrl, ask };
 export { scanTests };
 
 unsafe fn Connection reach(const ref string tail, const ref string what) {
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: "", tail: tail));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "scan_test: ${what}: connect: ${m}"); }
+        case Err(error: e): { string m = e.message(); panic(msg: "scan_test: ${what}: connect: ${m}"); }
     };
     return give c;
 }

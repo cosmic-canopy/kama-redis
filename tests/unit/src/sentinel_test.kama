@@ -5,7 +5,7 @@
 import { std::collections::DynamicArray, std::memory::Owned,
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Dialer,
          redis::Scan, redis::TxOutcome, redis::libraryVersion, redis::resp::Value,
-         redis_unit_tests::check, redis_unit_tests::stop, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
+         redis_unit_tests::check, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
          commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport };
 export { sentinelTests, topo };
 
@@ -130,7 +130,7 @@ unsafe fn Connection standIn() {
     Result<Connection, RedisError> r = Connection.connectOver(transport: give fake, config: config);
     return match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { := stop::<Connection>(msg: "sentinel_test: the stand-in connection"); }
+        case Err(error: e): { panic(msg: "sentinel_test: the stand-in connection"); }
     };
 }
 

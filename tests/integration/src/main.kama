@@ -2,18 +2,11 @@
 // server (tools/redis.sh) and exports its REDISTEST_* settings. A failing case prints its name. When cases fail, run
 // `tools/redis.sh smoke --server S` first: it tells a misconfigured server from a wrong client.
 import { core::println, core::env, flush, connectTests, authTests, socketTests, timeoutTests, failureTests, argTests, replyTests, pipelineTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, restartTests, sentinelTests, clusterTests, hardeningTests };
-export { check, setting, stop };
+export { check, setting };
 
 fn int32 check(bool ok, string what) {
     if (!ok) { println(s: "  FAIL ${what}"); return 1; }
     return 0;
-}
-
-// A value of type T that is never made: the program stops here, saying `msg`. A `match` arm that cannot go on ends
-// with it (`:= stop::<T>(msg: …)`, or `return stop::<R>(…)`), since no compiler of both kinds takes an arm that ends in
-// `panic` (KRD-12).
-fn T stop<T>(const ref string msg) {
-    panic(msg: msg);
 }
 
 // A REDISTEST_* setting the runner exports; the program cannot run without them.
@@ -21,7 +14,7 @@ unsafe fn string setting(string name) {
     Optional<string> v = env(name: copy name);
     return match (give v) {
         case Some(value: s): give s;
-        case None: { return stop::<string>(msg: "REDISTEST settings are missing: run tools/test-integration.sh, or source out/redistest-<server>.env"); }
+        case None: { panic(msg: "REDISTEST settings are missing: run tools/test-integration.sh, or source out/redistest-<server>.env"); }
     };
 }
 

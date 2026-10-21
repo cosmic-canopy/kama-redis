@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::Connection, redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::Scan,
          redis::ClusterSubscriber, redis::Delivery,
          redis::cluster::keySlot,
-         redis_unit_tests::check, redis_unit_tests::stop, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
+         redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
          commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex };
 export { clusterTests };
 
@@ -144,7 +144,7 @@ unsafe fn Cluster standIn() {
     Result<Cluster, RedisError> r = through(o: give o, url: oneSeed());
     return match (give r) {
         case Ok(value: c): give c;
-        case Err(error: e): { := stop::<Cluster>(msg: "cluster_test: the stand-in cluster"); }
+        case Err(error: e): { panic(msg: "cluster_test: the stand-in cluster"); }
     };
 }
 

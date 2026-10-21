@@ -10,7 +10,7 @@ import { core::println, std::collections::DynamicArray, std::collections::FixedA
          std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
          redis::Connection, redis::Config, redis::RedisError, redis::Protocol, redis::TlsVersion, redis::TlsSession,
          redis::Subscriber, redis::Message, redis::Pipeline, redis::Replies, redis::Command, redis::resp::Value,
-         redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, open, attempt, ask, mainUrl, commandOf, shown };
+         redis_integration_tests::check, redis_integration_tests::setting, open, attempt, ask, mainUrl, commandOf, shown };
 export { tlsTests };
 
 fn string cert(const ref string name) { return setting(name: "REDISTEST_CERTDIR").concat(other: "/").concat(other: name); }
@@ -39,7 +39,7 @@ unsafe fn string through(const ref string url, const ref string command) {
 
 unsafe fn Config configOf(const ref string url) {
     Result<Config, RedisError> r = Config.parse(url: url);
-    return match (give r) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); := stop::<Config>(msg: "tls_test: ${m}"); } };
+    return match (give r) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); panic(msg: "tls_test: ${m}"); } };
 }
 
 fn bool isTls(const ref Result<Connection, RedisError> r) {

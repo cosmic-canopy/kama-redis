@@ -1,7 +1,7 @@
 // Transactions against the server, under RESP3 and RESP2: a commit, a conflict another connection makes, watched
 // trying again, EXECABORT, an error when EXEC runs a command, and MULTI refused by the server's ACL.
 import { redis::Connection, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::TxOutcome,
-         redis::TxBody, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::stop, redis_integration_tests::setting, open,
+         redis::TxBody, redis::resp::Value, redis_integration_tests::check, redis_integration_tests::setting, open,
          mainUrl, ask, commandOf };
 export { transactionTests };
 
@@ -9,7 +9,7 @@ unsafe fn Connection reach(const ref string userinfo, const ref string tail, con
     Result<Connection, RedisError> r = open(url: mainUrl(userinfo: userinfo, tail: tail));
     Connection c = match (give r) {
         case Ok(value: v): give v;
-        case Err(error: e): { string m = e.message(); return stop::<Connection>(msg: "transaction_test: ${what}: connect: ${m}"); }
+        case Err(error: e): { string m = e.message(); panic(msg: "transaction_test: ${what}: connect: ${m}"); }
     };
     return give c;
 }

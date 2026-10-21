@@ -60,7 +60,7 @@ for ex in "$work"/ex*.kama; do
         -e "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" -e "s#127\.0\.0\.1:6380#$REDISTEST_HOST:$REDISTEST_TLS_PORT#g" \
         -e "s#/etc/redis/#$REDISTEST_CERTDIR/#g" "$ex" > "$project/src/main.kama"
     cat > "$project/kama.json" <<EOF
-{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.690",
+{ "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.707",
   "entry": "src/main.kama", "dependencies": { "@kama/redis": { "path": "../../.." } },
   "modules": { ".": { "visibility": "internal" } } }
 EOF

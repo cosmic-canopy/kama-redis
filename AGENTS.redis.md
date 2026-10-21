@@ -17,7 +17,7 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.690**, declared as `"kama"` in every manifest here, and CI pins `v0.9.690`. That is the
+**The package needs kama ≥ 0.9.707**, declared as `"kama"` in every manifest here, and CI pins `v0.9.707`. That is the
 first tagged compiler with everything this package relies on (users install tagged releases):
 - the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
 - `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
@@ -31,21 +31,22 @@ first tagged compiler with everything this package relies on (users install tagg
 - the `Deserializer` members `peekKind`/`readNumberText`, `unknownField` and `atKeyedMap` (all in v0.9.667), which the
   reader implements too, and `std::memory::replace`, which `ServerInfo` reads its HELLO reply with (v0.9.667's
   borrow rule refuses a borrow of a field across a call that may write it);
+- a channel's `send` answering `Result<Unit, Undelivered<T>>` (0.9.680), which the live program's relays use;
 - `fn uint8 main()`, the exit status in the platform's own type (0.9.684, KRD-11): the ten `main`s (`tests/*/src`,
   `examples/*/src`) and the README's programs say it, and no tag before v0.9.690 takes it;
-- a channel's `send` answering `Result<Unit, Undelivered<T>>` (0.9.680), which the live program's relays use.
+- a project named like a dependency's module refused by name (0.9.693, KRD-10);
+- `View.copyWithin` (0.9.694, KRD-9), one `memmove`, which `Reader.spare` slides its unread bytes with;
+- a value-producing arm that may end in `panic`, and unreachable code refused (0.9.696, KRD-12): a test's arm that
+  cannot go on ends in `panic(msg:)`, and nothing follows a `while (true)` or a function's last `panic`.
 
-Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on v0.9.690 and cstar's
-0.9.707 (2026-10-20), with `@kama/tls` ^0.1.6, the first release that builds on 0.9.696 and later. `ci.yml` moves the
-pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on the v0.9.707 tag
+(2026-10-21, the newest tag and cstar's newest build), with `@kama/tls` ^0.1.6, the first release that builds on
+0.9.696 and later. `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
 gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
-(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.690`), and run the gates with `KAMA=<dir>/bin/kama`.
-- **Two rules of 0.9.696 and later that no tag has yet:** unreachable code is an error, and a value-producing arm may
-  end in `panic`. The tree takes the forms both accept: nothing after a `while (true)` or a function's last `panic`,
-  and a test arm that stops ends in `stop::<T>(msg:)` (KRD-12). `string.find` changed type in 0.9.706; nothing here
-  calls it.
+(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.707`), and run the gates with `KAMA=<dir>/bin/kama`.
+- `string.find` answers `Optional<isize>` since 0.9.706; nothing here calls it.
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
 live ones): each mutation of the source must make the case it names fail, or the test is not good yet. A step adds
@@ -159,7 +160,7 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
   `tools/test.sh` and run live by `tools/check-examples.sh --server S`, as `tools/check-readme.sh` runs the README's
   programs; CI's integration job runs both. They read `REDIS_URL` (and `REDIS_TLS_URL`, `REDIS_SENTINEL_URL`, `REDIS_CLUSTER_URL`) and check their own results.
   Their `kama.lock`s pin the newest `@kama/tls` the package's range admits, as a consumer's would; the package's own
-  locks pin its floor. No example (nor any project using this package) may be named `tls`: KRD-10.
+  locks pin its floor. No example (nor any project using this package) may be named `tls`: kama refuses it by name (KRD-10).
 
 - **`tools/redis.sh` is the server.**
   - It runs the official images under podman or docker: `redis:6.2`, `7.2`, `7.4`, `8.2` and `8.10`, and
@@ -303,7 +304,7 @@ the source moved on. Run the live mutations after the matrix, not beside it: bot
   - A field cannot be the `const ref` argument of a method that writes `this`: copy it into a local first
     (`Config c = copy this.settings;`), as a redial does.
   - A `Set` iterates its keys only when the key is `Copyable`: `Name` has a copy constructor for that.
-  - A project's name is its root module, and it shadows a dependency's module of the same name (KRD-10).
+  - A project's name is its root module, so a project named like a dependency's module is refused (KRD-10).
 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-redis/kama.json`) and happens only when
   the user says so, because a version is permanent. `kama publish kama.json --dry-run` must list no certificates

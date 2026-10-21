@@ -9,7 +9,7 @@
 import { core::println, std::collections::DynamicArray, std::collections::ConstView, std::time::Duration,
          std::memory::Owned, redis::Transport, redis::Connection, redis::Config, redis::Subscriber, redis::Delivery, redis::Message, redis::ChannelKind,
          redis::RedisError, redis::Command, redis::resp::Value, redis::resp::Reader, redis::resp::Read,
-         redis::resp::Limits, redis_unit_tests::check, redis_unit_tests::stop, FakeServer, Step, welcome, expect, reply, configOf, connected,
+         redis::resp::Limits, redis_unit_tests::check, FakeServer, Step, welcome, expect, reply, configOf, connected,
          textOf, bytesOf, resp, isSimple, serverVersions, replyNames, replyCommands };
 export { subscriberTests, shown, soon };
 
@@ -149,7 +149,7 @@ unsafe fn Subscriber subscriberOf(DynamicArray<Step> script, int32 proto, const 
     Result<Subscriber, RedisError> r = Subscriber.over(connection: give c);
     return match (give r) {
         case Ok(value: s): give s;
-        case Err(error: e): { string m = e.message(); := stop::<Subscriber>(msg: "subscriber_test: ${what}: ${m}"); }
+        case Err(error: e): { string m = e.message(); panic(msg: "subscriber_test: ${what}: ${m}"); }
     };
 }
 

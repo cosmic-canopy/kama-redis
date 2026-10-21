@@ -12,7 +12,7 @@ Cluster and Sentinel (docs/ROADMAP.md, "Phase 6"). Tested live on Redis 6.2–8.
 Sentinel and as a cluster, debug and release.
 
 What a caller of 0.1.0 may need to change:
-- kama ≥ 0.9.690 (was 0.9.667): the first tag whose `main` is `fn uint8 main()`, which cstar's newer builds require;
+- kama ≥ 0.9.707 (was 0.9.667), whose `main` is `fn uint8 main()`: every tag before v0.9.690 requires `fn int32 main()`;
 - a `match` on `RedisError`, `ServerCode` or `Delivery` needs `case _:`: each is `@nonExhaustive` now, and
   `RedisError` gained `Sentinel`, `Delivery` gained `Moved`;
 - `redis://a,b` is a list of hosts now, which a `Connection` refuses: before, it was the one host `a,b`;
@@ -65,10 +65,11 @@ What a caller of 0.1.0 may need to change:
   - `Redirect` and `RedirectKind`, what a MOVED or ASK says.
 
 ### Changed
-- Needs kama ≥ 0.9.690 (was 0.9.667), and CI pins v0.9.690. From 0.9.684 kama requires `fn uint8 main()` and refuses
-  `fn int32 main()`, which every earlier tag requires, so no program builds on both. v0.9.690 is the first tag with
-  the new rule, and the examples, the test programs and the README's programs say `fn uint8 main()` now. A program of
-  yours that uses this package needs the same change.
+- Needs kama ≥ 0.9.707 (was 0.9.667), and CI pins v0.9.707. From 0.9.684 kama requires `fn uint8 main()` and refuses
+  `fn int32 main()`, which every earlier tag requires, so no program builds on both; the examples, the test programs
+  and the README's programs say `fn uint8 main()` now, and a program of yours that uses this package needs the same
+  change. 0.9.707 also gives `View.copyWithin`, so the reader moves the unread part of a line to the front of its
+  buffer in one copy again, where 0.1.0 moved it a byte at a time (KRD-9).
 - Needs `@kama/tls` ^0.1.6 (was ^0.1.3): 0.1.6 builds on kama 0.9.696 and later, where the earlier releases do not.
 - `Replies` holds a result per command: on a cluster a reply can be the failure of a node's link as well as the server's
   error reply. `take` is unchanged.
