@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::io::IoError, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, tls::TlsError, redis::resp::ProtocolError };
+         std::encoding::utf8::Utf8Error, tls::TlsError, redis::resp::ProtocolError, redis::CredentialsError };
 export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, ReconnectError, SentinelError };
 
 // What can go wrong talking to Redis or Valkey. A data error is one of these; a contract violation (an index out of
@@ -9,7 +9,7 @@ export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, Reco
 // "Could not connect to …"), so a log line from this client reads the same as one from the server's own tools.
 //
 // It is `@nonExhaustive`: a later release may add a kind of failure, so a `match` on it outside this package has a
-// `case _:`, and adding one breaks no caller (0.2.0 added `Sentinel`).
+// `case _:`, and adding one breaks no caller (0.2.0 added `Sentinel`, 0.3.0 `Credentials`).
 @nonExhaustive
 type enum RedisError implements Error, Sendable {
     // A setting that cannot be used: a URL that does not parse, an option this client does not know, a value out
@@ -51,7 +51,12 @@ type enum RedisError implements Error, Sendable {
     // The sentinels were reached, and none gave the server's address (none knew the name, or each refused), or the
     // server they named would not confirm its role. Each sentinel's answer is kept. When no sentinel could be reached
     // at all, the error is `Connect`, with an attempt per sentinel.
-    Sentinel(SentinelError error);
+    Sentinel(SentinelError error),
+    // The connection's credentials provider (`Config.setCredentials`) failed, or the server refused the login it gave
+    // when the connection logged in anew before a call: nothing of the call was sent, and the connection is closed
+    // until its next call, which asks the provider again. At a connect it is the connect's error; at a redial, the
+    // cause of `Reconnect`.
+    Credentials(CredentialsError error);
 
     public const fn string message() {
         return match (this) {
@@ -68,6 +73,7 @@ type enum RedisError implements Error, Sendable {
             case Usage(detail: d): copy d;
             case Reconnect(error: r): r.message();
             case Sentinel(error: s): s.message();
+            case Credentials(error: c): c.message();
         };
     }
 

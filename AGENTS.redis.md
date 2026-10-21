@@ -232,6 +232,21 @@ printed first.
   lets `DynamicArray<uint8>` be bytes (one argument) beside `<DynamicArray> when [T: RedisArg]` (an argument per
   element). An adapter must live in the contract's module (src/arg.kama).
 
+- **A credentials provider is the server's one source of a login** (src/credentials.kama, phase 7b).
+  - It rides on a `Config` as a 0/1 `DynamicArray<Owned<Credentials>>`. A copy forks it, so every connection a pool,
+    a cluster or a redial path makes from that Config has its own.
+  - `establish` and `connectOver` move it into the `Opener`, so the kept `settings` hold no provider and no password:
+    every redial asks it again (`loginFor`).
+  - Every call path goes `prepared()`: `settle()`, `ready()`, then `refreshed()`, which re-AUTHs once the login's
+    `refreshAfter` has passed. A refusal or a provider failure loses the link and is `Credentials`; a link lost during
+    the re-AUTH is redialed at once, since nothing of the call was sent. `transactAt` checks `watchLost` again after
+    it.
+  - A `Subscriber` re-AUTHs in place under RESP3 (`relogin`, modelled on `ping`). Under RESP2 it lets the link go,
+    so `linked()` redials and queues `Reconnected`.
+  - The server keeps a connection logged in whatever its user's passwords become (only `ACL DELUSER` lets it go), so
+    closing on a refused re-AUTH is what ends a revoked connection. The live test counts `user=kr_rot` in CLIENT LIST,
+    waiting for the server to see the close.
+
 - **A `Subscriber` reaches its connection only through the private members `Connection` grants it, method by
   method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, for reconnecting `lost` and `ready`, and
   `rawHandle` for a `ClusterSubscriber`'s `Poller`). Nothing on

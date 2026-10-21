@@ -3,7 +3,7 @@ import { std::collections::DynamicArray, std::collections::Deque, std::collectio
          std::encoding::utf8::Utf8Error,
          redis::Config, redis::Connection, redis::Dialer, redis::Protocol, redis::RedisError, redis::ServerError,
          redis::RedisArg, redis::Command, redis::cluster::keySlot, redis::cluster::ClusterNode, redis::wire::Deadline, redis::wire::footprint, redis::wire::unattributed,
-         redis::wire::serverError, redis::resp::Value };
+         redis::wire::serverError, redis::resp::Value, redis::Login, redis::CredentialsError };
 export { Subscriber, Delivery, Message, ChannelKind };
 
 // Pub/sub on a connection of its own, under RESP3 and RESP2 alike (docs/ROADMAP.md, "Decided, and why", "Phase 4").
@@ -583,7 +583,13 @@ type resource Subscriber implements Sendable {
     // queued first. `Closed` when it cannot be made again; `Reconnect` when making it failed (the next call tries
     // again, the names still kept).
     unsafe fn Result<Unit, RedisError> linked() {
-        if (!this.held[0].lost()) { return Result::Ok(value: Unit::Unit); }
+        if (!this.held[0].lost()) {
+            Result<Unit, RedisError> fresh = this.relogin();
+            if (!this.held[0].lost()) { return give fresh; }
+            bool failed = match (fresh) { case Err(error: e): true; case Ok(value: u): false; };
+            if (failed) { return give fresh; }
+            Result<Unit, RedisError> unused = give fresh;
+        }
         Result<Unit, RedisError> up = this.held[0].ready();
         match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         // It marks a gap, not a message: it is queued whatever the bound, and costs nothing against it.
@@ -594,6 +600,56 @@ type resource Subscriber implements Sendable {
         Result<Unit, RedisError> b = this.again(kind: ChannelKind::Pattern);
         match (give b) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         return this.again(kind: ChannelKind::Shard);
+    }
+
+    // A fresh login, once the credentials provider's last one has passed its refreshAfter (src/credentials.kama). Under
+    // RESP3 the subscriber logs in anew where it is: AUTH, its +OK awaited among the messages, which are queued for
+    // `next`. A subscribed RESP2 connection takes no AUTH, so the link is let go, and `linked` makes it again, which logs
+    // in anew and subscribes again (`Reconnected` marks the gap). The provider's failure, or the server's refusal, is
+    // `Credentials`, and the link is lost: the next call makes it again, asking anew.
+    unsafe fn Result<Unit, RedisError> relogin() {
+        if (!this.held[0].loginExpired()) { return Result::Ok(value: Unit::Unit); }
+        if (this.resp2()) {
+            this.lostWith(e: RedisError::Usage(detail: "a subscribed RESP2 connection takes no AUTH: it was made again to log in as its credentials provider's new login"));
+            return Result::Ok(value: Unit::Unit);
+        }
+        Result<Login, RedisError> asked = this.held[0].nextLogin();
+        Login login = match (give asked) {
+            case Ok(value: l): give l;
+            case Err(error: e): { this.lostWith(e: copy e); return Result::Err(error: give e); }
+        };
+        Command auth = Command.of(name: "AUTH");
+        Optional<string> user = login.user();
+        match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
+        auth.arg(text: login.password());
+        Deadline deadline = Deadline.within(span: this.held[0].commandTimeout());
+        Result<Unit, RedisError> sent = this.write(command: auth, deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        while (true) {
+            Result<Incoming, RedisError> got = this.arrival(deadline: deadline);
+            Incoming frame = match (give got) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+            match (give frame) {
+                case Other(value: x): {
+                    if (isOk(v: x)) { this.held[0].loggedIn(login: login); return Result::Ok(value: Unit::Unit); }
+                    return this.fail(detail: "AUTH was answered with something other than OK");
+                }
+                case Refused(error: e): {
+                    RedisError why = RedisError::Credentials(error: CredentialsError.refusal(cause: RedisError::Server(error: give e)));
+                    this.lostWith(e: copy why);
+                    return Result::Err(error: give why);
+                }
+                case Pong: { return this.fail(detail: "the server answered a PING no call sent"); }
+                case Confirmed(op: o, name: n, named: has): {
+                    Result<Unit, RedisError> kept = this.ownConfirmation(op: o, name: give n, named: has);
+                    match (give kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Delivered(message: m, cost: c): {
+                    Result<Unit, RedisError> queued = this.enqueue(d: Delivery::Message(message: give m), cost: c);
+                    match (give queued) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Aside(push: p): { this.keepAside(push: give p); }
+            };
+        }
     }
 
     // Subscribe again to the kept names of `kind`, sorted, so each run sends the same: in one command, or for shard
@@ -683,6 +739,11 @@ type resource Subscriber implements Sendable {
 }
 
 fn RedisError released() { return RedisError::Usage(detail: "the subscriber released its connection already"); }
+
+// Whether `v` is +OK.
+fn bool isOk(const ref Value v) {
+    return match (v) { case Simple(bytes: b): sameWord(b: b.view(), word: "OK"); case _: false; };
+}
 
 // Whether `v` is +PONG: PING's answer under RESP3, and under RESP2 with nothing subscribed.
 fn bool isPong(const ref Value v) {

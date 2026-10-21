@@ -1,0 +1,227 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.dialing.hasCredentials()) {\n            Result<Login, RedisError> got = this.dialing.login();",
+  "new": "        if (false) {\n            Result<Login, RedisError> got = this.dialing.login();",
+  "expect": "provider: the sentinels keep their own login",
+  "timeout": 300
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.loginExpired()) { return Result::Ok(value: Unit::Unit); }\n        Result<Unit, RedisError> done = this.relogin();",
+  "new": "        if (true) { return Result::Ok(value: Unit::Unit); }\n        Result<Unit, RedisError> done = this.relogin();",
+  "expect": "credentials: a login past its refreshAfter is renewed",
+  "timeout": 300
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Some(value: at): monotonicNow() >= at; case None: false; };",
+  "new": "case Some(value: at): true; case None: false; };",
+  "expect": "credentials: a login past its refreshAfter is renewed",
+  "timeout": 300
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.loginDue = match (after) { case Some(value: d): Optional::Some(value: monotonicNow() + d); case None: Optional::None; };",
+  "new": "        this.loginDue = Optional::None;",
+  "expect": "credentials: a login past its refreshAfter is renewed",
+  "timeout": 300
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            ServerError refused = serverError(v: v);\n            this.lose();\n            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(",
+  "new": "            ServerError refused = serverError(v: v);\n            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(",
+  "expect": "credentials: a refused re-AUTH",
+  "timeout": 300
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(cause: RedisError::Server(error: give refused))));\n        }\n        if (!isStatus(v: v, text: \"OK\"))",
+  "new": "            return Result::Err(error: RedisError::Credentials(error: CredentialsError.provider(cause: RedisError::Server(error: give refused))));\n        }\n        if (!isStatus(v: v, text: \"OK\"))",
+  "expect": "credentials: a refused re-AUTH",
+  "timeout": 300
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<Unit, RedisError> dropped = give done;\n        return this.ready();",
+  "new": "        return give done;",
+  "expect": "credentials: a link lost at the re-AUTH",
+  "timeout": 300
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Err(error: e): match (e) { case Credentials(error: c): true; case _: false; }; case Ok(value: u): true; };",
+  "new": "case Err(error: e): false; case Ok(value: u): true; };",
+  "expect": "credentials: a refused re-AUTH",
+  "timeout": 300
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        // A fresh login that lost the link lost the WATCH with it.\n        if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }\n",
+  "new": "",
+  "expect": "credentials: a WATCH lost as a fresh login",
+  "timeout": 300
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live) {\n            // The link is made again as the new user",
+  "new": "        if (false) {\n            // The link is made again as the new user",
+  "expect": "credentials: authenticate after a lost link",
+  "timeout": 300
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                case Err(error: e): { this.settings = give before; return Result::Err(error: give e); }",
+  "new": "                case Err(error: e): { Config unused = give before; return Result::Err(error: give e); }",
+  "expect": "credentials: a new login refused as the link is made keeps the old one",
+  "timeout": 300
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.dialing.hasCredentials()) {\n            return Result::Err(error: RedisError::Usage(",
+  "new": "        if (false) {\n            return Result::Err(error: RedisError::Usage(",
+  "expect": "credentials: authenticate on a provider's connection is Usage",
+  "timeout": 300
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (given) {\n            Owned<Credentials> unused = give provider;",
+  "new": "        if (false) {\n            Owned<Credentials> unused = give provider;",
+  "expect": "credentials: a provider beside a URL's password is refused",
+  "timeout": 300
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (this.provider.length() > 0) { return Result::Err(error: RedisError::Config(detail: \"this configuration's credentials come from its provider",
+  "new": "        if (false) { return Result::Err(error: RedisError::Config(detail: \"this configuration's credentials come from its provider",
+  "expect": "credentials: setAuth beside a provider is refused",
+  "timeout": 300
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "        if (source.provider.length() > 0) { this.provider.add(item: source.provider[0].fork()); }\n",
+  "new": "",
+  "expect": "credentials: a Config's copy holds a fork",
+  "timeout": 300
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/credentials.kama",
+  "old": "        if (now) { return Result::Err(",
+  "new": "        if (false) { return Result::Err(",
+  "expect": "credentials: a login with an empty user or password",
+  "timeout": 300
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "                    if (isOk(v: x)) { this.held[0].loggedIn(login: login); return Result::Ok(value: Unit::Unit); }",
+  "new": "                    if (false) { this.held[0].loggedIn(login: login); return Result::Ok(value: Unit::Unit); }",
+  "expect": "credentials: a RESP3 subscriber logs in anew",
+  "timeout": 300
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "        if (this.resp2()) {\n            this.lostWith(e: RedisError::Usage(",
+  "new": "        if (false) {\n            this.lostWith(e: RedisError::Usage(",
+  "expect": "credentials: a RESP2 subscriber makes its link again",
+  "timeout": 300
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/subscriber.kama",
+  "old": "            Result<Unit, RedisError> fresh = this.relogin();",
+  "new": "            Result<Unit, RedisError> fresh = Result::Ok(value: Unit::Unit);",
+  "expect": "credentials: a RESP3 subscriber logs in anew",
+  "timeout": 300
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                auth.arg(text: l.password());\n                auth.encode(into: this.outbox);\n                steps.add(item: \"AUTH\");",
+  "new": "                auth.arg(text: \"x\");\n                auth.encode(into: this.outbox);\n                steps.add(item: \"AUTH\");",
+  "expect": "protocol=2: AUTH, CLIENT SETNAME, SELECT, and no HELLO",
+  "timeout": 300
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Opener none = Opener.none();\n        none.holdCredentials(creds: own.takeCredentials());",
+  "new": "        Opener none = Opener.none();",
+  "expect": "credentials: connectOver logs in with the provider's login",
+  "timeout": 300
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Config own = copy config;\n        opener.holdCredentials(creds: own.takeCredentials());",
+  "new": "        Config own = copy config;",
+  "expect": "provider: the sentinels keep their own login",
+  "timeout": 300
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            case Err(error: e): { this.lose(); := Result::Err(error: RedisError::Credentials(error: CredentialsError.provider(cause: give e))); }",
+  "new": "            case Err(error: e): { := Result::Err(error: RedisError::Credentials(error: CredentialsError.provider(cause: give e))); }",
+  "expect": "credentials: a provider failing at a refresh",
+  "timeout": 300
+ },
+ {
+  "id": "IM1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "            ServerError refused = serverError(v: v);\n            this.lose();\n            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(",
+  "new": "            ServerError refused = serverError(v: v);\n            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(",
+  "expect": "credentials: a refused login closes the connection",
+  "timeout": 300
+ },
+ {
+  "id": "IM2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (!this.loginExpired()) { return Result::Ok(value: Unit::Unit); }\n        Result<Unit, RedisError> done = this.relogin();",
+  "new": "        if (true) { return Result::Ok(value: Unit::Unit); }\n        Result<Unit, RedisError> done = this.relogin();",
+  "expect": "credentials: a login renewed when its time comes",
+  "timeout": 300
+ }
+]

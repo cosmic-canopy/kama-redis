@@ -92,6 +92,42 @@ fn uint8 main() {
   transport (`connectOver`) has nothing to redial with, so it stays closed too.
 - **The connection belongs to one isolate at a time,** and moves between them whole.
 
+## Credentials that change
+
+A password that rotates, or a token that expires (ElastiCache IAM, Entra ID), comes from a provider: a type of yours
+that implements `Credentials`, set on the configuration with `Config.setCredentials`. It is then the server's one
+source of a user and password, and a URL's password or `setAuth` beside it is refused.
+
+```kama
+// Reads the user, password and lifetime a sidecar keeps current; `fork` gives each connection one of its own.
+type resource SecretFile implements Credentials, Sendable {
+    string path;
+    public ctor make(string path) { this.path = give path; }
+    public unsafe fn Result<Login, RedisError> login() {
+        // … read the file …
+        return Login.of(user: Optional::Some(value: "app"), password: token, refreshAfter: Optional::Some(value: Duration.fromSecs(s: 600i64)));
+    }
+    public unsafe fn Owned<Credentials> fork() {
+        Owned<Credentials> f = new SecretFile.make(path: copy this.path);
+        return give f;
+    }
+}
+```
+
+- **It is asked at every connect and every redial,** so a connection made after a rotation logs in with the new
+  login. The sentinels keep their own (`setSentinelAuth`); a cluster's nodes each ask a fork of their own.
+- **A login may say when to ask again** (`refreshAfter`). Once that has passed, the connection's next call asks again
+  and logs in anew (`AUTH`) before it writes anything, so a token never lapses on a live connection. A subscriber
+  under RESP3 logs in anew where it is; under RESP2, which takes no `AUTH` while subscribed, it makes its connection
+  again, and `Reconnected` marks the gap.
+- **It fails closed.** A provider that fails, or a login the server refuses, closes the connection: the call fails
+  with `Credentials`, nothing of it was sent, and the next call makes the connection again, asking anew. The server
+  itself keeps a connection logged in as it was whatever its user's passwords become (`ACL SETUSER … resetpass`, or
+  `off`), so closing is what ends a connection whose credentials were revoked. Every peer re-authenticates on its own
+  schedule; rueidis also closes on a refusal, while go-redis, redis-py and node-redis go on as the old user.
+- **The password is not kept with the connection.** Each redial asks the provider again, and `fork` may be called
+  more often than connections are made, so keep it cheap. `authenticate` on such a connection is `Usage`.
+
 ## TLS
 
 `rediss://` (and `valkeys://`) connect over TLS, from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls), which
@@ -288,7 +324,8 @@ fn uint8 main() {
   `DISCARD`, since `transact` sends a transaction whole.
 - **What sets what a connection is goes through the connection,** because a reconnect would quietly undo a command
   that set it. `conn.select(db: 3)` and `conn.authenticate(user: Optional::Some(value: "app"), password: pw)` send
-  `SELECT` and `AUTH`, and every reconnect keeps what they set. `SELECT` and `AUTH` themselves are refused, and so are
+  `SELECT` and `AUTH`, and every reconnect keeps what they set. A connection whose link was lost makes it again as
+  the new user, never logging in as the old one first; credentials that change by themselves are a provider's (above). `SELECT` and `AUTH` themselves are refused, and so are
   `CLIENT SETNAME` and `SETINFO` (the `Config`'s `client_name` and identity, sent by the handshake), `CLIENT
   NO-EVICT`, `NO-TOUCH`, `CAPA` and `IMPORT-SOURCE`, `READONLY` and `READWRITE`, each saying what to do instead. The
   table is checked against every server's `ACL CAT connection`.
@@ -455,6 +492,7 @@ Whether a failed call's command could have run:
 | `Server` | yes | the server answered with an error; `LOADING`, `BUSY`, `TRYAGAIN` and `MASTERDOWN` mean it did not run it |
 | `Io`, `Timeout`, `Protocol`, `Unexpected`, `Tls` during a call | maybe | the connection was lost with the command sent or half answered: it may have run |
 | `Sentinel` | no | the sentinels gave no address, or the server they named never said it was the master |
+| `Credentials` | no | the credentials provider failed, or the server refused its new login: the connection is closed, and the next call makes it again |
 | a cluster's `Server` `MOVED` or `ASK` | no | past `max_redirects`: the node named was asked, and did not run it |
 | any error from a command a cluster split by slot | partly | `MSET`, `DEL` and their kin go as a piece per slot: the others may have run |
 

@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::memory::Owned,
          redis::Connection, redis::Config, redis::Command, redis::Pipeline, redis::Replies, redis::RedisError, redis::Dialer,
          redis::Scan, redis::TxOutcome, redis::libraryVersion, redis::resp::Value,
          redis_unit_tests::check, unhex, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, isSimple, callOutcome,
-         commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport };
+         commandOf, bytesOf, topologyNames, topologyHex, FakeServer, redis::Transport, Answer, loginAs, providing, answerList };
 export { sentinelTests, topo };
 
 fn string server() { return "redis-8.10.2"; }
@@ -475,8 +475,35 @@ unsafe fn int32 scanTests() {
     return f;
 }
 
+// A credentials provider (src/credentials.kama) is the server's: the sentinels are asked with their own login (none
+// here, a plain HELLO 3), and the server they name is logged in to with the provider's.
+unsafe fn int32 providerTests() {
+    int32 f = 0;
+    Dials d = Dials.make();
+    d.serve(place: "127.0.0.1:7300", script: names7200());
+    DynamicArray<Step> m = steps();
+    m.add(item: expect(command: "HELLO 3 AUTH kr_acl pw1", answer: reply(server: server(), kase: "hello3-auth")));
+    string version = libraryVersion();
+    m.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    m.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server(), kase: "setinfo-ver")));
+    m.add(item: expect(command: "PING", answer: reply(server: server(), kase: "ping")));
+    d.serve(place: "127.0.0.1:7200", script: give m);
+    DynamicArray<Answer> answers = answerList();
+    answers.add(item: loginAs(password: "pw1", refreshMs: 0i64));
+    Config config = providing(url: "redis-sentinel://127.0.0.1:7300?master_name=kr", answers: give answers);
+    Result<Connection, RedisError> r = through(d: give d, config: config);
+    string o = match (r) { case Ok(value: c): "ok"; case Err(error: e): e.message(); };
+    string pinged = match (give r) {
+        case Ok(value: c): { Connection k = give c; := callOutcome(r: ping(c: k)); }
+        case Err(error: e): "-";
+    };
+    f = f + check(ok: o == "ok" && pinged == "ok", what: "provider: the sentinels keep their own login, and the server they name gets the provider's (${o}; ${pinged})");
+    return f;
+}
+
 unsafe fn int32 sentinelTests() {
     int32 f = 0;
+    f = f + providerTests();
     f = f + findingTests();
     f = f + listTests();
     f = f + roleTests();

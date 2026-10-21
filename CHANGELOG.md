@@ -6,6 +6,24 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+What a caller of 0.2.0 may need to change:
+- `RedisError` gained `Credentials` (it is `@nonExhaustive`, so a `match` with `case _:` needs nothing).
+
+### Added
+- A credentials provider (src/credentials.kama): `Credentials`, a contract of yours (`login()` and `fork()`), set with
+  `Config.setCredentials` (`hasCredentials`). It is asked at every connect and every redial, for the server's own
+  login, and again before a call once its `Login`'s `refreshAfter` has passed, when the connection logs in anew (AUTH)
+  before it writes. A subscriber logs in anew where it is under RESP3, and makes its connection again under RESP2.
+  It fails closed: a provider's failure, or a login the server refuses, closes the connection.
+- `Login` (a user, a password and an optional `refreshAfter`), and `RedisError::Credentials(CredentialsError)`: the
+  provider failed (`byServer()` false) or the server refused its login (true); nothing of the call was sent.
+- A URL's password, or `setAuth`, beside a provider is refused, and so is a provider beside them; `authenticate` on a
+  provider's connection is `Usage`.
+
+### Fixed
+- `authenticate` on a connection whose link was lost made it again as the old user first, so a password that had
+  been revoked failed the redial for good and the new one was never sent. It now makes the link again as the new user.
+
 ## [0.2.0] - 2026-10-21
 
 Cluster and Sentinel (docs/ROADMAP.md, "Phase 6"). Tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under

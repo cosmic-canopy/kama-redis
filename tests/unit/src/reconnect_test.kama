@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::memor
          redis::resp::Value, redis::resp::Reader, redis::resp::Read,
          redis_unit_tests::check, Step, ScriptDialer, Dial, welcome, expect, reply, proxy, configOf, isSimple, callOutcome, callClosed,
          commandOf, transaction, setThenIncr, pushIn, connected };
-export { reconnectTests };
+export { reconnectTests, again, dialed, losing, send, isIo, reconnectOf, said, done, pub, joined, names, subscriberWith };
 
 
 // The server whose replies the scripts play.

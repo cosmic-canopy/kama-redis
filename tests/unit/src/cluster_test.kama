@@ -10,7 +10,8 @@ import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration
          redis::ClusterSubscriber, redis::Delivery,
          redis::cluster::keySlot,
          redis_unit_tests::check, Step, Dial, ScriptDialer, ScriptDialers, expect, reply, proxy, configOf, callOutcome,
-         commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex };
+         commandOf, bytesOf, textOf, topo, topologyKeyServers, topologyKeys, topologyNames, topologyHex, unhex,
+         Answer, loginAs, providing, answerList };
 export { clusterTests };
 
 fn string server() { return "redis-8.10.2"; }
@@ -1413,8 +1414,53 @@ unsafe fn int32 clusterSubscriberTests() {
     return f;
 }
 
+// A node's handshake that logs in as kr_acl with `password`.
+fn DynamicArray<Step> loggedNode(const ref string password) {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3 AUTH kr_acl ".concat(other: password), answer: topo(kase: "hello3-node")));
+    string version = libraryVersion();
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: version), answer: reply(server: server(), kase: "setinfo-ver")));
+    return give s;
+}
+
+// A credentials provider (src/credentials.kama): each node's connection logs in with a fork of its own, asked for
+// itself. The script answers pw1, then pw2: a fork shared among the nodes would give the second node pw2.
+unsafe fn int32 providerTests() {
+    int32 f = 0;
+    string a = keyAt(index: 0);
+    string b = keyAt(index: 2);
+    Opens o = Opens.make();
+    DynamicArray<Step> s0 = loggedNode(password: "pw1");
+    s0.add(item: expect(command: "CLUSTER SLOTS", answer: topo(kase: "slots/3")));
+    s0.add(item: expect(command: "GET ${a}", answer: topo(kase: "replica-get-readonly/3")));
+    o.serve(place: "127.0.0.1:7000", script: give s0);
+    DynamicArray<Step> s1 = loggedNode(password: "pw1");
+    s1.add(item: expect(command: "GET ${b}", answer: reply(server: server(), kase: "get-missing/3")));
+    o.serve(place: "127.0.0.1:7001", script: give s1);
+    DynamicArray<Answer> answers = answerList();
+    answers.add(item: loginAs(password: "pw1", refreshMs: 0i64));
+    answers.add(item: loginAs(password: "pw2", refreshMs: 0i64));
+    Config config = providing(url: oneSeed(), answers: give answers);
+    Owned<Dialers> d = o.dialers();
+    Result<Cluster, RedisError> made = Cluster.connectWith(dialers: give d, config: config);
+    string connected = match (made) { case Ok(value: x): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: connected == "ok", what: "provider: the cluster's seed logs in with the provider's login (${connected})");
+    match (give made) {
+        case Ok(value: c): {
+            Cluster k = give c;
+            string o1 = callOutcome(r: callText(c: k, text: "GET ${a}"));
+            string o2 = callOutcome(r: callText(c: k, text: "GET ${b}"));
+            f = f + check(ok: o1 == "ok" && o2 == "ok", what: "provider: each node's connection logs in with a fork of its own (${o1}; ${o2})");
+        }
+        case Err(error: e): { }
+    };
+    return f;
+}
+
 unsafe fn int32 clusterTests() {
     int32 f = 0;
+    f = f + providerTests();
     f = f + routingTests();
     f = f + redirectTests();
     f = f + waitTests();

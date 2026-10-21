@@ -1,5 +1,5 @@
-import { std::collections::ConstView, std::collections::DynamicArray, std::time::Duration, redis::RedisUrl,
-         redis::UrlTransport, redis::UrlError, redis::RedisError, redis::resp::Limits };
+import { std::collections::ConstView, std::collections::DynamicArray, std::memory::Owned, std::time::Duration, redis::RedisUrl,
+         redis::UrlTransport, redis::UrlError, redis::RedisError, redis::Credentials, redis::resp::Limits };
 export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socketPathMax };
 
 // How to reach a server and what to ask of it: from a URL (`Config.parse`), or from a host or a socket and typed
@@ -31,7 +31,9 @@ export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socket
 //                         primary; replica: one of its replicas, which may be behind it, or the primary when it has none
 //   max_redirects=N       a cluster's: how many MOVED and ASK one call follows, 0 to 100. Default 5.
 // The URL's user and password are the server's. The sentinels' own, when they want one, are set in code
-// (`setSentinelAuth`), never in a URL.
+// (`setSentinelAuth`), never in a URL. Credentials that change while a connection lives come from a provider
+// (`setCredentials`, src/credentials.kama), which then is the server's one source: a URL's password and `setAuth`
+// are refused beside it.
 //
 // Over TLS (rediss://, valkeys://) as well (docs/ROADMAP.md, "Phase 5"); each is refused on redis:// and unix://:
 //   tls_verify=full|chain|none   full (the default): the certificate chains to a trusted root and names the server;
@@ -158,12 +160,17 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     // A cluster node's link that serves reads from a replica (read_from=replica): READONLY in its handshake, every
     // time it is made. Set by the cluster alone.
     bool replicaReads = false;
+    // The server's credentials provider (setCredentials): zero or one. A copy holds a fork of it.
+    DynamicArray<Owned<Credentials>> provider;
 
     // A connection through sentinels asks each one with `forSentinel`, and reaches the server it names with `forNode`.
     friend redis::Connection::askSentinels[forSentinel, forNode];
     friend redis::Cluster::nodeConfig[forNode, replicaReads];
     friend redis::Connection::handshake[replicaReads];
     friend redis::Connection::resp2Handshake[replicaReads];
+    // A connection keeps its provider beside its link, so its kept Config holds no credentials.
+    friend redis::Connection::establish[takeCredentials];
+    friend redis::Connection::connectOver[takeCredentials];
 
     ctor blank(UrlTransport kind) {
         this.kind = kind;
@@ -202,6 +209,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.sentinelSecret = Optional::None;
         this.readChoice = Optional::None;
         this.redirectChoice = Optional::None;
+        this.provider = DynamicArray.empty();
     }
 
     public ctor copy(ref Config source) {
@@ -242,6 +250,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.readChoice = source.readChoice;
         this.redirectChoice = source.redirectChoice;
         this.replicaReads = source.replicaReads;
+        this.provider = DynamicArray.empty();
+        if (source.provider.length() > 0) { this.provider.add(item: source.provider[0].fork()); }
     }
 
     // A connection URL: redis://, valkey://, rediss://, valkeys://, unix://, redis-sentinel:// or rediss-sentinel://
@@ -338,8 +348,10 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         return Result::Ok(value: give c);
     }
 
-    // AUTH's user and password. With no user, the password is the `default` user's, as `requirepass` sets it.
+    // AUTH's user and password. With no user, the password is the `default` user's, as `requirepass` sets it. Refused
+    // once a credentials provider is set (setCredentials): it is then the one source.
     public fn Result<Unit, RedisError> setAuth(Optional<string> user, string password) {
+        if (this.provider.length() > 0) { return Result::Err(error: RedisError::Config(detail: "this configuration's credentials come from its provider (setCredentials): a password beside it would be a second source")); }
         if (password.length() == 0) { return Result::Err(error: RedisError::Config(detail: "the password is empty: an empty password authenticates no one, so leave it out")); }
         bool emptyUser = match (user) { case Some(value: u): u.length() == 0; case None: false; };
         if (emptyUser) { return Result::Err(error: RedisError::Config(detail: "the user is empty: give a user, or none for the default user")); }
@@ -557,6 +569,30 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public const fn ReadFrom readFrom() { return match (this.readChoice) { case Some(value: r): r; case None: ReadFrom::Primary; }; }
     public const fn int32 maxRedirects() { return match (this.redirectChoice) { case Some(value: n): n; case None: DEFAULT_MAX_REDIRECTS; }; }
     // Whether either cluster option was set: a `Connection` refuses them.
+    // Where the server's user and password come from from now on: `provider`, asked at every connect and redial, and
+    // again once a login's refreshAfter passes (src/credentials.kama). Refused when the URL or setAuth gave a password:
+    // there is one source. A second provider replaces the first.
+    public fn Result<Unit, RedisError> setCredentials(Owned<Credentials> provider) {
+        // A user never comes without a password (the URL refuses `user:@`, and setAuth wants one).
+        bool given = match (this.secret) { case Some(value: s): true; case None: false; };
+        if (given) {
+            Owned<Credentials> unused = give provider;
+            return Result::Err(error: RedisError::Config(detail: "this configuration has a password (the URL's, or setAuth's): a credentials provider beside it would be a second source"));
+        }
+        this.provider = DynamicArray.empty();
+        this.provider.add(item: give provider);
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn bool hasCredentials() { return this.provider.length() > 0; }
+
+    // The provider, taken out (zero or one): a connection keeps it beside its link.
+    fn DynamicArray<Owned<Credentials>> takeCredentials() {
+        DynamicArray<Owned<Credentials>> taken = DynamicArray.empty();
+        Optional<Owned<Credentials>> p = this.provider.pop();
+        match (give p) { case Some(value: x): { taken.add(item: give x); } case None: { } };
+        return give taken;
+    }
+
     public const fn bool clusterOptions() {
         bool r = match (this.readChoice) { case Some(value: x): true; case None: false; };
         bool m = match (this.redirectChoice) { case Some(value: x): true; case None: false; };

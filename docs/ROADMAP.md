@@ -483,13 +483,54 @@ Each step ends green before its commit:
      setup says. The topology captures are the cluster's and the cache's to replay (steps 5 and 6).
    - No mutations: the step adds no library code. The captures' readers come with steps 2, 3 and 6, whose mutations
      cover them.
-2. **The credentials provider.**
-   - `Config`, `Login`, `Credentials` and `RedisError::Credentials`.
-   - The handshake and the redial; the re-AUTH before a call; failing closed.
-   - Sentinel; a cluster node's fork; the subscriber; the fix to `authenticate`.
-   - Unit: each path and each refusal, through the scripted dialer.
-   - Live (`credentials_test.kama`): a `kr_rot` user made with ACL SETUSER, a rotation, a revocation, then a kill and
-     a redial. On a cluster and under Sentinel.
+2. **Done (2026-10-21).** **The credentials provider** (`src/credentials.kama`).
+   - **What was built:**
+     - `Credentials`, `Login`, `CredentialsError` and `RedisError::Credentials`;
+     - `Config.setCredentials` and `hasCredentials`, with the refusals both ways;
+     - the login asked at every handshake (`loginFor`), and `prepared()` (settle, ready, `refreshed`) on every call
+       path;
+     - the subscriber's `relogin`;
+     - the `authenticate` fix.
+   - **Settled on the way:**
+     - `login()` takes no argument. Five of the six peers with a provider pass nothing (redis-py, go-redis, Jedis,
+       node-redis, Lettuce); only rueidis passes the address. A `Config` argument would have made `Config` and
+       `Credentials` refer to each other.
+     - The provider moves from the `Config` into the `Opener` at `establish` and `connectOver`. So the kept `settings`
+       hold neither a provider nor a password, and a `copy this.settings` forks nothing.
+     - `recourseFor` already treats `Credentials` as final: it falls to `case _`, and `transient` is false for it.
+       Nothing was added there.
+     - A sentinel's connection is over `Opener.none()`, so `forSentinel` needs no clearing (the line was dead, and
+       went).
+     - A re-AUTH that loses its link redials at once, since nothing of the call was sent, and `transactAt` checks
+       `watchLost` again after it.
+   - **Unit** (`credentials_test.kama`, and a case each in `cluster_test` and `sentinel_test`), through the scripted
+     dialer:
+     - asked at the connect and at a redial; RESP2's AUTH; over `connectOver`;
+     - the refresh, and not before;
+     - a refused re-AUTH, and the provider failing at a refresh, at the connect and at a redial (final, one try);
+     - the link lost at the re-AUTH;
+     - a WATCH lost that way holding the transaction back;
+     - `authenticate` refused beside a provider, and after a lost link (and refused there, the old login kept);
+     - the subscriber under both protocols;
+     - each cluster node with a fork of its own;
+     - the sentinels keeping their own login;
+     - the `Config` refusals and the `Login` checks.
+   - **Live** (`credentials_test.kama`, all eight servers):
+     - a `kr_rot` user, and a rotation: the refresh, then pw1 taken away and a kill, with the redial on pw2;
+     - a revocation and a provider failure, each closing the connection (counted in CLIENT LIST);
+     - a cluster, every node logging in;
+     - the master found through sentinels.
+
+     The rotation's second login is another user's (`kr_rot2`). The server keeps a session logged in whatever its
+     passwords become, so only ACL WHOAMI naming the new user shows that the connection logged in anew. A first
+     version rotated kr_rot's own password, and the live mutation that turned the refresh off survived it.
+   - **Mutations** (`7b-s2.json`): 25, every one CAUGHT. 23 are unit (M1–M23) and two live (IM1–IM2, on Redis 8.10).
+     - Making them caught tightened the tests. After a refusal or a provider failure, the old link's script refuses a
+       login there, so a client that went on with that link fails visibly.
+     - `setCredentials`'s check for a user without a password went: neither the URL (`user:@` is refused) nor
+       `setAuth` can give one.
+   - **Gates:** `tools/test.sh` debug and release on v0.9.707 and 0.9.713, and the integration matrix on all eight
+     servers. The live credentials cases ran again on all eight once the rotation changed.
 3. **The pool core** (S3).
    - `Pool`, `Lease`, `PoolShare`, `PoolOptions`, `PoolDialers` and `PoolTimeout`.
    - The put-back and the local resets; acquire's zero-time check; share and join; the Scan fix.

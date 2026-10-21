@@ -1,10 +1,11 @@
-import { std::collections::DynamicArray, std::collections::Deque, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
+import { std::collections::DynamicArray, std::collections::Deque, std::io::IoError, std::io::IoErrorKind, std::memory::Owned, std::memory::replace,
          std::net::SocketAddr, std::net::resolve, std::time::Duration, std::time::Instant, std::time::monotonicNow, std::time::sleep,
          std::random::Rng,
          redis::Config, redis::Protocol, redis::UrlTransport, redis::RedisError, redis::ServerError, redis::ServerCode,
          redis::ConnectError, redis::ConnectAttempt, redis::ReconnectError, redis::SentinelError, redis::SentinelRole,
          redis::Transport, redis::TcpTransport, redis::UnixTransport,
          redis::Dialer, redis::DialTarget, redis::Command, redis::ServerInfo, redis::TlsSession,
+         redis::Credentials, redis::Login, redis::CredentialsError,
          redis::secure::TlsTransport, redis::secure::prepareTls, redis::secure::hasIdentity, tls::TlsConfig, tls::TlsError,
          redis::Pipeline, redis::Replies, redis::TxOutcome, redis::TxBody, redis::ScriptCall, redis::wire::Wire, redis::wire::Deadline, redis::wire::admit,
          redis::wire::watchEffect, redis::wire::serverError, redis::wire::blockingWait, redis::wire::callDeadline, redis::wire::isWatch, redis::wire::footprint, redis::wire::unattributed,
@@ -85,6 +86,11 @@ type resource Connection implements Sendable {
     Rng jitter;
     // How many times the link was made again: a SCAN's cursor means nothing on a new server process.
     int64 links = 0;
+    // When the credentials provider must be asked again (src/credentials.kama): None while the login holds. The user
+    // last logged in as. Whether `authenticate` changed who this connection is (a pool will not keep it).
+    Optional<Instant> loginDue;
+    Optional<string> loginUser;
+    bool authenticatedByHand = false;
 
     // A Subscriber owns its connection while it is subscribed, and reads what comes back itself (src/subscriber.kama).
     friend redis::Subscriber::write[transmit];
@@ -96,6 +102,7 @@ type resource Connection implements Sendable {
     friend redis::Subscriber::change[lost];
     friend redis::Subscriber::lostWith[lose];
     friend redis::Subscriber::rawHandle[rawHandle];
+    friend redis::Subscriber::relogin[loginExpired, nextLogin, loggedIn];
     friend redis::Scan::next[generation];
     // A cluster asks its live nodes for the map first (src/cluster.kama).
     friend redis::NodeLink::live[lost];
@@ -118,6 +125,8 @@ type resource Connection implements Sendable {
         this.dialing = give dialing;
         this.redialAfter = monotonicNow();
         this.jitter = Rng.fromEntropy();
+        this.loginDue = Optional::None;
+        this.loginUser = Optional::None;
     }
 
     // Connect to the server `config` names, over a socket of this client's.
@@ -145,29 +154,35 @@ type resource Connection implements Sendable {
             wrong = Optional::Some(value: RedisError::Config(detail: "a Sentinel configuration finds its server through the sentinels, so it cannot run over a transport the caller opened: connect with Connection.connect or connectWith"));
         }
         match (give wrong) { case Some(value: e): { Owned<Transport> unused = give transport; return Result::Err(error: give e); } case None: { } };
-        Deadline deadline = Deadline.within(span: config.connectTimeout());
+        Config own = copy config;
+        Opener none = Opener.none();
+        none.holdCredentials(creds: own.takeCredentials());
+        Deadline deadline = Deadline.within(span: own.connectTimeout());
         DynamicArray<TlsSession> session = DynamicArray.empty();
-        Result<Owned<Transport>, RedisError> secured = Connection::secure(link: give transport, config: config, place: hostAndPort(config: config), deadline: deadline, session: session);
+        Result<Owned<Transport>, RedisError> secured = Connection::secure(link: give transport, config: own, place: hostAndPort(config: own), deadline: deadline, session: session);
         Owned<Transport> link = match (give secured) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
-        Connection c = Connection.over(transport: give link, config: config, dialing: Opener.none());
+        Connection c = Connection.over(transport: give link, config: own, dialing: give none);
         c.secured = give session;
-        Result<Unit, RedisError> done = c.handshake(config: config, deadline: deadline, again: false);
+        Result<Unit, RedisError> done = c.handshake(config: own, deadline: deadline, again: false);
         return match (give done) {
             case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }
             case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
         };
     }
 
-    // A connection to the first address of `config` that opens, made by `opener`, which the connection keeps.
+    // A connection to the first address of `config` that opens, made by `opener`, which the connection keeps, with
+    // the config's credentials provider beside it: the Config the connection keeps holds none.
     unsafe ctor Result<Connection, RedisError> establish(const ref Config config, Opener opener) {
+        Config own = copy config;
+        opener.holdCredentials(creds: own.takeCredentials());
         Deadline left = Deadline.none();
         DynamicArray<TlsSession> session = DynamicArray.empty();
-        Result<Owned<Transport>, RedisError> reached = Connection::reach(config: config, opener: opener, left: left, session: session);
+        Result<Owned<Transport>, RedisError> reached = Connection::reach(config: own, opener: opener, left: left, session: session);
         Owned<Transport> link = match (give reached) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
-        Connection c = Connection.over(transport: give link, config: config, dialing: give opener);
+        Connection c = Connection.over(transport: give link, config: own, dialing: give opener);
         c.secured = give session;
-        Result<Unit, RedisError> shaken = c.handshake(config: config, deadline: left, again: false);
-        Result<Unit, RedisError> done = c.confirmed(shaken: give shaken, config: config, deadline: left);
+        Result<Unit, RedisError> shaken = c.handshake(config: own, deadline: left, again: false);
+        Result<Unit, RedisError> done = c.confirmed(shaken: give shaken, config: own, deadline: left);
         return match (give done) {
             case Ok(value: u): { c.settings.setProtocol(protocol: c.speaking); := Result::Ok(value: give c); }
             case Err(error: e): { Connection failed = give c; := Result::Err(error: give e); }
@@ -454,18 +469,38 @@ type resource Connection implements Sendable {
     // Change who this connection is: AUTH, and every reconnect logs in as that user too. With no user, the password
     // is the `default` user's. A user or password the Config would refuse (empty) is `Config`, and nothing is sent; a
     // refusal (WRONGPASS) is `Server`, and the connection stays the user it was.
+    // A connection whose link was lost logs in as the new user as it is made again, not as the old one first. On a
+    // connection whose credentials come from a provider (Config.setCredentials) it is `Usage`: the provider is the one
+    // source, and the connection logs in anew itself when its login changes.
     public unsafe fn Result<Unit, RedisError> authenticate(Optional<string> user, string password) {
+        if (this.dialing.hasCredentials()) {
+            return Result::Err(error: RedisError::Usage(detail: "this connection's credentials come from its provider (Config.setCredentials), which it asks again itself when its login changes"));
+        }
         Config next = copy this.settings;
         Optional<string> named = copy user;
         string secret = copy password;
         Result<Unit, RedisError> valid = next.setAuth(user: give named, password: give secret);
         match (give valid) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> idle = this.settle();
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (!this.live) {
+            // The link is made again as the new user, whose AUTH is its handshake's; failing, the old one is kept.
+            if (!this.canRedial()) { return Result::Err(error: RedisError::Closed); }
+            Config before = replace::<Config>(place: this.settings, with: give next);
+            Result<Unit, RedisError> up = this.ready();
+            match (give up) {
+                case Ok(value: u): { this.authenticatedByHand = true; return Result::Ok(value: Unit::Unit); }
+                case Err(error: e): { this.settings = give before; return Result::Err(error: give e); }
+            };
+        }
         Command auth = Command.of(name: "AUTH");
         match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
         auth.arg(text: password);
         Result<Value, RedisError> r = this.exchange(command: auth);
         match (give r) { case Ok(value: v): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.settings = give next;
+        this.loginUser = copy user;
+        this.authenticatedByHand = true;
         return Result::Ok(value: Unit::Unit);
     }
 
@@ -486,9 +521,7 @@ type resource Connection implements Sendable {
     }
 
     unsafe fn Result<Value, RedisError> exchangeOnce(const ref Command command) {
-        Result<Unit, RedisError> idle = this.settle();
-        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Unit, RedisError> up = this.ready();
+        Result<Unit, RedisError> up = this.prepared();
         match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: blockingWait(command: command));
         this.outbox.clear();
@@ -525,9 +558,7 @@ type resource Connection implements Sendable {
     // write. The deadline its replies have; `unsent` when the failure came before anything was written. A cluster
     // begins every node's batch before it finishes any (src/cluster.kama).
     unsafe fn Result<Deadline, RedisError> begin(const ref Pipeline pipeline, ref bool unsent) {
-        Result<Unit, RedisError> idle = this.settle();
-        match (give idle) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
-        Result<Unit, RedisError> up = this.ready();
+        Result<Unit, RedisError> up = this.prepared();
         match (give up) { case Ok(value: u): { } case Err(error: e): { unsent = true; return Result::Err(error: give e); } };
         Deadline deadline = callDeadline(limit: this.commandLimit, extra: pipeline.waiting());
         if (pipeline.length() == 0) { return Result::Ok(value: deadline); }
@@ -613,6 +644,10 @@ type resource Connection implements Sendable {
         if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }
         Result<Unit, RedisError> up = this.ready();
         match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> fresh = this.refreshed();
+        match (give fresh) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        // A fresh login that lost the link lost the WATCH with it.
+        if (this.watchLost) { this.watchLost = false; return Result::Ok(value: TxOutcome::WatchConflict); }
         // EXEC drops every watched key, whatever it answers; a link lost from here on loses no WATCH.
         this.watching = false;
         Deadline deadline = Deadline.within(span: this.commandLimit);
@@ -832,22 +867,23 @@ type resource Connection implements Sendable {
 
     // HELLO, then what follows it in the same write (docs/ROADMAP.md, "Phase 2", "The handshake is one round trip").
     unsafe fn Result<Unit, RedisError> handshake(const ref Config config, Deadline deadline, bool again) {
+        Result<Optional<Login>, RedisError> wanted = this.loginFor(config: config);
+        Optional<Login> login = match (give wanted) { case Ok(value: l): give l; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
         Optional<Protocol> asked = config.protocol();
         bool resp2 = match (asked) { case Some(value: p): p == Protocol::Resp2; case None: false; };
-        if (resp2) { return this.resp2Handshake(config: config, deadline: deadline); }
+        if (resp2) { return this.resp2Handshake(config: config, deadline: deadline, login: login); }
         bool required = match (asked) { case Some(value: p): true; case None: false; };
 
         Command hello = Command.of(name: "HELLO");
         hello.arg(text: "3");
-        Optional<string> password = config.password();
         bool carriesAuth = false;
-        match (password) {
-            case Some(value: pw): {
-                Optional<string> user = config.user();
+        match (login) {
+            case Some(value: l): {
+                Optional<string> user = l.user();
                 string name = match (user) { case Some(value: u): copy u; case None: "default"; };
                 hello.arg(text: "AUTH");
                 hello.arg(text: name);
-                hello.arg(text: pw);
+                hello.arg(text: l.password());
                 carriesAuth = true;
             }
             case None: { }
@@ -914,7 +950,7 @@ type resource Connection implements Sendable {
                 match (give dropped) { case Ok(value: v): { } case Err(error: e): { this.lose(); return Result::Err(error: refusedOr(e: give e, refused: give refused)); } };
                 k = k + 1;
             }
-            Result<Unit, RedisError> fell = this.resp2Handshake(config: config, deadline: deadline);
+            Result<Unit, RedisError> fell = this.resp2Handshake(config: config, deadline: deadline, login: login);
             return match (give fell) {
                 case Ok(value: u): { ServerError unused = give refused; := Result::Ok(value: u); }
                 case Err(error: e): Result::Err(error: refusedOr(e: give e, refused: give refused));
@@ -957,16 +993,15 @@ type resource Connection implements Sendable {
     // nothing to send, it sends PING, which twemproxy and Envoy answer themselves, so a connect always knows the link
     // is open (Lettuce's `pingBeforeActivateConnection` on its RESP2 path): a server with no room left (maxclients)
     // says so as it accepts, then closes, and only a round trip sees that.
-    unsafe fn Result<Unit, RedisError> resp2Handshake(const ref Config config, Deadline deadline) {
+    unsafe fn Result<Unit, RedisError> resp2Handshake(const ref Config config, Deadline deadline, const ref Optional<Login> login) {
         this.outbox.clear();
         DynamicArray<string> steps = DynamicArray.empty();
-        Optional<string> password = config.password();
-        match (password) {
-            case Some(value: pw): {
+        match (login) {
+            case Some(value: l): {
                 Command auth = Command.of(name: "AUTH");
-                Optional<string> user = config.user();
+                Optional<string> user = l.user();
                 match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
-                auth.arg(text: pw);
+                auth.arg(text: l.password());
                 auth.encode(into: this.outbox);
                 steps.add(item: "AUTH");
             }
@@ -1027,6 +1062,96 @@ type resource Connection implements Sendable {
         if (v.isError()) { return Result::Err(error: RedisError::Server(error: serverError(v: v))); }
         bool ok = match (v) { case Simple(bytes: b): b.length() == 2 && b[0] == 79ui8 && b[1] == 75ui8; case _: false; };
         if (!ok) { return Result::Err(error: RedisError::Unexpected(detail: what.concat(other: " answered with something other than OK"))); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // ---- credentials (src/credentials.kama) ----
+
+    // The login a handshake sends: the credentials provider's, asked now, or the configuration's own; None for none. A
+    // provider's failure is `Credentials`.
+    unsafe fn Result<Optional<Login>, RedisError> loginFor(const ref Config config) {
+        if (this.dialing.hasCredentials()) {
+            Result<Login, RedisError> got = this.dialing.login();
+            return match (give got) {
+                case Ok(value: l): { this.loggedIn(login: l); := Result::Ok(value: Optional::Some(value: give l)); }
+                case Err(error: e): Result::Err(error: RedisError::Credentials(error: CredentialsError.provider(cause: give e)));
+            };
+        }
+        Optional<string> password = config.password();
+        this.loginDue = Optional::None;
+        this.loginUser = config.user();
+        return match (give password) {
+            case Some(value: pw): Result::Ok(value: Optional::Some(value: Login.make(name: config.user(), secret: give pw, after: Optional::None)));
+            case None: Result::Ok(value: Optional::None);
+        };
+    }
+
+    // The provider's next login, to log in anew on the live link. Its failure loses the link, and is `Credentials`.
+    unsafe fn Result<Login, RedisError> nextLogin() {
+        Result<Login, RedisError> got = this.dialing.login();
+        return match (give got) {
+            case Ok(value: l): Result::Ok(value: give l);
+            case Err(error: e): { this.lose(); := Result::Err(error: RedisError::Credentials(error: CredentialsError.provider(cause: give e))); }
+        };
+    }
+
+    // `login` is in force: it holds until its refreshAfter passes.
+    unsafe fn void loggedIn(const ref Login login) {
+        Optional<Duration> after = login.refreshAfter();
+        this.loginDue = match (after) { case Some(value: d): Optional::Some(value: monotonicNow() + d); case None: Optional::None; };
+        this.loginUser = login.user();
+    }
+
+    // Whether the provider's last login has passed its refreshAfter.
+    unsafe fn bool loginExpired() {
+        return match (this.loginDue) { case Some(value: at): monotonicNow() >= at; case None: false; };
+    }
+
+    // Before a call writes: what came while idle (settle), the link (ready), and a fresh login once the last one's time
+    // has passed (refreshed).
+    unsafe fn Result<Unit, RedisError> prepared() {
+        Result<Unit, RedisError> idle = this.settle();
+        match (give idle) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, RedisError> up = this.ready();
+        match (give up) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.refreshed();
+    }
+
+    // A fresh login, once the last one's time has passed: the provider asked again, and AUTH, before the call writes.
+    // A link lost on the way is made again, which logs in anew, since nothing of the call was sent. The provider's
+    // failure, or the server's refusal, is `Credentials`, and the connection stays closed until the next call.
+    unsafe fn Result<Unit, RedisError> refreshed() {
+        if (!this.loginExpired()) { return Result::Ok(value: Unit::Unit); }
+        Result<Unit, RedisError> done = this.relogin();
+        bool settled = match (done) { case Err(error: e): match (e) { case Credentials(error: c): true; case _: false; }; case Ok(value: u): true; };
+        if (settled) { return give done; }
+        Result<Unit, RedisError> dropped = give done;
+        return this.ready();
+    }
+
+    // Log in anew on the live link: the provider asked, then AUTH, its reply awaited (a push on the way is set aside).
+    // Every failure loses the link; the provider's, or the server's refusal, is `Credentials`.
+    unsafe fn Result<Unit, RedisError> relogin() {
+        Result<Login, RedisError> got = this.nextLogin();
+        Login login = match (give got) { case Ok(value: l): give l; case Err(error: e): { return Result::Err(error: give e); } };
+        Deadline deadline = Deadline.within(span: this.commandLimit);
+        this.outbox.clear();
+        Command auth = Command.of(name: "AUTH");
+        Optional<string> user = login.user();
+        match (user) { case Some(value: u): { auth.arg(text: u); } case None: { } };
+        auth.arg(text: login.password());
+        auth.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+        Result<Value, RedisError> answer = this.nextReply(deadline: deadline);
+        Value v = match (give answer) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (v.isError()) {
+            ServerError refused = serverError(v: v);
+            this.lose();
+            return Result::Err(error: RedisError::Credentials(error: CredentialsError.refusal(cause: RedisError::Server(error: give refused))));
+        }
+        if (!isStatus(v: v, text: "OK")) { this.lose(); return Result::Err(error: RedisError::Unexpected(detail: "AUTH answered with something other than OK")); }
+        this.loggedIn(login: login);
         return Result::Ok(value: Unit::Unit);
     }
 
@@ -1301,12 +1426,15 @@ type resource Opener implements Sendable {
     string foundAt;
     // The socket of the link last opened, when this client opened it; -1 over a caller's dialer.
     isize lastHandle = -1;
+    // The server's credentials provider (Config.setCredentials): zero or one, asked at every handshake.
+    DynamicArray<Owned<Credentials>> creds;
 
     public ctor builtIn(Duration keepAlive) {
         this.dialers = DynamicArray.empty();
         this.keepIdle = keepAlive;
         this.sentinels = DynamicArray.empty();
         this.foundAt = "";
+        this.creds = DynamicArray.empty();
     }
     public ctor through(Owned<Dialer> dialer) {
         this.dialers = DynamicArray.empty();
@@ -1314,6 +1442,7 @@ type resource Opener implements Sendable {
         this.keepIdle = Duration.zero();
         this.sentinels = DynamicArray.empty();
         this.foundAt = "";
+        this.creds = DynamicArray.empty();
     }
     public ctor none() {
         this.dialers = DynamicArray.empty();
@@ -1321,6 +1450,7 @@ type resource Opener implements Sendable {
         this.dials = false;
         this.sentinels = DynamicArray.empty();
         this.foundAt = "";
+        this.creds = DynamicArray.empty();
     }
 
     // The sentinels `config` names, the first time it is asked; after that, the list as answers have ordered it.
@@ -1353,6 +1483,15 @@ type resource Opener implements Sendable {
     // Where the sentinels last said the server is ("127.0.0.1:7200").
     public fn void found(string place) { this.foundAt = give place; }
     public const fn string foundText() { return copy this.foundAt; }
+
+    // The credentials provider a connection logs in with, taken from its Config (zero or one).
+    public fn void holdCredentials(DynamicArray<Owned<Credentials>> creds) { this.creds = give creds; }
+    public const fn bool hasCredentials() { return this.creds.length() > 0; }
+    // The provider's login, asked now.
+    public unsafe fn Result<Login, RedisError> login() {
+        if (this.creds.length() == 0) { return Result::Err(error: RedisError::Usage(detail: "no credentials provider")); }
+        return this.creds[0].login();
+    }
 
     // Whether this can open a link again: false for a transport the caller opened.
     public const fn bool canDial() { return this.dials; }
