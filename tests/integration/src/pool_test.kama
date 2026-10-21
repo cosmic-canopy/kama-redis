@@ -5,7 +5,8 @@ import { std::collections::DynamicArray, std::concurrent::Channel, std::concurre
          std::concurrent::Isolate, std::concurrent::RecvError, std::time::Duration, std::time::sleep,
          redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::Pipeline, redis::TxOutcome,
          redis::resp::Value, redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
-         redis_integration_tests::check, open, ask, commandOf, shown, mainUrl, tlsUrl, trusting, openDescriptors };
+         redis_integration_tests::check, open, ask, commandOf, shown, mainUrl, tlsUrl, trusting, openDescriptors,
+         Answer, providing };
 export { poolTests };
 
 unsafe fn Result<Pool, RedisError> poolAt(const ref string url, isize maxSize, int64 acquireMs) {
@@ -58,6 +59,14 @@ unsafe fn isize killPool(ref Connection admin) {
         i = i + 1;
     }
     return killed;
+}
+
+// The same, waiting up to five seconds: for what the maintenance does in its rounds.
+unsafe fn isize settledLong(ref Connection admin, isize want) {
+    isize n = poolClients(admin: admin);
+    isize tries = 0;
+    while (n != want && tries < 100) { sleep(d: Duration.fromMillis(ms: 50i64)); n = poolClients(admin: admin); tries = tries + 1; }
+    return n;
 }
 
 // The pool's clients once they number `want`, or after two seconds: a close reaches the server a moment later.
@@ -261,6 +270,74 @@ unsafe fn int32 poolTests() {
             }
             case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: TLS make: ${m}"); }
         };
+    }
+
+    // The maintenance (step 4): minIdle made with no acquire; idle connections the pool did not need pruned; killed
+    // ones replaced; an idle connection's login renewed (CLIENT LIST's user=); and the drop closing everything.
+    {
+        Result<Config, RedisError> pc = Config.parse(url: url);
+        Config config = match (give pc) { case Ok(value: v): give v; case Err(error: e): { string m = e.message(); return check(ok: false, what: "pool: ${m}"); } };
+        PoolOptions o = PoolOptions.defaults();
+        o.maxSize = 3;
+        o.minIdle = 1;
+        o.healthCheck = Duration.fromMillis(ms: 200i64);
+        o.idleTimeout = Optional::Some(value: Duration.fromMillis(ms: 600i64));
+        Result<Pool, RedisError> made = Pool.make(config: config, options: o);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                isize atStart = settledClients(admin: admin, want: 1);
+                {
+                    Result<Lease, RedisError> x = pool.acquire();
+                    Result<Lease, RedisError> y = pool.acquire();
+                    Result<Lease, RedisError> z = pool.acquire();
+                }
+                isize busy = poolClients(admin: admin);
+                isize pruned = settledLong(admin: admin, want: 1);
+                isize killed = killPool(admin: admin);
+                isize refilled = settledLong(admin: admin, want: 1);
+                f = f + check(ok: atStart == 1 && busy == 3 && pruned == 1 && killed == 1 && refilled == 1,
+                              what: "pool maintenance: minIdle at the start, pruned back to it, a killed one replaced (${atStart}; ${busy}; ${pruned}; ${killed}; ${refilled})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool maintenance: make: ${m}"); }
+        };
+    }
+    isize afterDrop = settledClients(admin: admin, want: 0);
+    f = f + check(ok: afterDrop == 0, what: "pool maintenance: dropping the pool closes its connections (${afterDrop})");
+    {
+        string dropUsers = ask(c: admin, text: "ACL DELUSER kr_rot kr_rot2");
+        string u1 = ask(c: admin, text: "ACL SETUSER kr_rot on >pw1 ~* &* +@all");
+        string u2 = ask(c: admin, text: "ACL SETUSER kr_rot2 on >pw2 ~* &* +@all");
+        DynamicArray<Answer> turns = DynamicArray.empty();
+        turns.add(item: Answer::Give(password: "pw1", refreshMs: 300i64));
+        turns.add(item: Answer::GiveAs(user: "kr_rot2", password: "pw2"));
+        Result<Config, RedisError> pc = providing(url: url, answers: give turns);
+        match (give pc) {
+            case Ok(value: config): {
+                PoolOptions o = PoolOptions.defaults();
+                o.maxSize = 1;
+                o.minIdle = 1;
+                o.healthCheck = Duration.fromMillis(ms: 200i64);
+                Result<Pool, RedisError> made = Pool.make(config: config, options: o);
+                match (give made) {
+                    case Ok(value: p): {
+                        Pool pool = give p;
+                        string renewed = "-";
+                        int32 tries = 0;
+                        while (tries < 100 && !renewed.contains(substring: "user=kr_rot2 ")) {
+                            sleep(d: Duration.fromMillis(ms: 50i64));
+                            renewed = ask(c: admin, text: "CLIENT LIST");
+                            tries = tries + 1;
+                        }
+                        f = f + check(ok: renewed.contains(substring: "name=kr-pool ") && renewed.contains(substring: "user=kr_rot2 "),
+                                      what: "pool maintenance: an idle connection logs in anew when its login's time comes (CLIENT LIST user=kr_rot2)");
+                    }
+                    case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool maintenance: make: ${m}"); }
+                };
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool maintenance: ${m}"); }
+        };
+        string undo = ask(c: admin, text: "ACL DELUSER kr_rot kr_rot2");
     }
 
     // With every pool dropped, its connections are closed: no descriptor is left behind, and the server sees none.

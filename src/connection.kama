@@ -114,6 +114,7 @@ type resource Connection implements Sendable {
     // A pool takes a connection back and checks one it leases (src/pool/pool.kama).
     friend redis::pool::PoolCore::release[putBack];
     friend redis::pool::PoolCore::checkout[settleIdle];
+    friend redis::pool::PoolCore::round[probeIdle];
 
     unsafe ctor over(Owned<Transport> transport, const ref Config config, Opener dialing) {
         this.wire = Wire.over(transport: give transport, limits: config.limits());
@@ -1212,6 +1213,25 @@ type resource Connection implements Sendable {
     unsafe fn bool settleIdle() {
         if (this.shut || !this.live) { return false; }
         return this.idleIntact();
+    }
+
+    // For a pool's maintenance: whether an idle connection is alive. What came while it sat is read, a fresh login is
+    // made once its time has come (src/credentials.kama), then PING within `timeout`: any answer is a server that is
+    // serving. Nothing is made again here; any failure loses the link, and the pool closes the connection.
+    unsafe fn bool probeIdle(Duration timeout) {
+        if (!this.settleIdle()) { return false; }
+        if (this.loginExpired()) {
+            Result<Unit, RedisError> fresh = this.relogin();
+            match (give fresh) { case Ok(value: u): { } case Err(error: e): { this.lose(); return false; } };
+        }
+        Deadline deadline = Deadline.within(span: timeout);
+        this.outbox.clear();
+        Command ping = Command.of(name: "PING");
+        ping.encode(into: this.outbox);
+        Result<Unit, RedisError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { this.lose(); return false; } };
+        Result<Value, RedisError> got = this.nextReply(deadline: deadline);
+        return match (give got) { case Ok(value: v): true; case Err(error: e): false; };
     }
 
     // Whether nothing but pushes came while the connection sat idle (the pushes are set aside): a close, or anything

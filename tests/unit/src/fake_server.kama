@@ -15,7 +15,7 @@
 // hangs up.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::collections::FixedArray,
          std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::ReliableStream,
-         std::memory::Owned, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error,
+         std::memory::Owned, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, std::concurrent::Sender,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          redis::Transport, redis::Dialer, redis::Dialers, redis::DialTarget, redis::RedisError,
          redis::resp::Reader, redis::resp::Read, redis::resp::Value };
@@ -112,6 +112,12 @@ type resource FakeServer implements Transport, Sendable {
     int32 patience = 0;
     bool holding = false;
     bool pausing = false;   // at a Step::Pause, until a wait comes back empty
+    // A traced server (`traced`) tells its test what happens: "connect", each command as words, and "close". With
+    // `pong` given, it answers every PING with it, whenever it comes, outside the script: a pool's maintenance pings
+    // when its rounds come round, which no script can place.
+    DynamicArray<Sender<string>> tracer;   // zero or one
+    DynamicArray<uint8> pong;
+    bool shutDown = false;
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps;
@@ -125,6 +131,28 @@ type resource FakeServer implements Transport, Sendable {
         this.outbox = DynamicArray.empty();
         this.engine = DynamicArray.empty();
         this.sniWanted = "";
+        this.tracer = DynamicArray.empty();
+        this.pong = DynamicArray.empty();
+        this.advance();
+    }
+
+    // `make`, telling `tracer` what happens, and answering every PING with `pong` (when it is not empty).
+    public unsafe ctor traced(DynamicArray<Step> steps, isize chunk, isize writeLimit, Sender<string> tracer, DynamicArray<uint8> pong) {
+        this.steps = give steps;
+        this.toClient = DynamicArray.empty();
+        this.fromClient = Reader.make();
+        this.chunk = chunk;
+        this.writeLimit = writeLimit;
+        this.backlog = -1;
+        this.held = DynamicArray.empty();
+        this.patient = DynamicArray.empty();
+        this.outbox = DynamicArray.empty();
+        this.engine = DynamicArray.empty();
+        this.sniWanted = "";
+        this.pong = give pong;
+        this.tracer = DynamicArray.empty();
+        _ = tracer.send(item: "connect");
+        this.tracer.add(item: give tracer);
         this.advance();
     }
 
@@ -143,6 +171,8 @@ type resource FakeServer implements Transport, Sendable {
         this.outbox = DynamicArray.empty();
         this.engine = DynamicArray.empty();
         this.sniWanted = give sni;
+        this.tracer = DynamicArray.empty();
+        this.pong = DynamicArray.empty();
         Result<TlsStream<ServerSide>, TlsError> opened = TlsStream::<ServerSide>.server(inner: ServerSide.make(), config: config);
         match (give opened) {
             case Ok(value: t): { this.engine.add(item: give t); }
@@ -164,6 +194,8 @@ type resource FakeServer implements Transport, Sendable {
         this.outbox = DynamicArray.empty();
         this.engine = DynamicArray.empty();
         this.sniWanted = "";
+        this.tracer = DynamicArray.empty();
+        this.pong = DynamicArray.empty();
         this.advance();
     }
 
@@ -180,6 +212,8 @@ type resource FakeServer implements Transport, Sendable {
         this.outbox = DynamicArray.empty();
         this.engine = DynamicArray.empty();
         this.sniWanted = give sni;
+        this.tracer = DynamicArray.empty();
+        this.pong = DynamicArray.empty();
         Result<TlsStream<ServerSide>, TlsError> opened = TlsStream::<ServerSide>.server(inner: ServerSide.make(), config: config);
         match (give opened) {
             case Ok(value: t): { this.engine.add(item: give t); }
@@ -256,7 +290,11 @@ type resource FakeServer implements Transport, Sendable {
         return Result::Ok(value: Ready.of(readable: readable, writable: !this.blocked()));
     }
 
-    public fn void shutdown() { }
+    public unsafe fn void shutdown() {
+        if (this.shutDown) { return; }
+        this.shutDown = true;
+        if (this.tracer.length() > 0) { _ = this.tracer[0].send(item: "close"); }
+    }
     public fn Optional<RedisError> explain(IoError error) { return Optional::None; }
 
     // What the script has sent goes on to the client: as it is, or over TLS once the handshake is done (until then
@@ -338,10 +376,16 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     unsafe fn void answer(const ref Value command) {
+        DynamicArray<string> args = argsOf(v: command);
+        if (this.tracer.length() > 0) { _ = this.tracer[0].send(item: joined(args: args)); }
+        if (this.pong.length() > 0 && args.length() == 1 && args[0] == "PING") {
+            this.outbox.addAll(items: this.pong.view());
+            this.handOn();
+            return;
+        }
         if (this.next >= this.steps.length()) { return; }
         isize at = this.next;
         this.next = this.next + 1;
-        DynamicArray<string> args = argsOf(v: command);
         match (this.steps[at]) {
             case Expect(args: want, reply: r): {
                 if (!sameArgs(a: want, b: args)) {
@@ -490,7 +534,9 @@ type enum Dial implements Sendable {
     Refuse,
     TimeOut,
     Serve(DynamicArray<Step> steps),
-    ServeTls(DynamicArray<Step> steps, TlsConfig config, string sni);
+    ServeTls(DynamicArray<Step> steps, TlsConfig config, string sni),
+    // `Serve`, by a traced server (FakeServer.traced) that tells `tracer` what happens, answering PING with `pong`.
+    ServeTraced(DynamicArray<Step> steps, Sender<string> tracer, DynamicArray<uint8> pong);
 }
 
 // A `Dialer` that answers each dial with the next entry; with none left, it refuses as a closed port would. Made
@@ -532,6 +578,10 @@ type resource ScriptDialer implements Dialer, Sendable {
             }
             case ServeTls(steps: s, config: c, sni: n): {
                 Owned<Transport> fake = new FakeServer.secure(steps: give s, chunk: 1, writeLimit: 3, config: c, sni: give n);
+                return Result::Ok(value: give fake);
+            }
+            case ServeTraced(steps: s, tracer: t, pong: p): {
+                Owned<Transport> fake = new FakeServer.traced(steps: give s, chunk: 1, writeLimit: 3, tracer: give t, pong: give p);
                 return Result::Ok(value: give fake);
             }
         };

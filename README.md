@@ -535,6 +535,10 @@ match (give got) {
   | `acquireTimeout` | 6 s (go-redis's rule: a command's timeout and one more); then `PoolTimeout`, nothing sent |
   | `lifetime` | none (go-redis and rueidis set none); a connection past it is closed when it is next released or acquired |
   | `lifetimeJitter` | 90 s, a random part of it added to each connection's lifetime |
+  | `minIdle` | 0: the fewest idle connections the maintenance keeps open |
+  | `idleTimeout` | 30 minutes (go-redis's): how long idle connections the pool has not needed are watched before they are closed |
+  | `healthCheck` | 60 s: how often the maintenance runs |
+  | `pingTimeout` | 5 s: how long a probe's `PING` may take |
 - **Release puts back only what the lease changed:** `UNWATCH` for a `WATCH` in force and `SELECT` for a database
   `select` changed, in one write sent as the lease drops, so a failure is the releaser's, never the next lease's. The
   command timeout comes back, and pushes set aside are dropped (counted in `droppedPushes`). A connection whose link
@@ -543,6 +547,11 @@ match (give got) {
   out and drop its name, protocol and tracking.
 - **An idle connection is checked before it is lent,** with no round trip: one the server let go while it sat (an
   idle timeout, a kill) is closed and its place used. The pool never makes a link again on its own time.
+- **A maintenance isolate keeps the pool** (@kama/postgres's, after pgxpool and Npgsql), stopped and joined when the
+  pool that made it drops. It connects until `minIdle` are idle. Every `healthCheck` it closes connections past their
+  lifetime and those the pool has not needed, by the median of the idle counts over `idleTimeout` (Npgsql's pruning,
+  never below `minIdle`). It probes each connection idle for more than a second: what came while it sat, a fresh login
+  once a credentials provider's time has come, then `PING` within `pingTimeout`. One that fails is closed.
 - **A scan stays on its link.** A `Scan` continued on another lease's connection ends with `Usage`, since its cursor
   means nothing on another link.
 - **`Pool.makeWith(dialers:)`** opens each connection's transports through a dialer of yours (`PoolDialers`).

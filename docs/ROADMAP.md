@@ -584,10 +584,39 @@ Each step ends green before its commit:
        (postgres's rule: widen the margin rather than retry).
      - The pool's live cases ran again on all eight once the WATCH order changed, and Redis 8.10's full run once the
        margin did.
-4. **Maintenance** (S4).
-   - minIdle, pruning by the median, the idle probe (settle, re-AUTH when due, a PING within `pingTimeout`, never a
-     redial), the lifetime with its jitter, and stopping on drop.
-   - Unit and live, as PG's S4, plus an idle re-AUTH seen in CLIENT LIST's `user=`.
+4. **Done (2026-10-21).** **Maintenance** (S4).
+   - **What was built:**
+     - `PoolOptions` gains `minIdle` (0), `idleTimeout` (30 minutes), `healthCheck` (60 s) and `pingTimeout` (5 s),
+       with their checks;
+     - a maintenance isolate per pool that made its channels, stopped by the pool's drop through a channel it hears:
+       fill to minIdle, then a round every healthCheck (retire the expired and the pruned, probe, refill);
+     - Npgsql's median pruning;
+     - `Connection.probeIdle`: settle, a fresh login when due, PING within pingTimeout, never a redial;
+     - the maintenance's connects bounded by acquireTimeout when connect_timeout is 0 (`boundConnects`).
+   - **Unit**, through a traced scripted server (`FakeServer.traced`, `Dial::ServeTraced`: it logs "connect", each
+     command and "close", and answers PING whenever it comes):
+     - minIdle at the start, then leased with no new connect;
+     - a lost idle connection replaced, and an idle one probed;
+     - an unanswered probe closing its connection;
+     - pruning by the median, and its floor at minIdle;
+     - a lifetime retired by a round;
+     - an idle re-AUTH;
+     - the drop stopping the maintenance at once;
+     - the options' checks and defaults.
+   - **Live**, on all eight servers:
+     - minIdle at the start;
+     - pruned back to minIdle after three leases;
+     - a killed idle connection replaced;
+     - an idle connection logging in as the provider's next user (CLIENT LIST's `user=`);
+     - the drop closing everything.
+   - **Mutations** (`7b-s4.json`): 17, every one CAUGHT. 14 are unit (K1–K14) and three live (KI1–KI3, on Redis 8.10).
+     Making them caught tightened the tests:
+     - an unanswered probe, and a lost idle connection, refilled to minIdle in the same round (K13, K14);
+     - the acquire's own check moved to the live test with `reconnect=off`, since the scripted server cannot stage a
+       close between a release and the next acquire.
+   - **Gates:** `tools/test.sh` debug and release on v0.9.707 and 0.9.715, and the integration matrix on all eight
+     servers. The mutations ran on v0.9.707: by then cstar's tree held KR-230's `Poller` change, uncommitted, which
+     its build reads from `lib/`, and nothing that uses `std::net::Ready` compiled with it.
 5. **The pool under Sentinel and on a cluster.**
    - `ClusterPool`, `ClusterLease` and `ClusterPoolShare`; the cluster's put-back and probe; the dialers adapter.
    - Unit: a scripted failover with idle pooled connections, and a per-link put-back.

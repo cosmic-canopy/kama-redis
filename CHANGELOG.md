@@ -25,7 +25,10 @@ What a caller of 0.2.0 may need to change:
 
 - `redis::pool`: `Pool` (`make`, `makeWith` with `PoolDialers`, `join`, `share`, `acquire`), `Lease` (`conn()`, given
   back when dropped), `PoolShare` (Sendable) and `PoolOptions` (`maxSize`, `acquireTimeout`, `lifetime`,
-  `lifetimeJitter`). Two channels, no lock: a bound across every isolate the pool is shared with. A release puts back
+  `lifetimeJitter`, `minIdle`, `idleTimeout`, `healthCheck`, `pingTimeout`). Two channels, no lock: a bound across
+  every isolate the pool is shared with. A maintenance isolate keeps minIdle, prunes the idle connections the pool has
+  not needed (Npgsql's median), closes those past their lifetime, and probes the idle ones (a fresh login when due,
+  then PING within pingTimeout). A release puts back
   only what the lease changed (UNWATCH, SELECT), sent at the release; a connection lost, closed, re-authenticated by
   hand, past its lifetime or whose put-back failed is closed and its place reused. An idle connection the server let
   go is found with no round trip and not lent. `RedisError::PoolTimeout`.

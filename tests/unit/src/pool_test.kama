@@ -600,8 +600,198 @@ fn DynamicArray<Step> loggedIn(const ref string password) {
     return give s;
 }
 
+// ---- the maintenance (step 4) ----
+
+// A test's log of what its servers saw: "connect", each command as words, "close".
+type resource Log {
+    Channel<string> lines;
+    Receiver<string> reading;
+    DynamicArray<string> seen;
+    public unsafe ctor make() { this.lines = Channel.bounded(capacity: 4096); this.reading = this.lines.receiver(); this.seen = DynamicArray.empty(); }
+    public unsafe fn Sender<string> sender() { return this.lines.sender(); }
+    // Everything told since it was made.
+    public fn void drain() {
+        bool more = true;
+        while (more) {
+            Result<string, RecvError> r = this.reading.tryRecv();
+            match (give r) { case Ok(value: x): { this.seen.add(item: give x); } case _: { more = false; } };
+        }
+    }
+    public fn isize count(const ref string line) {
+        this.drain();
+        isize n = 0;
+        isize i = 0;
+        while (i < this.seen.length()) { if (this.seen[i] == line) { n = n + 1; } i = i + 1; }
+        return n;
+    }
+    // Wait up to `ms` for `line` to have been told `n` times; how many times it was.
+    public unsafe fn isize awaits(const ref string line, isize n, int64 ms) {
+        int64 waited = 0i64;
+        isize got = this.count(line: line);
+        while (got < n && waited < ms) { sleep(d: Duration.fromMillis(ms: 20i64)); waited = waited + 20i64; got = this.count(line: line); }
+        return got;
+    }
+}
+
+// A connection that tells `log` what it sees and answers every PING (or not, with `pings` false).
+unsafe fn void traced(ref DynamicArray<DynamicArray<Dial>> all, DynamicArray<Step> script, ref Log log, bool pings) {
+    DynamicArray<uint8> pong = DynamicArray.empty();
+    if (pings) { pong = reply(server: server(), kase: "ping"); }
+    DynamicArray<Dial> d = DynamicArray.empty();
+    d.add(item: Dial::ServeTraced(steps: give script, tracer: log.sender(), pong: give pong));
+    all.add(item: give d);
+}
+
+fn PoolOptions kept(isize maxSize, isize minIdle, int64 healthMs) {
+    PoolOptions o = sized(maxSize: maxSize, acquireMs: 1000i64);
+    o.minIdle = minIdle;
+    o.healthCheck = Duration.fromMillis(ms: healthMs);
+    o.idleTimeout = Optional::None;
+    o.pingTimeout = Duration.fromMillis(ms: 300i64);
+    return o;
+}
+
+unsafe fn int32 maintenanceTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+
+    // minIdle connections are made at the start, with no acquire; leases then take them, with no new connect.
+    Log l1 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    traced(all: c1, script: welcome(server: server()), log: l1, pings: true);
+    traced(all: c1, script: welcome(server: server()), log: l1, pings: true);
+    Pool p1 = pooled(connections: give c1, config: plain, options: kept(maxSize: 3, minIdle: 2, healthMs: 60000i64), what: "minIdle");
+    isize made = l1.awaits(line: "connect", n: 2, ms: 3000i64);
+    Result<Lease, RedisError> a1 = p1.acquire();
+    Result<Lease, RedisError> b1 = p1.acquire();
+    bool both = match (a1) { case Ok(value: x): true; case Err(error: e): false; } && match (b1) { case Ok(value: x): true; case Err(error: e): false; };
+    isize after = l1.count(line: "connect");
+    f = f + check(ok: made == 2 && both && after == 2, what: "pool maintenance: minIdle connections made at the start, then leased with no new connect (${made}; ${after})");
+
+    // A round probes an idle connection last known alive more than a second ago (PING), and refills minIdle once one
+    // is found lost: the server let this one go, so it is closed and a new one made.
+    Log l2 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c2 = conns();
+    DynamicArray<Step> s2 = welcome(server: server());
+    s2.add(item: Step::Hangup);
+    traced(all: c2, script: give s2, log: l2, pings: true);
+    traced(all: c2, script: welcome(server: server()), log: l2, pings: true);
+    Pool p2 = pooled(connections: give c2, config: plain, options: kept(maxSize: 2, minIdle: 1, healthMs: 200i64), what: "refill");
+    isize refilled = l2.awaits(line: "connect", n: 2, ms: 4000i64);
+    isize closed2 = l2.count(line: "close");
+    isize pinged = l2.awaits(line: "PING", n: 1, ms: 4000i64);
+    f = f + check(ok: refilled == 2 && closed2 >= 1 && pinged >= 1,
+                  what: "pool maintenance: a lost idle connection is closed and minIdle refilled, and an idle one probed with PING (${refilled}; ${closed2}; ${pinged})");
+
+    // A probe that is not answered closes the connection (pingTimeout), and minIdle is refilled.
+    Log l3 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c3 = conns();
+    DynamicArray<Step> s3 = welcome(server: server());
+    s3.add(item: Step::Silent);
+    traced(all: c3, script: give s3, log: l3, pings: false);
+    traced(all: c3, script: welcome(server: server()), log: l3, pings: true);
+    // Rounds a second apart: the close comes in the probe's own round, and the refill right after it, never a round on.
+    Pool p3 = pooled(connections: give c3, config: plain, options: kept(maxSize: 2, minIdle: 1, healthMs: 1000i64), what: "probe unanswered");
+    isize probed = l3.awaits(line: "PING", n: 1, ms: 5000i64);
+    isize closed3 = l3.awaits(line: "close", n: 1, ms: 500i64);
+    isize replaced = l3.awaits(line: "connect", n: 2, ms: 400i64);
+    f = f + check(ok: probed == 1 && closed3 == 1 && replaced == 2,
+                  what: "pool maintenance: a probe not answered closes the connection, and minIdle is refilled, in the same round (${probed}; ${closed3}; ${replaced})");
+
+    // Idle connections the pool has not needed are pruned: three idle through a window of rounds (idleTimeout over
+    // healthCheck), the median of the counts (three) closed, none kept (minIdle 0).
+    Log l4 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c4 = conns();
+    traced(all: c4, script: welcome(server: server()), log: l4, pings: true);
+    traced(all: c4, script: welcome(server: server()), log: l4, pings: true);
+    traced(all: c4, script: welcome(server: server()), log: l4, pings: true);
+    PoolOptions o4 = kept(maxSize: 3, minIdle: 0, healthMs: 100i64);
+    o4.idleTimeout = Optional::Some(value: Duration.fromMillis(ms: 300i64));
+    Pool p4 = pooled(connections: give c4, config: plain, options: o4, what: "pruning");
+    {
+        Result<Lease, RedisError> x = p4.acquire();
+        Result<Lease, RedisError> y = p4.acquire();
+        Result<Lease, RedisError> z = p4.acquire();
+    }
+    isize pruned = l4.awaits(line: "close", n: 3, ms: 3000i64);
+    f = f + check(ok: pruned == 3, what: "pool maintenance: idle connections the pool did not need are pruned by the median of a window's counts (${pruned})");
+
+    // pruning never goes below minIdle.
+    Log l5 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c5 = conns();
+    traced(all: c5, script: welcome(server: server()), log: l5, pings: true);
+    traced(all: c5, script: welcome(server: server()), log: l5, pings: true);
+    PoolOptions o5 = kept(maxSize: 2, minIdle: 1, healthMs: 100i64);
+    o5.idleTimeout = Optional::Some(value: Duration.fromMillis(ms: 300i64));
+    Pool p5 = pooled(connections: give c5, config: plain, options: o5, what: "pruning floor");
+    {
+        Result<Lease, RedisError> x = p5.acquire();
+        Result<Lease, RedisError> y = p5.acquire();
+    }
+    isize floor = l5.awaits(line: "close", n: 2, ms: 1500i64);
+    f = f + check(ok: floor == 1, what: "pool maintenance: pruning leaves minIdle idle (${floor} closed of 2)");
+
+    // A connection past its lifetime is closed by a round, with no acquire.
+    Log l6 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c6 = conns();
+    traced(all: c6, script: welcome(server: server()), log: l6, pings: true);
+    PoolOptions o6 = kept(maxSize: 1, minIdle: 0, healthMs: 100i64);
+    o6.lifetime = Optional::Some(value: Duration.fromMillis(ms: 200i64));
+    o6.lifetimeJitter = Duration.zero();
+    Pool p6 = pooled(connections: give c6, config: plain, options: o6, what: "lifetime in a round");
+    { Result<Lease, RedisError> x = p6.acquire(); }
+    isize expired = l6.awaits(line: "close", n: 1, ms: 2000i64);
+    f = f + check(ok: expired == 1, what: "pool maintenance: a connection past its lifetime is closed by a round (${expired})");
+
+    // An idle connection's login is renewed by a round once its time has come (AUTH, then PING).
+    Log l7 = Log.make();
+    DynamicArray<Answer> a7 = answerList();
+    a7.add(item: loginAs(password: "pw1", refreshMs: 300i64));
+    a7.add(item: loginAs(password: "pw2", refreshMs: 0i64));
+    Config provided = providing(url: "redis://127.0.0.1:6379", answers: give a7);
+    DynamicArray<DynamicArray<Dial>> c7 = conns();
+    DynamicArray<Step> s7 = loggedIn(password: "pw1");
+    s7.add(item: expect(command: "AUTH kr_acl pw2", answer: reply(server: server(), kase: "auth2")));
+    traced(all: c7, script: give s7, log: l7, pings: true);
+    Pool p7 = pooled(connections: give c7, config: provided, options: kept(maxSize: 1, minIdle: 1, healthMs: 200i64), what: "idle re-AUTH");
+    isize renewed = l7.awaits(line: "AUTH kr_acl pw2", n: 1, ms: 4000i64);
+    isize closed7 = l7.count(line: "close");
+    f = f + check(ok: renewed == 1 && closed7 == 0, what: "pool maintenance: an idle connection's login is renewed when its time comes (${renewed}; ${closed7} closed)");
+
+    // Dropping the pool stops its maintenance at once, whatever its healthCheck.
+    Log l8 = Log.make();
+    DynamicArray<DynamicArray<Dial>> c8 = conns();
+    traced(all: c8, script: welcome(server: server()), log: l8, pings: true);
+    Instant dropAt = monotonicNow();
+    {
+        Pool p8 = pooled(connections: give c8, config: plain, options: kept(maxSize: 1, minIdle: 1, healthMs: 600000i64), what: "drop");
+        isize m8 = l8.awaits(line: "connect", n: 1, ms: 2000i64);
+    }
+    int64 took = dropAt.elapsed().asMillis();
+    isize closed8 = l8.awaits(line: "close", n: 1, ms: 1000i64);
+    f = f + check(ok: took < 3000i64 && closed8 == 1, what: "pool maintenance: dropping the pool stops the maintenance at once, and closes its connections (${took} ms; ${closed8})");
+
+    // What cannot make a pool's maintenance, and its defaults.
+    PoolOptions m1 = PoolOptions.defaults();
+    m1.minIdle = m1.maxSize + 1;
+    PoolOptions m2 = PoolOptions.defaults();
+    m2.healthCheck = Duration.zero();
+    PoolOptions m3 = PoolOptions.defaults();
+    m3.pingTimeout = Duration.zero();
+    PoolOptions m4 = PoolOptions.defaults();
+    m4.idleTimeout = Optional::Some(value: Duration.fromSecs(s: 1i64));
+    bool refused = isConfig(r: Pool.make(config: plain, options: m1)) && isConfig(r: Pool.make(config: plain, options: m2))
+                   && isConfig(r: Pool.make(config: plain, options: m3)) && isConfig(r: Pool.make(config: plain, options: m4));
+    PoolOptions d = PoolOptions.defaults();
+    bool defaults = d.minIdle == 0 && d.healthCheck.asMillis() == 60000i64 && d.pingTimeout.asMillis() == 5000i64
+                    && match (d.idleTimeout) { case Some(value: x): x.asMillis() == 1800000i64; case None: false; };
+    f = f + check(ok: refused && defaults, what: "pool maintenance: minIdle past maxSize, a zero healthCheck or pingTimeout, and an idleTimeout under healthCheck are Config; the defaults");
+    return f;
+}
+
 unsafe fn int32 poolTests() {
     int32 f = 0;
+    f = f + maintenanceTests();
     f = f + boundTests();
     f = f + putBackTests();
     f = f + linkTests();

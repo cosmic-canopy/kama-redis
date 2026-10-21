@@ -259,6 +259,12 @@ printed first.
     `borrow lease.conn() as conn { … }`.
   - A unit test's pool takes its connections from `ScriptPoolDialers`, one connection's dials at a time, so a
     connection too many meets a refused dial.
+  - The maintenance (S4) runs in an isolate of its own, over ends of the channels that hear the pool drop. It reaches
+    `Connection` through `probeIdle` (settle, a fresh login when due, PING within pingTimeout, never a redial). Its
+    tests use a traced scripted server (`Dial::ServeTraced`, `FakeServer.traced`), which logs "connect", each command
+    and "close", and answers PING whenever it comes: a round's timing cannot be scripted.
+  - The scripted server acts only when the client reads or waits. A close between a release and the next acquire
+    cannot be staged there, so the acquire's own check is a live case (with `reconnect=off`).
   - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process: a live
     descriptor count uses IP addresses.
 

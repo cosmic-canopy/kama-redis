@@ -1,0 +1,155 @@
+[
+ {
+  "id": "K1",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        this.fill(wanted: this.settings.minIdle);\n        while (!this.ends.stopsWithin",
+  "new": "        while (!this.ends.stopsWithin",
+  "expect": "pool maintenance: minIdle connections made at the start",
+  "timeout": 300
+ },
+ {
+  "id": "K2",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        this.fill(wanted: this.settings.minIdle - count);\n    }",
+  "new": "    }",
+  "expect": "pool maintenance: a lost idle connection is closed and minIdle refilled",
+  "timeout": 300
+ },
+ {
+  "id": "K3",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                                keep = conn.probeIdle(timeout: this.settings.pingTimeout);",
+  "new": "                                keep = true;",
+  "expect": "pool maintenance: a probe not answered closes the connection",
+  "timeout": 300
+ },
+ {
+  "id": "K4",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "fn Duration pingAfter() { return Duration.fromSecs(s: 1i64); }",
+  "new": "fn Duration pingAfter() { return Duration.fromSecs(s: 3600i64); }",
+  "expect": "pool maintenance: a lost idle connection is closed and minIdle refilled",
+  "timeout": 300
+ },
+ {
+  "id": "K5",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                    if (expired || (prune > 0 && count > this.settings.minIdle)) {",
+  "new": "                    if (expired || (prune > 0)) {",
+  "expect": "pool maintenance: pruning leaves minIdle idle",
+  "timeout": 300
+ },
+ {
+  "id": "K6",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        isize prune = this.sample(idleCount: count);",
+  "new": "        isize prune = 0;",
+  "expect": "pool maintenance: idle connections the pool did not need are pruned",
+  "timeout": 300
+ },
+ {
+  "id": "K7",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                    bool expired = past(expires: until);",
+  "new": "                    bool expired = false;",
+  "expect": "pool maintenance: a connection past its lifetime is closed by a round",
+  "timeout": 300
+ },
+ {
+  "id": "K8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.settleIdle()) { return false; }\n        if (this.loginExpired()) {",
+  "new": "        if (!this.settleIdle()) { return false; }\n        if (false) {",
+  "expect": "pool maintenance: an idle connection's login is renewed",
+  "timeout": 300
+ },
+ {
+  "id": "K9",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        while (!this.ends.stopsWithin(period: this.settings.healthCheck)) { this.round(); }",
+  "new": "        while (true) { bool unheard = this.ends.stopsWithin(period: this.settings.healthCheck); this.round(); }",
+  "expect": "(timed out)",
+  "timeout": 120
+ },
+ {
+  "id": "K10",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "    if (options.minIdle < 0 || options.minIdle > options.maxSize) {",
+  "new": "    if (options.minIdle < 0) {",
+  "expect": "pool maintenance: minIdle past maxSize",
+  "timeout": 300
+ },
+ {
+  "id": "K11",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "    if (!idleOk) { return Optional::Some(value: \"pool idleTimeout must be at least healthCheck (or None, for no limit)\"); }",
+  "new": "",
+  "expect": "pool maintenance: minIdle past maxSize",
+  "timeout": 300
+ },
+ {
+  "id": "K12",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        this.healthCheck = Duration.fromSecs(s: 60i64);",
+  "new": "        this.healthCheck = Duration.fromSecs(s: 30i64);",
+  "expect": "pool maintenance: minIdle past maxSize",
+  "timeout": 300
+ },
+ {
+  "id": "K13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        return match (give got) { case Ok(value: v): true; case Err(error: e): false; };\n    }\n\n    // Whether nothing but pushes",
+  "new": "        return true;\n    }\n\n    // Whether nothing but pushes",
+  "expect": "pool maintenance: a probe not answered closes the connection",
+  "timeout": 300
+ },
+ {
+  "id": "K14",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                            else {\n                                Connection gone = give conn;\n                                gone.close();\n                                this.ends.put(slot: Slot::Empty);\n                                count = count - 1;\n                            }",
+  "new": "                            else {\n                                Connection gone = give conn;\n                                gone.close();\n                                this.ends.put(slot: Slot::Empty);\n                            }",
+  "expect": "pool maintenance: a probe not answered closes the connection",
+  "timeout": 300
+ },
+ {
+  "id": "KI1",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "        isize prune = this.sample(idleCount: count);",
+  "new": "        isize prune = 0;",
+  "expect": "pool maintenance: minIdle at the start, pruned back to it",
+  "timeout": 300
+ },
+ {
+  "id": "KI2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "                                keep = conn.probeIdle(timeout: this.settings.pingTimeout);",
+  "new": "                                keep = true;",
+  "expect": "pool maintenance: minIdle at the start, pruned back to it",
+  "timeout": 300
+ },
+ {
+  "id": "KI3",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (!this.settleIdle()) { return false; }\n        if (this.loginExpired()) {",
+  "new": "        if (!this.settleIdle()) { return false; }\n        if (false) {",
+  "expect": "pool maintenance: an idle connection logs in anew",
+  "timeout": 300
+ }
+]
