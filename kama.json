@@ -20,6 +20,7 @@
     ".": { "visibility": "public" },
     "resp": { "visibility": "public" },
     "cluster": { "visibility": "public" },
+    "pool": { "visibility": "public" },
     "wire": { "visibility": "internal" },
     "secure": { "visibility": "internal" }
   }

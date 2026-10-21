@@ -1,0 +1,272 @@
+// A pool, live (docs/ROADMAP.md, "Phase 7b", step 3): isolates sharing it within its bound, what a release puts back,
+// idle connections the server lets go, PoolTimeout, TLS, and no descriptor left behind. Its connections name
+// themselves kr-pool (client_name), so CLIENT LIST counts them.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::Isolate, std::concurrent::RecvError, std::time::Duration, std::time::sleep,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::Pipeline, redis::TxOutcome,
+         redis::resp::Value, redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
+         redis_integration_tests::check, open, ask, commandOf, shown, mainUrl, tlsUrl, trusting, openDescriptors };
+export { poolTests };
+
+unsafe fn Result<Pool, RedisError> poolAt(const ref string url, isize maxSize, int64 acquireMs) {
+    Result<Config, RedisError> c = Config.parse(url: url);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = maxSize;
+    o.acquireTimeout = Duration.fromMillis(ms: acquireMs);
+    return Pool.make(config: config, options: o);
+}
+
+// A command on a lease's connection, its reply shown, or "(failed) <message>".
+unsafe fn string on(ref Lease lease, const ref string text) {
+    Command c = commandOf(text: text);
+    Result<Value, RedisError> r = lease.conn().call(command: c);
+    return match (r) { case Ok(value: v): shown(v: v); case Err(error: e): "(failed) ".concat(other: e.message()); };
+}
+
+// How many of the server's clients are the pool's (name=kr-pool).
+unsafe fn isize poolClients(ref Connection admin) {
+    string list = ask(c: admin, text: "CLIENT LIST");
+    string word = "name=kr-pool ";
+    isize n = 0;
+    isize i = 0;
+    while (i + word.length() <= list.length()) {
+        if (list.substring(start: i, end: i + word.length()) == word) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Kill the pool's clients (name=kr-pool), by id; how many were killed.
+unsafe fn isize killPool(ref Connection admin) {
+    string list = ask(c: admin, text: "CLIENT LIST");
+    isize killed = 0;
+    isize start = 0;
+    isize i = 0;
+    while (i <= list.length()) {
+        if (i == list.length() || list.bytes()[i] == 10ui8) {
+            string line = list.substring(start: start, end: i);
+            if (line.contains(substring: "name=kr-pool ") && line.startsWith(prefix: "id=")) {
+                isize sp = 3;
+                while (sp < line.length() && line.bytes()[sp] != 32ui8) { sp = sp + 1; }
+                string id = line.substring(start: 3, end: sp);
+                string r = ask(c: admin, text: "CLIENT KILL ID ".concat(other: id));
+                if (r == "1") { killed = killed + 1; }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return killed;
+}
+
+// The pool's clients once they number `want`, or after two seconds: a close reaches the server a moment later.
+unsafe fn isize settledClients(ref Connection admin, isize want) {
+    isize n = poolClients(admin: admin);
+    isize tries = 0;
+    while (n != want && tries < 40) { sleep(d: Duration.fromMillis(ms: 50i64)); n = poolClients(admin: admin); tries = tries + 1; }
+    return n;
+}
+
+// One isolate's share of the work: `count` INCRs, each on a lease of its own.
+type resource Worker implements Sendable {
+    PoolShare share;
+    int32 count;
+    Sender<string> said;
+    public ctor make(PoolShare share, int32 count, Sender<string> said) { this.share = give share; this.count = count; this.said = give said; }
+    public unsafe fn void run() {
+        Pool p = Pool.join(share: this.share);
+        int32 failed = 0;
+        int32 i = 0;
+        while (i < this.count) {
+            Result<Lease, RedisError> r = p.acquire();
+            match (give r) {
+                case Ok(value: l): { Lease lease = give l; string v = on(lease: lease, text: "INCR kr:pool:n"); if (v.startsWith(prefix: "(failed)")) { failed = failed + 1; } }
+                case Err(error: e): { failed = failed + 1; }
+            };
+            i = i + 1;
+        }
+        _ = this.said.send(item: "${failed}");
+    }
+}
+unsafe fn void work(Worker job) { job.run(); }
+
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    Result<Connection, RedisError> a = open(url: mainUrl(userinfo: "", tail: ""));
+    Connection admin = match (give a) { case Ok(value: c): give c; case Err(error: e): { string m = e.message(); return check(ok: false, what: "pool: admin: ${m}"); } };
+    isize fds = openDescriptors();
+    string url = mainUrl(userinfo: "", tail: "?client_name=kr-pool");
+    string cleared = ask(c: admin, text: "DEL kr:pool:n kr:pool:w kr:pool:db");
+
+    // Four isolates, 250 INCRs each, through a pool of two: every INCR counted, and never more than two connections.
+    {
+        Result<Pool, RedisError> made = poolAt(url: url, maxSize: 2, acquireMs: 10000i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                Channel<string> told = Channel.bounded(capacity: 4);
+                Receiver<string> heard = told.receiver();
+                DynamicArray<Isolate> workers = DynamicArray.empty();
+                int32 k = 0;
+                while (k < 4) {
+                    Result<PoolShare, RedisError> s = pool.share();
+                    match (give s) {
+                        case Ok(value: sh): { Worker w = Worker.make(share: give sh, count: 250, said: told.sender()); Isolate i = spawn work(job: give w); workers.add(item: give i); }
+                        case Err(error: e): { }
+                    };
+                    k = k + 1;
+                }
+                isize most = 0;
+                int32 failures = 0;
+                int32 done = 0;
+                while (done < 4) {
+                    isize n = poolClients(admin: admin);
+                    if (n > most) { most = n; }
+                    Result<string, RecvError> got = heard.recvTimeout(timeout: Duration.fromMillis(ms: 20i64));
+                    match (give got) { case Ok(value: x): { done = done + 1; if (x != "0") { failures = failures + 1; } } case Err(error: e): { } };
+                }
+                workers.clear();
+                string total = ask(c: admin, text: "GET kr:pool:n");
+                isize stillOpen = poolClients(admin: admin);
+                f = f + check(ok: total == "1000" && failures == 0 && most <= 2 && stillOpen <= 2,
+                              what: "pool: four isolates share a pool of two: every INCR counted (${total}), at most two connections (${most})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: make: ${m}"); }
+        };
+    }
+
+    // What a release puts back, live: a database `select` changed, and a WATCH in force.
+    {
+        Result<Pool, RedisError> made = poolAt(url: url, maxSize: 1, acquireMs: 2000i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                string inThree = "-";
+                {
+                    Result<Lease, RedisError> r = pool.acquire();
+                    match (give r) {
+                        case Ok(value: l): {
+                            Lease lease = give l;
+                            // The WATCH first, on database 0's key, which the admin then writes.
+                            string w = on(lease: lease, text: "WATCH kr:pool:w");
+                            Result<Unit, RedisError> sel = lease.conn().select(db: 3i64);
+                            inThree = on(lease: lease, text: "SET kr:pool:db three");
+                        }
+                        case Err(error: e): { }
+                    };
+                }
+                string changed = ask(c: admin, text: "SET kr:pool:w changed");
+                string inZero = "-";
+                string fate = "-";
+                {
+                    Result<Lease, RedisError> r = pool.acquire();
+                    match (give r) {
+                        case Ok(value: l): {
+                            Lease lease = give l;
+                            inZero = on(lease: lease, text: "GET kr:pool:db");
+                            Pipeline tx = Pipeline.make();
+                            tx.add(command: commandOf(text: "SET kr:pool:w mine"));
+                            Result<TxOutcome, RedisError> t = lease.conn().transact(pipeline: tx);
+                            fate = match (t) { case Ok(value: o): match (o) { case WatchConflict: "held back"; case _: "committed"; }; case Err(error: e): e.message(); };
+                        }
+                        case Err(error: e): { }
+                    };
+                }
+                string cleanup = ask(c: admin, text: "SELECT 3");
+                string gone = ask(c: admin, text: "DEL kr:pool:db");
+                string zero = ask(c: admin, text: "SELECT 0");
+                f = f + check(ok: inThree == "OK" && inZero == "(nil)" && fate == "committed",
+                              what: "pool: the next lease finds database 0 and no WATCH left by the last (${inZero}; ${fate})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: make: ${m}"); }
+        };
+    }
+
+    // Idle connections the server lets go (a kill, an idle timeout) are not leased: a lease after works.
+    {
+        Result<Pool, RedisError> made = poolAt(url: url, maxSize: 2, acquireMs: 2000i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                {
+                    Result<Lease, RedisError> r1 = pool.acquire();
+                    Result<Lease, RedisError> r2 = pool.acquire();
+                }
+                isize before = settledClients(admin: admin, want: 2);
+                isize killed = killPool(admin: admin);
+                isize after = settledClients(admin: admin, want: 0);
+                string used = "-";
+                {
+                    Result<Lease, RedisError> r = pool.acquire();
+                    match (give r) { case Ok(value: l): { Lease lease = give l; used = on(lease: lease, text: "PING"); } case Err(error: e): { used = e.message(); } };
+                }
+                f = f + check(ok: before == 2 && killed == 2 && after == 0 && used == "PONG",
+                              what: "pool: idle connections the server killed are not leased, and the next lease works (${before} then ${after}; ${used})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: make: ${m}"); }
+        };
+    }
+
+    // The same with reconnect=off, where a lost connection that was lent would answer Closed: the acquire's own check
+    // (no round trip) finds the kill, and lends a new connection.
+    {
+        Result<Pool, RedisError> made = poolAt(url: mainUrl(userinfo: "", tail: "?client_name=kr-pool&reconnect=off"), maxSize: 1, acquireMs: 2000i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                { Result<Lease, RedisError> r = pool.acquire(); }
+                isize before = settledClients(admin: admin, want: 1);
+                isize killed = killPool(admin: admin);
+                isize after = settledClients(admin: admin, want: 0);
+                string used = "-";
+                {
+                    Result<Lease, RedisError> r = pool.acquire();
+                    match (give r) { case Ok(value: l): { Lease lease = give l; used = on(lease: lease, text: "PING"); } case Err(error: e): { used = e.message(); } };
+                }
+                f = f + check(ok: before == 1 && killed == 1 && after == 0 && used == "PONG",
+                              what: "pool: with reconnect=off, an idle connection the server killed is not lent (${before}; ${killed}; ${after}; ${used})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: make: ${m}"); }
+        };
+    }
+
+    // Every connection leased past acquireTimeout: PoolTimeout.
+    {
+        Result<Pool, RedisError> made = poolAt(url: url, maxSize: 1, acquireMs: 300i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                Result<Lease, RedisError> held = pool.acquire();
+                Result<Lease, RedisError> waited = pool.acquire();
+                bool timedOut = match (waited) { case Err(error: e): match (e) { case PoolTimeout: true; case _: false; }; case Ok(value: l): false; };
+                f = f + check(ok: timedOut, what: "pool: every connection leased past acquireTimeout is PoolTimeout");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: make: ${m}"); }
+        };
+    }
+
+    // Over TLS, to the address the certificate names (an IP: a name's first lookup on macOS keeps two descriptors of
+    // the resolver's open for the process, which the count at the end would take for a leak).
+    {
+        Result<Pool, RedisError> made = poolAt(url: tlsUrl(userinfo: "", host: "127.0.0.1", tail: trusting().concat(other: "&client_name=kr-pool")), maxSize: 2, acquireMs: 2000i64);
+        match (give made) {
+            case Ok(value: p): {
+                Pool pool = give p;
+                string first = "-";
+                string second = "-";
+                { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; first = on(lease: lease, text: "PING"); } case Err(error: e): { first = e.message(); } }; }
+                { Result<Lease, RedisError> r = pool.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; second = on(lease: lease, text: "PING"); } case Err(error: e): { second = e.message(); } }; }
+                f = f + check(ok: first == "PONG" && second == "PONG", what: "pool: over TLS (${first}; ${second})");
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pool: TLS make: ${m}"); }
+        };
+    }
+
+    // With every pool dropped, its connections are closed: no descriptor is left behind, and the server sees none.
+    isize left = settledClients(admin: admin, want: 0);
+    isize now = openDescriptors();
+    f = f + check(ok: left == 0 && now == fds, what: "pool: dropped pools leave no connection and no descriptor (${left} clients; ${fds} then ${now} descriptors)");
+    string tidy = ask(c: admin, text: "DEL kr:pool:n kr:pool:w");
+    return f;
+}

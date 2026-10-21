@@ -531,25 +531,59 @@ Each step ends green before its commit:
        `setAuth` can give one.
    - **Gates:** `tools/test.sh` debug and release on v0.9.707 and 0.9.713, and the integration matrix on all eight
      servers. The live credentials cases ran again on all eight once the rotation changed.
-3. **The pool core** (S3).
-   - `Pool`, `Lease`, `PoolShare`, `PoolOptions`, `PoolDialers` and `PoolTimeout`.
-   - The put-back and the local resets; acquire's zero-time check; share and join; the Scan fix.
-   - Unit, through a scripted `PoolDialers`:
+3. **Done (2026-10-21).** **The pool core** (S3; `src/pool/pool.kama`, the public module `redis::pool`).
+   - **What was built:**
+     - `Pool` (`make`, `makeWith`, `join`, `share`, `acquire`), `Lease`, `PoolShare` and `PoolOptions` (`maxSize`,
+       `acquireTimeout`, `lifetime`, `lifetimeJitter`; the maintenance's options come with step 4);
+     - the `PoolDialers` contract, and `RedisError::PoolTimeout`;
+     - `Connection.putBack` (the release) and `settleIdle` (the acquire's zero-time check), granted to the core;
+     - the Scan fix: each link draws a random identity (`linkId`).
+   - **Settled on the way:**
+     - A lease's connection is handed out as a `ref`, which a `ref` parameter cannot take: callers borrow it
+       (`borrow lease.conn() as conn { … }`), as the README says.
+     - The scripted server acts only when the client reads or waits, so a close after a release cannot be told from
+       one before it there. The release's check is a unit case; the acquire's own check is a live case with
+       `reconnect=off`, where a lost connection that was lent would answer Closed.
+     - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process. So the live
+       descriptor count uses an IP address, which the test certificate names.
+   - **Unit** (`pool_test.kama`, through a scripted `PoolDialers`):
+     - reuse;
      - the bound and `PoolTimeout`;
-     - an idle connection before an empty place;
-     - the put-back's bytes, and each discard;
-     - a redial inside a lease;
-     - a join from another isolate;
-     - a scan across leases;
-     - no `watchLost` or command timeout carried over.
-   - Live (`pool_test.kama`):
-     - isolates × INCRs;
-     - CLIENT LIST shows at most maxSize;
-     - SELECT and WATCH put back;
-     - idle connections killed;
+     - a lease given back is lent again;
+     - an idle connection behind a freed place is lent first, and the place kept;
+     - a waiter in another isolate woken by a release;
+     - the put-back's UNWATCH and SELECT, once;
+     - pushes dropped and counted;
+     - each discard: a refused put-back, a hand `authenticate`, lost at the release, closed by the lease, past its
+       lifetime;
+     - no command timeout or lost WATCH carried over;
+     - a redial inside a lease; `reconnect=off`;
+     - a pool joined in another isolate, and not shared again;
+     - a scan carried to another lease's connection;
+     - the refusals and the defaults;
+     - a provider forked for each connection.
+   - **Live** (`pool_test.kama`, all eight servers):
+     - four isolates × 250 INCRs through a pool of two: every one counted, never more than two connections;
+     - the next lease finding database 0 and no WATCH;
+     - idle connections killed, with and without `reconnect=off`;
+     - `PoolTimeout`;
      - TLS;
-     - `/dev/fd` back to its count.
-   - The README's pool section and the `reconnect=off` text.
+     - no connection and no descriptor left once the pools drop.
+   - **Mutations** (`7b-s3.json`): 25, every one CAUGHT. 22 are unit (P1–P22) and three live (IP1–IP3, on Redis 8.10).
+     Making them caught tightened the tests:
+     - a third lease (the database recorded at the release);
+     - pushes dropped;
+     - a freed place ahead of an idle connection;
+     - a joined pool dialing through its fork;
+     - a lifetime with jitter;
+     - the live WATCH on database 0's key.
+   - **Gates:** `tools/test.sh` debug and release on v0.9.707 and 0.9.715, and the integration matrix on all eight
+     servers.
+     - Valkey 8.1's release run once answered `BLPOP 1` 500 ms late, past a 1.5 s deadline; its rerun was green. The
+       case now waits `BLPOP 2` under `command_timeout=1`: a 1 s margin, and still apart from command_timeout alone
+       (postgres's rule: widen the margin rather than retry).
+     - The pool's live cases ran again on all eight once the WATCH order changed, and Redis 8.10's full run once the
+       margin did.
 4. **Maintenance** (S4).
    - minIdle, pruning by the median, the idle probe (settle, re-AUTH when due, a PING within `pingTimeout`, never a
      redial), the lifetime with its jitter, and stopping on drop.

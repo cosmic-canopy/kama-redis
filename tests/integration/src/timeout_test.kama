@@ -78,12 +78,14 @@ unsafe fn int32 timeoutTests() {
     f = f + check(ok: paused == "OK" && unpaused == "OK" && timedOut && ms >= 280i64 && ms < 1400i64 && lostNotClosed && after == "PONG",
                   what: "timeout: a SET held by the server against command_timeout=0.3, after ${ms} ms, then a redial: ${after}");
 
-    // A blocking command waits for its own timeout, on top of command_timeout: BLPOP 1 under 0.5 returns its null.
-    Connection b = reach(tail: "?command_timeout=0.5", what: "command_timeout=0.5");
+    // A blocking command waits for its own timeout, on top of command_timeout: BLPOP 2 under 1 returns its null, at 2 s
+    // of a 3 s deadline (a server under load once answered a second's BLPOP 500 ms late), where command_timeout alone
+    // would end it at 1 s.
+    Connection b = reach(tail: "?command_timeout=1", what: "command_timeout=1");
     Instant blocked = monotonicNow();
-    string waitedOut = ask(c: b, text: "BLPOP kr:t:never 1");
+    string waitedOut = ask(c: b, text: "BLPOP kr:t:never 2");
     int64 bms = (monotonicNow() - blocked).asMillis();
-    f = f + check(ok: waitedOut == "(nil)" && bms >= 900i64 && !b.isClosed(), what: "timeout: BLPOP 1 under command_timeout=0.5 returns null after ${bms} ms: ${waitedOut}");
+    f = f + check(ok: waitedOut == "(nil)" && bms >= 1900i64 && !b.isClosed(), what: "timeout: BLPOP 2 under command_timeout=1 returns null after ${bms} ms: ${waitedOut}");
     // XREAD BLOCK 800 likewise.
     string cleared = ask(c: b, text: "DEL kr:t:stream");
     Instant streamed = monotonicNow();

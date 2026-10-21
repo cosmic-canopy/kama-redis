@@ -1,9 +1,10 @@
 // The package's hermetic tests: one program, one `xxxTests()` per area, exit 0 when every case holds. No
-// server, no network, no clock — these run anywhere `tools/test.sh` runs, debug and release. The cases that
-// need a live server are in tests/integration. A failing case prints its name, so the log says WHICH, not
-// just that.
+// server and no network — these run anywhere `tools/test.sh` runs, debug and release. A few cases wait on the clock
+// (a login's refreshAfter, a pool's acquireTimeout, a connection's lifetime), each with a margin of 200 ms or more.
+// The cases that need a live server are in tests/integration. A failing case prints its name, so the log says WHICH,
+// not just that.
 import { core::println, respTests, slotTests, urlTests, errorTests, configTests, connectionTests, argTests, replyTests, pipelineTests, blockingTests, transactionTests, scriptTests, scanTests, subscriberTests, tlsTests, reconnectTests,
-         topologyTests, sentinelTests, routeTests, mapTests, clusterTests, trackingTests, credentialsTests };
+         topologyTests, sentinelTests, routeTests, mapTests, clusterTests, trackingTests, credentialsTests, poolTests };
 export { check };
 
 fn int32 check(bool ok, string what) {
@@ -36,6 +37,7 @@ fn uint8 main() {
     failed = failed + clusterTests();
     failed = failed + trackingTests();
     failed = failed + credentialsTests();
+    failed = failed + poolTests();
     if (failed != 0) { println(s: "redis unit tests: ${failed} failed"); return 1; }
     println(s: "redis unit tests: OK");
     return 0;

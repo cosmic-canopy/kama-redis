@@ -105,7 +105,7 @@ type resource Scan implements Sendable {
         int64 now = conn.generation();
         if (this.link >= 0i64 && now != this.link) {
             Result<Value, RedisError> dropped = give r;
-            this.trouble = "the connection was made again since this scan began, and the new server knows nothing of its cursor: start a new Scan";
+            this.trouble = "this scan went to another link than the one it began on (its connection was made again, or it is another connection, a pool's), where its cursor means nothing: start a new Scan";
             return Result::Err(error: RedisError::Usage(detail: copy this.trouble));
         }
         this.link = now;

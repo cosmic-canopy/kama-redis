@@ -247,6 +247,21 @@ printed first.
     closing on a refused re-AUTH is what ends a revoked connection. The live test counts `user=kr_rot` in CLIENT LIST,
     waiting for the server to see the close.
 
+- **`redis::pool` is @kama/postgres's S3 shape, copied** (src/pool/pool.kama): two bounded channels (`slots`,
+  `permits`), no lock, a `Lease` released only by its destructor through `Shared<Home>`, and `share`/`join` across
+  isolates.
+  - It reaches `Connection` through two grants: `putBack` (release) and `settleIdle` (acquire's zero-time check).
+  - A pool never redials on its own time, and a lease redials as any connection does (phase 7b, decision 6).
+  - A release puts back only what changed, sent at the release (decision 3). `Connection` tracks what a lease can
+    leave (`watching`, `watchLost`, `settings.database()`, `authenticatedByHand`); a new piece of session state must
+    be put back there, or make the connection unkeepable.
+  - `Lease.conn()` returns a `ref`, which a `ref` parameter cannot take: tests and callers use
+    `borrow lease.conn() as conn { … }`.
+  - A unit test's pool takes its connections from `ScriptPoolDialers`, one connection's dials at a time, so a
+    connection too many meets a refused dial.
+  - On macOS a host name's first lookup keeps two of the resolver's descriptors open for the process: a live
+    descriptor count uses IP addresses.
+
 - **A `Subscriber` reaches its connection only through the private members `Connection` grants it, method by
   method** (`transmit`, `receiveFrame`, `lose`, `setAside`, `budget`, for reconnecting `lost` and `ready`, and
   `rawHandle` for a `ClusterSubscriber`'s `Poller`). Nothing on

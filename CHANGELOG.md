@@ -7,7 +7,10 @@ All notable changes to this package are recorded here. The format follows
 ## [Unreleased]
 
 What a caller of 0.2.0 may need to change:
-- `RedisError` gained `Credentials` (it is `@nonExhaustive`, so a `match` with `case _:` needs nothing).
+- `RedisError` gained `Credentials` and `PoolTimeout` (it is `@nonExhaustive`, so a `match` with `case _:` needs
+  nothing).
+- A `Scan` continued over another connection than the one it began on ends with `Usage` (its message names both
+  causes now).
 
 ### Added
 - A credentials provider (src/credentials.kama): `Credentials`, a contract of yours (`login()` and `fork()`), set with
@@ -20,7 +23,18 @@ What a caller of 0.2.0 may need to change:
 - A URL's password, or `setAuth`, beside a provider is refused, and so is a provider beside them; `authenticate` on a
   provider's connection is `Usage`.
 
+- `redis::pool`: `Pool` (`make`, `makeWith` with `PoolDialers`, `join`, `share`, `acquire`), `Lease` (`conn()`, given
+  back when dropped), `PoolShare` (Sendable) and `PoolOptions` (`maxSize`, `acquireTimeout`, `lifetime`,
+  `lifetimeJitter`). Two channels, no lock: a bound across every isolate the pool is shared with. A release puts back
+  only what the lease changed (UNWATCH, SELECT), sent at the release; a connection lost, closed, re-authenticated by
+  hand, past its lifetime or whose put-back failed is closed and its place reused. An idle connection the server let
+  go is found with no round trip and not lent. `RedisError::PoolTimeout`.
+- `PoolDialers`, a contract for a pool's dialers: `another()` for each connection, `fork()` for each isolate.
+
 ### Fixed
+- A `Scan` told links apart by a count of each connection's redials, which starts at 0 on every connection, so a scan
+  continued over another connection (another lease's) sent its cursor to another link without a word. Each link now
+  draws an identity at random.
 - `authenticate` on a connection whose link was lost made it again as the old user first, so a password that had
   been revoked failed the redial for good and the new one was never sent. It now makes the link again as the new user.
 

@@ -17,7 +17,8 @@ export { Config, Protocol, TlsVerify, TlsVersion, SentinelRole, ReadFrom, socket
 //   keepalive=S           TCP keepalive, as hiredis sets it: idle S seconds, a probe every S/3, 3 probes. 0 is off.
 //                         Default 15, redis-cli's.
 //   reconnect=on|off      whether a lost connection is made again by its next call (docs/ROADMAP.md, "Phase 7a"). On
-//                         by default; off leaves it closed, for a pool that replaces it.
+//                         by default; off leaves it closed. A pool's connections keep it as set (its leases behave
+//                         as any connection), and a pool replaces one that is lost when it is given back.
 //   reconnect_timeout=S   seconds, to the millisecond; 0 for no limit. Default 5. How long a call may go on trying to
 //                         make a lost connection again, while the server is down or restarting.
 // The database is the URL's path (redis://host/2), or ?db= on unix://, as RedisUrl reads it.

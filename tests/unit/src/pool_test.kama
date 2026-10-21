@@ -1,0 +1,611 @@
+// redis::pool (src/pool/pool.kama; docs/ROADMAP.md, "Phase 7b", step 3) over the scripted server. Each connection the
+// pool opens takes the next connection's dials (its connect, then its redials), so a script lists every command each
+// connection must carry, in order: a pool that opens one connection too many meets a refused dial, and one that sends
+// a command it should not meets an Expect it does not match.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::RecvError, std::concurrent::Isolate, std::memory::Owned, std::time::Duration, std::time::Instant,
+         std::time::monotonicNow, std::time::sleep,
+         redis::Connection, redis::Config, redis::Command, redis::RedisError, redis::Dialer, redis::PoolDialers,
+         redis::Pipeline, redis::TxOutcome, redis::Scan, redis::libraryVersion, redis::resp::Value,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease,
+         redis_unit_tests::check, Step, Dial, ScriptDialer, expect, reply, welcome, configOf, callOutcome, commandOf,
+         again, transaction, setThenIncr, Answer, loginAs, providing, answerList };
+export { poolTests };
+
+fn string server() { return "redis-8.10.2"; }
+
+// One pooled connection's dials, in the order the pool opens connections.
+type enum Scripted implements Sendable { One(DynamicArray<Dial> dials) }
+
+// The dialers a test's pool opens its connections with: each connection the next one's dials; with none left, a
+// dialer that refuses. A fork draws on the same queue, so a pool joined in another isolate connects over it too; a
+// fork's fork opens nothing.
+type resource ScriptPoolDialers implements PoolDialers, Sendable {
+    DynamicArray<Channel<Scripted>> queue;   // zero or one: kept by the dialers a test made, for its forks
+    DynamicArray<Receiver<Scripted>> left;   // zero or one: this one's end of them
+
+    public unsafe ctor make(DynamicArray<DynamicArray<Dial>> connections) {
+        isize room = connections.length();
+        if (room < 1) { room = 1; }
+        Channel<Scripted> q = Channel.bounded(capacity: cast<usize>(room));
+        Sender<Scripted> into = q.sender();
+        while (connections.length() > 0) { _ = into.send(item: Scripted::One(dials: connections.remove(index: 0))); }
+        this.left = DynamicArray.empty();
+        this.left.add(item: q.receiver());
+        this.queue = DynamicArray.empty();
+        this.queue.add(item: give q);
+    }
+    ctor sharing(Receiver<Scripted> scripts) {
+        this.queue = DynamicArray.empty();
+        this.left = DynamicArray.empty();
+        this.left.add(item: give scripts);
+    }
+    ctor none() { this.queue = DynamicArray.empty(); this.left = DynamicArray.empty(); }
+
+    public unsafe fn Owned<Dialer> another() {
+        if (this.left.length() > 0) {
+            Result<Scripted, RecvError> r = this.left[0].tryRecv();
+            match (give r) {
+                case Ok(value: x): {
+                    match (give x) { case One(dials: d): { Owned<Dialer> one = new ScriptDialer.make(dials: give d); return give one; } };
+                }
+                case _: { }
+            };
+        }
+        Owned<Dialer> refusing = new ScriptDialer.make(dials: DynamicArray.empty());
+        return give refusing;
+    }
+
+    public unsafe fn Owned<PoolDialers> fork() {
+        if (this.queue.length() == 0) {
+            Owned<PoolDialers> nothing = new ScriptPoolDialers.none();
+            return give nothing;
+        }
+        Owned<PoolDialers> next = new ScriptPoolDialers.sharing(scripts: this.queue[0].receiver());
+        return give next;
+    }
+}
+
+fn DynamicArray<DynamicArray<Dial>> conns() { return DynamicArray.empty(); }
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+// A connection served by `script` alone (no redial).
+fn void serve(ref DynamicArray<DynamicArray<Dial>> all, DynamicArray<Step> script) {
+    DynamicArray<Dial> d = DynamicArray.empty();
+    d.add(item: Dial::Serve(steps: give script));
+    all.add(item: give d);
+}
+
+fn PoolOptions sized(isize maxSize, int64 acquireMs) {
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = maxSize;
+    o.acquireTimeout = Duration.fromMillis(ms: acquireMs);
+    return o;
+}
+
+unsafe fn Pool pooled(DynamicArray<DynamicArray<Dial>> connections, const ref Config config, PoolOptions options, const ref string what) {
+    Owned<PoolDialers> d = new ScriptPoolDialers.make(connections: give connections);
+    Result<Pool, RedisError> r = Pool.makeWith(dialers: give d, config: config, options: options);
+    return match (give r) {
+        case Ok(value: p): give p;
+        case Err(error: e): { string m = e.message(); panic(msg: "pool_test: ${what}: ${m}"); }
+    };
+}
+
+// GET kr:k answered as the server answers a hit.
+fn void get(ref DynamicArray<Step> s) { s.add(item: expect(command: "GET kr:k", answer: reply(server: server(), kase: "get-hit/3"))); }
+
+unsafe fn string getOn(ref Lease lease) {
+    Command c = commandOf(text: "GET kr:k");
+    return callOutcome(r: lease.conn().call(command: c));
+}
+
+// A lease's outcome: "lease" or what acquire failed with.
+unsafe fn string leased(ref Pool pool) {
+    Result<Lease, RedisError> r = pool.acquire();
+    return match (r) { case Ok(value: l): "lease"; case Err(error: e): e.message(); };
+}
+
+// A lease that holds `pool`'s connection while `f` runs: acquire it, GET with it, and drop it.
+unsafe fn string useOnce(ref Pool pool) {
+    Result<Lease, RedisError> r = pool.acquire();
+    return match (give r) {
+        case Ok(value: l): { Lease lease = give l; := getOn(lease: lease); }
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn void wait(int64 ms) { sleep(d: Duration.fromMillis(ms: ms)); }
+
+fn bool isPoolTimeout(const ref Result<Lease, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case PoolTimeout: true; case _: false; }; case Ok(value: l): false; };
+}
+
+// ---- the bound, reuse and the wait ----
+
+unsafe fn int32 boundTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+
+    // One lease at a time keeps using one connection: the script has one, so a second connect would be refused.
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    DynamicArray<Step> one = welcome(server: server());
+    get(s: one); get(s: one); get(s: one);
+    serve(all: c1, script: give one);
+    Pool p1 = pooled(connections: give c1, config: plain, options: sized(maxSize: 2, acquireMs: 300i64), what: "reuse");
+    string u1 = useOnce(pool: p1);
+    string u2 = useOnce(pool: p1);
+    string u3 = useOnce(pool: p1);
+    f = f + check(ok: u1 == "ok" && u2 == "ok" && u3 == "ok", what: "pool: one lease at a time keeps using one connection (${u1}; ${u2}; ${u3})");
+
+    // maxSize leases held, the next acquire waits acquireTimeout and is PoolTimeout; a lease given back is then leased.
+    DynamicArray<DynamicArray<Dial>> c2 = conns();
+    DynamicArray<Step> a = welcome(server: server());
+    get(s: a); get(s: a);
+    serve(all: c2, script: give a);
+    serve(all: c2, script: welcome(server: server()));
+    Pool p2 = pooled(connections: give c2, config: plain, options: sized(maxSize: 2, acquireMs: 300i64), what: "bound");
+    Result<Lease, RedisError> first = p2.acquire();
+    Result<Lease, RedisError> second = p2.acquire();
+    Instant before = monotonicNow();
+    Result<Lease, RedisError> third = p2.acquire();
+    int64 waited = before.elapsed().asMillis();
+    bool timedOut = isPoolTimeout(r: third);
+    string message = match (third) { case Err(error: e): e.message(); case Ok(value: l): "leased"; };
+    f = f + check(ok: timedOut && waited >= 250i64 && waited < 3000i64,
+                  what: "pool: past maxSize, acquire waits acquireTimeout and is PoolTimeout (${waited} ms: ${message})");
+    string gotFirst = match (give first) { case Ok(value: l): { Lease held = give l; := getOn(lease: held); } case Err(error: e): e.message(); };
+    string again1 = useOnce(pool: p2);
+    f = f + check(ok: gotFirst == "ok" && again1 == "ok", what: "pool: a lease given back is leased again, with no new connect (${again1})");
+
+    // A freed place ahead of an idle connection: the idle one is lent first, and the place is kept for a new one.
+    DynamicArray<DynamicArray<Dial>> c4 = conns();
+    serve(all: c4, script: welcome(server: server()));
+    DynamicArray<Step> s4b = welcome(server: server());
+    get(s: s4b); get(s: s4b);
+    serve(all: c4, script: give s4b);
+    DynamicArray<Step> s4c = welcome(server: server());
+    get(s: s4c);
+    serve(all: c4, script: give s4c);
+    Pool p4 = pooled(connections: give c4, config: plain, options: sized(maxSize: 2, acquireMs: 300i64), what: "a freed place first");
+    {
+        Result<Lease, RedisError> ra = p4.acquire();
+        Result<Lease, RedisError> rb = p4.acquire();
+        match (give ra) { case Ok(value: l): { Lease first4 = give l; first4.conn().close(); } case Err(error: e): { } };
+        match (give rb) { case Ok(value: l): { Lease second4 = give l; string x = getOn(lease: second4); } case Err(error: e): { } };
+    }
+    string idleFirst = "-";
+    string fresh = "-";
+    {
+        Result<Lease, RedisError> rc = p4.acquire();
+        match (give rc) {
+            case Ok(value: l): {
+                Lease third4 = give l;
+                idleFirst = getOn(lease: third4);
+                fresh = useOnce(pool: p4);
+            }
+            case Err(error: e): { idleFirst = e.message(); }
+        };
+    }
+    f = f + check(ok: idleFirst == "ok" && fresh == "ok",
+                  what: "pool: an idle connection behind a freed place is lent first, and the place kept for a new one (${idleFirst}; ${fresh})");
+
+    // A waiter in another isolate is woken by a release, with no new connect: the one connection serves it.
+    DynamicArray<DynamicArray<Dial>> c3 = conns();
+    DynamicArray<Step> s3 = welcome(server: server());
+    get(s: s3);
+    serve(all: c3, script: give s3);
+    Pool p3 = pooled(connections: give c3, config: plain, options: sized(maxSize: 1, acquireMs: 3000i64), what: "waiter");
+    Channel<string> told = Channel.bounded(capacity: 1);
+    Receiver<string> heard = told.receiver();
+    Result<Lease, RedisError> held = p3.acquire();
+    DynamicArray<Isolate> workers = DynamicArray.empty();   // dropped last: dropping one joins it
+    Result<PoolShare, RedisError> sh = p3.share();
+    match (give sh) {
+        case Ok(value: x): { Visitor v = Visitor.make(share: give x, said: told.sender()); Isolate w = spawn visit(job: give v); workers.add(item: give w); }
+        case Err(error: e): { }
+    };
+    wait(ms: 200i64);
+    { Result<Lease, RedisError> given = give held; }
+    Optional<string> theirs = heard.recv();
+    string t = match (give theirs) { case Some(value: x): give x; case None: "(nothing)"; };
+    workers.clear();
+    f = f + check(ok: t == "ok", what: "pool: a waiter in another isolate is woken by a release, with no new connect (${t})");
+    return f;
+}
+
+// ---- what a release puts back ----
+
+unsafe fn int32 putBackTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+
+    // A WATCH in force and a database `select` changed: UNWATCH, then SELECT back, sent at the release; the next lease
+    // finds the connection as the pool made it.
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    DynamicArray<Step> s1 = welcome(server: server());
+    s1.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "watch/3")));
+    s1.add(item: expect(command: "SELECT 3", answer: reply(server: server(), kase: "select1")));
+    s1.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "putback-unwatch/3")));
+    s1.add(item: expect(command: "SELECT 0", answer: reply(server: server(), kase: "putback-select/3")));
+    get(s: s1);
+    get(s: s1);
+    serve(all: c1, script: give s1);
+    Pool p1 = pooled(connections: give c1, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "put back");
+    string watched = "-";
+    string chose = "-";
+    {
+        Result<Lease, RedisError> r = p1.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                Command w = commandOf(text: "WATCH kr:w");
+                watched = callOutcome(r: lease.conn().call(command: w));
+                Result<Unit, RedisError> sel = lease.conn().select(db: 3i64);
+                chose = match (sel) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+            }
+            case Err(error: e): { }
+        };
+    }
+    string next = useOnce(pool: p1);
+    string third = useOnce(pool: p1);
+    f = f + check(ok: watched == "ok" && chose == "ok" && next == "ok" && third == "ok",
+                  what: "pool: a release puts back a WATCH (UNWATCH) and a database (SELECT 0) once, before the next lease (${watched}; ${chose}; ${next}; ${third})");
+
+    // Pushes a lease left set aside do not reach the next lease: they are dropped, and counted.
+    DynamicArray<DynamicArray<Dial>> c6 = conns();
+    DynamicArray<Step> s6 = welcome(server: server());
+    DynamicArray<uint8> withPush = reply(server: server(), kase: "tracked-flush/3");
+    withPush.addAll(items: reply(server: server(), kase: "get-hit/3").view());
+    s6.add(item: expect(command: "GET kr:k", answer: give withPush));
+    get(s: s6);
+    serve(all: c6, script: give s6);
+    Pool p6 = pooled(connections: give c6, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "pushes");
+    isize pending = -1;
+    { Result<Lease, RedisError> r = p6.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; string x = getOn(lease: lease); pending = lease.conn().pendingPushes(); } case Err(error: e): { } }; }
+    isize later = -1;
+    int64 dropped = -1i64;
+    { Result<Lease, RedisError> r = p6.acquire(); match (give r) { case Ok(value: l): { Lease lease = give l; later = lease.conn().pendingPushes(); string x = getOn(lease: lease); dropped = lease.conn().droppedPushes(); } case Err(error: e): { } }; }
+    f = f + check(ok: pending == 1 && later == 0 && dropped == 1i64,
+                  what: "pool: pushes a lease left set aside are dropped at the release, and counted (${pending}; ${later}; ${dropped})");
+
+    // A put-back the server refuses: the connection is closed, and the next lease is a new connection.
+    DynamicArray<DynamicArray<Dial>> c2 = conns();
+    DynamicArray<Step> s2 = welcome(server: server());
+    s2.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "watch/3")));
+    s2.add(item: expect(command: "UNWATCH", answer: reply(server: server(), kase: "noperm")));
+    serve(all: c2, script: give s2);
+    DynamicArray<Step> s2b = welcome(server: server());
+    get(s: s2b);
+    serve(all: c2, script: give s2b);
+    Pool p2 = pooled(connections: give c2, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "put back refused");
+    {
+        Result<Lease, RedisError> r = p2.acquire();
+        match (give r) { case Ok(value: l): { Lease lease = give l; Command w = commandOf(text: "WATCH kr:w"); Result<Value, RedisError> x = lease.conn().call(command: w); } case Err(error: e): { } };
+    }
+    string after2 = useOnce(pool: p2);
+    f = f + check(ok: after2 == "ok", what: "pool: a put-back the server refuses closes the connection, and the next lease connects anew (${after2})");
+
+    // `authenticate` changed who the connection is: it is not kept.
+    DynamicArray<DynamicArray<Dial>> c3 = conns();
+    DynamicArray<Step> s3 = welcome(server: server());
+    s3.add(item: expect(command: "AUTH kr_acl kr_acl_pw", answer: reply(server: server(), kase: "auth2")));
+    serve(all: c3, script: give s3);
+    DynamicArray<Step> s3b = welcome(server: server());
+    get(s: s3b);
+    serve(all: c3, script: give s3b);
+    Pool p3 = pooled(connections: give c3, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "authenticate");
+    string authed = "-";
+    {
+        Result<Lease, RedisError> r = p3.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                Result<Unit, RedisError> a = lease.conn().authenticate(user: Optional::Some(value: "kr_acl"), password: "kr_acl_pw");
+                authed = match (a) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+            }
+            case Err(error: e): { }
+        };
+    }
+    string after3 = useOnce(pool: p3);
+    f = f + check(ok: authed == "ok" && after3 == "ok", what: "pool: a connection whose user authenticate changed is not kept (${authed}; ${after3})");
+
+    // A connection lost at the release (the server closed it on the lease's last call) is not kept, and is not made
+    // again on the pool's time: the next lease is a new connection. So is one the caller closed.
+    DynamicArray<DynamicArray<Dial>> c4 = conns();
+    DynamicArray<Step> s4 = welcome(server: server());
+    s4.add(item: Step::Close);
+    serve(all: c4, script: give s4);
+    DynamicArray<Step> s4b = welcome(server: server());
+    get(s: s4b);
+    serve(all: c4, script: give s4b);
+    DynamicArray<Step> s4c = welcome(server: server());
+    get(s: s4c);
+    serve(all: c4, script: give s4c);
+    Pool p4 = pooled(connections: give c4, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "lost at the release");
+    string lostCall = useOnce(pool: p4);
+    string after4 = "-";
+    {
+        Result<Lease, RedisError> r = p4.acquire();
+        match (give r) { case Ok(value: l): { Lease lease = give l; after4 = getOn(lease: lease); lease.conn().close(); } case Err(error: e): { after4 = e.message(); } };
+    }
+    string after4b = useOnce(pool: p4);
+    f = f + check(ok: lostCall != "ok" && after4 == "ok" && after4b == "ok",
+                  what: "pool: a connection lost at the release, or closed by its lease, gives its place to a new one (${lostCall}; ${after4}; ${after4b})");
+
+    // The command timeout a lease set, and a WATCH lost with its link, do not reach the next lease.
+    DynamicArray<DynamicArray<Dial>> c5 = conns();
+    DynamicArray<Dial> d5 = DynamicArray.empty();
+    DynamicArray<Step> s5 = welcome(server: server());
+    s5.add(item: expect(command: "WATCH kr:w", answer: reply(server: server(), kase: "watch/3")));
+    s5.add(item: Step::Close);
+    d5.add(item: Dial::Serve(steps: give s5));
+    DynamicArray<Step> s5b = again();
+    get(s: s5b);
+    transaction(s: s5b, server: server(), protocol: "3", exec: reply(server: server(), kase: "exec-ok/3"));
+    d5.add(item: Dial::Serve(steps: give s5b));
+    c5.add(item: give d5);
+    Pool p5 = pooled(connections: give c5, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "leftovers");
+    {
+        Result<Lease, RedisError> r = p5.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                Command w = commandOf(text: "WATCH kr:w");
+                Result<Value, RedisError> x = lease.conn().call(command: w);
+                Result<Value, RedisError> lost = lease.conn().call(command: commandOf(text: "GET kr:k"));
+                string back = getOn(lease: lease);
+                Result<Unit, RedisError> t = lease.conn().setCommandTimeout(timeout: Duration.fromMillis(ms: 10i64));
+            }
+            case Err(error: e): { }
+        };
+    }
+    string outcome5 = "-";
+    int64 limit = -1i64;
+    {
+        Result<Lease, RedisError> r = p5.acquire();
+        match (give r) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                limit = lease.conn().commandTimeout().asMillis();
+                Pipeline tx = setThenIncr();
+                Result<TxOutcome, RedisError> done = lease.conn().transact(pipeline: tx);
+                outcome5 = match (done) { case Ok(value: o): match (o) { case WatchConflict: "held back"; case _: "committed"; }; case Err(error: e): e.message(); };
+            }
+            case Err(error: e): { outcome5 = e.message(); }
+        };
+    }
+    f = f + check(ok: limit == 5000i64 && outcome5 == "committed",
+                  what: "pool: a lease's command timeout and a WATCH lost with its link do not reach the next lease (${limit} ms; ${outcome5})");
+    return f;
+}
+
+// ---- a lease's connection, and the idle ones ----
+
+unsafe fn int32 linkTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+
+    // Within a lease, a lost link is made again by its next call, as on any connection; the connection then goes back.
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    DynamicArray<Dial> d1 = DynamicArray.empty();
+    DynamicArray<Step> s1 = welcome(server: server());
+    s1.add(item: Step::Close);
+    d1.add(item: Dial::Serve(steps: give s1));
+    DynamicArray<Step> s1b = again();
+    get(s: s1b);
+    get(s: s1b);
+    d1.add(item: Dial::Serve(steps: give s1b));
+    c1.add(item: give d1);
+    Pool p1 = pooled(connections: give c1, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "redial in a lease");
+    string lost = "-";
+    string back = "-";
+    {
+        Result<Lease, RedisError> r = p1.acquire();
+        match (give r) { case Ok(value: l): { Lease lease = give l; lost = getOn(lease: lease); back = getOn(lease: lease); } case Err(error: e): { } };
+    }
+    string reused = useOnce(pool: p1);
+    f = f + check(ok: lost != "ok" && back == "ok" && reused == "ok",
+                  what: "pool: a lease's connection makes a lost link again on its next call, and is kept (${lost}; ${back}; ${reused})");
+
+    // reconnect=off is honoured: the lease's calls answer Closed after a loss, and the place goes to a new connection.
+    Config off = configOf(url: "redis://127.0.0.1:6379?reconnect=off");
+    DynamicArray<DynamicArray<Dial>> c2 = conns();
+    DynamicArray<Step> s2 = welcome(server: server());
+    s2.add(item: Step::Close);
+    serve(all: c2, script: give s2);
+    DynamicArray<Step> s2b = welcome(server: server());
+    get(s: s2b);
+    serve(all: c2, script: give s2b);
+    Pool p2 = pooled(connections: give c2, config: off, options: sized(maxSize: 1, acquireMs: 300i64), what: "reconnect=off");
+    string closed = "-";
+    {
+        Result<Lease, RedisError> r = p2.acquire();
+        match (give r) { case Ok(value: l): { Lease lease = give l; string x = getOn(lease: lease); closed = getOn(lease: lease); } case Err(error: e): { } };
+    }
+    string fresh = useOnce(pool: p2);
+    f = f + check(ok: closed == "the connection is closed" && fresh == "ok",
+                  what: "pool: reconnect=off: a lease's lost connection stays closed, and its place goes to a new one (${closed}; ${fresh})");
+
+    // A connection the server let go before it was given back is found without a round trip, and not kept: its place
+    // goes to a new one. (The scripted server acts only when the client reads or waits, so a close after the release
+    // shows the same way; the live test shows the acquire's own check, with reconnect=off.)
+    DynamicArray<DynamicArray<Dial>> c3 = conns();
+    DynamicArray<Step> s3 = welcome(server: server());
+    get(s: s3);
+    s3.add(item: Step::Hangup);
+    serve(all: c3, script: give s3);
+    DynamicArray<Step> s3b = welcome(server: server());
+    get(s: s3b);
+    serve(all: c3, script: give s3b);
+    Pool p3 = pooled(connections: give c3, config: plain, options: sized(maxSize: 1, acquireMs: 300i64), what: "idle let go");
+    string used = useOnce(pool: p3);
+    string replaced = useOnce(pool: p3);
+    f = f + check(ok: used == "ok" && replaced == "ok", what: "pool: a connection the server let go before it was given back is not kept (${used}; ${replaced})");
+
+    // A connection past its lifetime is closed, not leased again.
+    DynamicArray<DynamicArray<Dial>> c4 = conns();
+    DynamicArray<Step> s4 = welcome(server: server());
+    get(s: s4);
+    serve(all: c4, script: give s4);
+    DynamicArray<Step> s4b = welcome(server: server());
+    get(s: s4b);
+    serve(all: c4, script: give s4b);
+    PoolOptions brief = sized(maxSize: 1, acquireMs: 300i64);
+    brief.lifetime = Optional::Some(value: Duration.fromMillis(ms: 200i64));
+    brief.lifetimeJitter = Duration.fromMillis(ms: 100i64);
+    Pool p4 = pooled(connections: give c4, config: plain, options: brief, what: "lifetime");
+    string young = useOnce(pool: p4);
+    wait(ms: 500i64);
+    string old = useOnce(pool: p4);
+    f = f + check(ok: young == "ok" && old == "ok", what: "pool: a connection past its lifetime and all its jitter is closed, and its place used (${young}; ${old})");
+
+    // A scan carried from one lease's connection to another's ends with an error: its cursor means nothing there.
+    DynamicArray<DynamicArray<Dial>> c5 = conns();
+    DynamicArray<Step> s5 = welcome(server: server());
+    DynamicArray<uint8> page = DynamicArray.empty();
+    page.addAll(items: "*2\r\n$2\r\n17\r\n*1\r\n$4\r\nkr:a\r\n".bytes());
+    s5.add(item: expect(command: "SCAN 0", answer: give page));
+    serve(all: c5, script: give s5);
+    DynamicArray<Step> s5b = welcome(server: server());
+    s5b.add(item: expect(command: "SCAN 17", answer: reply(server: server(), kase: "scan/3")));
+    serve(all: c5, script: give s5b);
+    Pool p5 = pooled(connections: give c5, config: plain, options: sized(maxSize: 2, acquireMs: 300i64), what: "scan");
+    Scan keys = Scan.keys();
+    string first = "-";
+    string second = "-";
+    Result<Lease, RedisError> ra = p5.acquire();
+    Result<Lease, RedisError> rb = p5.acquire();
+    match (give ra) {
+        case Ok(value: la): {
+            Lease a = give la;
+            borrow a.conn() as conn { first = callOutcome(r: keys.next(conn: conn)); }
+            match (give rb) {
+                case Ok(value: lb): { Lease b = give lb; borrow b.conn() as conn { second = callOutcome(r: keys.next(conn: conn)); } }
+                case Err(error: e): { second = e.message(); }
+            };
+        }
+        case Err(error: e): { first = e.message(); Result<Lease, RedisError> unused = give rb; }
+    };
+    f = f + check(ok: first == "ok" && second.startsWith(prefix: "this scan went to another link"),
+                  what: "pool: a scan carried to another lease's connection ends with an error (${first}; ${second})");
+    return f;
+}
+
+// ---- shared with another isolate ----
+
+type resource Visitor implements Sendable {
+    PoolShare share;
+    Sender<string> said;
+    public ctor make(PoolShare share, Sender<string> said) { this.share = give share; this.said = give said; }
+    public unsafe fn void run() {
+        Pool joined = Pool.join(share: this.share);
+        string got = useOnce(pool: joined);
+        _ = this.said.send(item: give got);
+    }
+}
+unsafe fn void visit(Visitor job) { job.run(); }
+
+unsafe fn int32 shareTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    // A pool joined in another isolate leases within the same maxSize, and opens its connections through a fork of the
+    // pool's dialers: with this isolate's lease held, the other isolate's is a second connection, from the same script.
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    serve(all: c1, script: welcome(server: server()));
+    DynamicArray<Step> s1b = welcome(server: server());
+    get(s: s1b);
+    serve(all: c1, script: give s1b);
+    Pool p1 = pooled(connections: give c1, config: plain, options: sized(maxSize: 2, acquireMs: 2000i64), what: "share");
+    Result<Lease, RedisError> mine = p1.acquire();
+    string held = match (mine) { case Ok(value: l): "ok"; case Err(error: e): e.message(); };
+    Channel<string> told = Channel.bounded(capacity: 1);
+    Receiver<string> heard = told.receiver();
+    DynamicArray<Isolate> workers = DynamicArray.empty();
+    Result<PoolShare, RedisError> s = p1.share();
+    match (give s) {
+        case Ok(value: sh): { Visitor v = Visitor.make(share: give sh, said: told.sender()); Isolate w = spawn visit(job: give v); workers.add(item: give w); }
+        case Err(error: e): { }
+    };
+    Optional<string> theirs = heard.recv();
+    string t = match (give theirs) { case Some(value: x): give x; case None: "(nothing)"; };
+    workers.clear();
+    { Result<Lease, RedisError> given = give mine; }
+    f = f + check(ok: held == "ok" && t == "ok", what: "pool: a pool joined in another isolate opens its connections through a fork of the dialers (${held}; ${t})");
+    // A joined pool cannot be shared again.
+    Result<PoolShare, RedisError> s2 = p1.share();
+    match (give s2) {
+        case Ok(value: sh): {
+            PoolShare carried = give sh;
+            Pool joined = Pool.join(share: carried);
+            Result<PoolShare, RedisError> reshared = joined.share();
+            bool usage = match (reshared) { case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; case Ok(value: x): false; };
+            f = f + check(ok: usage, what: "pool: a pool joined from a share cannot be shared again (Usage)");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "pool: share"); }
+    };
+    return f;
+}
+
+// ---- what cannot make a pool, and the provider ----
+
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    Config plain = configOf(url: "redis://127.0.0.1:6379");
+    PoolOptions zero = PoolOptions.defaults();
+    zero.maxSize = 0;
+    PoolOptions negative = PoolOptions.defaults();
+    negative.acquireTimeout = Duration.fromMillis(ms: -1i64);
+    PoolOptions noLife = PoolOptions.defaults();
+    noLife.lifetime = Optional::Some(value: Duration.zero());
+    Result<Pool, RedisError> r1 = Pool.make(config: plain, options: zero);
+    Result<Pool, RedisError> r2 = Pool.make(config: plain, options: negative);
+    Result<Pool, RedisError> r3 = Pool.make(config: plain, options: noLife);
+    Config cluster = configOf(url: "redis://127.0.0.1:7000,127.0.0.1:7001");
+    Result<Pool, RedisError> r4 = Pool.make(config: cluster, options: PoolOptions.defaults());
+    f = f + check(ok: isConfig(r: r1) && isConfig(r: r2) && isConfig(r: r3) && isConfig(r: r4),
+                  what: "pool: a maxSize under 1, a negative duration, a zero lifetime and a cluster's seeds are Config");
+    PoolOptions d = PoolOptions.defaults();
+    bool sane = d.maxSize >= 4 && d.acquireTimeout.asMillis() == 6000i64 && match (d.lifetime) { case Some(value: x): false; case None: true; }
+                && d.lifetimeJitter.asMillis() == 90000i64;
+    f = f + check(ok: sane, what: "pool: the defaults: maxSize at least 4, acquireTimeout 6 s, no lifetime, 90 s of jitter");
+
+    // Each pooled connection logs in with a fork of the provider of its own: two connections, each asked from its start.
+    DynamicArray<Answer> a = answerList();
+    a.add(item: loginAs(password: "pw1", refreshMs: 0i64));
+    a.add(item: loginAs(password: "pw2", refreshMs: 0i64));
+    Config provided = providing(url: "redis://127.0.0.1:6379", answers: give a);
+    DynamicArray<DynamicArray<Dial>> c1 = conns();
+    serve(all: c1, script: loggedIn(password: "pw1"));
+    serve(all: c1, script: loggedIn(password: "pw1"));
+    Pool p1 = pooled(connections: give c1, config: provided, options: sized(maxSize: 2, acquireMs: 300i64), what: "provider");
+    string l1 = leased(pool: p1);
+    Result<Lease, RedisError> held = p1.acquire();
+    string l2 = match (held) { case Ok(value: l): "lease"; case Err(error: e): e.message(); };
+    Result<Lease, RedisError> other = p1.acquire();
+    string l3 = match (other) { case Ok(value: l): "lease"; case Err(error: e): e.message(); };
+    f = f + check(ok: l2 == "lease" && l3 == "lease", what: "pool: each pooled connection logs in with a fork of the provider of its own (${l2}; ${l3})");
+    return f;
+}
+
+fn bool isConfig(const ref Result<Pool, RedisError> r) {
+    return match (r) { case Err(error: e): match (e) { case Config(detail: d): true; case _: false; }; case Ok(value: p): false; };
+}
+
+fn DynamicArray<Step> loggedIn(const ref string password) {
+    DynamicArray<Step> s = steps();
+    s.add(item: expect(command: "HELLO 3 AUTH kr_acl ".concat(other: password), answer: reply(server: server(), kase: "hello3-auth")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-NAME kama-redis", answer: reply(server: server(), kase: "setinfo-name")));
+    s.add(item: expect(command: "CLIENT SETINFO LIB-VER ".concat(other: libraryVersion()), answer: reply(server: server(), kase: "setinfo-ver")));
+    return give s;
+}
+
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    f = f + boundTests();
+    f = f + putBackTests();
+    f = f + linkTests();
+    f = f + shareTests();
+    f = f + refusalTests();
+    return f;
+}

@@ -1,0 +1,227 @@
+[
+ {
+  "id": "P1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.watching) {\n            Command unwatch = Command.of(name: \"UNWATCH\");",
+  "new": "        if (false) {\n            Command unwatch = Command.of(name: \"UNWATCH\");",
+  "expect": "pool: a release puts back a WATCH",
+  "timeout": 300
+ },
+ {
+  "id": "P2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool reselect = this.settings.database() != config.database();",
+  "new": "        bool reselect = false;",
+  "expect": "pool: a release puts back a WATCH",
+  "timeout": 300
+ },
+ {
+  "id": "P3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            Result<Unit, RedisError> chosen = this.settings.setDatabase(db: config.database());\n            match (give chosen) { case Ok(value: u): { } case Err(error: e): { this.lose(); return false; } };\n",
+  "new": "",
+  "expect": "pool: a release puts back a WATCH",
+  "timeout": 300
+ },
+ {
+  "id": "P4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.commandLimit = config.commandTimeout();\n        this.watchLost = false;",
+  "new": "        this.watchLost = false;",
+  "expect": "pool: a lease's command timeout",
+  "timeout": 300
+ },
+ {
+  "id": "P5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.commandLimit = config.commandTimeout();\n        this.watchLost = false;",
+  "new": "        this.commandLimit = config.commandTimeout();",
+  "expect": "pool: a lease's command timeout",
+  "timeout": 300
+ },
+ {
+  "id": "P6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.shut || !this.live || this.authenticatedByHand) { return false; }",
+  "new": "        if (this.shut || !this.live) { return false; }",
+  "expect": "pool: a connection whose user authenticate changed is not kept",
+  "timeout": 300
+ },
+ {
+  "id": "P7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (!isStatus(v: v, text: \"OK\")) { this.lose(); return false; }\n            k = k + 1;",
+  "new": "            k = k + 1;",
+  "expect": "pool: a put-back the server refuses",
+  "timeout": 300
+ },
+ {
+  "id": "P8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.watchLost = false;\n        this.dropPushes();\n        this.outbox.clear();",
+  "new": "        this.watchLost = false;\n        this.outbox.clear();",
+  "expect": "pool: pushes a lease left set aside",
+  "timeout": 300
+ },
+ {
+  "id": "P9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.linkId = cast<int64>(this.jitter.next() >> 1);\n        this.loginDue = Optional::None;",
+  "new": "        this.linkId = 0i64;\n        this.loginDue = Optional::None;",
+  "expect": "pool: a scan carried to another lease's connection",
+  "timeout": 300
+ },
+ {
+  "id": "P10",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                    if (!past(expires: until) && conn.settleIdle()) {",
+  "new": "                    if (conn.settleIdle()) {",
+  "expect": "pool: a connection past its lifetime",
+  "timeout": 300
+ },
+ {
+  "id": "P11",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        back.close();\n        Connection gone = give back;\n        this.ends.put(slot: Slot::Empty);",
+  "new": "        back.close();\n        Connection gone = give back;",
+  "expect": "pool: a put-back the server refuses",
+  "timeout": 300
+ },
+ {
+  "id": "P12",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                    case None: { return Result::Err(error: RedisError::PoolTimeout); }",
+  "new": "                    case None: { return Result::Err(error: RedisError::Closed); }",
+  "expect": "pool: past maxSize, acquire waits",
+  "timeout": 300
+ },
+ {
+  "id": "P13",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        Instant deadline = start + this.home.core().acquireTimeout();",
+  "new": "        Instant deadline = start;",
+  "expect": "pool: past maxSize, acquire waits",
+  "timeout": 300
+ },
+ {
+  "id": "P14",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "    if (options.maxSize < 1) {",
+  "new": "    if (false) {",
+  "expect": "pool: a maxSize under 1",
+  "timeout": 300
+ },
+ {
+  "id": "P15",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        Optional<string> cluster = notOneServer(config: config);\n        match (give cluster) { case Some(value: why): { return Result::Err(error: RedisError::Config(detail: give why)); } case None: { } };\n",
+  "new": "",
+  "expect": "pool: a maxSize under 1",
+  "timeout": 300
+ },
+ {
+  "id": "P16",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        return Result::Err(error: RedisError::Usage(detail: \"a pool joined from a PoolShare cannot be shared again",
+  "new": "        return Result::Err(error: RedisError::Config(detail: \"a pool joined from a PoolShare cannot be shared again",
+  "expect": "pool: a pool joined from a share cannot be shared again",
+  "timeout": 300
+ },
+ {
+  "id": "P17",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        this.acquireTimeout = Duration.fromSecs(s: 6i64);",
+  "new": "        this.acquireTimeout = Duration.fromSecs(s: 30i64);",
+  "expect": "pool: the defaults",
+  "timeout": 300
+ },
+ {
+  "id": "P18",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "            case Some(value: conn): { this.home.core().release(conn: give conn, expires: this.expires); }",
+  "new": "            case Some(value: conn): { Connection gone = give conn; }",
+  "expect": "pool: one lease at a time keeps using one connection",
+  "timeout": 300
+ },
+ {
+  "id": "P19",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        if (this.dialers.length() > 0) {\n            Owned<Dialer> d = this.dialers[0].another();",
+  "new": "        if (false) {\n            Owned<Dialer> d = this.dialers[0].another();",
+  "expect": "pool: one lease at a time keeps using one connection",
+  "timeout": 300
+ },
+ {
+  "id": "P20",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        if (this.dialers.length() > 0) { next.add(item: this.dialers[0].fork()); }\n",
+  "new": "",
+  "expect": "pool: a pool joined in another isolate opens its connections through a fork",
+  "timeout": 300
+ },
+ {
+  "id": "P21",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                    // place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();\n                    match (give other) {\n                        case Some(value: o): { this.ends.put(slot: Slot::Empty); next.add(item: give o); }",
+  "new": "                    // place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();\n                    match (give other) {\n                        case Some(value: o): { next.add(item: give o); }",
+  "expect": "pool: an idle connection behind a freed place is lent first",
+  "timeout": 300
+ },
+ {
+  "id": "P22",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                if (most > 0i64) { spread = range(rng: ref this.rng, lo: 0i64, hi: most + 1i64); }",
+  "new": "                if (most > 0i64) { spread = most * 1000i64; }",
+  "expect": "pool: a connection past its lifetime",
+  "timeout": 300
+ },
+ {
+  "id": "IP1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        bool reselect = this.settings.database() != config.database();",
+  "new": "        bool reselect = false;",
+  "expect": "pool: the next lease finds database 0",
+  "timeout": 300
+ },
+ {
+  "id": "IP2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "                    if (!past(expires: until) && conn.settleIdle()) {",
+  "new": "                    if (!past(expires: until)) {",
+  "expect": "pool: with reconnect=off, an idle connection the server killed is not lent",
+  "timeout": 300
+ },
+ {
+  "id": "IP3",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (this.watching) {\n            Command unwatch = Command.of(name: \"UNWATCH\");",
+  "new": "        if (false) {\n            Command unwatch = Command.of(name: \"UNWATCH\");",
+  "expect": "pool: the next lease finds database 0",
+  "timeout": 300
+ }
+]

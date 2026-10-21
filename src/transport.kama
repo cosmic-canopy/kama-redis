@@ -1,7 +1,7 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
          std::net::SocketAddr, std::net::IpAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
          std::net::UnixStream, std::net::UnixAddr, std::time::Duration, std::memory::Owned, redis::RedisError };
-export { Transport, TcpTransport, UnixTransport, Dialer, Dialers, DialTarget };
+export { Transport, TcpTransport, UnixTransport, Dialer, Dialers, PoolDialers, DialTarget };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. That is what lets every step
@@ -46,6 +46,14 @@ type contract Dialer for resource implements Sendable {
 // a node's announced address somewhere else (a tunnel, a NAT), as redis-py's address_remap does.
 type contract Dialers for resource implements Sendable {
     fn Owned<Dialer> another();
+}
+
+// Dialers for a pool (`Pool.makeWith`): one for each connection it opens, and `fork` for each isolate the pool is
+// shared with (`Pool.share`), whose connections it opens there. `Dialers` is not extended, since a new member would
+// break every implementer of it.
+type contract PoolDialers for resource implements Sendable {
+    fn Owned<Dialer> another();
+    fn Owned<PoolDialers> fork();
 }
 
 // One place a connection attempt goes: an address of a host, or a Unix-domain socket.

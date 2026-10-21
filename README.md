@@ -478,8 +478,8 @@ made, then sends.
   password, a refused certificate or bytes that are not RESP end it at once.
 - **A transaction whose `WATCH` was lost** with the connection answers `WatchConflict` and is not sent, so `watched`
   runs its body again on the new connection.
-- **`reconnect=off`** leaves a lost connection closed (a pool that replaces its connections wants that), and so does
-  `close()`. A connection over a transport you opened (`connectOver`) has nothing to make it again with.
+- **`reconnect=off`** leaves a lost connection closed, and so does `close()`. A connection over a transport you
+  opened (`connectOver`) has nothing to make it again with.
 
 Whether a failed call's command could have run:
 
@@ -492,12 +492,60 @@ Whether a failed call's command could have run:
 | `Server` | yes | the server answered with an error; `LOADING`, `BUSY`, `TRYAGAIN` and `MASTERDOWN` mean it did not run it |
 | `Io`, `Timeout`, `Protocol`, `Unexpected`, `Tls` during a call | maybe | the connection was lost with the command sent or half answered: it may have run |
 | `Sentinel` | no | the sentinels gave no address, or the server they named never said it was the master |
+| `PoolTimeout` | no | every connection of a pool stayed leased past its `acquireTimeout` |
 | `Credentials` | no | the credentials provider failed, or the server refused its new login: the connection is closed, and the next call makes it again |
 | a cluster's `Server` `MOVED` or `ASK` | no | past `max_redirects`: the node named was asked, and did not run it |
 | any error from a command a cluster split by slot | partly | `MSET`, `DEL` and their kin go as a piece per slot: the others may have run |
 
 A [reliable queue](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/job_queue/src/main.kama) shows one way to
 live with "maybe": BLMOVE into a processing list, so a job that may have been taken is found again.
+
+## A pool shared by isolates
+
+`redis::pool` holds connections that the isolates of a program share, as redis-py, go-redis and Jedis pool theirs.
+`acquire()` lends one, as a `Lease`, which gives it back when it is dropped, on every path out of its scope.
+
+```kama
+// A pool of at most four connections, and one isolate's call on a lease.
+PoolOptions options = PoolOptions.defaults();
+options.maxSize = 4;
+Result<Pool, RedisError> made = Pool.make(config: config, options: options);
+// …
+Result<Lease, RedisError> got = pool.acquire();
+match (give got) {
+    case Ok(value: l): {
+        Lease lease = give l;
+        Command incr = cmd"INCR ${key}";
+        Result<int64, RedisError> n = reply::<int64>(result: lease.conn().call(command: incr));
+    }
+    case Err(error: e): { println(s: e.message()); }
+};
+```
+
+- **A pool belongs to one isolate.** `pool.share()` makes a `PoolShare`, which is `Sendable`, and `Pool.join(share:)`
+  in another isolate makes a pool over the same connections, within the same `maxSize`.
+- **A lease is a whole `Connection`:** commands, pipelines, transactions, `watched`, `Scan`, blocking commands. Where
+  a function takes `ref Connection`, borrow the lease's: `borrow lease.conn() as conn { keys.next(conn: conn); }`.
+  A lost link is made again by the lease's next call, as on any connection, and nothing is ever sent twice.
+- **`PoolOptions`**, in code (a URL option would be a second way to say the same):
+
+  | option | default |
+  |---|---|
+  | `maxSize` | the larger of 4 and the CPUs online |
+  | `acquireTimeout` | 6 s (go-redis's rule: a command's timeout and one more); then `PoolTimeout`, nothing sent |
+  | `lifetime` | none (go-redis and rueidis set none); a connection past it is closed when it is next released or acquired |
+  | `lifetimeJitter` | 90 s, a random part of it added to each connection's lifetime |
+- **Release puts back only what the lease changed:** `UNWATCH` for a `WATCH` in force and `SELECT` for a database
+  `select` changed, in one write sent as the lease drops, so a failure is the releaser's, never the next lease's. The
+  command timeout comes back, and pushes set aside are dropped (counted in `droppedPushes`). A connection whose link
+  is lost, one that was closed, one whose user `authenticate` changed, one past its lifetime and one whose put-back
+  failed is closed instead, and its place goes to a new connection. No `RESET` is sent: it would log the connection
+  out and drop its name, protocol and tracking.
+- **An idle connection is checked before it is lent,** with no round trip: one the server let go while it sat (an
+  idle timeout, a kill) is closed and its place used. The pool never makes a link again on its own time.
+- **A scan stays on its link.** A `Scan` continued on another lease's connection ends with `Usage`, since its cursor
+  means nothing on another link.
+- **`Pool.makeWith(dialers:)`** opens each connection's transports through a dialer of yours (`PoolDialers`).
 
 ## Pub/sub
 

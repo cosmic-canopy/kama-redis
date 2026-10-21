@@ -9,7 +9,7 @@ export { RedisError, ServerError, ServerCode, ConnectError, ConnectAttempt, Reco
 // "Could not connect to …"), so a log line from this client reads the same as one from the server's own tools.
 //
 // It is `@nonExhaustive`: a later release may add a kind of failure, so a `match` on it outside this package has a
-// `case _:`, and adding one breaks no caller (0.2.0 added `Sentinel`, 0.3.0 `Credentials`).
+// `case _:`, and adding one breaks no caller (0.2.0 added `Sentinel`, 0.3.0 `Credentials` and `PoolTimeout`).
 @nonExhaustive
 type enum RedisError implements Error, Sendable {
     // A setting that cannot be used: a URL that does not parse, an option this client does not know, a value out
@@ -56,7 +56,10 @@ type enum RedisError implements Error, Sendable {
     // when the connection logged in anew before a call: nothing of the call was sent, and the connection is closed
     // until its next call, which asks the provider again. At a connect it is the connect's error; at a redial, the
     // cause of `Reconnect`.
-    Credentials(CredentialsError error);
+    Credentials(CredentialsError error),
+    // A pool's every connection stayed leased past its acquireTimeout (`redis::pool`): nothing was sent, and the pool
+    // is as it was.
+    PoolTimeout;
 
     public const fn string message() {
         return match (this) {
@@ -74,6 +77,7 @@ type enum RedisError implements Error, Sendable {
             case Reconnect(error: r): r.message();
             case Sentinel(error: s): s.message();
             case Credentials(error: c): c.message();
+            case PoolTimeout: "the pool timed out waiting for a connection: every one stayed leased past acquireTimeout";
         };
     }
 

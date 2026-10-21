@@ -11,7 +11,7 @@ import { core::println, std::collections::DynamicArray, std::collections::FixedA
          redis::Connection, redis::Config, redis::RedisError, redis::Protocol, redis::TlsVersion, redis::TlsSession,
          redis::Subscriber, redis::Message, redis::Pipeline, redis::Replies, redis::Command, redis::resp::Value,
          redis_integration_tests::check, redis_integration_tests::setting, open, attempt, ask, mainUrl, commandOf, shown };
-export { tlsTests };
+export { tlsTests, tlsUrl, trusting };
 
 fn string cert(const ref string name) { return setting(name: "REDISTEST_CERTDIR").concat(other: "/").concat(other: name); }
 
