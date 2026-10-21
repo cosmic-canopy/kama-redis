@@ -6,7 +6,7 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-20
+## [0.2.0] - 2026-10-21
 
 Cluster and Sentinel (docs/ROADMAP.md, "Phase 6"). Tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under
 Sentinel and as a cluster, debug and release.
