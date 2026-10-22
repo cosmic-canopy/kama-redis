@@ -16,7 +16,7 @@ package needs `^0.1.6`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-13, KRD-14 and KRD-15. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-13, KRD-14, KRD-15 and KRD-16. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -109,6 +109,10 @@ Either one makes a multiplexed client the better design here, and this package w
 
 **Workaround:** none. The pool is the design until one lands (ROADMAP, phase 7b, decision 1).
 
+**Since:** cstar's `0.9.719+g44a0db85` (KR-201) adds `Poller.waker(token:)` and `Receiver.wakeOnSend`, "a channel is one
+more thing a loop waits on". No tag carries it yet (KRD-16). Once one does, this entry's repro and a multiplexed
+connection are to be tried on it, and the entry closed or narrowed.
+
 ### KRD-15 · MED · No shared mutable state across isolates: a cache per pool, a shared slot map and a shared master hint wait for KR-226
 
 **Found** 2026-10-21, planning 0.3.0. An absence: cstar's ROADMAP KR-226 (`Locked<T>`, a lock window), which names "a
@@ -133,6 +137,56 @@ window.
 
 **Workaround:** none built. The per-connection cache, the whole-`Cluster` lease and the per-connection provider fork
 are designs of their own, documented with their costs, not stand-ins to delete.
+
+### KRD-16 · MED · KR-230 removed `std::net::Ready` with no tag that has `Event`: no source builds on both the newest tag and cstar's newest build, so 0.3.0 cannot publish
+
+**Found** 2026-10-21, gating 0.3.0. cstar's KR-230 (`Poller` over each OS's own mechanism, 0.9.717–0.9.718) replaced
+`Ready` with `Event` and `Events`, and `Poller.add`/`wait` now take a token and a ready list. No tag carries it: the
+newest is v0.9.707. This package's users install tags, so its floor is v0.9.707 and CI pins it, while the registry
+checks a publish with cstar's newest build. Each half refuses what the other needs, so a release built on today's tag
+cannot publish, and one ported to KR-230 cannot build for its users. 0.3.0 is ready, gated on v0.9.707 and on cstar's
+committed 0.9.716, and waits on this.
+
+**Repro**, two whole programs, `kama check` on each:
+```kama
+// old.kama
+import { core::println, std::net::Poller, std::net::Interest, std::net::Ready, std::io::IoError };
+
+fn uint8 main() {
+    Result<Poller, IoError> made = Poller.create();
+    match (give made) { case Ok(value: p): { println(s: "made"); } case Err(error: e): { return 1; } };
+    Ready r = Ready.of(readable: false, writable: false);
+    return 0;
+}
+```
+```kama
+// new.kama
+import { core::println, std::net::Poller, std::net::Interest, std::net::Event, std::net::Events, std::io::IoError };
+
+fn uint8 main() {
+    Result<Poller, IoError> made = Poller.create();
+    match (give made) { case Ok(value: p): { println(s: "made"); } case Err(error: e): { return 1; } };
+    Events events = Events.withCapacity(capacity: 8);
+    return 0;
+}
+```
+
+| | `old.kama` | `new.kama` |
+|---|---|---|
+| v0.9.707 | OK | FAILED (4 errors) |
+| `0.9.719+g44a0db85` | FAILED (3 errors) | OK |
+
+**What it costs here.** `Transport.wait` returns `std::net::Ready`, so the type is in this package's public contract
+(src/transport.kama), and `TcpTransport`, `UnixTransport`, the TLS transport, the wire and a `ClusterSubscriber`'s wait
+use `Poller` and `Ready` (46 errors on 0.9.719). The unit program's scripted server and the live program's relays
+implement or use them too.
+
+**What would close it:** a tag with KR-230 (and KR-201, which this package's KRD-14 asked for), so the floor can move to
+it and the port be made once; or `Ready` and the one-descriptor `add`/`wait` kept beside the new forms until a tag
+carries both.
+
+**Workaround:** none built. When a tag carries KR-230, the port is planned to give `Transport.wait` a `Ready` of this
+package's own, so that a later change to `std::net` changes no user's `Transport` again (raised with the maintainer).
 
 ## FIXED — kept for the record
 

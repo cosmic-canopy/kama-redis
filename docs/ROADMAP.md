@@ -107,7 +107,9 @@ Anything not in a release yet is refused clearly rather than half there: before 
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6). Published 2026-10-21, from `f9b7d38`, on kama ≥ 0.9.707.
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), client-side caching
   (phase 4's research and decisions, kept below), and a credentials provider: a contract called at each connect, and
-  live re-AUTH when its credentials change (moved here from "Carried" on 2026-10-21; seven of the eight peers have one). Ready 2026-10-21 (phase 7b, steps 0–8), on kama ≥ 0.9.707; published on the maintainer's word.
+  live re-AUTH when its credentials change (moved here from "Carried" on 2026-10-21; seven of the eight peers have one). Ready 2026-10-21 (phase 7b, steps 0–8), on kama ≥ 0.9.707; published on the maintainer's word. It cannot publish yet: cstar's
+  newest build, which the registry checks with, took KR-230 (`std::net::Ready` became `Event`), and no tag has it
+  (KAMA_GAPS.md, KRD-16).
 - **0.4.0, typed commands:** phase 8. A method per command and the Redis 8 modules, typed, were the largest day-to-day
   gap the peer survey found: every peer has a typed API, and the four clients Redis maintains have every module.
 - **After 0.4.0:** phase 9's items, each placed in a release when it is planned.
@@ -754,6 +756,9 @@ Each step ends green before its commit:
      `libraryVersion()` say 0.3.0; "Decided, and why", "Phase 7b".
    - The gates from a clean clone, `tools/check-readme.sh` and `tools/check-examples.sh`, and `kama publish --dry-run`.
      Pushed and published on the maintainer's word.
+   - **Blocked from publishing by KRD-16:** by the end of the session cstar had committed KR-230 (0.9.718) and KR-201
+     (0.9.719), so its newest build, the registry's, refuses `std::net::Ready`, while v0.9.707, the newest tag, has
+     nothing else.
 
 ## Parity with the peers (surveyed 2026-10-21)
 
