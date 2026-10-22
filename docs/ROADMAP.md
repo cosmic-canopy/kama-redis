@@ -1,11 +1,16 @@
 # Roadmap
 
-Where this is, 2026-10-21: phases 0 to 6 and 7a are done, on kama v0.9.707 (the floor, CI's pin and the newest tag;
-cstar's newest build is `0.9.713+g03d52a6b`). **0.1.0, a complete client for one server, is published** (2026-10-19,
-from `146a4d8`). **0.2.0, Cluster and Sentinel, is published** (2026-10-21, from `f9b7d38`). **Phase 7b, for 0.3.0, is
-under way:** "Phase 7b: where to start", just below, is its session plan (drawn up 2026-10-21, the maintainer's
-decisions in it), and "Parity with the peers" (surveyed 2026-10-21) is why the releases after it hold what they
-hold. "Phase 6: where to start" has what each step of 0.2.0 did.
+Where this is, 2026-10-22: phases 0 to 7b are done, on kama v0.9.719 (the floor, CI's pin and the newest tag;
+cstar's newest build is `0.9.719+g00e13b15`). **0.1.0, a complete client for one server, is published** (2026-10-19,
+from `146a4d8`). **0.2.0, Cluster and Sentinel, is published** (2026-10-21, from `f9b7d38`). **0.3.0, scale, is
+ready** (phase 7b: a pool shared by isolates, client-side caching, a credentials provider, hardened across failovers),
+ported to v0.9.719's `Poller` on 2026-10-22, which closed KRD-16; it is published on the maintainer's word. "Phase 7b:
+where to start" has what each of its steps did, and "Parity with the peers" (surveyed 2026-10-21) is why the releases
+after it hold what they hold. Phase 8 (0.4.0, typed commands) is next.
+- The floor moved to v0.9.719 on 2026-10-22, when that tag came out with KR-230 (`std::net::Poller` over each OS's own
+  mechanism; `Ready` became `Event`, in an `Events` list) and KR-201 (a waker, and a channel a `Poller` waits on). It
+  closed KRD-16, and KRD-13 (0.9.715). `Transport.wait` takes `redis::Interest` and answers `redis::Ready` now, so the
+  contract names no `std::net` type ("Decided, and why", "Phase 7b").
 - The floor moved from v0.9.667 to v0.9.690 on 2026-10-20 (the maintainer's word), which closed KRD-11: from 0.9.684
   kama requires `fn uint8 main()` and every earlier tag refuses it. The ten `main`s, the README's programs and the live
   program's channel `send` (0.9.680) took the new forms.
@@ -56,7 +61,8 @@ hold. "Phase 6: where to start" has what each step of 0.2.0 did.
   the README's programs and the examples live. Every step proven by mutation (`tools/mutate.sh`). Published 2026-10-21.
   - `tools/test.sh` installs the manifest's dependencies first: a fresh checkout has no `.kama/deps`, and CI's unit
     jobs failed on the phase 5 push until it did (2026-10-18).
-- No gap is open here (KAMA_GAPS.md). KRD-9 (std had no in-place copy, and 0.9.675 refused the reader's copy between
+- Open gaps (KAMA_GAPS.md): KRD-14 (a connection shared by isolates, to try on KR-201) and KRD-15 (shared mutable
+  state, KR-226), both absences the 0.3.0 design documents its way around. KRD-16 and KRD-13 closed with v0.9.719. KRD-9 (std had no in-place copy, and 0.9.675 refused the reader's copy between
   two windows of its buffer) and KRD-12 closed with v0.9.707; KRD-10 (an application named like a dependency's module
   broke that dependency's imports) is refused by name since 0.9.693; KRD-11 closed with v0.9.690. KRD-7, KRD-8
   and KPG-38 were fixed upstream and tagged in v0.9.573 (2026-10-13): the floor and CI pin moved there, `RedisArg`
@@ -107,9 +113,10 @@ Anything not in a release yet is refused clearly rather than half there: before 
 - **0.2.0, topologies:** Cluster and Sentinel (phase 6). Published 2026-10-21, from `f9b7d38`, on kama ≥ 0.9.707.
 - **0.3.0, scale:** a pool shared across isolates, and hardening across a failover (phase 7b), client-side caching
   (phase 4's research and decisions, kept below), and a credentials provider: a contract called at each connect, and
-  live re-AUTH when its credentials change (moved here from "Carried" on 2026-10-21; seven of the eight peers have one). Ready 2026-10-21 (phase 7b, steps 0–8), on kama ≥ 0.9.707; published on the maintainer's word. It cannot publish yet: cstar's
-  newest build, which the registry checks with, took KR-230 (`std::net::Ready` became `Event`), and no tag has it
-  (KAMA_GAPS.md, KRD-16).
+  live re-AUTH when its credentials change (moved here from "Carried" on 2026-10-21; seven of the eight peers have one).
+  Ready 2026-10-21 (phase 7b, steps 0–8); held by KRD-16, since cstar's newest build, which the registry checks with,
+  took KR-230 (`std::net::Ready` became `Event`) before any tag had it; ported on 2026-10-22 to v0.9.719, which has
+  it, and on kama ≥ 0.9.719 since. Published on the maintainer's word.
 - **0.4.0, typed commands:** phase 8. A method per command and the Redis 8 modules, typed, were the largest day-to-day
   gap the peer survey found: every peer has a typed API, and the four clients Redis maintains have every module.
 - **After 0.4.0:** phase 9's items, each placed in a release when it is planned.
@@ -759,6 +766,15 @@ Each step ends green before its commit:
    - **Blocked from publishing by KRD-16:** by the end of the session cstar had committed KR-230 (0.9.718) and KR-201
      (0.9.719), so its newest build, the registry's, refuses `std::net::Ready`, while v0.9.707, the newest tag, has
      nothing else.
+   - **Unblocked (2026-10-22):** cstar tagged v0.9.719. The port moved the floor and CI's pin there, gave
+     `Transport.wait` this package's own `Interest` and `Ready`, and waits through one `Events` per socket transport,
+     registered again only when the side waited for changes (`SocketPoll`). Mutations in `tools/mutations/krd16.json`.
+   - **The port's gates:** `tools/test.sh` on v0.9.719 and on `0.9.719+g00e13b15`, and the matrix on all eight servers
+     on v0.9.719. Of its 16 runs, valkey-9.1's debug run failed once: the standalone hardening counted one lease failing
+     after the word that the topology had settled (one of 20 such runs that day). Four runs of valkey-9.1 after it were
+     green. It fits the restart's known window: a call written to a link before the forwarder passes the server's close
+     on fails on I/O, and is not sent again. The test does not say which disruption it was, so its timing is unchanged.
+     If it comes back, record the failure's phase and error in the test before changing a wait.
 
 ## Parity with the peers (surveyed 2026-10-21)
 
@@ -3248,6 +3264,16 @@ release and sanitized, and confirmed the kama facts underneath.
     subscriber's `Name` went.
   - **The hardening test's stale check** (step 7) is a hit right after the lease's own INCR, never "a value older
     than the INCR": a failover can discard the INCR itself, so the latter is no evidence about the cache.
+  - **The `Transport` contract owns its readiness types** (2026-10-22, the KRD-16 port; the maintainer agreed).
+    `wait` takes `redis::Interest` and answers `redis::Ready`, the shapes std's had, where it named `std::net`'s.
+    - cstar's ruling on KRD-16 concerned std: std keeps one way to wait on a socket (GOALS #4), and before 1.0 a
+      source break is allowed. That is why the contract should not name std's types: each such break would reach every
+      caller's own transport.
+    - tokio 1.0 keeps mio's types out of its public API, and hyper 1.0 defines its own `rt::Read`/`Write` rather than
+      expose tokio's, for the same reason.
+    - It costs a two-field value, a three-case enum and one mapping in `SocketPoll`. `Interest` is exhaustive, so an
+      implementer's `match` needs no `case _:`.
+    - If `@kama/postgres` makes the same change, the two should use these names.
 - **Found on the way:**
   - KRD-13 (step 0): `kama check` takes an `Optional<R>` where a resource `R` is wanted; only clang refuses it.
   - cstar's working tree held KR-230's `Poller` (`std::net::Ready` becomes `Event`, with a token) uncommitted from

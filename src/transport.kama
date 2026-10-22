@@ -1,7 +1,8 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
-         std::net::SocketAddr, std::net::IpAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
-         std::net::UnixStream, std::net::UnixAddr, std::time::Duration, std::memory::Owned, redis::RedisError };
-export { Transport, TcpTransport, UnixTransport, Dialer, Dialers, PoolDialers, DialTarget };
+         std::net::SocketAddr, std::net::IpAddr, std::net::Poller, std::net::Interest as NetInterest, std::net::Event,
+         std::net::Events, std::net::Shutdown, std::net::UnixStream, std::net::UnixAddr, std::time::Duration,
+         std::memory::Owned, redis::RedisError };
+export { Transport, Interest, Ready, TcpTransport, UnixTransport, Dialer, Dialers, PoolDialers, DialTarget };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. That is what lets every step
@@ -29,6 +30,17 @@ type contract Transport for resource implements Sendable {
     // This transport's own account of a failure it reported, when it has one (a TLS transport words its failures
     // as its TLS layer does); `None` to report the `IoError` as it is.
     fn Optional<RedisError> explain(IoError error);
+}
+
+// The side a `Transport.wait` is for. This package's own, as `Ready` is, so that the contract names no `std::net`
+// type and a change there changes no caller's transport.
+type enum Interest { Read, Write, ReadWrite }
+
+// What a `Transport.wait` found: whether a read, a write, or both can proceed now. A timeout is neither.
+@generate(of)
+type value Ready implements Sendable {
+    public bool readable;
+    public bool writable;
 }
 
 // Opens the transports `Connection.connectWith` makes, one per address tried, so a connection through a tunnel or
@@ -98,19 +110,72 @@ fn string placeOf(const ref string host, SocketAddr address) {
     return host.concat(other: " at ").concat(other: shown);
 }
 
+// One socket's readiness, over a `Poller` of its own. The interest is registered again only when it changes, so a
+// wait for what the last one asked is one system call.
+type resource SocketPoll implements Sendable {
+    Poller poller;
+    Events events;
+    isize fd;
+    Interest registered;
+
+    friend redis::TcpTransport::connect[over, wait];
+    friend redis::TcpTransport::wait[wait];
+    friend redis::UnixTransport::connect[over, wait];
+    friend redis::UnixTransport::wait[wait];
+
+    unsafe ctor make(Poller poller, isize fd, Interest registered) {
+        this.poller = give poller;
+        Events one = Events.withCapacity(capacity: 1);
+        this.events = give one;
+        this.fd = fd;
+        this.registered = registered;
+    }
+
+    // A poll of `fd`, watched for `interest` until a wait asks for another.
+    unsafe ctor Result<SocketPoll, IoError> over(isize fd, Interest interest) {
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Unit, IoError> added = poller.add(fd: fd, interest: netInterest(interest: interest), token: 0);
+        match (added) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: SocketPoll.make(poller: give poller, fd: fd, registered: interest));
+    }
+
+    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit), as `Transport.wait` does.
+    unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (interest != this.registered) {
+            Result<Unit, IoError> added = this.poller.add(fd: this.fd, interest: netInterest(interest: interest), token: 0);
+            match (added) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+            this.registered = interest;
+        }
+        Result<int32, IoError> waited = this.poller.wait(events: ref this.events, timeoutMs: timeoutMs);
+        match (waited) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: e); } };
+        bool readable = false;
+        bool writable = false;
+        foreach (Event e in this.events) {
+            if (e.readable) { readable = true; }
+            if (e.writable) { writable = true; }
+        }
+        return Result::Ok(value: Ready.of(readable: readable, writable: writable));
+    }
+}
+
+fn NetInterest netInterest(Interest interest) {
+    return match (interest) { case Read: NetInterest::Read; case Write: NetInterest::Write; case ReadWrite: NetInterest::ReadWrite; };
+}
+
 // TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.
 type resource TcpTransport implements Transport, Sendable {
     TcpStream stream;
-    Poller poller;
+    SocketPoll poll;
     isize handle = 0;
 
     // A connection records its socket as it opens it, so a cluster's subscriber can wait on many at once.
     friend redis::Opener::open[handle];
 
-    unsafe ctor make(TcpStream stream, Poller poller) {
+    unsafe ctor make(TcpStream stream, SocketPoll poll) {
         this.handle = stream.rawHandle();
         this.stream = give stream;
-        this.poller = give poller;
+        this.poll = give poll;
     }
 
     // Connect to `address` within `timeoutMs` (< 0: no limit). A timeout is a `TimedOut` error that no OS code
@@ -118,17 +183,17 @@ type resource TcpTransport implements Transport, Sendable {
     public unsafe ctor Result<TcpTransport, IoError> connect(const ref SocketAddr address, int32 timeoutMs) {
         Result<TcpStream, IoError> started = TcpStream.connectToNonBlocking(address: address);
         TcpStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
-        Result<Poller, IoError> made = Poller.create();
-        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
-        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
-        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
-        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
-        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<SocketPoll, IoError> made = SocketPoll.over(fd: stream.rawHandle(), interest: Interest::Write);
+        SocketPoll poll = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Ready, IoError> waited = poll.wait(interest: Interest::Write, timeoutMs: timeoutMs);
+        Ready ready = match (waited) { case Ok(value: r): r; case Err(error: e): { return Result::Err(error: e); } };
+        // Either side reported means the connect resolved; a failed one reads as readable too.
+        if (!ready.readable && !ready.writable) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
         Result<Unit, IoError> connected = stream.checkConnected();
         match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
         Result<Unit, IoError> nodelay = stream.setNoDelay(on: true);
         match (nodelay) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        return Result::Ok(value: TcpTransport.make(stream: give stream, poller: give poller));
+        return Result::Ok(value: TcpTransport.make(stream: give stream, poll: give poll));
     }
 
     // TCP keepalive as hiredis's redisKeepAlive sets it: on, idle `idle`, a probe every idle/3 (at least one
@@ -149,11 +214,7 @@ type resource TcpTransport implements Transport, Sendable {
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
 
     public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
-        this.poller.add(fd: this.handle, interest: interest);
-        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
-        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
-        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
-        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+        return this.poll.wait(interest: interest, timeoutMs: timeoutMs);
     }
 
     public unsafe fn void shutdown() {
@@ -167,13 +228,13 @@ type resource TcpTransport implements Transport, Sendable {
 // own `Poller`. The connect is non-blocking too, so `connect_timeout` bounds it.
 type resource UnixTransport implements Transport, Sendable {
     UnixStream stream;
-    Poller poller;
+    SocketPoll poll;
     isize handle = 0;
 
-    unsafe ctor make(UnixStream stream, Poller poller) {
+    unsafe ctor make(UnixStream stream, SocketPoll poll) {
         this.handle = stream.rawHandle();
         this.stream = give stream;
-        this.poller = give poller;
+        this.poll = give poll;
     }
 
     // Connect to the socket at `path` within `timeoutMs` (< 0: no limit). A timeout is a `TimedOut` error.
@@ -182,27 +243,22 @@ type resource UnixTransport implements Transport, Sendable {
         UnixAddr target = match (address) { case Ok(value: a): a; case Err(error: e): { return Result::Err(error: e); } };
         Result<UnixStream, IoError> started = UnixStream.connectToNonBlocking(address: target);
         UnixStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
-        Result<Poller, IoError> made = Poller.create();
-        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        Result<SocketPoll, IoError> made = SocketPoll.over(fd: stream.rawHandle(), interest: Interest::Write);
+        SocketPoll poll = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
         // A local connect has usually completed already; one in flight resolves once the socket is writable.
-        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
-        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
-        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
-        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<Ready, IoError> waited = poll.wait(interest: Interest::Write, timeoutMs: timeoutMs);
+        Ready ready = match (waited) { case Ok(value: r): r; case Err(error: e): { return Result::Err(error: e); } };
+        if (!ready.readable && !ready.writable) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
         Result<Unit, IoError> connected = stream.checkConnected();
         match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        return Result::Ok(value: UnixTransport.make(stream: give stream, poller: give poller));
+        return Result::Ok(value: UnixTransport.make(stream: give stream, poll: give poll));
     }
 
     public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.stream.read(into: into); }
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
 
     public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
-        this.poller.add(fd: this.handle, interest: interest);
-        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
-        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
-        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
-        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+        return this.poll.wait(interest: interest, timeoutMs: timeoutMs);
     }
 
     public unsafe fn void shutdown() {

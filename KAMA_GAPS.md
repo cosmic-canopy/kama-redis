@@ -5,10 +5,10 @@ Every entry with a repro was **run** on the version named. Nothing is inferred f
 that is an absence cites the cstar files that show it instead. This file is excluded from the published
 package, as it is in `@kama/postgres` and `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.707` (tag `v0.9.707`), which CI pins and the manifests' floor names. It moved from
-`v0.9.667` to `v0.9.690` on 2026-10-20, which closed KRD-11, and to `v0.9.707` on 2026-10-21, which closed KRD-9 and
-KRD-12: the tree carries no workaround. Each repro is also run on cstar's newest build, which the registry publishes
-with: on 2026-10-21, at phase 7b's start, `0.9.713+g03d52a6b`. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
+**Current compiler:** `kama 0.9.719` (tag `v0.9.719`), which CI pins and the manifests' floor names. It moved from
+`v0.9.667` to `v0.9.690` on 2026-10-20, which closed KRD-11, to `v0.9.707` on 2026-10-21, which closed KRD-9 and
+KRD-12, and to `v0.9.719` on 2026-10-22, which closed KRD-13 and KRD-16: the tree carries no workaround. Each repro is
+also run on cstar's newest build, which the registry publishes with: on 2026-10-22, `0.9.719+g00e13b15`. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
 statements after a `while (true)`, and from 0.9.706 a `string.find` whose type changed); 0.1.6 does, and this
 package needs `^0.1.6`.
 
@@ -16,7 +16,7 @@ package needs `^0.1.6`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-13, KRD-14, KRD-15 and KRD-16. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** KRD-14 and KRD-15. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -31,44 +31,6 @@ the commit that made it pass.
 ---
 
 ## OPEN
-
-### KRD-13 · MED · `kama check` takes an `Optional<R>` where a resource `R` is wanted, and only the C compiler refuses it
-
-**Found** 2026-10-21, on `0.9.707` (tag `v0.9.707`) and cstar's `0.9.713+g03d52a6b`, writing phase 7b's first repro:
-`taken.add(item: this.provider.pop())`, which is wrong, since `pop()` answers `Optional<T>`. For a number the checker
-refuses the same mistake, in good words: "a local is declared `int32`, so it cannot be initialized with an
-`Optional<int32>` — take its value out with `match`". It also refuses an unrelated resource ("argument `b` expects a
-`Box`, so it cannot be given a `Other`"). But an `Optional` of the very resource wanted passes `kama check`, as a
-local's initializer and as an argument. `kama build` then fails in clang, in the generated C's names.
-
-**Repro**, a whole program:
-
-```kama
-import { std::collections::DynamicArray };
-type resource Box { int32 n; public ctor make(int32 n) { this.n = n; } }
-fn void keep(Box b) { }
-fn uint8 main() {
-    DynamicArray<Box> from = DynamicArray.empty();
-    from.add(item: Box.make(n: 1));
-    from.add(item: Box.make(n: 2));
-    Box b = from.pop();      // an Optional<Box> where a Box is wanted
-    keep(b: from.pop());     // and as an argument
-    return 0;
-}
-```
-
-| | `kama check` | `kama build` |
-|---|---|---|
-| `v0.9.707`, `0.9.713+g03d52a6b` | `OK (4 units analyzed)` | clang: "assigning to 'k_Fkrd13__Box' … from incompatible type 'kama__Optional_k_Fkrd13__Box'" at 8:9, and "passing 'kama__Optional_k_Fkrd13__Box' to parameter of incompatible type 'k_Fkrd13__Box'" at 9:20 |
-
-**Why MED:** the registry checks a publish with `kama check`, so a package with this mistake on a path its own build
-never compiles (a `@compileFor` arm, say) would pass the registry and fail for every consumer. Here the build caught
-it at once, so nothing is worked around.
-
-**What would close it:** the number case's refusal, for a resource payload too.
-
-**Workaround:** none needed; the code takes the value out with `match (give p) { case Some(value: x): … }`, as it
-should.
 
 ### KRD-14 · MED · An isolate cannot wait on a socket and a channel at once, so a connection shared by isolates cannot multiplex
 
@@ -109,9 +71,9 @@ Either one makes a multiplexed client the better design here, and this package w
 
 **Workaround:** none. The pool is the design until one lands (ROADMAP, phase 7b, decision 1).
 
-**Since:** cstar's `0.9.719+g44a0db85` (KR-201) adds `Poller.waker(token:)` and `Receiver.wakeOnSend`, "a channel is one
-more thing a loop waits on". No tag carries it yet (KRD-16). Once one does, this entry's repro and a multiplexed
-connection are to be tried on it, and the entry closed or narrowed.
+**Since:** cstar's 0.9.719 (KR-201) adds `Poller.waker(token:)` and `Receiver.wakeOnSend`, "a channel is one more
+thing a loop waits on", and the v0.9.719 tag carries it (2026-10-22). This entry's repro and a multiplexed connection
+are to be tried on it, and the entry closed or narrowed.
 
 ### KRD-15 · MED · No shared mutable state across isolates: a cache per pool, a shared slot map and a shared master hint wait for KR-226
 
@@ -138,7 +100,13 @@ window.
 **Workaround:** none built. The per-connection cache, the whole-`Cluster` lease and the per-connection provider fork
 are designs of their own, documented with their costs, not stand-ins to delete.
 
-### KRD-16 · MED · KR-230 removed `std::net::Ready` with no tag that has `Event`: no source builds on both the newest tag and cstar's newest build, so 0.3.0 cannot publish
+## FIXED — kept for the record
+
+KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
+the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
+same change, the first tag with all three.
+
+### KRD-16 · MED · KR-230 removed `std::net::Ready` with no tag that has `Event`: no source builds on both the newest tag and cstar's newest build, so 0.3.0 cannot publish — FIXED by the v0.9.719 tag
 
 **Found** 2026-10-21, gating 0.3.0. cstar's KR-230 (`Poller` over each OS's own mechanism, 0.9.717–0.9.718) replaced
 `Ready` with `Event` and `Events`, and `Poller.add`/`wait` now take a token and a ready list. No tag carries it: the
@@ -188,11 +156,55 @@ carries both.
 **Workaround:** none built. When a tag carries KR-230, the port is planned to give `Transport.wait` a `Ready` of this
 package's own, so that a later change to `std::net` changes no user's `Transport` again (raised with the maintainer).
 
-## FIXED — kept for the record
+**Closed** 2026-10-22: cstar tagged v0.9.719 (2026-10-22), with KR-230 and KR-201, rather than keeping `Ready` beside
+the new forms (GOALS #4, one way to do a thing; pre-1.0 source breaks are allowed). On v0.9.719 and
+`0.9.719+g00e13b15` alike, `old.kama` fails (3 errors, "module `std.net` does not export `Ready`") and `new.kama` is
+OK. The floor and CI pin moved to v0.9.719, and the port went as planned: `Transport.wait` takes `redis::Interest` and
+answers `redis::Ready`, this package's own, so the contract names no `std::net` type. The socket transports wait
+through one `Events` each, and register a socket again only when the side waited for changes.
 
-KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
-the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
-same change, the first tag with all three.
+### KRD-13 · MED · `kama check` takes an `Optional<R>` where a resource `R` is wanted, and only the C compiler refuses it — FIXED in 0.9.715, tagged in v0.9.719
+
+**Found** 2026-10-21, on `0.9.707` (tag `v0.9.707`) and cstar's `0.9.713+g03d52a6b`, writing phase 7b's first repro:
+`taken.add(item: this.provider.pop())`, which is wrong, since `pop()` answers `Optional<T>`. For a number the checker
+refuses the same mistake, in good words: "a local is declared `int32`, so it cannot be initialized with an
+`Optional<int32>` — take its value out with `match`". It also refuses an unrelated resource ("argument `b` expects a
+`Box`, so it cannot be given a `Other`"). But an `Optional` of the very resource wanted passes `kama check`, as a
+local's initializer and as an argument. `kama build` then fails in clang, in the generated C's names.
+
+**Repro**, a whole program:
+
+```kama
+import { std::collections::DynamicArray };
+type resource Box { int32 n; public ctor make(int32 n) { this.n = n; } }
+fn void keep(Box b) { }
+fn uint8 main() {
+    DynamicArray<Box> from = DynamicArray.empty();
+    from.add(item: Box.make(n: 1));
+    from.add(item: Box.make(n: 2));
+    Box b = from.pop();      // an Optional<Box> where a Box is wanted
+    keep(b: from.pop());     // and as an argument
+    return 0;
+}
+```
+
+| | `kama check` | `kama build` |
+|---|---|---|
+| `v0.9.707`, `0.9.713+g03d52a6b` | `OK (4 units analyzed)` | clang: "assigning to 'k_Fkrd13__Box' … from incompatible type 'kama__Optional_k_Fkrd13__Box'" at 8:9, and "passing 'kama__Optional_k_Fkrd13__Box' to parameter of incompatible type 'k_Fkrd13__Box'" at 9:20 |
+
+**Why MED:** the registry checks a publish with `kama check`, so a package with this mistake on a path its own build
+never compiles (a `@compileFor` arm, say) would pass the registry and fail for every consumer. Here the build caught
+it at once, so nothing is worked around.
+
+**What would close it:** the number case's refusal, for a resource payload too.
+
+**Workaround:** none needed; the code takes the value out with `match (give p) { case Some(value: x): … }`, as it
+should.
+
+**Closed** 2026-10-22: on v0.9.719 and cstar's `0.9.719+g00e13b15`, `kama check` refuses both lines of the repro in
+the number case's words: "a local expects a `Box`, so it cannot be given an `Optional<Box>` — take its value out with
+`match` (`case Some(value: v): …` / `case None: …`)" at 8:4, and the same for argument `b` at 9:4. cstar's `d4357ddb`
+(0.9.715). Nothing here worked around it.
 
 ### KRD-12 · MED · A value-producing `match` arm that ends in `panic` has no form both kinds of compiler take — FIXED in 0.9.696, tagged in v0.9.707
 

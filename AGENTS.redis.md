@@ -17,7 +17,7 @@ the matching part of its code before designing something here. Copy what fits; d
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.707**, declared as `"kama"` in every manifest here, and CI pins `v0.9.707`. That is the
+**The package needs kama ≥ 0.9.719**, declared as `"kama"` in every manifest here, and CI pins `v0.9.719`. That is the
 first tagged compiler with everything this package relies on (users install tagged releases):
 - the registry keys `description`, `repository` and `keywords` in `kama.json` (0.9.523);
 - `copy` through an enum whose payloads copy, `Optional<string>` included (0.9.527, KRD-4);
@@ -37,17 +37,20 @@ first tagged compiler with everything this package relies on (users install tagg
 - a project named like a dependency's module refused by name (0.9.693, KRD-10);
 - `View.copyWithin` (0.9.694, KRD-9), one `memmove`, which `Reader.spare` slides its unread bytes with;
 - a value-producing arm that may end in `panic`, and unreachable code refused (0.9.696, KRD-12): a test's arm that
-  cannot go on ends in `panic(msg:)`, and nothing follows a `while (true)` or a function's last `panic`.
+  cannot go on ends in `panic(msg:)`, and nothing follows a `while (true)` or a function's last `panic`;
+- `Poller` over each OS's own mechanism (0.9.717–0.9.718, KR-230): `add` takes a token and answers a `Result`, and a
+  wait fills an `Events` list. `std::net::Ready` and `readyFor` are gone, and no tag before v0.9.719 has the new form
+  (KRD-16).
 
 Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), for 0.2.0 on the v0.9.707 tag
-(2026-10-21, the newest tag and cstar's newest build), and for 0.3.0 on v0.9.707 and cstar's committed 0.9.716
-(2026-10-21; its working tree then held KR-230's `Poller` uncommitted, read live from its `lib/`, so the gates ran
-its committed compiler with its own `lib/` and `include/`), with `@kama/tls` ^0.1.6, the first release that builds on
-0.9.696 and later. `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
+(2026-10-21, the newest tag and cstar's newest build), and for 0.3.0 on the v0.9.719 tag and cstar's
+`0.9.719+g00e13b15` (2026-10-22), with `@kama/tls` ^0.1.6, the first release that builds on 0.9.696 and later.
+Check `git -C ~/Documents/cstar status --short lib include` before a gate: cstar's build reads its `lib/` live, so
+another session's uncommitted std change breaks every compile mid-gate. `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:
 gate on that build too before calling a release ready. Install a tag beside your own with cstar's `install.sh`
-(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.707`), and run the gates with `KAMA=<dir>/bin/kama`.
+(`KAMA_HOME=<dir> KAMA_VERSION=v0.9.719`), and run the gates with `KAMA=<dir>/bin/kama`.
 - `string.find` answers `Optional<isize>` since 0.9.706; nothing here calls it.
 
 **Every step of a phase is proven by mutation** (`tools/mutate.sh tools/mutations/<file>.json`, `--server S` for the
@@ -78,6 +81,11 @@ printed first.
     sends each step's bytes as records of their own, as a server does; `Truncate` ends a reply mid-record with no
     close_notify. The unit tests read the PKI through `REDISTEST_CERTDIR`, which `tools/test.sh` sets after running
     `tools/gen-test-certs.sh` (OpenSSL or LibreSSL).
+
+- **The `Transport` contract names no `std::net` type** (src/transport.kama). `wait` takes `redis::Interest` and
+  answers `redis::Ready`, this package's own, so a change to std (KR-230 removed `std::net::Ready`) changes no caller's
+  transport. The socket transports map to std's in `SocketPoll`, which registers a socket's interest again only when it
+  changes. A new contract member uses `redis::` types and std's basics (`IoError`, the views), nothing more.
 
 - **A lost connection is made again by its next call, and nothing is ever sent twice** (docs/ROADMAP.md, "Phase
   7a"). Keep it that way.

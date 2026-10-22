@@ -14,10 +14,10 @@
 // client sent, and its hangups send close_notify. A client that sends it anything but TLS breaks its handshake, and it
 // hangs up.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::collections::FixedArray,
-         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::ReliableStream,
+         std::io::IoError, std::io::IoErrorKind, std::net::ReliableStream,
          std::memory::Owned, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, std::concurrent::Sender,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
-         redis::Transport, redis::Dialer, redis::Dialers, redis::DialTarget, redis::RedisError,
+         redis::Transport, redis::Interest, redis::Ready, redis::Dialer, redis::Dialers, redis::DialTarget, redis::RedisError,
          redis::resp::Reader, redis::resp::Read, redis::resp::Value };
 export { FakeServer, Step, ScriptDialer, ScriptDialers, Dial, ServerSide };
 

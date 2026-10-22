@@ -6,13 +6,19 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-21
+## [0.3.0] - 2026-10-22
 
 Scale (docs/ROADMAP.md, "Phase 7b"): a pool shared by isolates, client-side caching and a credentials provider, hardened
 across failovers. Tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under Sentinel and as a cluster, debug and
 release.
 
 What a caller of 0.2.0 may need to change:
+- kama ≥ 0.9.719 (was 0.9.707), whose `std::net::Poller` reports readiness as `Event`s in an `Events` list:
+  `std::net::Ready` is gone (KR-230).
+- A `Transport` of your own takes `redis::Interest` and answers `redis::Ready`, where it named `std::net::Interest`
+  and `std::net::Ready`: change the two imports. The two have the same cases and fields as std's did, and
+  `Interest` is exhaustive, so a `match` on it needs no `case _:`. The contract names no `std::net` type now, so a
+  later change there leaves your transport alone.
 - `RedisError` gained `Credentials` and `PoolTimeout` (it is `@nonExhaustive`, so a `match` with `case _:` needs
   nothing).
 - A `Scan` continued over another connection than the one it began on ends with `Usage` (its message names both
@@ -51,6 +57,11 @@ What a caller of 0.2.0 may need to change:
   cluster the first after the map changed, makes a round trip first, and a node the map takes a slot from has its cache
   emptied. Emptied on a lost link, FLUSHALL, another database, `authenticate` and a login as another user.
   `cacheStats()` (`CacheStats`). The commands it may hold are generated from every server (src/wire/cacheable.kama).
+
+### Changed
+- `Transport.wait(interest:, timeoutMs:)` takes `redis::Interest` and answers `redis::Ready`, both new and this
+  package's own. The TCP and Unix transports wait through KR-230's `Poller`, and register a socket again only when the
+  side waited for changes, so a wait for the same side as the last is one system call.
 
 ### Fixed
 - A `Scan` told links apart by a count of each connection's redials, which starts at 0 on every connection, so a scan

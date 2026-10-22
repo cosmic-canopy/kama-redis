@@ -2,7 +2,7 @@
   "name": "pubsub_worker",
   "version": "0.1.0",
   "kind": "executable",
-  "kama": ">=0.9.707",
+  "kama": ">=0.9.719",
   "entry": "src/main.kama",
   "dependencies": { "@kama/redis": { "path": "../.." } },
   "modules": { ".": { "visibility": "internal" } }

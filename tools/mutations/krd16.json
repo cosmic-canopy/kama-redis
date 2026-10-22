@@ -1,0 +1,18 @@
+[
+ {
+  "id": "K1",
+  "suite": "integration",
+  "file": "src/transport.kama",
+  "old": "        if (interest != this.registered) {",
+  "new": "        if (interest != this.registered && this.registered != Interest::ReadWrite) {",
+  "expect": "failure: a 10 MiB value round trip"
+ },
+ {
+  "id": "K2",
+  "suite": "integration",
+  "file": "src/transport.kama",
+  "old": "            if (e.readable) { readable = true; }",
+  "new": "            if (e.readable) { }",
+  "expect": "flush: connect"
+ }
+]

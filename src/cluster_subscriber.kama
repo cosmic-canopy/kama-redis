@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::collections::Deque, std::memory::Owned, std::time::Duration,
-         std::time::monotonicNow, std::time::sleep, std::random::Rng, std::net::Poller, std::net::Interest, std::io::IoError,
+         std::time::monotonicNow, std::time::sleep, std::random::Rng, std::net::Poller, std::net::Interest, std::net::Events, std::io::IoError,
          redis::Cluster, redis::Config, redis::Dialers, redis::Connection, redis::Subscriber, redis::Delivery,
          redis::ChannelKind, redis::RedisArg, redis::Command, redis::RedisError, redis::ReconnectError, redis::cluster::ClusterNode,
          redis::cluster::keySlot, redis::wire::Deadline, redis::wire::backoffAfter };
@@ -232,12 +232,20 @@ type resource ClusterSubscriber implements Sendable {
             match (give made) {
                 case Ok(value: p): {
                     Poller poller = give p;
+                    bool watched = true;
                     isize k = 0;
-                    while (k < handles.length()) { poller.add(fd: handles[k], interest: Interest::Read); k = k + 1; }
-                    int32 ms = -1;
-                    if (until.isBounded()) { ms = until.remainingMs(); }
-                    Result<int32, IoError> waited = poller.wait(timeoutMs: ms);
-                    polled = match (waited) { case Ok(value: n): true; case Err(error: e): false; };
+                    while (k < handles.length() && watched) {
+                        Result<Unit, IoError> added = poller.add(fd: handles[k], interest: Interest::Read, token: cast<uint64>(k));
+                        watched = match (added) { case Ok(value: u): true; case Err(error: e): false; };
+                        k = k + 1;
+                    }
+                    if (watched) {
+                        int32 ms = -1;
+                        if (until.isBounded()) { ms = until.remainingMs(); }
+                        Events ready = Events.withCapacity(capacity: handles.length());
+                        Result<int32, IoError> waited = poller.wait(events: ref ready, timeoutMs: ms);
+                        polled = match (waited) { case Ok(value: n): true; case Err(error: e): false; };
+                    }
                 }
                 case Err(error: e): { }
             };

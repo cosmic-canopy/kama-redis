@@ -1,6 +1,6 @@
-import { std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind, std::memory::Owned, std::net::Interest,
-         std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
-         redis::Transport, redis::RedisError, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
+import { std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
+         std::time::Instant, std::time::Duration, std::time::monotonicNow,
+         redis::Transport, redis::Interest, redis::Ready, redis::RedisError, redis::resp::Reader, redis::resp::Read, redis::resp::Value,
          redis::resp::Limits };
 export { Wire, Deadline, footprint, unattributed };
 

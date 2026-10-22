@@ -3,10 +3,10 @@
 // (tools/test.sh sets it). Every case reads one byte at a time and writes three at a time, so every TLS record is
 // split everywhere it can be.
 import { core::println, core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
-         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::net::SocketAddr, std::net::resolve,
+         std::io::IoError, std::io::IoErrorKind, std::net::SocketAddr, std::net::resolve,
          std::memory::Owned, std::time::Duration, std::fs::readFile, std::fs::writeFile,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion as EngineVersion,
-         redis::Connection, redis::Config, redis::RedisError, redis::Transport, redis::Dialer, redis::TlsVerify, redis::TlsVersion,
+         redis::Connection, redis::Config, redis::RedisError, redis::Transport, redis::Interest, redis::Ready, redis::Dialer, redis::TlsVerify, redis::TlsVersion,
          redis::TlsSession, redis::Subscriber, redis::Pipeline, redis::Command, redis::Replies, redis::resp::Value,
          redis_unit_tests::check, FakeServer, Step, ScriptDialer, Dial, welcome, expect, reply, configOf, callOutcome, isSimple,
          commandOf, serverVersions, ended, setThenIncr, transaction, shown, soon };
