@@ -1,0 +1,97 @@
+// pool: one pool shared by four isolates. Each isolate joins the pool from a share the main isolate made, and runs 250
+// INCRs, each on a lease of its own: at most two connections between all of them, and every INCR counted once.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/pool/kama.json
+import { core::println, core::env, std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::Isolate,
+         redis::Config, redis::RedisError, redis::cmd, redis::reply,
+         redis::pool::Pool, redis::pool::PoolOptions, redis::pool::PoolShare, redis::pool::Lease };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+// One isolate's work: 250 INCRs through the pool it joins, and how many failed, told back.
+type resource Worker implements Sendable {
+    PoolShare share;
+    Sender<int32> done;
+    public ctor make(PoolShare share, Sender<int32> done) { this.share = give share; this.done = give done; }
+    public unsafe fn void run() {
+        Pool pool = Pool.join(share: this.share);
+        string key = "example:pool:hits";
+        int32 failed = 0;
+        int32 i = 0;
+        while (i < 250) {
+            // The lease gives its connection back when it goes out of scope, on every path.
+            Result<Lease, RedisError> got = pool.acquire();
+            match (give got) {
+                case Ok(value: l): {
+                    Lease lease = give l;
+                    Result<int64, RedisError> n = reply::<int64>(result: lease.conn().call(command: cmd"INCR ${key}"));
+                    match (n) { case Ok(value: v): { } case Err(error: e): { failed = failed + 1; } };
+                }
+                case Err(error: e): { failed = failed + 1; }
+            };
+            i = i + 1;
+        }
+        _ = this.done.send(item: failed);
+    }
+}
+
+unsafe fn void work(Worker job) { job.run(); }
+
+fn uint8 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    PoolOptions options = PoolOptions.defaults();
+    options.maxSize = 2;
+    Result<Pool, RedisError> made = Pool.make(config: config, options: options);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { println(s: e.message()); return 1; } };
+    string key = "example:pool:hits";
+    {
+        Result<Lease, RedisError> got = pool.acquire();
+        match (give got) {
+            case Ok(value: l): { Lease lease = give l; Result<int64, RedisError> cleared = reply::<int64>(result: lease.conn().call(command: cmd"DEL ${key}")); }
+            case Err(error: e): { println(s: e.message()); return 1; }
+        };
+    }
+
+    // Each isolate gets a share of its own, and joins the pool with it.
+    Channel<int32> told = Channel.bounded(capacity: 4);
+    Receiver<int32> answers = told.receiver();
+    DynamicArray<Isolate> workers = DynamicArray.empty();
+    int32 k = 0;
+    while (k < 4) {
+        Result<PoolShare, RedisError> share = pool.share();
+        match (give share) {
+            case Ok(value: s): { Worker w = Worker.make(share: give s, done: told.sender()); Isolate i = spawn work(job: give w); workers.add(item: give i); }
+            case Err(error: e): { println(s: e.message()); return 1; }
+        };
+        k = k + 1;
+    }
+    int32 failed = 0;
+    int32 heard = 0;
+    while (heard < 4) {
+        Optional<int32> n = answers.recv();
+        match (n) { case Some(value: x): { failed = failed + x; } case None: { } };
+        heard = heard + 1;
+    }
+    workers.clear();
+
+    int64 total = -1;
+    {
+        Result<Lease, RedisError> got = pool.acquire();
+        match (give got) {
+            case Ok(value: l): {
+                Lease lease = give l;
+                Result<int64, RedisError> n = reply::<int64>(result: lease.conn().call(command: cmd"GET ${key}"));
+                total = match (n) { case Ok(value: v): v; case Err(error: e): -1; };
+            }
+            case Err(error: e): { println(s: e.message()); return 1; }
+        };
+    }
+    println(s: "four isolates, 1000 INCRs through a pool of two: the count is ${total}, ${failed} failed");
+    if (total != 1000 || failed != 0) { return 1; }
+    return 0;
+}

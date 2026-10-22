@@ -1,0 +1,52 @@
+// cache: a client-side cache on a connection. A read through it is served again with no round trip until the server
+// says the key changed: another client's write, or this connection's own.
+//
+//   REDIS_URL=redis://127.0.0.1:6379 kama run examples/cache/kama.json
+import { core::println, core::env, std::time::Duration,
+         redis::Config, redis::Connection, redis::RedisError, redis::CacheConfig, redis::CacheStats, redis::cmd,
+         redis::reply };
+
+unsafe fn string serverUrl() {
+    Optional<string> v = env(name: "REDIS_URL");
+    return match (give v) { case Some(value: u): give u; case None: "redis://127.0.0.1:6379"; };
+}
+
+// `key` through the cache, kept for a minute at most: its value, or "(error) …".
+unsafe fn string read(ref Connection conn, const ref string key) {
+    Result<string, RedisError> v = reply::<string>(result: conn.cached(command: cmd"GET ${key}", ttl: Duration.fromSecs(s: 60i64)));
+    return match (give v) { case Ok(value: s): give s; case Err(error: e): "(error) ".concat(other: e.message()); };
+}
+
+fn uint8 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: serverUrl());
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> plain = Connection.connect(config: config);
+    Connection other = match (give plain) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Each connection made from this configuration keeps a cache of its own.
+    Result<Unit, RedisError> set = config.setCache(cache: CacheConfig.defaults());
+    match (give set) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    string key = "example:cache:greeting";
+    Result<string, RedisError> first = reply::<string>(result: other.call(command: cmd"SET ${key} hello"));
+    string a = read(conn: conn, key: key);   // a miss: read from the server, and kept
+    string b = read(conn: conn, key: key);   // a hit: no round trip
+
+    // Another client's write: the server tells this connection, and its next round trip brings the word.
+    Result<string, RedisError> changed = reply::<string>(result: other.call(command: cmd"SET ${key} goodbye"));
+    Result<string, RedisError> ping = reply::<string>(result: conn.call(command: cmd"PING"));
+    string c = read(conn: conn, key: key);
+
+    // This connection's own write is read back at once.
+    Result<string, RedisError> mine = reply::<string>(result: conn.call(command: cmd"SET ${key} mine"));
+    string d = read(conn: conn, key: key);
+
+    CacheStats stats = conn.cacheStats();
+    int64 hits = stats.hits;
+    int64 misses = stats.misses;
+    println(s: "${a}, ${b}, ${c}, ${d}: ${hits} hit(s), ${misses} miss(es)");
+    if (a != "hello" || b != "hello" || c != "goodbye" || d != "mine" || hits != 1i64 || misses != 3i64) { return 1; }
+    return 0;
+}

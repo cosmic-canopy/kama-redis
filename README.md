@@ -99,18 +99,47 @@ that implements `Credentials`, set on the configuration with `Config.setCredenti
 source of a user and password, and a URL's password or `setAuth` beside it is refused.
 
 ```kama
-// Reads the user, password and lifetime a sidecar keeps current; `fork` gives each connection one of its own.
+import { core::println, std::fs::readText, std::io::IoError, std::memory::Owned, std::time::Duration, redis::Config,
+         redis::Connection, redis::Credentials, redis::Login, redis::RedisError, redis::cmd, redis::reply };
+
+// The user and password a sidecar keeps current in a file ("user password"), read at each login and asked for
+// again every ten minutes. `fork` gives each connection a provider of its own.
 type resource SecretFile implements Credentials, Sendable {
     string path;
     public ctor make(string path) { this.path = give path; }
     public unsafe fn Result<Login, RedisError> login() {
-        // … read the file …
-        return Login.of(user: Optional::Some(value: "app"), password: token, refreshAfter: Optional::Some(value: Duration.fromSecs(s: 600i64)));
+        Result<string, IoError> read = readText(path: this.path);
+        string text = match (give read) {
+            case Ok(value: t): t.trim();
+            case Err(error: e): { return Result::Err(error: RedisError::Config(detail: "the secret file cannot be read")); }
+        };
+        Optional<isize> space = text.find(substring: " ");
+        isize at = match (space) { case Some(value: i): i; case None: -1; };
+        if (at <= 0) { return Result::Err(error: RedisError::Config(detail: "the secret file holds no \"user password\"")); }
+        string user = text.substring(start: 0, end: at);
+        string password = text.substring(start: at + 1, end: text.length());
+        return Login.of(user: Optional::Some(value: give user), password: give password,
+                        refreshAfter: Optional::Some(value: Duration.fromSecs(s: 600i64)));
     }
     public unsafe fn Owned<Credentials> fork() {
         Owned<Credentials> f = new SecretFile.make(path: copy this.path);
         return give f;
     }
+}
+
+fn uint8 main() {
+    Result<Config, RedisError> parsed = Config.parse(url: "redis://127.0.0.1:6379");
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Owned<Credentials> provider = new SecretFile.make(path: "/run/secrets/redis");
+    Result<Unit, RedisError> set = config.setCredentials(provider: give provider);
+    match (give set) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, RedisError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<string, RedisError> who = reply::<string>(result: conn.call(command: cmd"ACL WHOAMI"));
+    return match (give who) {
+        case Ok(value: name): { println(s: "logged in as ${name}"); := 0; }
+        case Err(error: e): { println(s: e.message()); := 1; }
+    };
 }
 ```
 
@@ -800,13 +829,18 @@ examples/quickstart/kama.json`.
   failover does to a call.
 - [`cluster`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/cluster/src/main.kama): a cluster from its seeds, a split MSET and MGET, a
   transaction under one hash tag, a pipeline over the nodes.
+- [`pool`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/pool/src/main.kama): four isolates sharing a pool of two connections, each
+  INCR on a lease of its own.
+- [`cache`](https://github.com/cosmic-canopy/kama-redis/blob/main/examples/cache/src/main.kama): a client-side cache: a hit with no round trip, another
+  client's write, and one's own.
 
 ## What comes next
 
 On Redis 6.2 to 8.x and Valkey 7.2 to 9.x, tested on every one:
 - **0.1.0, one server, complete.**
-- **0.2.0, topologies:** Cluster and Sentinel. This release.
-- **0.3.0, scale:** a connection pool shared across isolates, client-side caching, and a credentials provider.
+- **0.2.0, topologies:** Cluster and Sentinel.
+- **0.3.0, scale:** a connection pool shared across isolates, client-side caching, and a credentials provider. This
+  release.
 - **0.4.0, typed commands:** a method per command, and the Redis 8 modules (JSON, search, time series, probabilistic)
   with typed replies.
 

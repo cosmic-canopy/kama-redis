@@ -49,7 +49,7 @@ export { Connection, libraryName, libraryVersion };
 // This library's name and version, as CLIENT SETINFO's lib-name and lib-ver tell them to the server.
 // tools/test.sh checks the version against kama.json's.
 fn string libraryName() { return "kama-redis"; }
-fn string libraryVersion() { return "0.2.0"; }
+fn string libraryVersion() { return "0.3.0"; }
 
 // The most push messages a connection sets aside for `takePushes`; past it the oldest is dropped, and counted.
 comptime isize MAX_PUSHES = 1024;

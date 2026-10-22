@@ -39,8 +39,10 @@ first tagged compiler with everything this package relies on (users install tagg
 - a value-producing arm that may end in `panic`, and unreachable code refused (0.9.696, KRD-12): a test's arm that
   cannot go on ends in `panic(msg:)`, and nothing follows a `while (true)` or a function's last `panic`.
 
-Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), and for 0.2.0 on the v0.9.707 tag
-(2026-10-21, the newest tag and cstar's newest build), with `@kama/tls` ^0.1.6, the first release that builds on
+Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), for 0.2.0 on the v0.9.707 tag
+(2026-10-21, the newest tag and cstar's newest build), and for 0.3.0 on v0.9.707 and cstar's committed 0.9.716
+(2026-10-21; its working tree then held KR-230's `Poller` uncommitted, read live from its `lib/`, so the gates ran
+its committed compiler with its own `lib/` and `include/`), with `@kama/tls` ^0.1.6, the first release that builds on
 0.9.696 and later. `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The
 registry checks a publish with cstar's newest build**, so a package that only builds on the tags does not publish:

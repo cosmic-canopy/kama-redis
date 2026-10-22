@@ -2,9 +2,9 @@
 # check-readme.sh — build every complete program in README.md (each ```kama block with a `fn uint8 main()`) against
 # this package, and run it against a live server. The only change made to an example is its URL: the test server's
 # host and port take the place of 127.0.0.1:6379, its TLS port that of 127.0.0.1:6380, the test PKI's files those
-# under /etc/redis/, its sentinel topology's URL that of redis-sentinel://127.0.0.1:26379?master_name=mymaster, and its
-# cluster's seeds those of redis://127.0.0.1:7000,127.0.0.1:7001. A program that does not build, or exits other than
-# 0, fails.
+# under /etc/redis/, its sentinel topology's URL that of redis-sentinel://127.0.0.1:26379?master_name=mymaster, its
+# cluster's seeds those of redis://127.0.0.1:7000,127.0.0.1:7001, and a file holding the test server's kr_acl login
+# ("kr_acl <password>") that of /run/secrets/redis. A program that does not build, or exits other than 0, fails.
 #
 #   tools/check-readme.sh                    on redis-8.10
 #   tools/check-readme.sh --server S         on the server named (tools/redis.sh list)
@@ -34,6 +34,7 @@ done
 work="$ROOT/out/readme"
 rm -rf "$work"
 mkdir -p "$work"
+printf 'kr_acl %s\n' "$REDISTEST_ACL_PASSWORD" > "$work/secret"
 
 # Each program to its own file: ex1.kama, ex2.kama, …
 perl -e '
@@ -58,7 +59,7 @@ for ex in "$work"/ex*.kama; do
     sed -e "s#redis-sentinel://127\.0\.0\.1:26379?master_name=mymaster#$REDISTEST_SENTINEL_URL#g" \
         -e "s#redis://127\.0\.0\.1:7000,127\.0\.0\.1:7001#$REDISTEST_CLUSTER_URL#g" \
         -e "s#127\.0\.0\.1:6379#$REDISTEST_HOST:$REDISTEST_PORT#g" -e "s#127\.0\.0\.1:6380#$REDISTEST_HOST:$REDISTEST_TLS_PORT#g" \
-        -e "s#/etc/redis/#$REDISTEST_CERTDIR/#g" "$ex" > "$project/src/main.kama"
+        -e "s#/etc/redis/#$REDISTEST_CERTDIR/#g" -e "s#/run/secrets/redis#$work/secret#g" "$ex" > "$project/src/main.kama"
     cat > "$project/kama.json" <<EOF
 { "name": "readme_$name", "version": "0.1.0", "kind": "executable", "kama": ">=0.9.707",
   "entry": "src/main.kama", "dependencies": { "@kama/redis": { "path": "../../.." } },

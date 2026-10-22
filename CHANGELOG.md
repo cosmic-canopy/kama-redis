@@ -6,6 +6,12 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-21
+
+Scale (docs/ROADMAP.md, "Phase 7b"): a pool shared by isolates, client-side caching and a credentials provider, hardened
+across failovers. Tested live on Redis 6.2–8.10 and Valkey 7.2–9.1, alone, under Sentinel and as a cluster, debug and
+release.
+
 What a caller of 0.2.0 may need to change:
 - `RedisError` gained `Credentials` and `PoolTimeout` (it is `@nonExhaustive`, so a `match` with `case _:` needs
   nothing).
