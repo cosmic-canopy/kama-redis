@@ -6,7 +6,9 @@ hand-edited; a re-install rewrites them. This file is the project-specific third
 edit.
 
 **Read [docs/ROADMAP.md](docs/ROADMAP.md) first.** It gives the order of work, where the next phase starts, and every
-decision made so far with its reason. Read [KAMA_GAPS.md](KAMA_GAPS.md) for the compiler gaps this package has hit.
+decision made so far with its reason. Phase 8 (0.4.0) starts at "Phase 8: where to start", "Before step 1": its
+decisions are the maintainer's, and no phase 8 code is written before they are made. Read
+[KAMA_GAPS.md](KAMA_GAPS.md) for the compiler gaps this package has hit.
 
 **The sibling `@kama/postgres` (`../kama-postgres`) is the model.** It is the same kind of package (a native wire
 protocol over `std::net`, a non-blocking `Transport` with deadlines, TLS from `@kama/tls`, typed values through
@@ -44,7 +46,9 @@ first tagged compiler with everything this package relies on (users install tagg
 
 Verified on v0.9.675 (2026-10-19, the build the registry published 0.1.0 with), for 0.2.0 on the v0.9.707 tag
 (2026-10-21, the newest tag and cstar's newest build), and for 0.3.0 on the v0.9.719 tag and cstar's
-`0.9.719+g00e13b15` (2026-10-22), with `@kama/tls` ^0.1.6, the first release that builds on 0.9.696 and later.
+`0.9.719+g00e13b15` (2026-10-22; published 2026-10-26), with `@kama/tls` ^0.1.6, the first release that builds on
+0.9.696 and later. On 2026-10-26 the package, both test programs and every example checked clean on v0.9.734 and
+`0.9.744+g90169f87` too, and the examples' locks moved to `@kama/tls` 0.1.8.
 Check `git -C ~/Documents/cstar status --short lib include` before a gate: cstar's build reads its `lib/` live, so
 another session's uncommitted std change breaks every compile mid-gate. `ci.yml` moves the pin only with the floor. Gate on CI's tag, and on cstar's newest build when it has one (`~/Documents/cstar/out/<platform>/kama`): that build
 is under active work and has regressed before (KRD-8; KRD-9, where 0.9.675 refused `Reader.spare`'s copy). **The

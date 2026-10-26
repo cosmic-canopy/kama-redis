@@ -7,8 +7,10 @@ package, as it is in `@kama/postgres` and `@kama/sodium`.
 
 **Current compiler:** `kama 0.9.719` (tag `v0.9.719`), which CI pins and the manifests' floor names. It moved from
 `v0.9.667` to `v0.9.690` on 2026-10-20, which closed KRD-11, to `v0.9.707` on 2026-10-21, which closed KRD-9 and
-KRD-12, and to `v0.9.719` on 2026-10-22, which closed KRD-13 and KRD-16: the tree carries no workaround. Each repro is
-also run on cstar's newest build, which the registry publishes with: on 2026-10-22, `0.9.719+g00e13b15`. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
+KRD-12, and to `v0.9.719` on 2026-10-22, which closed KRD-13, KRD-14 and KRD-16: the tree carries no workaround. Each repro is
+also run on cstar's newest build, which the registry publishes with: on 2026-10-22, `0.9.719+g00e13b15`. On
+2026-10-26 the package, both test programs and every example checked clean on v0.9.734, the newest tag, and on
+`0.9.744+g90169f87`; the floor stays v0.9.719 until the package needs more. `@kama/tls` 0.1.5 did not build on 0.9.696 and later (four
 statements after a `while (true)`, and from 0.9.706 a `string.find` whose type changed); 0.1.6 does, and this
 package needs `^0.1.6`.
 
@@ -16,7 +18,7 @@ package needs `^0.1.6`.
 can be deleted when the gap closes. **We are not attached to any workaround.** If a fix changes the right design
 here, say so and we will follow it.
 
-**Open now:** KRD-14 and KRD-15. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
+**Open now:** none. Entries are numbered KRD-1, KRD-2, …. A gap this package hits that `@kama/postgres` already
 filed is cited by its KPG number rather than filed again.
 
 **Finding a fix:** since 0.9.532, cstar's commit messages describe a defect in kama's own terms and cite no other
@@ -32,7 +34,63 @@ the commit that made it pass.
 
 ## OPEN
 
-### KRD-14 · MED · An isolate cannot wait on a socket and a channel at once, so a connection shared by isolates cannot multiplex
+None, since 2026-10-26.
+
+## FIXED — kept for the record
+
+KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
+the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
+same change, the first tag with all three.
+
+### KRD-15 · MED · No shared mutable state across isolates: a cache per pool, a shared slot map and a shared master hint wait for KR-226 — FIXED in v0.9.734 (KR-226)
+
+**Found** 2026-10-21, planning 0.3.0. An absence: cstar's ROADMAP KR-226 (`Locked<T>`, a lock window), which names "a
+shared cache, a connection table" as its case.
+
+**What it costs.** Isolates share nothing mutable. `Shared` is not `Sendable`, and `Atomic<T>` holds a scalar
+(`lib/std/concurrent/atomic.kama`). So state that a pool's isolates would share must live behind an owner isolate, at
+a channel round trip (2.5 µs, KRD-14) per access. That defeats the four designs the peers use:
+- **One client-side cache per pool,** as redis-py, go-redis, Jedis and node-redis keep. A local cache's hit should cost
+  a hash lookup, not a hop. 0.3.0 keeps one cache per connection instead (rueidis's design, production-grade on its
+  own), at the price of hits split across the pool's connections and a cache's memory per connection.
+- **One slot map and per-node pools under one cluster client** (go-redis, redis-py, Jedis). 0.3.0's cluster pool
+  leases whole `Cluster`s instead. Each costs about 320 KiB resident and a link to every primary it uses (measured: 64
+  Clusters on a three-primary cluster held 21.9 MiB and 256 sockets), and each reads the map and follows MOVED alone.
+- **A found-master hint shared by a pool's connections,** so a Sentinel failover is asked of the sentinels once, not
+  once per pooled connection.
+- **One token cache across a credentials provider's forks,** so a provider that fetches tokens over the network
+  fetches once per pool, not once per connection.
+
+**What would close it:** KR-226 as designed, a `Sendable` `Locked<T>` whose payload is reached only inside a `borrow`
+window.
+
+**Workaround:** none built. The per-connection cache, the whole-`Cluster` lease and the per-connection provider fork
+are designs of their own, documented with their costs, not stand-ins to delete.
+
+**Closed** 2026-10-26, on v0.9.734 (2026-10-24), release, on the Apple M4. `Locked<T>` and `ReadWriteLocked<T>` are
+`Sendable` handles whose copies share one cell, and the payload is reached only inside a `borrow` window that may not
+wait or take another lock (`@parks`). The repro: a `Locked<Map<int64, int64>>`, one `copy` given to each isolate; each
+access is one window, a lookup and a put on a miss, over 1000 keys:
+
+```kama
+borrow this.cache.lock().value() as m {
+    Optional<int64> hit = m.get(key: k);
+    bool missed = match (hit) { case Some(value: v): false; case None: true; };
+    if (missed) { m.put(key: k, value: i); }
+}
+```
+
+| isolates, 1 000 000 accesses each | wall time over all accesses, two runs |
+|---|---|
+| 1 | 7 ns, 9 ns |
+| 4 | 16 ns, 23 ns |
+| 8 | 26 ns, 24 ns |
+
+So an access costs 7–9 ns alone, and about 200 ns for each isolate with eight of them at once, against the 2.5 µs
+round trip to an owner isolate this entry measured. Each design it names is possible now, and they are under
+"Carried, to be placed in a release" in docs/ROADMAP.md. Using one moves the floor to v0.9.734.
+
+### KRD-14 · MED · An isolate cannot wait on a socket and a channel at once, so a connection shared by isolates cannot multiplex — FIXED in 0.9.719 (KR-201), tagged in v0.9.719
 
 **Found** 2026-10-21, planning 0.3.0 (docs/ROADMAP.md, "Phase 7b: where to start"). An absence, so it cites cstar's
 files rather than a repro.
@@ -75,36 +133,34 @@ Either one makes a multiplexed client the better design here, and this package w
 thing a loop waits on", and the v0.9.719 tag carries it (2026-10-22). This entry's repro and a multiplexed connection
 are to be tried on it, and the entry closed or narrowed.
 
-### KRD-15 · MED · No shared mutable state across isolates: a cache per pool, a shared slot map and a shared master hint wait for KR-226
+**Closed** 2026-10-22, on v0.9.719, release, against Redis 8.10.2 through podman's forwarder, on the Apple M4 the
+entry was measured on. One isolate owns a connection and waits on its socket and on a channel of requests through one
+`Poller`: `p.waker(token:)`, given to `Receiver.wakeOnSend`, and the socket added under a token of its own. It writes
+every request queued since its last wait as one batch, and gives each `+PONG` to the oldest request waiting. The core
+of the owner's loop:
 
-**Found** 2026-10-21, planning 0.3.0. An absence: cstar's ROADMAP KR-226 (`Locked<T>`, a lock window), which names "a
-shared cache, a connection table" as its case.
+```kama
+Result<Waker, IoError> rw = p.waker(token: WORK);
+Waker w = match (give rw) { case Ok(value: x): give x; case Err(error: e): { return; } };
+asks.wakeOnSend(waker: give w);                                  // a send to an empty queue ends the wait
+Result<Unit, IoError> added = p.add(fd: link.rawHandle(), interest: Interest::Read, token: SOCKET);
+Events ev = Events.withCapacity(capacity: 4);
+while (answered < total) {
+    Result<int32, IoError> n = p.wait(events: ev, timeoutMs: 5000);
+    // drain `asks` with tryRecv into one write; if an event has token SOCKET, read the replies and answer in order
+}
+```
 
-**What it costs.** Isolates share nothing mutable. `Shared` is not `Sendable`, and `Atomic<T>` holds a scalar
-(`lib/std/concurrent/atomic.kama`). So state that a pool's isolates would share must live behind an owner isolate, at
-a channel round trip (2.5 µs, KRD-14) per access. That defeats the four designs the peers use:
-- **One client-side cache per pool,** as redis-py, go-redis, Jedis and node-redis keep. A local cache's hit should cost
-  a hash lookup, not a hop. 0.3.0 keeps one cache per connection instead (rueidis's design, production-grade on its
-  own), at the price of hits split across the pool's connections and a cache's memory per connection.
-- **One slot map and per-node pools under one cluster client** (go-redis, redis-py, Jedis). 0.3.0's cluster pool
-  leases whole `Cluster`s instead. Each costs about 320 KiB resident and a link to every primary it uses (measured: 64
-  Clusters on a three-primary cluster held 21.9 MiB and 256 sockets), and each reads the map and follows MOVED alone.
-- **A found-master hint shared by a pool's connections,** so a Sentinel failover is asked of the sentinels once, not
-  once per pooled connection.
-- **One token cache across a credentials provider's forks,** so a provider that fetches tokens over the network
-  fetches once per pool, not once per connection.
+| | each |
+|---|---|
+| a request through a channel to an isolate waiting in `Poller.wait`, and its answer (100 000 rounds, no socket) | 5.3 µs |
+| 1 caller, 2000 PINGs: one shared connection, or a connection of its own | 227 µs, or 209 µs |
+| 4 callers, 2000 PINGs each | 58 µs, or 89 µs |
+| 16 callers, 2000 PINGs each (the shared one wrote 32 000 PINGs in 6989 batches) | 16.5 µs, or 47 µs |
 
-**What would close it:** KR-226 as designed, a `Sendable` `Locked<T>` whose payload is reached only inside a `borrow`
-window.
-
-**Workaround:** none built. The per-connection cache, the whole-`Cluster` lease and the per-connection provider fork
-are designs of their own, documented with their costs, not stand-ins to delete.
-
-## FIXED — kept for the record
-
-KRD-7, KRD-8 and KPG-38's citation were verified on `0.9.573` (tag `v0.9.573`) and `0.9.577+g135c27c5`, each with
-the repro it was filed with; each still fails on `0.9.542`. The package's floor and CI pin moved to `0.9.573` in the
-same change, the first tag with all three.
+So a connection shared by isolates can multiplex now, and with 16 callers it costs a third of a connection each. A
+multiplexed connection beside the pool is under "Carried, to be placed in a release" in docs/ROADMAP.md. KR-3 (fibers)
+would remove the hop as well.
 
 ### KRD-16 · MED · KR-230 removed `std::net::Ready` with no tag that has `Event`: no source builds on both the newest tag and cstar's newest build, so 0.3.0 cannot publish — FIXED by the v0.9.719 tag
 
